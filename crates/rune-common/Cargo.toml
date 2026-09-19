@@ -1,0 +1,22 @@
+[package]
+name = "rune-common"
+description = "Shared types, errors, and utilities for the Rune build system"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+tracing.workspace = true
+serde = { workspace = true }
+serde_json.workspace = true
+xxhash-rust.workspace = true
+blake3.workspace = true
+semver.workspace = true
+home.workspace = true
+filetime.workspace = true
+toml_edit.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

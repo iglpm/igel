@@ -1,0 +1,24 @@
+[package]
+name = "rune-resolver"
+description = "High-speed SemVer dependency resolver, dynamic feature unifier, and binary/Cargo lockfile manager for Rune"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rune-common.workspace = true
+rune-manifest.workspace = true
+rune-registry.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+bincode.workspace = true
+semver.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+colored.workspace = true
+cfg-expr.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

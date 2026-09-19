@@ -1,0 +1,82 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/rune-common",
+    "crates/rune-manifest",
+    "crates/rune-graph",
+    "crates/rune-fingerprint",
+    "crates/rune-scheduler",
+    "crates/rune-compiler",
+    "crates/rune-cas",
+    "crates/rune-registry",
+    "crates/rune-resolver",
+    "crates/rune-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+rust-version = "1.85"
+
+[workspace.dependencies]
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "1"
+toml_edit = "0.25"
+bincode = "1.3"
+
+# Networking & Compression
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "blocking", "json", "gzip", "http2"] }
+flate2 = "1.0"
+tar = "0.4"
+
+# Hashing
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+blake3 = "1"
+
+# Parallelism
+jobserver = "0.1"
+rayon = "1"
+crossbeam-channel = "0.5"
+
+# CLI & UI
+clap = { version = "4", features = ["derive"] }
+colored = "2"
+console = "0.15"
+
+# Logging & Diagnostics
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+indicatif = "0.17"
+
+# Error Handling
+thiserror = "2"
+anyhow = "1"
+
+# Utilities
+semver = { version = "1", features = ["serde"] }
+glob = "0.3"
+cfg-expr = { version = "0.17", features = ["targets"] }
+home = "0.5"
+filetime = "0.2"
+tempfile = "3"
+memmap2 = "0.9"
+walkdir = "2"
+
+# Internal crates
+rune-common = { path = "crates/rune-common" }
+rune-manifest = { path = "crates/rune-manifest" }
+rune-graph = { path = "crates/rune-graph" }
+rune-fingerprint = { path = "crates/rune-fingerprint" }
+rune-scheduler = { path = "crates/rune-scheduler" }
+rune-compiler = { path = "crates/rune-compiler" }
+rune-cas = { path = "crates/rune-cas" }
+rune-registry = { path = "crates/rune-registry" }
+rune-resolver = { path = "crates/rune-resolver" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

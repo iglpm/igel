@@ -1,0 +1,12 @@
+//! # rune-scheduler
+//!
+//! Parallel build task scheduler with DAG-based execution,
+//! critical-path-first scheduling, and rmeta pipelining.
+
+pub mod executor;
+pub mod pipeline;
+pub mod progress;
+
+pub use executor::BuildExecutor;
+pub use pipeline::PipelineEvent;
+pub use progress::BuildProgress;

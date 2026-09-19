@@ -1,0 +1,27 @@
+[package]
+name = "rune-scheduler"
+description = "Parallel build task scheduler with DAG-based execution and rmeta pipelining"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+jobserver.workspace = true
+rune-common.workspace = true
+rune-graph.workspace = true
+rune-fingerprint.workspace = true
+rune-compiler.workspace = true
+rune-cas.workspace = true
+rune-manifest.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+crossbeam-channel.workspace = true
+indicatif.workspace = true
+walkdir.workspace = true
+rayon.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+semver.workspace = true
+tempfile.workspace = true

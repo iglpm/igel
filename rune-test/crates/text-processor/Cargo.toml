@@ -1,0 +1,10 @@
+[package]
+name = "text-processor"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+math-engine = { path = "../math-engine" }
+
+[lib]
+path = "src/lib.rs"

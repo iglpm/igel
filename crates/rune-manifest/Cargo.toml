@@ -1,0 +1,21 @@
+[package]
+name = "rune-manifest"
+description = "Cargo.toml and Rune.toml manifest parser for the Rune build system"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rune-common.workspace = true
+toml.workspace = true
+toml_edit.workspace = true
+serde = { workspace = true }
+serde_json.workspace = true
+semver.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+glob.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

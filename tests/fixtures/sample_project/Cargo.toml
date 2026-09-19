@@ -1,0 +1,11 @@
+[package]
+name = "sample-project"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+helper = { path = "helper" }
+
+[[bin]]
+name = "sample-app"
+path = "src/main.rs"

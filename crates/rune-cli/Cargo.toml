@@ -1,0 +1,39 @@
+[package]
+name = "rune-cli"
+description = "The rune command-line interface"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "rune"
+path = "src/main.rs"
+
+[dependencies]
+rune-common.workspace = true
+rune-manifest.workspace = true
+rune-graph.workspace = true
+rune-fingerprint.workspace = true
+rune-scheduler.workspace = true
+rune-compiler.workspace = true
+rune-cas.workspace = true
+rune-registry.workspace = true
+rune-resolver.workspace = true
+clap.workspace = true
+colored.workspace = true
+console.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+home.workspace = true
+crossbeam-channel.workspace = true
+toml_edit.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true
+indicatif.workspace = true
+semver.workspace = true
+rayon.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

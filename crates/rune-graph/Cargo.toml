@@ -1,0 +1,14 @@
+[package]
+name = "rune-graph"
+description = "Dependency graph, topological sort, and critical path computation for Rune"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rune-common.workspace = true
+rune-manifest.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+semver.workspace = true

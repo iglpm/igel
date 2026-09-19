@@ -1,0 +1,23 @@
+[package]
+name = "rune-registry"
+description = "crates.io sparse index client, crate downloader, and extraction cache for Rune"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rune-common.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+reqwest.workspace = true
+flate2.workspace = true
+tar.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+rayon.workspace = true
+semver.workspace = true
+home.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

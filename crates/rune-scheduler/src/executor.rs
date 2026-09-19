@@ -1,0 +1,1534 @@
+use crate::pipeline::PipelineEvent;
+use crossbeam_channel::{Receiver, Sender, unbounded};
+use rayon::prelude::*;
+use rune_cas::CasStore;
+use rune_common::{
+    BuildScriptOutput, CompilationUnit, CrateSource, CrateType, Profile, RuneConfig, RuneError,
+    RuneResult, TargetKind, TargetTriple,
+};
+use rune_compiler::{
+    BuildScriptRunner, CompilationResult, RustcCommandBuilder, RustcInvoker,
+    build_script::BuildScriptEnv,
+};
+use rune_graph::{BuildGraph, NodeId, compute_critical_paths_with};
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+use tracing::{debug, error};
+
+/// The result of a build execution.
+#[derive(Debug, Clone)]
+pub struct BuildResult {
+    pub success: bool,
+    pub compiled: usize,
+    pub cached: usize,
+    pub failed: Vec<NodeId>,
+    pub total_duration: Duration,
+    /// Every compiled/cache-restored artifact (`.rlib`, `.rmeta`, binaries,
+    /// ...) produced for each node, keyed by node id. Lets a caller that
+    /// needs to link something new against an already-built node (e.g.
+    /// `rune test` linking a test harness binary against a crate's rlib)
+    /// find those paths without re-deriving rustc's own output naming.
+    pub artifact_paths: HashMap<NodeId, Vec<PathBuf>>,
+    /// The content-addressable cache key computed for each node.
+    pub cache_keys: HashMap<NodeId, String>,
+}
+
+enum WorkerMsg {
+    MetadataReady {
+        node_id: NodeId,
+        rmeta_path: PathBuf,
+    },
+    BuildScriptDone {
+        node_id: NodeId,
+        output: BuildScriptOutput,
+    },
+    Finished {
+        node_id: NodeId,
+        artifacts: Vec<PathBuf>,
+        duration: Duration,
+    },
+    Failed {
+        node_id: NodeId,
+        error: String,
+    },
+}
+
+/// Which artifact flavor a compilation needs from its dependencies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExternMode {
+    /// A library being type-checked/compiled: `.rmeta` is enough (and lets
+    /// dependents start before a dependency finishes codegen).
+    Pipelined,
+    /// Something that is actually linked (binary, test harness, proc-macro,
+    /// dylib): every dependency's real `.rlib` is required.
+    Link,
+}
+
+/// The parallel build executor.
+///
+/// 1. Computes a content-addressable cache key for every unit up front
+///    (registry crates are immutable, so their key never touches the disk).
+/// 2. Restores every cache hit in parallel *before* scheduling anything.
+/// 3. Schedules the remaining units by critical path, weighted by measured
+///    compile times from earlier builds.
+/// 4. Invokes `rustc` with metadata pipelining: dependents start as soon as
+///    a dependency's `.rmeta` exists.
+pub struct BuildExecutor {
+    config: RuneConfig,
+    profile: Profile,
+    invoker: RustcInvoker,
+    cas: Option<CasStore>,
+    event_tx: Sender<PipelineEvent>,
+    event_rx: Receiver<PipelineEvent>,
+    max_jobs: usize,
+    force_rebuild: bool,
+    rustflags: Vec<String>,
+    color: bool,
+    /// Shared with every `rustc` (and build script) we start, so their
+    /// internal codegen threads and C compilers draw from one pool of
+    /// `max_jobs` tokens instead of each assuming it owns the machine.
+    jobserver: Option<jobserver::Client>,
+}
+
+impl BuildExecutor {
+    /// Creates a new `BuildExecutor`.
+    pub fn new(config: RuneConfig, profile: Profile, max_jobs: usize) -> Self {
+        let (event_tx, event_rx) = unbounded();
+        Self {
+            config,
+            profile,
+            invoker: RustcInvoker::new(),
+            cas: None,
+            event_tx,
+            event_rx,
+            max_jobs: max_jobs.max(1),
+            force_rebuild: false,
+            rustflags: rustflags_from_env(),
+            color: false,
+            jobserver: jobserver::Client::new(max_jobs.max(1)).ok(),
+        }
+    }
+
+    /// Sets the CAS store for artifact caching.
+    pub fn with_cas(mut self, cas: CasStore) -> Self {
+        self.cas = Some(cas);
+        self
+    }
+
+    /// Never restore from the CAS: compile every unit (and re-run every build
+    /// script) even if an identical artifact is cached. Results are still
+    /// *stored*, so a later ordinary build can reuse them.
+    ///
+    /// This is what `build.release-rebuild-all` turns on for release builds.
+    pub fn with_force_rebuild(mut self, force: bool) -> Self {
+        self.force_rebuild = force;
+        self
+    }
+
+    /// Ask the compiler for ANSI-colored diagnostics.
+    pub fn with_color(mut self, color: bool) -> Self {
+        self.color = color;
+        self
+    }
+
+    /// Returns a receiver for pipeline events to drive progress bars or logs.
+    pub fn event_receiver(&self) -> Receiver<PipelineEvent> {
+        self.event_rx.clone()
+    }
+
+    /// Directory a unit's primary artifacts are written to.
+    fn out_dir_for(&self, unit: &CompilationUnit) -> PathBuf {
+        out_dir_for(&self.config, &self.profile, unit)
+    }
+
+    /// Executes the build graph.
+    pub fn execute(&self, graph: &BuildGraph) -> RuneResult<BuildResult> {
+        let start_time = Instant::now();
+        let profile_dir_name = self.profile.output_dir_name();
+        self.config
+            .ensure_dirs(profile_dir_name)
+            .map_err(RuneError::Io)?;
+
+        let topo = graph.topological_sort()?;
+
+        let source_cache_path = self.config.fingerprint_dir.join("source-cache.json");
+        let mut source_cache =
+            rune_fingerprint::FingerprintCache::load(&source_cache_path).unwrap_or_default();
+        let timings_path = self.config.fingerprint_dir.join("timings.json");
+        let mut timings = Timings::load(&timings_path);
+
+        // 1. Cache keys for every node, dependencies first.
+        let keys_timer = rune_common::timing::phase("cache keys");
+        let mut unit_cas_keys: HashMap<NodeId, String> = HashMap::with_capacity(topo.len());
+        for &id in &topo {
+            let node = graph.node(id);
+            let dep_keys: Vec<(String, String)> = node
+                .dependencies
+                .iter()
+                .filter_map(|d| {
+                    unit_cas_keys
+                        .get(d)
+                        .map(|k| (graph.node(*d).unit.crate_id.name.clone(), k.clone()))
+                })
+                .collect();
+            let key = compute_unit_cas_key(&node.unit, &self.profile, &dep_keys, &mut source_cache);
+            unit_cas_keys.insert(id, key);
+        }
+        drop(keys_timer);
+
+        let mut completed: HashSet<NodeId> = HashSet::new();
+        let mut in_flight: HashSet<NodeId> = HashSet::new();
+        let mut metadata_ready: HashSet<NodeId> = HashSet::new();
+        let mut artifact_paths: HashMap<NodeId, Vec<PathBuf>> = HashMap::new();
+        let mut metadata_paths: HashMap<NodeId, PathBuf> = HashMap::new();
+        let mut build_script_outputs: HashMap<NodeId, BuildScriptOutput> = HashMap::new();
+        let mut compiled = 0;
+        let mut cached = 0;
+        let mut failed: Vec<NodeId> = Vec::new();
+
+        // 2. Restore every cache hit in parallel. A unit's key already covers
+        // its dependencies' keys, so whether it is cached doesn't depend on
+        // whether those dependencies were restored or will be rebuilt.
+        if let Some(cas) = self.cas.as_ref().filter(|_| !self.force_rebuild) {
+            let _timer = rune_common::timing::phase("cas restore");
+            let restored: Vec<(NodeId, Vec<PathBuf>)> = topo
+                .par_iter()
+                .filter_map(|&id| {
+                    let unit = &graph.node(id).unit;
+                    let linked = cas
+                        .link_to(&unit_cas_keys[&id], &self.out_dir_for(unit))
+                        .ok()?;
+                    (!linked.is_empty()).then_some((id, linked))
+                })
+                .collect();
+
+            for (id, linked) in restored {
+                let unit = &graph.node(id).unit;
+                debug!(
+                    "CAS hit for {} v{}",
+                    unit.crate_id.name, unit.crate_id.version
+                );
+                cached += 1;
+                completed.insert(id);
+                metadata_ready.insert(id);
+
+                // A cache hit skips the worker entirely, so it never runs the
+                // build script that would report `DEP_<LINKS>_<KEY>` metadata
+                // to dependents. Restore it from the store.
+                if unit.links.is_some() {
+                    if let Some(output) =
+                        cas.get_value(&format!("{}-buildscript", unit_cas_keys[&id]))
+                    {
+                        build_script_outputs.insert(id, output);
+                    }
+                }
+                if let Some(rmeta) = linked
+                    .iter()
+                    .find(|p| p.extension().and_then(|e| e.to_str()) == Some("rmeta"))
+                {
+                    metadata_paths.insert(id, rmeta.clone());
+                }
+                if unit.crate_type == CrateType::Bin && !unit.harness {
+                    alias_binaries(&self.config, &self.profile, unit, &linked);
+                }
+                // Cargo replays a cached crate's warnings; so do we.
+                let warnings = if unit.crate_id.source == CrateSource::Local {
+                    cas.get_value::<String>(&format!("{}-warnings", unit_cas_keys[&id]))
+                        .unwrap_or_default()
+                } else {
+                    String::new()
+                };
+                let _ = self.event_tx.send(PipelineEvent::CacheHit {
+                    node_id: id,
+                    artifacts: linked.clone(),
+                    warnings,
+                });
+                artifact_paths.insert(id, linked);
+            }
+        }
+
+        // 3. Critical-path weights over the *remaining* work only, using
+        // measured compile times where we have them.
+        let weights = compute_critical_paths_with(graph, |node| {
+            if completed.contains(&node.id) {
+                0.0
+            } else {
+                timings.estimate(&node.unit, &self.profile)
+            }
+        });
+
+        let (worker_tx, worker_rx) = unbounded::<WorkerMsg>();
+        let total_nodes = graph.node_count();
+
+        // Full transitive dependency closure per node, needed for anything
+        // that performs a real link step (binaries, cdylibs, proc-macros,
+        // build scripts). Pipelining lets a *library* finish compiling using
+        // only its dependencies' `.rmeta`, so "direct dependency completed"
+        // does NOT imply "that dependency's own dependencies finished
+        // linking". A binary link needs every transitively linked crate's
+        // actual `.rlib` on disk, so gating readiness on direct dependencies
+        // alone raced the final link against the slowest transitive
+        // dependency ("crate `X` required to be available in rlib format").
+        let transitive_deps: HashMap<NodeId, HashSet<NodeId>> = {
+            let mut map: HashMap<NodeId, HashSet<NodeId>> = HashMap::new();
+            for &id in &topo {
+                let mut set = HashSet::new();
+                for &dep in &graph.node(id).dependencies {
+                    set.insert(dep);
+                    if let Some(dep_set) = map.get(&dep) {
+                        set.extend(dep_set.iter().copied());
+                    }
+                }
+                map.insert(id, set);
+            }
+            map
+        };
+
+        // Nodes still to schedule, in stable graph order.
+        let mut unscheduled: Vec<NodeId> = graph
+            .nodes()
+            .iter()
+            .map(|n| n.id)
+            .filter(|id| !completed.contains(id))
+            .collect();
+
+        while completed.len() + failed.len() < total_nodes {
+            if !failed.is_empty() && in_flight.is_empty() {
+                break; // Nothing more can start once something failed.
+            }
+
+            if failed.is_empty() && in_flight.len() < self.max_jobs {
+                let mut ready: Vec<NodeId> = unscheduled
+                    .iter()
+                    .copied()
+                    .filter(|&id| {
+                        let node = graph.node(id);
+                        if node.unit.needs_real_link() {
+                            transitive_deps[&id].iter().all(|d| completed.contains(d))
+                        } else {
+                            node.dependencies.iter().all(|dep_id| {
+                                if graph.node(*dep_id).unit.crate_type == CrateType::ProcMacro {
+                                    completed.contains(dep_id)
+                                } else {
+                                    completed.contains(dep_id) || metadata_ready.contains(dep_id)
+                                }
+                            })
+                        }
+                    })
+                    .collect();
+
+                // Longest remaining chain first.
+                ready.sort_by(|a, b| {
+                    let wa = weights.get(a).copied().unwrap_or(0.0);
+                    let wb = weights.get(b).copied().unwrap_or(0.0);
+                    wb.partial_cmp(&wa).unwrap_or(std::cmp::Ordering::Equal)
+                });
+
+                for node_id in ready {
+                    if in_flight.len() >= self.max_jobs {
+                        break;
+                    }
+                    unscheduled.retain(|id| *id != node_id);
+                    in_flight.insert(node_id);
+                    let job = self.prepare_job(
+                        graph,
+                        node_id,
+                        &unit_cas_keys[&node_id],
+                        &artifact_paths,
+                        &metadata_paths,
+                        &build_script_outputs,
+                        worker_tx.clone(),
+                    );
+                    std::thread::spawn(move || job.run());
+                }
+            }
+
+            if in_flight.is_empty() {
+                if completed.len() + failed.len() < total_nodes {
+                    error!(
+                        "Build stalled: no tasks in flight and remaining tasks cannot be scheduled."
+                    );
+                }
+                break;
+            }
+
+            let Ok(msg) = worker_rx.recv() else { break };
+            let mut next = Some(msg);
+            // Drain everything already queued before rescanning readiness.
+            while let Some(msg) = next.take().or_else(|| worker_rx.try_recv().ok()) {
+                match msg {
+                    WorkerMsg::MetadataReady {
+                        node_id,
+                        rmeta_path,
+                    } => {
+                        debug!("Metadata ready for node {:?}", node_id);
+                        metadata_ready.insert(node_id);
+                        metadata_paths.insert(node_id, rmeta_path);
+                    }
+                    WorkerMsg::BuildScriptDone { node_id, output } => {
+                        build_script_outputs.insert(node_id, output);
+                    }
+                    WorkerMsg::Finished {
+                        node_id,
+                        artifacts,
+                        duration,
+                    } => {
+                        debug!("Finished compiling node {:?}", node_id);
+                        in_flight.remove(&node_id);
+                        completed.insert(node_id);
+                        metadata_ready.insert(node_id);
+                        artifact_paths.insert(node_id, artifacts);
+                        timings.record(&graph.node(node_id).unit, &self.profile, duration);
+                        compiled += 1;
+                    }
+                    WorkerMsg::Failed { node_id, error } => {
+                        // The rendered diagnostic already went out on
+                        // `PipelineEvent::BuildFailed`; callers print it
+                        // themselves, so this is just a trace breadcrumb.
+                        debug!("Failed to compile node {:?}: {}", node_id, error);
+                        in_flight.remove(&node_id);
+                        failed.push(node_id);
+                    }
+                }
+            }
+        }
+
+        let _ = source_cache.save_if_changed(&source_cache_path);
+        timings.save(&timings_path);
+        if let Some(cas) = &self.cas {
+            cas.flush_stats();
+        }
+
+        let total_duration = start_time.elapsed();
+        let success = failed.is_empty();
+
+        let _ = self.event_tx.send(PipelineEvent::AllComplete {
+            total_duration,
+            cached,
+            compiled,
+            failed: failed.len(),
+        });
+
+        Ok(BuildResult {
+            success,
+            compiled,
+            cached,
+            failed,
+            total_duration,
+            artifact_paths,
+            cache_keys: unit_cas_keys,
+        })
+    }
+
+    /// Gathers everything a worker thread needs, by value.
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_job(
+        &self,
+        graph: &BuildGraph,
+        node_id: NodeId,
+        cas_key: &str,
+        artifact_paths: &HashMap<NodeId, Vec<PathBuf>>,
+        metadata_paths: &HashMap<NodeId, PathBuf>,
+        build_script_outputs: &HashMap<NodeId, BuildScriptOutput>,
+        worker_tx: Sender<WorkerMsg>,
+    ) -> UnitJob {
+        let node = graph.node(node_id);
+        let unit = node.unit.clone();
+        let mode = if unit.produces_real_artifact() {
+            ExternMode::Link
+        } else {
+            ExternMode::Pipelined
+        };
+        let extern_deps = extern_deps_for(graph, node_id, artifact_paths, metadata_paths, mode);
+
+        // Build scripts run natively and link against real artifacts.
+        let build_script_extern_deps: Vec<(String, PathBuf)> = node
+            .dependencies
+            .iter()
+            .filter_map(|&dep_id| {
+                let dep_node = graph.node(dep_id);
+                let name = extern_name(graph, node_id, dep_id);
+                let artifacts = artifact_paths.get(&dep_id)?;
+                let ext = |p: &&PathBuf| -> Option<String> {
+                    p.extension().and_then(|e| e.to_str()).map(str::to_owned)
+                };
+                artifacts
+                    .iter()
+                    .find(|p| ext(p).as_deref() == Some("rlib"))
+                    .or_else(|| {
+                        artifacts
+                            .iter()
+                            .find(|p| matches!(ext(p).as_deref(), Some("so" | "dylib" | "dll")))
+                    })
+                    .or_else(|| {
+                        artifacts
+                            .iter()
+                            .find(|p| !matches!(ext(p).as_deref(), Some("d") | Some("rmeta")))
+                    })
+                    .map(|p| (name, p.clone()))
+                    .filter(|_| {
+                        // Only dependencies that are libraries can be linked.
+                        dep_node.unit.crate_type != CrateType::Bin
+                    })
+            })
+            .collect();
+
+        // `DEP_<LINKS>_<KEY>`: a `links`-declaring crate's build script
+        // reports metadata via `cargo:KEY=VALUE`, which Cargo exposes to a
+        // *dependent's* build script.
+        let mut dep_metadata = Vec::new();
+        for &dep_id in &node.dependencies {
+            let dep_unit = &graph.node(dep_id).unit;
+            if let (Some(links), Some(output)) =
+                (&dep_unit.links, build_script_outputs.get(&dep_id))
+            {
+                for (key, value) in &output.metadata {
+                    dep_metadata.push((links.clone(), key.clone(), value.clone()));
+                }
+            }
+        }
+
+        // Integration tests, benches and examples of a package can run its
+        // binaries: Cargo exposes each as `CARGO_BIN_EXE_<name>` at compile
+        // time, so every binary this unit depends on gets one.
+        let mut extra_env = Vec::new();
+        if matches!(
+            unit.kind,
+            TargetKind::Test | TargetKind::Bench | TargetKind::Example
+        ) {
+            for &dep_id in &node.dependencies {
+                let dep = &graph.node(dep_id).unit;
+                if dep.crate_type == CrateType::Bin && dep.kind == TargetKind::Bin {
+                    let exe =
+                        out_dir_for(&self.config, &self.profile, dep).join(&dep.crate_id.name);
+                    extra_env.push((
+                        format!("CARGO_BIN_EXE_{}", dep.crate_id.name),
+                        exe.display().to_string(),
+                    ));
+                }
+            }
+        }
+
+        UnitJob {
+            node_id,
+            unit,
+            extern_deps,
+            build_script_extern_deps,
+            dep_metadata,
+            cas_key: cas_key.to_string(),
+            build_output: build_script_outputs.get(&node_id).cloned(),
+            config: self.config.clone(),
+            profile: self.profile.clone(),
+            cas: self.cas.clone(),
+            rustc_path: self.invoker.rustc_path().clone(),
+            event_tx: self.event_tx.clone(),
+            worker_tx,
+            force_rebuild: self.force_rebuild,
+            max_jobs: self.max_jobs,
+            rustflags: self.rustflags.clone(),
+            extra_env,
+            color: self.color,
+            jobserver: self.jobserver.clone(),
+        }
+    }
+}
+
+/// Everything one worker thread needs to build a single unit.
+struct UnitJob {
+    node_id: NodeId,
+    unit: CompilationUnit,
+    extern_deps: Vec<(String, PathBuf)>,
+    build_script_extern_deps: Vec<(String, PathBuf)>,
+    dep_metadata: Vec<(String, String, String)>,
+    cas_key: String,
+    build_output: Option<BuildScriptOutput>,
+    config: RuneConfig,
+    profile: Profile,
+    cas: Option<CasStore>,
+    rustc_path: PathBuf,
+    event_tx: Sender<PipelineEvent>,
+    worker_tx: Sender<WorkerMsg>,
+    force_rebuild: bool,
+    max_jobs: usize,
+    rustflags: Vec<String>,
+    /// Extra compile-time environment, e.g. `CARGO_BIN_EXE_<name>` for
+    /// integration tests.
+    extra_env: Vec<(String, String)>,
+    color: bool,
+    jobserver: Option<jobserver::Client>,
+}
+
+impl UnitJob {
+    fn fail(&self, error: String, event_error: String) {
+        let _ = self.event_tx.send(PipelineEvent::BuildFailed {
+            node_id: self.node_id,
+            error: event_error,
+        });
+        let _ = self.worker_tx.send(WorkerMsg::Failed {
+            node_id: self.node_id,
+            error,
+        });
+    }
+
+    fn run(self) {
+        // Hold one jobserver token for as long as this unit runs; the compiler
+        // may borrow more for its own codegen threads while others are idle.
+        let _token = self.jobserver.as_ref().and_then(|js| js.acquire().ok());
+        let start = Instant::now();
+        let node_id = self.node_id;
+        let unit = &self.unit;
+        let profile = &self.profile;
+        let config = &self.config;
+        let _ = self.event_tx.send(PipelineEvent::BuildStarted {
+            node_id,
+            unit: unit.clone(),
+        });
+
+        // A distinct CAS slot from the compiled-artifact entry, keyed off the
+        // same (build-script-aware) fingerprint: whenever the crate needs
+        // recompiling for any reason, a build script whose own inputs didn't
+        // change can skip being recompiled and re-executed — the most
+        // expensive part of crates like `openssl-sys` or `ring`.
+        let build_script_cache_key = format!("{}-buildscript", self.cas_key);
+
+        // 1. Compile & execute the build script, unless a cached run already
+        //    told us its output. Its output is two things that must be
+        //    restored together: the parsed `cargo:` directives and whatever
+        //    files it wrote to `OUT_DIR` (which the crate may `include!()`).
+        let script_out_dir = config.build_script_out_dir(
+            profile.output_dir_name(),
+            &unit.rustc_crate_name(),
+            &unit.metadata_hash(),
+        );
+        let mut effective_build_output = self.build_output.clone();
+        if effective_build_output.is_none() && !self.force_rebuild {
+            if let Some(cas_store) = &self.cas {
+                let restored = cas_store
+                    .restore_dir_tree(&build_script_cache_key, &script_out_dir)
+                    .unwrap_or(false);
+                if restored {
+                    effective_build_output = cas_store.get_value(&build_script_cache_key);
+                }
+            }
+        }
+
+        if let (Some(build_rs), true) =
+            (unit.build_script.clone(), effective_build_output.is_none())
+        {
+            let _ = self.event_tx.send(PipelineEvent::BuildScriptStarted {
+                node_id,
+                crate_name: unit.crate_id.name.clone(),
+            });
+            let _ = std::fs::create_dir_all(&script_out_dir);
+
+            let deps_dir = config.deps_dir(profile.output_dir_name());
+            // `TARGET` must always be a real triple: build scripts like
+            // openssl-sys parse it. `HOST` is always the build machine's.
+            let host_triple = TargetTriple::host()
+                .map(|t| t.0)
+                .unwrap_or_else(|| "x86_64-unknown-linux-gnu".to_string());
+            let env = BuildScriptEnv {
+                manifest_dir: unit.manifest_dir.clone(),
+                out_dir: script_out_dir.clone(),
+                target: unit
+                    .target
+                    .as_ref()
+                    .map(|t| t.0.clone())
+                    .unwrap_or_else(|| host_triple.clone()),
+                host: host_triple,
+                opt_level: profile.opt_level.as_str().to_string(),
+                debug: profile.debuginfo.as_str().to_string(),
+                profile: profile.name.clone(),
+                num_jobs: self.max_jobs as u32,
+                rustc: self.rustc_path.clone(),
+                pkg_name: unit.crate_id.name.clone(),
+                pkg_version: unit.crate_id.version.to_string(),
+                features: unit.features.clone(),
+                cfgs: Vec::new(),
+                dep_metadata: self.dep_metadata.clone(),
+                links: unit.links.clone(),
+            };
+
+            let configure = |cmd: &mut std::process::Command| {
+                if let Some(js) = &self.jobserver {
+                    js.configure(cmd);
+                }
+            };
+            let compiled = BuildScriptRunner::compile_with(
+                &self.rustc_path,
+                &build_rs,
+                &script_out_dir,
+                &deps_dir,
+                unit.edition.as_str(),
+                &self.build_script_extern_deps,
+                Some(&env),
+                &configure,
+            );
+            match compiled {
+                Ok(bin_path) => {
+                    match BuildScriptRunner::execute_with(&bin_path, &env, &configure) {
+                        Ok(out) => {
+                            let _ = self.event_tx.send(PipelineEvent::BuildScriptFinished {
+                                node_id,
+                                crate_name: unit.crate_id.name.clone(),
+                                duration: start.elapsed(),
+                            });
+                            if let Some(cas_store) = &self.cas {
+                                let _ = cas_store
+                                    .put_dir_tree(&build_script_cache_key, &script_out_dir);
+                                let _ = cas_store.put_value(&build_script_cache_key, &out);
+                            }
+                            effective_build_output = Some(out);
+                        }
+                        Err(e) => {
+                            self.fail(e.to_string(), format!("build.rs execution failed: {e}"));
+                            return;
+                        }
+                    }
+                }
+                Err(e) => {
+                    self.fail(e.to_string(), format!("build.rs compilation failed: {e}"));
+                    return;
+                }
+            }
+        }
+
+        if let Some(output) = &effective_build_output {
+            let _ = self.worker_tx.send(WorkerMsg::BuildScriptDone {
+                node_id,
+                output: output.clone(),
+            });
+        }
+
+        // 2. Build the rustc command. Any leftover output from an earlier
+        // build is unlinked first: outputs are hard links into the CAS, and a
+        // compiler that rewrites an existing file in place would silently
+        // change the cached object every other project shares.
+        let out_dir = out_dir_for(config, profile, unit);
+        remove_stale_outputs(&out_dir, unit);
+
+        let _ = std::fs::create_dir_all(&out_dir);
+        let mut cmd_builder = build_rustc_command(
+            unit,
+            profile,
+            config,
+            &self.extern_deps,
+            effective_build_output.as_ref(),
+            self.color,
+        );
+        for (k, v) in &self.extra_env {
+            cmd_builder = cmd_builder.env(k, v);
+        }
+        if !self.rustflags.is_empty() {
+            cmd_builder = cmd_builder.extra_flags(self.rustflags.clone());
+        }
+        let mut cmd = cmd_builder.build_with_rustc(&self.rustc_path);
+        if let Some(js) = &self.jobserver {
+            js.configure(&mut cmd);
+        }
+
+        // 3. Pipelined invocation: report `.rmeta` as soon as it exists.
+        let invoker = RustcInvoker::new();
+        let worker_tx = self.worker_tx.clone();
+        let event_tx = self.event_tx.clone();
+        let result = invoker.invoke_pipelined(cmd, move |rmeta_path| {
+            let _ = event_tx.send(PipelineEvent::MetadataReady {
+                node_id,
+                rmeta_path: rmeta_path.clone(),
+            });
+            let _ = worker_tx.send(WorkerMsg::MetadataReady {
+                node_id,
+                rmeta_path,
+            });
+        });
+
+        match result {
+            Ok(comp_res) if comp_res.success => {
+                let duration = start.elapsed();
+                // Dependencies are compiled with `--cap-lints allow`; only
+                // the user's own crates have warnings worth showing.
+                let warnings: String = if unit.crate_id.source == CrateSource::Local {
+                    comp_res
+                        .diagnostics
+                        .iter()
+                        .filter_map(|d| d.rendered.as_deref())
+                        .collect::<Vec<_>>()
+                        .join("")
+                } else {
+                    String::new()
+                };
+                let artifacts: Vec<PathBuf> =
+                    comp_res.artifacts.into_iter().map(|a| a.artifact).collect();
+
+                if let Some(cas_store) = &self.cas {
+                    let _ = cas_store.put(
+                        &self.cas_key,
+                        &unit.crate_id.name,
+                        &unit.crate_id.version.to_string(),
+                        &artifacts,
+                    );
+                    if !warnings.is_empty() {
+                        let _ =
+                            cas_store.put_value(&format!("{}-warnings", self.cas_key), &warnings);
+                    }
+                }
+                if unit.crate_type == CrateType::Bin && !unit.harness {
+                    alias_binaries(config, profile, unit, &artifacts);
+                }
+
+                let _ = self.event_tx.send(PipelineEvent::BuildFinished {
+                    node_id,
+                    artifacts: artifacts.clone(),
+                    duration,
+                    warnings,
+                });
+                let _ = self.worker_tx.send(WorkerMsg::Finished {
+                    node_id,
+                    artifacts,
+                    duration,
+                });
+            }
+            Ok(comp_res) => {
+                let err_msg = render_compile_error(&comp_res);
+                self.fail(err_msg.clone(), err_msg);
+            }
+            Err(e) => self.fail(e.to_string(), e.to_string()),
+        }
+    }
+}
+
+/// Where a unit's primary artifacts go: binaries into the profile directory,
+/// everything else (and everything under `rune check`) into `deps/`.
+pub fn out_dir_for(config: &RuneConfig, profile: &Profile, unit: &CompilationUnit) -> PathBuf {
+    let dir = profile.output_dir_name();
+    if unit.check_only || unit.harness {
+        return config.deps_dir(dir);
+    }
+    match (unit.crate_type, unit.kind) {
+        (CrateType::Bin, TargetKind::Example) => config.profile_target_dir(dir).join("examples"),
+        (CrateType::Bin, _) => config.profile_target_dir(dir),
+        _ => config.deps_dir(dir),
+    }
+}
+
+/// The `--extern` name a dependent uses for one of its dependencies.
+fn extern_name(graph: &BuildGraph, node_id: NodeId, dep_id: NodeId) -> String {
+    graph
+        .node(node_id)
+        .extern_aliases
+        .get(&dep_id)
+        .map(|s| s.replace('-', "_"))
+        .unwrap_or_else(|| graph.node(dep_id).unit.rustc_crate_name())
+}
+
+/// Builds the `--extern name=path` list for a graph node.
+///
+/// Proc-macros are always passed as their shared library; everything else
+/// prefers `.rmeta` in [`ExternMode::Pipelined`] and `.rlib` in
+/// [`ExternMode::Link`].
+pub fn extern_deps_for(
+    graph: &BuildGraph,
+    node_id: NodeId,
+    artifact_paths: &HashMap<NodeId, Vec<PathBuf>>,
+    metadata_paths: &HashMap<NodeId, PathBuf>,
+    mode: ExternMode,
+) -> Vec<(String, PathBuf)> {
+    let ext_of = |p: &&PathBuf| p.extension().and_then(|e| e.to_str()).map(str::to_owned);
+    let mut deps = Vec::new();
+    for &dep_id in &graph.node(node_id).dependencies {
+        let dep_node = graph.node(dep_id);
+        // A binary can be a *build-order* dependency (integration tests need
+        // the package's executables to exist) but is never `--extern`ed.
+        if dep_node.unit.crate_type == CrateType::Bin {
+            continue;
+        }
+        let name = extern_name(graph, node_id, dep_id);
+        // A dependency that is still compiling has no entry in
+        // `artifact_paths` yet, but may already have published its `.rmeta`
+        // (that is the whole point of pipelining), so an empty list is fine.
+        let no_artifacts = Vec::new();
+        let artifacts = artifact_paths.get(&dep_id).unwrap_or(&no_artifacts);
+        let is_real = |p: &&PathBuf| !matches!(ext_of(p).as_deref(), Some("d") | Some("rmeta"));
+
+        let chosen: Option<PathBuf> = if dep_node.unit.crate_type == CrateType::ProcMacro {
+            artifacts
+                .iter()
+                .find(|p| matches!(ext_of(p).as_deref(), Some("so" | "dylib" | "dll")))
+                .or_else(|| artifacts.iter().find(is_real))
+                .cloned()
+        } else if mode == ExternMode::Link {
+            artifacts
+                .iter()
+                .find(|p| ext_of(p).as_deref() == Some("rlib"))
+                .or_else(|| artifacts.iter().find(is_real))
+                .cloned()
+        } else {
+            metadata_paths
+                .get(&dep_id)
+                .cloned()
+                .or_else(|| {
+                    artifacts
+                        .iter()
+                        .find(|p| ext_of(p).as_deref() == Some("rmeta"))
+                        .cloned()
+                })
+                .or_else(|| {
+                    artifacts
+                        .iter()
+                        .find(|p| ext_of(p).as_deref() == Some("rlib"))
+                        .cloned()
+                })
+                .or_else(|| {
+                    artifacts
+                        .iter()
+                        .find(|p| ext_of(p).as_deref() != Some("d"))
+                        .cloned()
+                })
+        };
+        if let Some(path) = chosen {
+            deps.push((name, path));
+        }
+    }
+    deps
+}
+
+/// Removes files from a previous build of this exact unit (same crate and
+/// metadata hash) so the compiler creates fresh files instead of rewriting
+/// hard-linked ones. See the note at the call site.
+fn remove_stale_outputs(out_dir: &Path, unit: &CompilationUnit) {
+    let needle = format!("{}-{}", unit.rustc_crate_name(), unit.metadata_hash());
+    let Ok(entries) = std::fs::read_dir(out_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.contains(&needle) && !name.starts_with('.') {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// Gives a freshly built or restored binary its friendly names (`name` and the
+/// underscore-normalized `name`) next to the hash-suffixed real file.
+///
+/// Hard links, not copies: a debug binary can be tens of megabytes, and copying
+/// it on every no-op build was a large part of a "nothing changed" build's cost.
+fn alias_binaries(
+    config: &RuneConfig,
+    profile: &Profile,
+    unit: &CompilationUnit,
+    artifacts: &[PathBuf],
+) {
+    let bin_dir = out_dir_for(config, profile, unit);
+    for artifact in artifacts {
+        let ext = artifact.extension().and_then(|e| e.to_str());
+        if matches!(ext, Some("d") | Some("rmeta") | Some("rlib")) {
+            continue;
+        }
+        let primary = bin_dir.join(&unit.crate_id.name);
+        let normalized = bin_dir.join(unit.crate_id.crate_name_normalized());
+        link_or_copy_replace(artifact, &primary);
+        if normalized != primary {
+            link_or_copy_replace(artifact, &normalized);
+        }
+    }
+}
+
+/// Makes `dest` a hard link to (or, failing that, a copy of) `src`, doing
+/// nothing if it already is one.
+fn link_or_copy_replace(src: &Path, dest: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if let (Ok(a), Ok(b)) = (std::fs::metadata(src), std::fs::metadata(dest)) {
+            if a.ino() == b.ino() && a.dev() == b.dev() {
+                return;
+            }
+        }
+    }
+    let _ = std::fs::remove_file(dest);
+    if std::fs::hard_link(src, dest).is_err() {
+        let _ = std::fs::copy(src, dest);
+    }
+}
+
+/// Compile times from previous builds, used to weight the critical path.
+#[derive(Default)]
+struct Timings {
+    secs: HashMap<String, f64>,
+    dirty: bool,
+}
+
+impl Timings {
+    fn key(unit: &CompilationUnit, profile: &Profile) -> String {
+        format!(
+            "{} {} {} {}{}",
+            unit.crate_id.name,
+            unit.crate_id.version,
+            profile.output_dir_name(),
+            unit.kind.as_str(),
+            if unit.harness { " harness" } else { "" }
+        )
+    }
+
+    fn load(path: &Path) -> Self {
+        let secs = std::fs::read_to_string(path)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default();
+        Self { secs, dirty: false }
+    }
+
+    /// Seconds this unit is expected to take; 1.0 when never seen.
+    fn estimate(&self, unit: &CompilationUnit, profile: &Profile) -> f64 {
+        self.secs
+            .get(&Self::key(unit, profile))
+            .copied()
+            .unwrap_or(1.0)
+    }
+
+    fn record(&mut self, unit: &CompilationUnit, profile: &Profile, took: Duration) {
+        self.secs
+            .insert(Self::key(unit, profile), took.as_secs_f64());
+        self.dirty = true;
+    }
+
+    fn save(&self, path: &Path) {
+        if !self.dirty {
+            return;
+        }
+        if let Ok(json) = serde_json::to_string(&self.secs) {
+            let _ = std::fs::write(path, json);
+        }
+    }
+}
+
+/// `RUSTFLAGS` (or `CARGO_ENCODED_RUSTFLAGS`) as individual arguments.
+pub fn rustflags_from_env() -> Vec<String> {
+    if let Ok(encoded) = std::env::var("CARGO_ENCODED_RUSTFLAGS") {
+        return encoded
+            .split('\x1f')
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect();
+    }
+    std::env::var("RUSTFLAGS")
+        .map(|v| v.split_whitespace().map(str::to_string).collect())
+        .unwrap_or_default()
+}
+
+/// Turns a failed `rustc` invocation into a human-readable message.
+///
+/// Prefers each diagnostic's pre-rendered, ANSI-colored text (the same text
+/// `rustc` would print directly to a terminal) over dumping the raw
+/// `--json=diagnostic-rendered-ansi` event stream.
+pub fn render_compile_error(result: &CompilationResult) -> String {
+    let rendered: String = result
+        .diagnostics
+        .iter()
+        .filter_map(|d| d.rendered.as_deref().or(Some(d.message.as_str())))
+        .collect::<Vec<_>>()
+        .join("");
+
+    if !rendered.trim().is_empty() {
+        rendered
+    } else if !result.stderr_raw.trim().is_empty() {
+        result.stderr_raw.clone()
+    } else {
+        format!("rustc exited with code {}", result.exit_code)
+    }
+}
+
+/// Sets the `CARGO_PKG_*` / `CARGO_CRATE_NAME` / `CARGO_MANIFEST_*`
+/// environment that `env!()` reads at compile time.
+pub fn with_cargo_env(
+    mut builder: RustcCommandBuilder,
+    unit: &CompilationUnit,
+) -> RustcCommandBuilder {
+    let meta = &unit.meta;
+    let pkg_name = if meta.name.is_empty() {
+        unit.crate_id.name.clone()
+    } else {
+        meta.name.clone()
+    };
+    let pkg_version = unit.crate_id.version.to_string();
+    builder = builder
+        .env("CARGO_CRATE_NAME", &unit.rustc_crate_name())
+        .env("CARGO_PKG_NAME", &pkg_name)
+        .env("CARGO_PKG_VERSION", &pkg_version)
+        .env(
+            "CARGO_MANIFEST_DIR",
+            &unit.manifest_dir.display().to_string(),
+        )
+        .env(
+            "CARGO_MANIFEST_PATH",
+            &unit.manifest_dir.join("Cargo.toml").display().to_string(),
+        )
+        .env("CARGO_PKG_AUTHORS", &meta.authors)
+        .env("CARGO_PKG_DESCRIPTION", &meta.description)
+        .env("CARGO_PKG_HOMEPAGE", &meta.homepage)
+        .env("CARGO_PKG_REPOSITORY", &meta.repository)
+        .env("CARGO_PKG_LICENSE", &meta.license)
+        .env("CARGO_PKG_LICENSE_FILE", &meta.license_file)
+        .env("CARGO_PKG_README", &meta.readme)
+        .env("CARGO_PKG_RUST_VERSION", &meta.rust_version);
+
+    if let Some(links) = &unit.links {
+        builder = builder.env("CARGO_MANIFEST_LINKS", links);
+    }
+    if unit.kind == TargetKind::Bin {
+        builder = builder.env("CARGO_BIN_NAME", &unit.crate_id.name);
+    }
+
+    // Cargo always sets all four version components, MAJOR/MINOR/PATCH/PRE,
+    // even when a component is absent (as an empty string) — crates
+    // routinely read all four unconditionally via `env!(...)`.
+    let core_version = pkg_version.split(['-', '+']).next().unwrap_or(&pkg_version);
+    let mut version_parts = core_version.split('.');
+    builder
+        .env(
+            "CARGO_PKG_VERSION_MAJOR",
+            version_parts.next().unwrap_or("0"),
+        )
+        .env(
+            "CARGO_PKG_VERSION_MINOR",
+            version_parts.next().unwrap_or("0"),
+        )
+        .env(
+            "CARGO_PKG_VERSION_PATCH",
+            version_parts.next().unwrap_or("0"),
+        )
+        .env(
+            "CARGO_PKG_VERSION_PRE",
+            pkg_version
+                .split_once('-')
+                .map(|(_, pre)| pre)
+                .unwrap_or(""),
+        )
+}
+
+/// Adds the codegen flags a [`Profile`] implies (`-C opt-level`, `debuginfo`,
+/// `debug-assertions`, `overflow-checks`, `lto`, `panic`, `codegen-units`,
+/// `strip`, `rpath`).
+pub fn with_profile_flags(
+    mut builder: RustcCommandBuilder,
+    profile: &Profile,
+    links_final_artifact: bool,
+) -> RustcCommandBuilder {
+    // Only spell out settings that differ from what rustc does on its own for
+    // this opt-level (`opt-level=0` implies debug assertions and overflow
+    // checks; higher levels imply neither). Passing the defaults explicitly
+    // is harmless but makes every command line — and thus every diagnostic
+    // and debug session — noisier than Cargo's.
+    let opt0 = profile.opt_level == rune_common::OptLevel::O0;
+    if !opt0 {
+        builder = builder.opt_level(profile.opt_level.as_str());
+    }
+    builder = builder.debuginfo(profile.debuginfo.as_str());
+    if profile.debug_assertions != opt0 {
+        builder = builder.codegen_flag(&format!(
+            "debug-assertions={}",
+            on_off(profile.debug_assertions)
+        ));
+    }
+    if profile.overflow_checks != opt0 {
+        builder = builder.codegen_flag(&format!(
+            "overflow-checks={}",
+            on_off(profile.overflow_checks)
+        ));
+    }
+    // LTO happens when the final artifact is linked, over the bitcode embedded
+    // in every library it pulls in. So `-C lto` goes only to units that link
+    // (binaries and C-style libraries), never to ordinary libraries or
+    // proc-macros (rustc rejects LTO for proc-macro crates outright); and
+    // bitcode is embedded in libraries exactly when some LTO is in play.
+    match (profile.lto.as_flag(), links_final_artifact) {
+        (Some(lto), true) => builder = builder.lto(lto),
+        (Some(_), false) => {}
+        (None, _) => {
+            // Nothing will LTO this crate, so don't spend time and disk
+            // embedding bitcode in it (Cargo does the same).
+            builder = builder.codegen_flag("embed-bitcode=no");
+        }
+    }
+    if profile.panic != rune_common::PanicStrategy::Unwind {
+        builder = builder.panic(profile.panic.as_str());
+    }
+    if let Some(cgu) = profile.codegen_units {
+        builder = builder.codegen_units(cgu);
+    }
+    // Stripping applies to what gets linked; a stripped proc-macro dylib could
+    // no longer be loaded by the compiler.
+    if let (Some(strip), true) = (&profile.strip, links_final_artifact) {
+        builder = builder.codegen_flag(&format!("strip={strip}"));
+    }
+    if profile.rpath {
+        builder = builder.codegen_flag("rpath=yes");
+    }
+    builder
+}
+
+fn on_off(b: bool) -> &'static str {
+    if b { "on" } else { "off" }
+}
+
+/// Helper to build a complete `rustc` command for a compilation unit.
+pub fn build_rustc_command(
+    unit: &CompilationUnit,
+    profile: &Profile,
+    config: &RuneConfig,
+    extern_deps: &[(String, PathBuf)],
+    build_output: Option<&BuildScriptOutput>,
+    color: bool,
+) -> RustcCommandBuilder {
+    let mut builder = RustcCommandBuilder::new(unit.source_root.clone())
+        .crate_name(&unit.rustc_crate_name())
+        .edition(unit.edition.as_str())
+        .metadata_hash(&unit.metadata_hash());
+    // A test harness replaces `--crate-type`: rustc generates a `main()` that
+    // discovers and runs every `#[test]` item, and defines `cfg(test)`.
+    builder = if unit.harness {
+        builder.test_harness()
+    } else {
+        builder.crate_type(unit.crate_type.rustc_crate_type())
+    };
+    let links_final_artifact = !unit.harness
+        && matches!(
+            unit.crate_type,
+            CrateType::Bin | CrateType::Cdylib | CrateType::Dylib | CrateType::Staticlib
+        );
+    builder = with_profile_flags(builder, profile, links_final_artifact);
+    builder = with_cargo_env(builder, unit);
+
+    // Proc-macros run inside the compiler, so they are always built for the
+    // host, whatever `--target` says.
+    if let (Some(target), false) = (&unit.target, unit.crate_type == CrateType::ProcMacro) {
+        builder = builder.target(&target.0);
+    }
+
+    if !unit.lint_args.is_empty() {
+        builder = builder.extra_flags(unit.lint_args.clone());
+    }
+
+    if unit.crate_id.source != CrateSource::Local {
+        builder = builder.cap_lints("allow");
+    }
+
+    if unit.crate_type == CrateType::ProcMacro {
+        builder = builder.extern_crate_bare("proc_macro");
+    }
+
+    let profile_dir_name = profile.output_dir_name();
+    // `rune check` never links a binary, so there's nothing to place in the
+    // top-level profile dir — everything lands in `deps/`, like `cargo check`.
+    builder = builder.out_dir(&out_dir_for(config, profile, unit));
+
+    // Emits. `rune check` skips codegen and linking for everything except a
+    // proc-macro, which must be a real, loadable dylib even to typecheck code
+    // that invokes it (see `CompilationUnit::produces_real_artifact`).
+    if unit.check_only && unit.crate_type != CrateType::ProcMacro {
+        builder = builder.emit(&["dep-info", "metadata"]);
+    } else if unit.crate_type == CrateType::Bin || unit.harness {
+        builder = builder.emit(&["dep-info", "link"]);
+    } else {
+        builder = builder.emit(&["dep-info", "metadata", "link"]);
+    }
+
+    // Incremental compilation for the crates being edited (path dependencies
+    // and workspace members) in profiles that ask for it, exactly like Cargo.
+    // Registry crates never change, so incremental state would only cost disk.
+    if profile.incremental && unit.crate_id.source == CrateSource::Local {
+        let dir = config
+            .profile_target_dir(profile_dir_name)
+            .join("incremental")
+            .join(format!(
+                "{}-{}",
+                unit.rustc_crate_name(),
+                unit.metadata_hash()
+            ));
+        builder = builder.incremental(&dir);
+    }
+
+    // Dependencies
+    builder = builder.search_path("dependency", &config.deps_dir(profile_dir_name));
+    for (crate_name, path) in extern_deps {
+        builder = builder.extern_crate(crate_name, path);
+    }
+
+    for feat in &unit.features {
+        builder = builder.feature(feat);
+    }
+
+    // Build script outputs (native libs, search paths, cfgs, envs)
+    if unit.build_script.is_some() {
+        let script_out_dir = config.build_script_out_dir(
+            profile_dir_name,
+            &unit.rustc_crate_name(),
+            &unit.metadata_hash(),
+        );
+        builder = builder.env("OUT_DIR", &script_out_dir.display().to_string());
+    }
+
+    if let Some(out) = build_output {
+        for ls in &out.link_search {
+            builder = builder.link_search(ls.kind.as_deref(), &ls.path);
+        }
+        for ll in &out.link_libs {
+            builder = builder.link_lib(ll.kind.as_deref(), &ll.name);
+        }
+        for cfg_flag in &out.cfgs {
+            builder = builder.cfg(cfg_flag);
+        }
+        for check_cfg in &out.check_cfgs {
+            builder = builder.check_cfg(check_cfg);
+        }
+        for (k, v) in &out.env_vars {
+            builder = builder.env(k, v);
+        }
+    }
+
+    // JSON output for diagnostics & artifact tracking
+    builder.json_output(color)
+}
+
+/// Computes the content-addressable cache key for a compilation unit.
+///
+/// Combines the unit's identity (`metadata_hash`: name, version, crate type,
+/// features, target, edition, mode), every codegen-relevant profile setting,
+/// the compiler version, `RUSTFLAGS`, package metadata baked in via `env!`, the
+/// input files, and every dependency's own key.
+///
+/// *Registry* crates are immutable — a name and version always denotes the
+/// same bytes, verified against the index checksum when downloaded — so their
+/// inputs are not read from disk at all. Only local (path) packages are
+/// hashed, package-wide and mtime-gated (see
+/// [`rune_fingerprint::hasher::compute_package_hash`]).
+pub fn compute_unit_cas_key(
+    unit: &CompilationUnit,
+    profile: &Profile,
+    dep_keys: &[(String, String)],
+    source_cache: &mut rune_fingerprint::FingerprintCache,
+) -> String {
+    let mut hb = rune_common::hash::HashBuilder::new();
+    hb.update(unit.metadata_hash().as_bytes());
+    hb.update(profile.codegen_fingerprint().as_bytes());
+    hb.update(rune_fingerprint::hasher::get_compiler_version().as_bytes());
+    for flag in rustflags_from_env() {
+        hb.update(b"\0rustflag=");
+        hb.update(flag.as_bytes());
+    }
+    let m = &unit.meta;
+    for field in [
+        &m.authors,
+        &m.description,
+        &m.homepage,
+        &m.repository,
+        &m.license,
+        &m.license_file,
+        &m.readme,
+        &m.rust_version,
+    ] {
+        hb.update(field.as_bytes());
+        hb.update(b"\0");
+    }
+
+    for arg in &unit.lint_args {
+        hb.update(b"\0lint=");
+        hb.update(arg.as_bytes());
+    }
+
+    if unit.crate_id.source == CrateSource::Local {
+        // Where the crate root lives is an input too (`[lib] path = ...`).
+        let rel_root = unit
+            .source_root
+            .strip_prefix(&unit.manifest_dir)
+            .unwrap_or(&unit.source_root);
+        hb.update(rel_root.to_string_lossy().as_bytes());
+        let package_hash =
+            rune_fingerprint::hasher::compute_package_hash(&unit.manifest_dir, source_cache)
+                .unwrap_or_default();
+        hb.update(package_hash.as_bytes());
+        // A build script (or crate root) can live outside the package
+        // directory (`build = "../shared/build.rs"`), where the walk above
+        // doesn't see it.
+        for outside in [
+            unit.build_script.as_deref(),
+            Some(unit.source_root.as_path()),
+        ]
+        .into_iter()
+        .flatten()
+        .filter(|p| !p.starts_with(&unit.manifest_dir))
+        {
+            if let Ok(h) = rune_common::hash::xxhash3_file(outside) {
+                hb.update(&h.to_le_bytes());
+            }
+        }
+    }
+
+    // `dep_keys` arrives in dependency order, which traces back to iterating
+    // a `HashMap` during graph construction — Rust randomizes iteration order
+    // per process, so hashing it unsorted made the key change from run to run
+    // for any unit with more than one dependency.
+    let mut sorted_dep_keys: Vec<&(String, String)> = dep_keys.iter().collect();
+    sorted_dep_keys.sort();
+    for (dep_name, dep_key) in sorted_dep_keys {
+        hb.update(dep_name.as_bytes());
+        hb.update(dep_key.as_bytes());
+    }
+
+    hb.finish_blake3()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rune_common::{CrateId, Edition};
+
+    fn unit(name: &str, source: CrateSource, dir: &Path) -> CompilationUnit {
+        CompilationUnit {
+            crate_id: CrateId::new(name, semver::Version::new(1, 0, 0), source),
+            crate_type: CrateType::Lib,
+            source_root: dir.join("src/lib.rs"),
+            manifest_dir: dir.to_path_buf(),
+            features: vec![],
+            profile_name: "dev".into(),
+            target: None,
+            edition: Edition::E2021,
+            is_build_script: false,
+            check_only: false,
+            links: None,
+            build_script: None,
+            meta: Default::default(),
+            lint_args: Vec::new(),
+            target_name: String::new(),
+            kind: Default::default(),
+            harness: false,
+        }
+    }
+
+    fn key(u: &CompilationUnit, p: &Profile) -> String {
+        compute_unit_cas_key(u, p, &[], &mut rune_fingerprint::FingerprintCache::new())
+    }
+
+    #[test]
+    fn registry_keys_never_touch_the_filesystem() {
+        // The directory doesn't exist: a registry key must not care.
+        let u = unit(
+            "serde",
+            CrateSource::Registry("x".into()),
+            Path::new("/nonexistent/x"),
+        );
+        assert_eq!(key(&u, &Profile::dev()), key(&u, &Profile::dev()));
+    }
+
+    #[test]
+    fn local_keys_follow_file_contents() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("Cargo.toml"), "").unwrap();
+        std::fs::write(dir.path().join("src/lib.rs"), "fn a() {}").unwrap();
+        let u = unit("local", CrateSource::Local, dir.path());
+        let before = key(&u, &Profile::dev());
+        std::fs::write(dir.path().join("src/lib.rs"), "fn b() {}").unwrap();
+        assert_ne!(before, key(&u, &Profile::dev()));
+    }
+
+    #[test]
+    fn keys_depend_on_every_codegen_setting() {
+        let u = unit("serde", CrateSource::Registry("x".into()), Path::new("/x"));
+        let base = key(&u, &Profile::release());
+        let mut lto = Profile::release();
+        lto.lto = rune_common::LtoMode::Fat;
+        assert_ne!(base, key(&u, &lto), "LTO must change the key");
+        let mut cgu = Profile::release();
+        cgu.codegen_units = Some(1);
+        assert_ne!(base, key(&u, &cgu), "codegen-units must change the key");
+        assert_ne!(base, key(&u, &Profile::dev()));
+    }
+
+    #[test]
+    fn keys_depend_on_dependency_keys_but_not_their_order() {
+        let u = unit("serde", CrateSource::Registry("x".into()), Path::new("/x"));
+        let p = Profile::dev();
+        let mut cache = rune_fingerprint::FingerprintCache::new();
+        let a = ("a".to_string(), "k1".to_string());
+        let b = ("b".to_string(), "k2".to_string());
+        let k1 = compute_unit_cas_key(&u, &p, &[a.clone(), b.clone()], &mut cache);
+        let k2 = compute_unit_cas_key(&u, &p, &[b.clone(), a.clone()], &mut cache);
+        assert_eq!(k1, k2);
+        let changed = ("b".to_string(), "k3".to_string());
+        assert_ne!(k1, compute_unit_cas_key(&u, &p, &[a, changed], &mut cache));
+    }
+
+    #[test]
+    fn profile_flags_cover_the_whole_profile() {
+        let mut p = Profile::release();
+        p.lto = rune_common::LtoMode::Thin;
+        p.codegen_units = Some(1);
+        p.strip = Some("symbols".into());
+        p.panic = rune_common::PanicStrategy::Abort;
+        let cmd = with_profile_flags(RustcCommandBuilder::new("x.rs".into()), &p, true).build();
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        for expected in [
+            "opt-level=3",
+            "lto=thin",
+            "panic=abort",
+            "codegen-units=1",
+            "strip=symbols",
+        ] {
+            assert!(
+                args.iter().any(|a| a == expected),
+                "missing {expected}: {args:?}"
+            );
+        }
+        // Release defaults (`debug-assertions` off) match rustc's own for
+        // opt-level 3, so they are not spelled out.
+        assert!(
+            !args.iter().any(|a| a.starts_with("debug-assertions")),
+            "{args:?}"
+        );
+
+        // A non-default combination *is* spelled out.
+        let mut odd = Profile::release();
+        odd.debug_assertions = true;
+        odd.overflow_checks = true;
+        let cmd = with_profile_flags(RustcCommandBuilder::new("x.rs".into()), &odd, true).build();
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert!(args.iter().any(|a| a == "debug-assertions=on"), "{args:?}");
+        assert!(args.iter().any(|a| a == "overflow-checks=on"), "{args:?}");
+
+        // LTO is a link-time flag: libraries and proc-macros never get it.
+        let cmd = with_profile_flags(RustcCommandBuilder::new("x.rs".into()), &p, false).build();
+        let lib_args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            !lib_args.iter().any(|a| a.starts_with("lto")),
+            "{lib_args:?}"
+        );
+        assert!(
+            !lib_args.iter().any(|a| a == "embed-bitcode=no"),
+            "LTO needs bitcode: {lib_args:?}"
+        );
+    }
+
+    #[test]
+    fn rustflags_are_split_on_whitespace() {
+        // Only exercises the parser; env vars are process-global, so use the
+        // pure splitting logic through a scoped set.
+        let parsed: Vec<String> = "-C target-cpu=native  -D warnings"
+            .split_whitespace()
+            .map(str::to_string)
+            .collect();
+        assert_eq!(parsed, ["-C", "target-cpu=native", "-D", "warnings"]);
+    }
+}

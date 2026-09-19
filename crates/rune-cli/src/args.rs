@@ -1,0 +1,663 @@
+//! Command-line argument definitions.
+
+use clap::{Args, Parser, Subcommand};
+use std::path::PathBuf;
+
+#[derive(Parser, Debug)]
+#[command(
+    name = "rune",
+    about = "A fast, next-generation build system & package manager for Rust",
+    version,
+    long_about = "Rune is an alternative build system and package manager for Rust that is \
+        significantly faster through content-addressable caching (CAS), \
+        parallel scheduling, streaming sparse registry resolution, and rmeta pipelining. \
+        It reads ordinary Cargo.toml manifests and accepts Cargo's flags."
+)]
+pub struct Cli {
+    /// Coloring of output
+    #[arg(long, global = true, value_parser = ["auto", "always", "never"], default_value = "auto")]
+    pub color: String,
+
+    #[command(subcommand)]
+    pub command: Commands,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum Commands {
+    /// Compile the current package (and its dependencies)
+    #[command(visible_alias = "b")]
+    Build(BuildArgs),
+    /// Type-check the package without producing binaries
+    #[command(visible_alias = "c")]
+    Check(BuildArgs),
+    /// Compile and run the package's tests
+    #[command(visible_alias = "t")]
+    Test(TestArgs),
+    /// Compile and run a binary or example
+    #[command(visible_alias = "r")]
+    Run(RunArgs),
+    /// Compile and run the package's benchmarks
+    Bench(TestArgs),
+    /// Format every local crate's source with rustfmt
+    Fmt(FmtArgs),
+    /// Lint every local crate with clippy
+    Clippy(BuildArgs),
+    /// Build the package's documentation
+    Doc(DocArgs),
+    /// Create a new package in a new directory
+    New(NewArgs),
+    /// Create a new package in an existing directory
+    Init(InitArgs),
+    /// Add a dependency to Cargo.toml and resolve lockfiles
+    Add(AddArgs),
+    /// Remove a dependency from Cargo.toml
+    #[command(visible_alias = "rm")]
+    Remove(RemoveArgs),
+    /// Update dependencies in lockfiles to latest compatible versions
+    Update(UpdateArgs),
+    /// Display the resolved dependency tree
+    Tree(TreeArgs),
+    /// Explain why a package is in the dependency graph
+    Why(WhyArgs),
+    /// Download every dependency without building
+    Fetch(ManifestArgs),
+    /// Resolve dependencies and write the lockfile
+    GenerateLockfile(ManifestArgs),
+    /// Print the path of the workspace's Cargo.toml as JSON
+    LocateProject(ManifestArgs),
+    /// Output workspace and dependency metadata as JSON
+    Metadata(MetadataArgs),
+    /// Build a package and install its binaries
+    Install(InstallArgs),
+    /// Remove generated target artifacts
+    Clean(CleanArgs),
+    /// View and change settings (global or per project)
+    #[command(subcommand)]
+    Config(ConfigCommands),
+    /// Inspect or clean the Content-Addressable Store (CAS)
+    #[command(subcommand)]
+    Cas(CasCommands),
+    /// Manage binary and standard lockfiles
+    #[command(subcommand)]
+    Lockfile(LockfileCommands),
+}
+
+/// Flags shared by every command that resolves and builds.
+#[derive(Args, Debug, Clone, Default)]
+pub struct CommonArgs {
+    /// Path to Cargo.toml
+    #[arg(long, value_name = "PATH")]
+    pub manifest_path: Option<PathBuf>,
+
+    /// Package to operate on (repeatable)
+    #[arg(short = 'p', long = "package", value_name = "SPEC")]
+    pub package: Vec<String>,
+
+    /// Operate on every workspace member
+    #[arg(long, alias = "all")]
+    pub workspace: bool,
+
+    /// Exclude a package from --workspace (repeatable)
+    #[arg(long, value_name = "SPEC")]
+    pub exclude: Vec<String>,
+
+    /// Features to activate (comma or space separated, repeatable)
+    #[arg(short = 'F', long, value_name = "FEATURES")]
+    pub features: Vec<String>,
+
+    /// Activate every feature of the selected packages
+    #[arg(long)]
+    pub all_features: bool,
+
+    /// Do not activate the `default` feature
+    #[arg(long)]
+    pub no_default_features: bool,
+
+    /// Build with the optimized `release` profile
+    #[arg(short = 'r', long)]
+    pub release: bool,
+
+    /// Build with the named profile
+    #[arg(long, value_name = "NAME", conflicts_with = "release")]
+    pub profile: Option<String>,
+
+    /// Build for the given target triple
+    #[arg(long, value_name = "TRIPLE")]
+    pub target: Option<String>,
+
+    /// Number of parallel jobs (default: number of CPUs)
+    #[arg(short = 'j', long, value_name = "N")]
+    pub jobs: Option<usize>,
+
+    /// Directory for build output
+    #[arg(long, value_name = "DIR")]
+    pub target_dir: Option<PathBuf>,
+
+    /// Show verbose output
+    #[arg(short = 'v', long)]
+    pub verbose: bool,
+
+    /// Suppress progress and summary output
+    #[arg(short = 'q', long)]
+    pub quiet: bool,
+
+    /// Fail if the lockfile would need to change
+    #[arg(long)]
+    pub locked: bool,
+
+    /// Use only locally cached registry data; never touch the network
+    #[arg(long)]
+    pub offline: bool,
+
+    /// Equivalent to --locked --offline
+    #[arg(long)]
+    pub frozen: bool,
+
+    /// Print how long each phase of the build takes
+    #[arg(long)]
+    pub timings: bool,
+
+    /// Recompile everything even if cached (`--rebuild-all=false` to force
+    /// using the cache when `build.release-rebuild-all` is set)
+    #[arg(
+        long,
+        value_name = "BOOL",
+        num_args = 0..=1,
+        default_missing_value = "true",
+        require_equals = true
+    )]
+    pub rebuild_all: Option<bool>,
+}
+
+/// Which targets of the selected packages to build.
+#[derive(Args, Debug, Clone, Default)]
+pub struct TargetArgs {
+    /// Only the library
+    #[arg(long)]
+    pub lib: bool,
+    /// All binaries
+    #[arg(long)]
+    pub bins: bool,
+    /// The named binary (repeatable)
+    #[arg(long, value_name = "NAME")]
+    pub bin: Vec<String>,
+    /// All examples
+    #[arg(long)]
+    pub examples: bool,
+    /// The named example (repeatable)
+    #[arg(long, value_name = "NAME")]
+    pub example: Vec<String>,
+    /// All integration tests
+    #[arg(long)]
+    pub tests: bool,
+    /// The named integration test (repeatable)
+    #[arg(long, value_name = "NAME")]
+    pub test: Vec<String>,
+    /// All benchmarks
+    #[arg(long)]
+    pub benches: bool,
+    /// The named benchmark (repeatable)
+    #[arg(long, value_name = "NAME")]
+    pub bench: Vec<String>,
+    /// Every target
+    #[arg(long)]
+    pub all_targets: bool,
+}
+
+#[derive(Args, Debug, Clone, Default)]
+pub struct BuildArgs {
+    #[command(flatten)]
+    pub common: CommonArgs,
+    #[command(flatten)]
+    pub targets: TargetArgs,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct TestArgs {
+    #[command(flatten)]
+    pub common: CommonArgs,
+    #[command(flatten)]
+    pub targets: TargetArgs,
+
+    /// Only run tests whose name contains this string
+    #[arg(value_name = "TESTNAME")]
+    pub filter: Option<String>,
+
+    /// Test only this package's library documentation
+    #[arg(long)]
+    pub doc: bool,
+
+    /// Skip documentation tests
+    #[arg(long)]
+    pub no_doc: bool,
+
+    /// Compile, but don't run tests
+    #[arg(long)]
+    pub no_run: bool,
+
+    /// Run every test binary even after one fails
+    #[arg(long)]
+    pub no_fail_fast: bool,
+
+    /// Number of threads each test binary uses (forwarded as `--test-threads`)
+    #[arg(long, value_name = "N")]
+    pub test_threads: Option<usize>,
+
+    /// Arguments passed to the test binaries (after `--`)
+    #[arg(last = true, value_name = "ARGS")]
+    pub test_args: Vec<String>,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct RunArgs {
+    #[command(flatten)]
+    pub common: CommonArgs,
+
+    /// The binary to run
+    #[arg(long, value_name = "NAME")]
+    pub bin: Option<String>,
+
+    /// The example to run
+    #[arg(long, value_name = "NAME", conflicts_with = "bin")]
+    pub example: Option<String>,
+
+    /// Arguments passed to the program (after `--`)
+    #[arg(last = true, value_name = "ARGS")]
+    pub args: Vec<String>,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct FmtArgs {
+    #[command(flatten)]
+    pub manifest: ManifestArgs,
+
+    /// Only format these packages
+    #[arg(short = 'p', long = "package")]
+    pub package: Vec<String>,
+
+    /// Format every workspace member
+    #[arg(long, alias = "all")]
+    pub workspace: bool,
+
+    /// Check formatting without writing changes; exits non-zero if any file
+    /// would be reformatted
+    #[arg(long)]
+    pub check: bool,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct DocArgs {
+    #[command(flatten)]
+    pub common: CommonArgs,
+
+    /// Don't build documentation for dependencies
+    #[arg(long)]
+    pub no_deps: bool,
+
+    /// Open the docs in a browser afterwards
+    #[arg(long)]
+    pub open: bool,
+}
+
+#[derive(Args, Debug, Clone, Default)]
+pub struct ManifestArgs {
+    /// Path to Cargo.toml
+    #[arg(long, value_name = "PATH")]
+    pub manifest_path: Option<PathBuf>,
+
+    /// Use only locally cached registry data
+    #[arg(long)]
+    pub offline: bool,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct NewArgs {
+    /// Directory (and package name) to create
+    pub path: PathBuf,
+    /// Create a library instead of a binary
+    #[arg(long)]
+    pub lib: bool,
+    /// Create a binary (the default)
+    #[arg(long, conflicts_with = "lib")]
+    pub bin: bool,
+    /// Package name (default: the directory name)
+    #[arg(long)]
+    pub name: Option<String>,
+    /// Rust edition
+    #[arg(long, default_value = "2024", value_parser = ["2015", "2018", "2021", "2024"])]
+    pub edition: String,
+    /// Don't create a `.gitignore`
+    #[arg(long)]
+    pub no_gitignore: bool,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct InitArgs {
+    /// Directory to initialize (default: the current directory)
+    #[arg(default_value = ".")]
+    pub path: PathBuf,
+    #[arg(long)]
+    pub lib: bool,
+    #[arg(long, conflicts_with = "lib")]
+    pub bin: bool,
+    #[arg(long)]
+    pub name: Option<String>,
+    #[arg(long, default_value = "2024", value_parser = ["2015", "2018", "2021", "2024"])]
+    pub edition: String,
+    #[arg(long)]
+    pub no_gitignore: bool,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct AddArgs {
+    #[command(flatten)]
+    pub manifest: ManifestArgs,
+
+    /// Crates to add (`serde`, or `serde@1.0` with a version requirement)
+    #[arg(required = true, value_name = "DEP")]
+    pub crate_specs: Vec<String>,
+
+    /// Explicit version requirement (e.g. `^1.0.210`)
+    #[arg(long, short = 'V')]
+    pub version: Option<String>,
+
+    /// Comma-separated list of features to enable
+    #[arg(long, short = 'F', value_delimiter = ',')]
+    pub features: Vec<String>,
+
+    /// Disable default features
+    #[arg(long)]
+    pub no_default_features: bool,
+
+    /// Add as development dependency (`[dev-dependencies]`)
+    #[arg(long, short = 'D')]
+    pub dev: bool,
+
+    /// Add as build dependency (`[build-dependencies]`)
+    #[arg(long, short = 'B')]
+    pub build: bool,
+
+    /// Mark dependency as optional
+    #[arg(long)]
+    pub optional: bool,
+
+    /// Add a path dependency
+    #[arg(long, value_name = "PATH")]
+    pub path: Option<PathBuf>,
+
+    /// Package to modify in a workspace
+    #[arg(short = 'p', long = "package")]
+    pub package: Option<String>,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct RemoveArgs {
+    #[command(flatten)]
+    pub manifest: ManifestArgs,
+    /// Crates to remove
+    #[arg(required = true)]
+    pub names: Vec<String>,
+    /// Only remove from `[dev-dependencies]`
+    #[arg(long, short = 'D')]
+    pub dev: bool,
+    /// Only remove from `[build-dependencies]`
+    #[arg(long, short = 'B')]
+    pub build: bool,
+    /// Package to modify in a workspace
+    #[arg(short = 'p', long = "package")]
+    pub package: Option<String>,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct UpdateArgs {
+    #[command(flatten)]
+    pub manifest: ManifestArgs,
+    /// Optional specific packages to update
+    pub packages: Vec<String>,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct TreeArgs {
+    #[command(flatten)]
+    pub manifest: ManifestArgs,
+
+    /// Packages to show the tree of
+    #[arg(short = 'p', long = "package")]
+    pub package: Vec<String>,
+
+    /// Show every workspace member
+    #[arg(long, alias = "all")]
+    pub workspace: bool,
+
+    /// Maximum tree depth to display
+    #[arg(long, short = 'd')]
+    pub depth: Option<usize>,
+
+    /// Show features enabled for each dependency
+    #[arg(long, short = 'f', alias = "features")]
+    pub show_features: bool,
+
+    /// Show only packages present in more than one version
+    #[arg(long, short = 'D')]
+    pub duplicates: bool,
+
+    /// Invert the tree: show what depends on this package
+    #[arg(long, short = 'i', value_name = "SPEC")]
+    pub invert: Option<String>,
+
+    /// Also show dev-dependencies
+    #[arg(long)]
+    pub dev: bool,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct WhyArgs {
+    #[command(flatten)]
+    pub manifest: ManifestArgs,
+    /// Package name to trace
+    pub package: String,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct MetadataArgs {
+    #[command(flatten)]
+    pub manifest: ManifestArgs,
+    /// Output format version (only 1 is supported)
+    #[arg(long, default_value = "1")]
+    pub format_version: u32,
+    /// Only workspace members, no dependency information
+    #[arg(long)]
+    pub no_deps: bool,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct InstallArgs {
+    #[command(flatten)]
+    pub common: CommonArgs,
+    /// Install the package at this path
+    #[arg(long, value_name = "PATH", default_value = ".")]
+    pub path: PathBuf,
+    /// Directory to install binaries into (default: `~/.cargo/bin`)
+    #[arg(long, value_name = "DIR")]
+    pub root: Option<PathBuf>,
+    /// Install only this binary
+    #[arg(long, value_name = "NAME")]
+    pub bin: Vec<String>,
+    /// Overwrite existing binaries
+    #[arg(short = 'f', long)]
+    pub force: bool,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct CleanArgs {
+    #[command(flatten)]
+    pub manifest: ManifestArgs,
+    /// Only clean release artifacts
+    #[arg(short = 'r', long)]
+    pub release: bool,
+    /// Only clean this profile's artifacts
+    #[arg(long, value_name = "NAME")]
+    pub profile: Option<String>,
+    /// Directory to clean instead of the default target directory
+    #[arg(long, value_name = "DIR")]
+    pub target_dir: Option<PathBuf>,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ConfigCommands {
+    /// List every setting with its effective value and where it came from
+    List {
+        /// Only show settings from the global file
+        #[arg(long, conflicts_with = "project")]
+        global: bool,
+        /// Only show settings from this project's Rune.toml
+        #[arg(long)]
+        project: bool,
+        /// Show which file or variable each value comes from
+        #[arg(long)]
+        show_origin: bool,
+    },
+    /// Print one setting's effective value
+    Get {
+        key: String,
+        /// Read from the global file only
+        #[arg(long, conflicts_with = "project")]
+        global: bool,
+        /// Read from this project's Rune.toml only
+        #[arg(long)]
+        project: bool,
+    },
+    /// Set a value (in this project's Rune.toml unless --global)
+    Set {
+        key: String,
+        value: String,
+        /// Write to `~/.rune/config.toml`, applying to every project
+        #[arg(long, conflicts_with = "project")]
+        global: bool,
+        /// Write to this project's Rune.toml (the default inside a project)
+        #[arg(long)]
+        project: bool,
+    },
+    /// Remove a value so it falls back to the next layer
+    Unset {
+        key: String,
+        #[arg(long, conflicts_with = "project")]
+        global: bool,
+        #[arg(long)]
+        project: bool,
+    },
+    /// Print the paths of the settings files
+    Path,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum CasCommands {
+    /// Show CAS store statistics and cache hit rates
+    Stats,
+    /// Garbage collect the CAS store by size or age
+    Gc(CasGcArgs),
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct CasGcArgs {
+    /// Maximum store size (bytes, or e.g. `10GB`)
+    #[arg(long)]
+    pub max_size: Option<String>,
+
+    /// Maximum entry age in seconds
+    #[arg(long)]
+    pub max_age: Option<u64>,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum LockfileCommands {
+    /// Export lockfile to Cargo.lock or JSON
+    Export {
+        #[arg(long, default_value = "cargo", value_parser = ["cargo", "toml", "json"])]
+        format: String,
+        /// Write to this file instead of stdout (`-` for stdout)
+        #[arg(long, short = 'o')]
+        output: Option<PathBuf>,
+    },
+    /// Migrate from Cargo.lock to Rune binary lockfile
+    Migrate,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn cli_definition_is_valid() {
+        Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn cargo_style_flags_parse() {
+        let cli = Cli::try_parse_from([
+            "rune",
+            "build",
+            "--release",
+            "-p",
+            "a",
+            "-p",
+            "b",
+            "-F",
+            "x,y",
+            "--bin",
+            "tool",
+            "-j",
+            "4",
+            "--manifest-path",
+            "x/Cargo.toml",
+        ])
+        .unwrap();
+        let Commands::Build(b) = cli.command else {
+            panic!()
+        };
+        assert!(b.common.release);
+        assert_eq!(b.common.package, ["a", "b"]);
+        assert_eq!(b.common.jobs, Some(4));
+        assert_eq!(b.targets.bin, ["tool"]);
+    }
+
+    #[test]
+    fn test_args_after_double_dash_go_to_the_binary() {
+        let cli = Cli::try_parse_from([
+            "rune",
+            "test",
+            "my_filter",
+            "--",
+            "--nocapture",
+            "--ignored",
+        ])
+        .unwrap();
+        let Commands::Test(t) = cli.command else {
+            panic!()
+        };
+        assert_eq!(t.filter.as_deref(), Some("my_filter"));
+        assert_eq!(t.test_args, ["--nocapture", "--ignored"]);
+    }
+
+    #[test]
+    fn rebuild_all_accepts_optional_bool() {
+        let on = Cli::try_parse_from(["rune", "build", "--rebuild-all"]).unwrap();
+        let off = Cli::try_parse_from(["rune", "build", "--rebuild-all=false"]).unwrap();
+        let unset = Cli::try_parse_from(["rune", "build"]).unwrap();
+        let get = |c: Cli| match c.command {
+            Commands::Build(b) => b.common.rebuild_all,
+            _ => unreachable!(),
+        };
+        assert_eq!(get(on), Some(true));
+        assert_eq!(get(off), Some(false));
+        assert_eq!(get(unset), None);
+    }
+
+    #[test]
+    fn short_aliases() {
+        for alias in ["b", "c", "t", "r"] {
+            assert!(Cli::try_parse_from(["rune", alias]).is_ok(), "{alias}");
+        }
+    }
+}

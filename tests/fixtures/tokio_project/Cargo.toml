@@ -1,0 +1,11 @@
+[package]
+name = "tokio-project"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "1.40.0", features = ["full"] }
+
+[[bin]]
+name = "tokio-project"
+path = "src/main.rs"
