@@ -1195,6 +1195,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror",
+ "toml",
  "toml_edit",
  "tracing",
  "xxhash-rust",
@@ -1263,6 +1264,7 @@ dependencies = [
 name = "rune-registry"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "flate2",
  "home",
  "rayon",
@@ -1274,6 +1276,7 @@ dependencies = [
  "tar",
  "tempfile",
  "thiserror",
+ "toml",
  "tracing",
 ]
 
@@ -1311,6 +1314,7 @@ dependencies = [
  "rune-graph",
  "rune-manifest",
  "semver",
+ "serde",
  "serde_json",
  "tempfile",
  "thiserror",
