@@ -239,9 +239,11 @@ impl Locals {
             for (name, spec) in specs {
                 if let Some(path) = spec.path {
                     let dir = path.canonicalize().unwrap_or(path);
-                    if !this.by_dir.contains_key(&dir) && !dir.join("Cargo.toml").is_file() {
+                    if !this.by_dir.contains_key(&dir)
+                        && !rune_common::manifest_file::has_manifest(&dir)
+                    {
                         bail!(
-                            "path dependency `{}` of `{}` does not contain a Cargo.toml",
+                            "path dependency `{}` of `{}` does not contain a Cargo.toml or Rune.toml",
                             dir.display(),
                             this.list[i].name
                         );
@@ -297,7 +299,7 @@ impl Locals {
         if let Some(&li) = self.by_dir.get(&dir) {
             return Ok(li);
         }
-        let manifest_path = dir.join("Cargo.toml");
+        let manifest_path = rune_common::manifest_file::manifest_in(&dir);
         let manifest = Manifest::from_path(&manifest_path)
             .with_context(|| format!("Failed to parse {}", manifest_path.display()))?;
         let enclosing = rune_manifest::find_enclosing_workspace(&dir, &manifest);
@@ -539,7 +541,7 @@ fn resolution_fingerprint(ws: &Workspace, locals: &Locals, _req: &Request) -> St
     let mut hasher = rune_common::hash::HashBuilder::new();
     hasher.update(env!("CARGO_PKG_VERSION").as_bytes());
     let mut paths: Vec<PathBuf> = vec![ws.manifest_path()];
-    paths.extend(locals.list.iter().map(|m| m.dir.join("Cargo.toml")));
+    paths.extend(locals.list.iter().map(|m| m.manifest_path.clone()));
     paths.sort();
     paths.dedup();
     for path in paths {

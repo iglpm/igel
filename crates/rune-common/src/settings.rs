@@ -549,6 +549,18 @@ pub fn set_in_file(path: &Path, key: &str, raw: &str) -> Result<Value, SettingsE
     if !doc.contains_key(table_name) {
         doc[table_name] = Item::Table(Table::new());
     }
+    if doc[table_name].is_array_of_tables() {
+        // `[[test]]` in a `Rune.toml` that is also the manifest: the name is taken
+        // by the list of test targets, so `[test]` settings cannot share the file.
+        return Err(SettingsError::File {
+            path: path.to_path_buf(),
+            message: format!(
+                "`{table_name}` is a list of targets (`[[{table_name}]]`) in this manifest, so the \
+                 `{key}` setting cannot be stored here; use `--global`, or the `{}` environment variable",
+                env_var_name(key)
+            ),
+        });
+    }
     let table = doc[table_name]
         .as_table_like_mut()
         .ok_or_else(|| SettingsError::File {
@@ -761,6 +773,54 @@ fn expand_home(p: &str) -> PathBuf {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn settings_share_a_rune_toml_with_the_manifest_except_where_test_targets_take_the_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Rune.toml");
+        std::fs::write(
+            &path,
+            "[package]\nname = \"a\"\n\n[dependencies]\nserde = \"1\"\n",
+        )
+        .unwrap();
+        // A manifest and settings in one file: each setting lands in its own table.
+        set_in_file(&path, "build.jobs", "4").unwrap();
+        set_in_file(&path, "test.doctests", "false").unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            text.contains("name = \"a\"") && text.contains("serde") && text.contains("jobs = 4"),
+            "{text}"
+        );
+        // …and they are read back next to the manifest.
+        let s = Settings::load_from(Some(dir.path()), &dir.path().join("none"), &|_| None).unwrap();
+        assert_eq!(s.jobs(), Some(4));
+        assert!(!s.doctests());
+
+        // `[[test]]` targets own the name `test`.
+        let with_targets = dir.path().join("t").join("Rune.toml");
+        std::fs::create_dir_all(with_targets.parent().unwrap()).unwrap();
+        std::fs::write(
+            &with_targets,
+            "[package]\nname = \"a\"\n\n[[test]]\nname = \"it\"\npath = \"tests/it.rs\"\n",
+        )
+        .unwrap();
+        let err = set_in_file(&with_targets, "test.doctests", "false")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("list of targets") && err.contains("RUNE_TEST_DOCTESTS"),
+            "{err}"
+        );
+        // Other settings are fine there.
+        set_in_file(&with_targets, "build.jobs", "2").unwrap();
+        let s = Settings::load_from(
+            Some(with_targets.parent().unwrap()),
+            &dir.path().join("none"),
+            &|_| None,
+        )
+        .unwrap();
+        assert_eq!(s.jobs(), Some(2));
+    }
 
     fn no_env(_: &str) -> Option<String> {
         None

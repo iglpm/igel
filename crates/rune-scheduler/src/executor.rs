@@ -1173,7 +1173,7 @@ impl UnitJob {
         let result = invoker.invoke_streaming(cmd, &mut |artifact| match artifact.emit.as_str() {
             "dep-info" => {
                 let reads = inputs::env_reads_from_dep_info(&artifact.artifact, &provided);
-                let manifest = unit.manifest_dir.join("Cargo.toml");
+                let manifest = rune_common::manifest_file::manifest_in(&unit.manifest_dir);
                 let read_manifest = inputs::reads_manifest(&artifact.artifact, &manifest);
                 if !reads.is_empty() || read_manifest {
                     declared.merge(DeclaredInputs {
@@ -1757,7 +1757,9 @@ pub fn with_cargo_env(
         )
         .env(
             "CARGO_MANIFEST_PATH",
-            &unit.manifest_dir.join("Cargo.toml").display().to_string(),
+            &rune_common::manifest_file::manifest_in(&unit.manifest_dir)
+                .display()
+                .to_string(),
         )
         .env("CARGO_PKG_AUTHORS", &meta.authors)
         .env("CARGO_PKG_DESCRIPTION", &meta.description)

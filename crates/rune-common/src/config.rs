@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 /// Global Rune configuration.
 #[derive(Debug, Clone)]
 pub struct RuneConfig {
-    /// The project root directory (where Cargo.toml lives).
+    /// The project root directory (where the manifest lives).
     pub project_root: PathBuf,
     /// The Rune output directory (`.rune/` within project root).
     pub rune_dir: PathBuf,
@@ -140,11 +140,11 @@ impl RuneConfig {
     }
 
     /// Discover the project root by searching upward from the given
-    /// path for a `Cargo.toml` file.
+    /// path for a manifest (`Cargo.toml`, or a `Rune.toml` that is one).
     pub fn discover(start: &Path) -> Option<Self> {
         let mut current = start.to_path_buf();
         loop {
-            if current.join("Cargo.toml").exists() {
+            if crate::manifest_file::has_manifest(&current) {
                 return Some(Self::new(current));
             }
             if !current.pop() {

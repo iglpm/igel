@@ -165,7 +165,7 @@ impl PatchEntry {
         } else {
             return Ok(None);
         };
-        let manifest = Manifest::from_path(&dir.join("Cargo.toml"))
+        let manifest = Manifest::from_path(&rune_common::manifest_file::manifest_in(&dir))
             .map_err(|e| format!("patch `{}`: {e}", self.name))?;
         let canon = dir.canonicalize().unwrap_or_else(|_| dir.clone());
         let enclosing = rune_manifest::find_enclosing_workspace(&canon, &manifest);

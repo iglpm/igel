@@ -2557,3 +2557,368 @@ fn a_shared_store_lets_another_machine_skip_what_was_already_built() {
     let t = text(&rune_with_env(&alone, &["build"], &[]));
     assert!(!t.contains("0 compiled"), "{t}");
 }
+
+// ---------------------------------------------------------------------------
+// Rune.toml as a manifest
+// ---------------------------------------------------------------------------
+
+const RUNE_MANIFEST: &str = "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n";
+
+/// A project with a `Rune.toml` manifest and no `Cargo.toml` at all.
+fn rune_only_project() -> Project {
+    let p = Project::new();
+    p.write("Rune.toml", RUNE_MANIFEST);
+    p.write(
+        "src/main.rs",
+        "fn main() { println!(\"hello from rune.toml\"); }\n\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn it_runs() { assert_eq!(2 + 2, 4); }\n}\n",
+    );
+    p
+}
+
+#[test]
+fn a_project_with_only_a_rune_toml_builds_runs_and_tests() {
+    let p = rune_only_project();
+    assert!(!p.path().join("Cargo.toml").exists());
+
+    assert!(p.ok(&["run"]).contains("hello from rune.toml"));
+    assert!(
+        p.ok(&["build"]).contains("0 compiled"),
+        "cached on the second build"
+    );
+    let t = p.ok(&["test"]);
+    assert!(t.contains("1 passed"), "{t}");
+    p.ok(&["check"]);
+    // Rune never invents a Cargo.toml for a project that does not have one.
+    assert!(!p.path().join("Cargo.toml").exists());
+    assert!(
+        p.path().join("Cargo.lock").exists(),
+        "the lockfile is still Cargo's format"
+    );
+}
+
+#[test]
+fn the_manifest_and_rune_settings_can_share_one_rune_toml() {
+    let p = Project::new();
+    p.write(
+        "Rune.toml",
+        &format!(
+            "{RUNE_MANIFEST}\n[dependencies]\n\n[build]\njobs = 3\n\n[test]\ndoctests = false\n"
+        ),
+    );
+    p.write("src/lib.rs", "pub fn f() {}\n");
+    // The settings in the manifest file are the project's settings…
+    let listing = p.ok(&["config", "list", "--show-origin"]);
+    assert!(
+        listing.contains("build.jobs") && listing.contains("Rune.toml"),
+        "{listing}"
+    );
+    assert_eq!(p.ok(&["config", "get", "build.jobs"]).trim(), "3");
+    // …`rune config set` writes into the same file and keeps the manifest.
+    p.ok(&["config", "set", "build.jobs", "5"]);
+    let text = p.read("Rune.toml");
+    assert!(
+        text.contains("name = \"demo\"") && text.contains("jobs = 5"),
+        "{text}"
+    );
+    p.ok(&["build"]);
+}
+
+#[test]
+fn editing_settings_in_the_manifest_file_does_not_rebuild_but_editing_the_package_does() {
+    let p = rune_only_project();
+    assert!(p.ok(&["build"]).contains("1 compiled"));
+    // A setting is not part of any unit's identity…
+    p.write(
+        "Rune.toml",
+        &format!("{RUNE_MANIFEST}\n[build]\njobs = 2\n"),
+    );
+    assert!(p.ok(&["build"]).contains("0 compiled"));
+    // …a manifest field that matters is.
+    p.write(
+        "Rune.toml",
+        "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2018\"\n\n[build]\njobs = 2\n",
+    );
+    assert!(p.ok(&["build"]).contains("1 compiled"));
+}
+
+#[test]
+fn a_workspace_can_mix_cargo_and_rune_manifests_and_path_dependencies_can_be_rune_only() {
+    let p = Project::new();
+    p.write(
+        "Rune.toml",
+        "[workspace]\nresolver = \"2\"\nmembers = [\"app\", \"lib-cargo\", \"lib-rune\"]\n",
+    );
+    p.write(
+        "app/Rune.toml",
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\nlib-cargo = { path = \"../lib-cargo\" }\nlib-rune = { path = \"../lib-rune\" }\nshared = { path = \"../shared\" }\n",
+    );
+    p.write(
+        "app/src/main.rs",
+        "fn main() { println!(\"{} {} {}\", lib_cargo::name(), lib_rune::name(), shared::name()); }\n",
+    );
+    p.write(
+        "lib-cargo/Cargo.toml",
+        "[package]\nname = \"lib-cargo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    p.write(
+        "lib-cargo/src/lib.rs",
+        "pub fn name() -> &'static str { \"cargo\" }\n",
+    );
+    p.write(
+        "lib-rune/Rune.toml",
+        "[package]\nname = \"lib-rune\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    p.write(
+        "lib-rune/src/lib.rs",
+        "pub fn name() -> &'static str { \"rune\" }\n",
+    );
+    // Not a workspace member: a plain path dependency next door.
+    p.write(
+        "shared/Rune.toml",
+        "[package]\nname = \"shared\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    p.write(
+        "shared/src/lib.rs",
+        "pub fn name() -> &'static str { \"shared\" }\n",
+    );
+
+    assert!(p.ok(&["run", "-p", "app"]).contains("cargo rune shared"));
+    let meta: serde_json::Value = serde_json::from_str(&p.ok(&["metadata"])).unwrap();
+    let manifests: Vec<String> = meta["packages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|pkg| pkg["manifest_path"].as_str())
+        .map(|m| {
+            Path::new(m)
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    assert!(
+        manifests.contains(&"Rune.toml".to_string())
+            && manifests.contains(&"Cargo.toml".to_string()),
+        "{manifests:?}"
+    );
+    // The workspace root is found from a member directory, too.
+    let out = p.rune_in(&p.path().join("lib-rune"), &["build"]);
+    assert!(out.status.success(), "{}", text(&out));
+}
+
+#[test]
+fn workspace_inheritance_works_from_a_rune_toml_root() {
+    let p = Project::new();
+    p.write(
+        "Rune.toml",
+        "[workspace]\nmembers = [\"a\"]\n\n[workspace.package]\nversion = \"2.5.0\"\nedition = \"2021\"\n",
+    );
+    p.write(
+        "a/Rune.toml",
+        "[package]\nname = \"a\"\nversion.workspace = true\nedition.workspace = true\n",
+    );
+    p.write(
+        "a/src/main.rs",
+        "fn main() { println!(\"v{}\", env!(\"CARGO_PKG_VERSION\")); }\n",
+    );
+    assert!(p.ok(&["run"]).contains("v2.5.0"));
+}
+
+#[test]
+fn when_both_files_are_manifests_rune_toml_wins_and_a_settings_only_one_does_not() {
+    let p = Project::new();
+    p.write(
+        "Cargo.toml",
+        "[package]\nname = \"from-cargo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    p.write(
+        "Rune.toml",
+        "[package]\nname = \"from-rune\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    p.write(
+        "src/main.rs",
+        "fn main() { println!(\"{}\", env!(\"CARGO_PKG_NAME\")); }\n",
+    );
+    assert!(p.ok(&["run"]).contains("from-rune"));
+
+    // Only settings in Rune.toml: Cargo.toml stays the manifest (how it always was).
+    p.write("Rune.toml", "[build]\njobs = 2\n");
+    assert!(p.ok(&["run"]).contains("from-cargo"));
+}
+
+#[test]
+fn locate_project_and_json_messages_name_the_real_manifest() {
+    let p = rune_only_project();
+    let located: serde_json::Value = serde_json::from_str(&p.ok(&["locate-project"])).unwrap();
+    assert!(
+        located["root"].as_str().unwrap().ends_with("Rune.toml"),
+        "{located}"
+    );
+
+    let out = p.rune(&["check", "--message-format", "json"]);
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let artifact = stdout
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .find(|v| v["reason"] == "compiler-artifact")
+        .expect("an artifact line");
+    assert!(
+        artifact["manifest_path"]
+            .as_str()
+            .unwrap()
+            .ends_with("Rune.toml"),
+        "{artifact}"
+    );
+}
+
+#[test]
+fn add_and_remove_edit_the_rune_toml_and_leave_its_settings_alone() {
+    let p = Project::new();
+    p.write(
+        "dep/Rune.toml",
+        "[package]\nname = \"helper\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    p.write("dep/src/lib.rs", "pub fn help() -> u32 { 42 }\n");
+    p.write(
+        "app/Rune.toml",
+        &format!(
+            "{}\n[dependencies]\n\n# my settings\n[build]\njobs = 2\n",
+            RUNE_MANIFEST.replace("demo", "app")
+        ),
+    );
+    p.write(
+        "app/src/main.rs",
+        "fn main() { println!(\"{}\", helper::help()); }\n",
+    );
+
+    let app = p.path().join("app");
+    let dep = p.path().join("dep");
+    let added = p.rune_in(&app, &["add", "helper", "--path", dep.to_str().unwrap()]);
+    assert!(added.status.success(), "{}", text(&added));
+    let manifest = std::fs::read_to_string(app.join("Rune.toml")).unwrap();
+    assert!(
+        manifest.contains("helper")
+            && manifest.contains("# my settings")
+            && manifest.contains("jobs = 2"),
+        "{manifest}"
+    );
+    assert!(!app.join("Cargo.toml").exists());
+    assert!(text(&p.rune_in(&app, &["run"])).contains("42"));
+
+    let removed = p.rune_in(&app, &["remove", "helper"]);
+    assert!(removed.status.success(), "{}", text(&removed));
+    let manifest = std::fs::read_to_string(app.join("Rune.toml")).unwrap();
+    assert!(
+        !manifest.contains("helper") && manifest.contains("jobs = 2"),
+        "{manifest}"
+    );
+}
+
+#[test]
+fn new_and_init_can_create_a_rune_toml_project() {
+    let p = Project::new();
+    let out = p.rune(&["new", "fresh", "--manifest", "rune", "--no-gitignore"]);
+    assert!(out.status.success(), "{}", text(&out));
+    let dir = p.path().join("fresh");
+    assert!(dir.join("Rune.toml").is_file() && !dir.join("Cargo.toml").exists());
+    let run = p.rune_in(&dir, &["run"]);
+    assert!(text(&run).contains("Hello, world!"), "{}", text(&run));
+
+    // `init` in a directory that already has a settings-only Rune.toml keeps the settings.
+    let existing = p.path().join("existing");
+    std::fs::create_dir_all(&existing).unwrap();
+    std::fs::write(existing.join("Rune.toml"), "[build]\njobs = 7\n").unwrap();
+    let out = p.rune_in(
+        &existing,
+        &[
+            "init",
+            "--manifest",
+            "rune",
+            "--name",
+            "existing",
+            "--no-gitignore",
+        ],
+    );
+    assert!(out.status.success(), "{}", text(&out));
+    let text_after = std::fs::read_to_string(existing.join("Rune.toml")).unwrap();
+    assert!(
+        text_after.contains("name = \"existing\"") && text_after.contains("jobs = 7"),
+        "{text_after}"
+    );
+    assert!(p.rune_in(&existing, &["build"]).status.success());
+
+    // And it refuses to overwrite a project that already has a manifest.
+    let again = p.rune_in(
+        &existing,
+        &["init", "--manifest", "cargo", "--no-gitignore"],
+    );
+    assert!(!again.status.success());
+    assert!(text(&again).contains("already exists"), "{}", text(&again));
+}
+
+#[test]
+fn a_git_dependency_can_be_a_rune_toml_only_repository() {
+    let repo = tempfile::tempdir().unwrap();
+    let d = repo.path();
+    git(d, &["init", "--quiet", "--initial-branch=main"]);
+    std::fs::create_dir_all(d.join("src")).unwrap();
+    std::fs::write(
+        d.join("Rune.toml"),
+        "[package]\nname = \"gitdep\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        d.join("src/lib.rs"),
+        "pub fn version() -> &'static str { \"rune-only git dependency\" }\n",
+    )
+    .unwrap();
+    git(d, &["add", "-A"]);
+    git(d, &["commit", "--quiet", "-m", "first"]);
+
+    let p = git_app(&format!("{{ git = {:?} }}", url(d)));
+    let out = p.ok(&["run"]);
+    assert!(
+        out.contains("gitdep says rune-only git dependency"),
+        "{out}"
+    );
+}
+
+#[test]
+fn an_unparsable_rune_toml_manifest_is_reported_not_skipped() {
+    let p = Project::new();
+    p.write(
+        "Cargo.toml",
+        "[package]\nname = \"fine\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    p.write("Rune.toml", "[package]\nname = \nversion = \"0.1.0\"\n");
+    p.write("src/main.rs", "fn main() {}\n");
+    let out = p.rune(&["build"]);
+    assert!(
+        !out.status.success(),
+        "must not silently fall back to Cargo.toml"
+    );
+    assert!(text(&out).contains("Rune.toml"), "{}", text(&out));
+}
+
+#[test]
+fn doctor_warns_when_rune_toml_shadows_a_cargo_toml() {
+    let p = Project::new();
+    p.write(
+        "Cargo.toml",
+        "[package]\nname = \"a\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    p.write(
+        "Rune.toml",
+        "[package]\nname = \"a\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    p.write("src/lib.rs", "");
+    assert!(
+        p.ok(&["doctor"])
+            .contains("both `Rune.toml` and `Cargo.toml` define this project")
+    );
+    // A settings-only Rune.toml next to a Cargo.toml is the normal case: no warning.
+    p.write("Rune.toml", "[build]\njobs = 2\n");
+    assert!(!p.ok(&["doctor"]).contains("both `Rune.toml`"));
+}

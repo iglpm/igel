@@ -52,20 +52,38 @@ pub fn validate_package_name(name: &str) -> Result<()> {
     Ok(())
 }
 
-fn scaffold(dir: &Path, name: &str, lib: bool, edition: &str, gitignore: bool) -> Result<()> {
+fn scaffold(
+    dir: &Path,
+    name: &str,
+    lib: bool,
+    edition: &str,
+    gitignore: bool,
+    manifest_file: &str,
+) -> Result<()> {
     validate_package_name(name)?;
-    if dir.join("Cargo.toml").exists() {
-        bail!("`Cargo.toml` already exists in `{}`", dir.display());
+    if let Some(existing) = rune_common::manifest_file::find_manifest(dir) {
+        bail!(
+            "`{}` already exists in `{}`",
+            existing
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("a manifest"),
+            dir.display()
+        );
     }
     let _: Edition = edition.parse().map_err(|e: String| anyhow::anyhow!(e))?;
     fs::create_dir_all(dir.join("src"))?;
 
-    fs::write(
-        dir.join("Cargo.toml"),
-        format!(
-            "[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"{edition}\"\n\n[dependencies]\n"
-        ),
-    )?;
+    let manifest = format!(
+        "[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"{edition}\"\n\n[dependencies]\n"
+    );
+    let manifest_path = dir.join(manifest_file);
+    // A `Rune.toml` may already exist as a settings file; keep those settings.
+    let content = match fs::read_to_string(&manifest_path) {
+        Ok(existing) if !existing.trim().is_empty() => format!("{manifest}\n{existing}"),
+        _ => manifest,
+    };
+    fs::write(&manifest_path, content)?;
 
     let source = if lib {
         dir.join("src/lib.rs")
@@ -147,7 +165,17 @@ pub fn new(args: NewArgs) -> Result<()> {
         args.lib,
         &args.edition,
         !args.no_gitignore,
+        manifest_file_for(&args.manifest),
     )
+}
+
+/// `--manifest cargo|rune` → the file name.
+fn manifest_file_for(choice: &str) -> &'static str {
+    if choice == "rune" {
+        rune_common::manifest_file::RUNE_TOML
+    } else {
+        rune_common::manifest_file::CARGO_TOML
+    }
 }
 
 pub fn init(args: InitArgs) -> Result<()> {
@@ -164,7 +192,14 @@ pub fn init(args: InitArgs) -> Result<()> {
     // Follow existing sources when initializing a populated directory.
     let lib = args.lib
         || (!args.bin && abs.join("src/lib.rs").exists() && !abs.join("src/main.rs").exists());
-    scaffold(&abs, &name, lib, &args.edition, !args.no_gitignore)
+    scaffold(
+        &abs,
+        &name,
+        lib,
+        &args.edition,
+        !args.no_gitignore,
+        manifest_file_for(&args.manifest),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -178,7 +213,9 @@ pub fn clean(args: CleanArgs) -> Result<()> {
             let settings = Settings::load(Some(r))?;
             RuneConfig::new(r).with_settings(settings)
         }
-        None => bail!("could not find `Cargo.toml` in the current directory or any parent"),
+        None => bail!(
+            "could not find `Cargo.toml` or `Rune.toml` in the current directory or any parent"
+        ),
     };
     if let Some(dir) = &args.target_dir {
         config.target_dir = dir.clone();
@@ -595,8 +632,9 @@ fn format_size_human(bytes: u64) -> String {
 }
 
 pub fn lockfile(cmd: LockfileCommands) -> Result<()> {
-    let root = find_project_root(None)
-        .context("could not find `Cargo.toml` in the current directory or any parent")?;
+    let root = find_project_root(None).context(
+        "could not find `Cargo.toml` or `Rune.toml` in the current directory or any parent",
+    )?;
     match cmd {
         LockfileCommands::Export { format, output } => {
             let lock = LockfileManager::load_fast(&root).context("No lockfile found to export")?;
@@ -653,7 +691,7 @@ mod tests {
     fn scaffold_creates_a_buildable_layout() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("demo");
-        scaffold(&p, "demo", true, "2021", false).unwrap();
+        scaffold(&p, "demo", true, "2021", false, "Cargo.toml").unwrap();
         assert!(p.join("Cargo.toml").is_file());
         assert!(
             fs::read_to_string(p.join("src/lib.rs"))
@@ -661,7 +699,7 @@ mod tests {
                 .contains("#[test]")
         );
         // A second init must not clobber it.
-        assert!(scaffold(&p, "demo", true, "2021", false).is_err());
+        assert!(scaffold(&p, "demo", true, "2021", false, "Cargo.toml").is_err());
     }
 
     #[test]
@@ -791,6 +829,15 @@ pub fn doctor() -> Result<()> {
         rustc_wrapper: std::env::var("RUSTC_WRAPPER")
             .ok()
             .filter(|w| !w.is_empty()),
+        shadowed_cargo_toml: ws.as_ref().is_some_and(|ws| {
+            use rune_common::manifest_file::{
+                CARGO_TOML, RUNE_TOML, find_manifest, text_is_manifest,
+            };
+            let root = ws.root();
+            find_manifest(root).is_some_and(|m| m.file_name().is_some_and(|n| n == RUNE_TOML))
+                && std::fs::read_to_string(root.join(CARGO_TOML))
+                    .is_ok_and(|t| text_is_manifest(&t))
+        }),
     };
 
     let findings = diagnose(&env);

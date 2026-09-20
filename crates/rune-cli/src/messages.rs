@@ -76,7 +76,7 @@ fn common(unit: &CompilationUnit, reason: &str) -> serde_json::Map<String, Value
     m.insert("package_id".into(), json!(package_id(unit)));
     m.insert(
         "manifest_path".into(),
-        json!(unit.manifest_dir.join("Cargo.toml")),
+        json!(rune_common::manifest_file::manifest_in(&unit.manifest_dir)),
     );
     m.insert("target".into(), target_json(unit));
     m

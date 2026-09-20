@@ -443,11 +443,27 @@ impl Manifest {
 
     /// Parses a manifest from a string, using `path` for error messages.
     pub fn from_str(content: &str, path: &Path) -> Result<Self, ManifestError> {
-        let raw: RawManifest =
-            toml::from_str(content).map_err(|source| ManifestError::TomlParse {
-                path: path.to_path_buf(),
-                source,
-            })?;
+        let parse_err = |source| ManifestError::TomlParse {
+            path: path.to_path_buf(),
+            source,
+        };
+        let raw: RawManifest = if path
+            .file_name()
+            .is_some_and(|n| n == rune_common::manifest_file::RUNE_TOML)
+        {
+            // A `Rune.toml` is both a manifest and Rune's settings file. Its
+            // settings live in tables of their own (`[build]`, `[cas]`, …), which
+            // are just unknown keys here — except `[test]`, which as a *table*
+            // holds the `test.*` settings and as an *array* (`[[test]]`) is the
+            // manifest's list of test targets.
+            let mut table: toml::Table = content.parse().map_err(parse_err)?;
+            if table.get("test").is_some_and(|v| v.is_table()) {
+                table.remove("test");
+            }
+            table.try_into().map_err(parse_err)?
+        } else {
+            toml::from_str(content).map_err(parse_err)?
+        };
 
         let mut parsed_deps = HashMap::new();
 
@@ -997,5 +1013,46 @@ mod tests {
         assert_eq!(meta.description, "shared");
         assert_eq!(meta.authors, "A:B");
         assert_eq!(pkg.edition_in(None), "2015");
+    }
+
+    #[test]
+    fn a_rune_toml_manifest_carries_settings_tables_beside_its_package() {
+        let toml = r#"
+            [package]
+            name = "demo"
+            version = "0.1.0"
+            edition = "2021"
+
+            [dependencies]
+            serde = "1"
+
+            # Rune settings, in the same file:
+            [build]
+            jobs = 4
+            [cas]
+            verify = true
+            [test]
+            doctests = false
+        "#;
+        let m = Manifest::from_str(toml, Path::new("Rune.toml")).unwrap();
+        assert_eq!(m.package.unwrap().name, "demo");
+        assert!(m.dependencies.values().any(|d| d.name == "serde"));
+    }
+
+    #[test]
+    fn a_rune_toml_with_test_targets_keeps_them() {
+        let toml = "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n\n[[test]]\nname = \"integration\"\npath = \"tests/it.rs\"\n";
+        let m = Manifest::from_str(toml, Path::new("Rune.toml")).unwrap();
+        assert_eq!(m.test.len(), 1);
+        assert_eq!(m.test[0].name.as_deref(), Some("integration"));
+    }
+
+    #[test]
+    fn a_test_settings_table_is_still_an_error_in_a_cargo_toml() {
+        let toml = "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n[test]\ndoctests = false\n";
+        assert!(
+            Manifest::from_str(toml, Path::new("Cargo.toml")).is_err(),
+            "Cargo has no such table"
+        );
     }
 }

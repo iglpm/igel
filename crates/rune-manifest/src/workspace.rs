@@ -76,7 +76,7 @@ pub fn find_enclosing_workspace(
     manifest: &crate::Manifest,
 ) -> Option<(PathBuf, WorkspaceManifest)> {
     let load = |root: &Path| -> Option<WorkspaceManifest> {
-        crate::Manifest::from_path(&root.join("Cargo.toml"))
+        crate::Manifest::from_path(&rune_common::manifest_file::manifest_in(root))
             .ok()
             .and_then(|m| m.workspace)
     };
@@ -90,7 +90,7 @@ pub fn find_enclosing_workspace(
     }
     let mut cur = dir.parent()?.to_path_buf();
     loop {
-        if cur.join("Cargo.toml").is_file() {
+        if rune_common::manifest_file::has_manifest(&cur) {
             if let Some(ws) = load(&cur) {
                 let is_member = ws
                     .resolve_members(&cur)
@@ -139,7 +139,9 @@ impl WorkspaceManifest {
             for entry in glob(&full_pattern)? {
                 match entry {
                     Ok(path) => {
-                        if path.join("Cargo.toml").exists() && !excluded.contains(&path) {
+                        if rune_common::manifest_file::has_manifest(&path)
+                            && !excluded.contains(&path)
+                        {
                             paths.push(path);
                         }
                     }

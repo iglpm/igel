@@ -36,7 +36,8 @@ run._
   cached test results, and a shared store (`cas.remote`, a directory or **Cairn**
   servers — the companion project in `../cairn`) for CI and teams.
 
-**Manifests, workspaces, targets** — the full compilation-relevant manifest;
+**Manifests, workspaces, targets** — the full compilation-relevant manifest, from
+`Cargo.toml` or from a `Rune.toml` (a Rune-only project needs no `Cargo.toml`);
 workspace inheritance (also from *foreign* workspaces); all target kinds and
 options; `[lib] crate-type` with several crate types per unit; target
 auto-discovery incl. `autolib`; `[lints]`; profiles with `inherits`,
@@ -74,7 +75,7 @@ set, dependency edges, ordering and format (a regenerated lock differs only
 where crates.io has published newer releases than the ones pinned).
 
 **Proof points**
-- 308 automated tests (`cargo test --workspace` and `rune test` both pass),
+- 332 automated tests (`cargo test --workspace` and `rune test` both pass),
   including end-to-end tests for build scripts, host/target roles, features per
   selection, git (tag/branch/rev/submodules/foreign workspaces), patches,
   local/vendored/authenticated registries, wrappers, runners, config, CAS
@@ -90,7 +91,7 @@ where crates.io has published newer releases than the ones pinned).
 | § | Topic | Status | Notes |
 | --- | --- | --- | --- |
 | 1 | Compatibility goal | 🟡 | Broad and verified on Rune's own graph; an ecosystem-wide sweep (top-N crates) is milestone M2. |
-| 2 | Manifest fields | ✅ | Compilation-relevant fields honoured; packaging-only fields (`include/exclude/publish/keywords/…`) are parsed and ignored. |
+| 2 | Manifest fields | ✅ | Compilation-relevant fields honoured; packaging-only fields (`include/exclude/publish/keywords/…`) are parsed and ignored. The manifest may be `Cargo.toml` **or** `Rune.toml` (§8). |
 | 3 | Workspaces | ✅ | members/exclude/default-members/resolver, `[workspace.package/dependencies/lints/metadata]`, `[patch]`, `[replace]`, `[profile]`. |
 | 4 | Package targets | ✅ | All target kinds/options; `doc = false` honoured by `rune doc`. |
 | 5 | Crate types | ✅ | Several per unit; part of identity. |
@@ -538,7 +539,7 @@ and cache lookups for IDEs, Bazel-style wrappers and corporate tooling (see P17)
 ## 7. How to verify the current state
 
 ```bash
-cargo test --workspace                       # 308 tests, no network needed
+cargo test --workspace                       # 332 tests, no network needed
 cargo clippy --workspace --all-targets
 
 # Rune builds and tests itself against live crates.io (use a scratch copy
@@ -603,7 +604,7 @@ above is a median of interleaved runs, not a single measurement.
 `compiler-message`/`compiler-artifact`/`build-finished`, diagnostics stored in the
 CAS and replayed on hits); `rune doctor`; `rune cas du`; `--timings` writes
 `.rune/fingerprints/trace.json` (Chrome trace of the schedule); tests
-(308 in total).
+(332 in total).
 
 **Second batch (same day):** `rune watch`, `rune affected`, `rune script`, install
 hints for failed build scripts (see F4–F6, F9), opt-in cached test results (P9), a shared store (F3), and a fix so a `KeyUpdate` recomputes
@@ -628,6 +629,29 @@ slot); moved to a two-thread background pool flushed at the end of the build, it
 path and a separate `RUNE_HOME` still hit: keys contain no checkout path. The HTTP
 backend and the Cairn server (next paragraphs) followed; not done: signing, S3,
 eviction of a shared *directory*.
+
+**`Rune.toml` as a manifest.** Rune's project settings file can now also be the
+manifest, so a project needs no `Cargo.toml` at all. One function
+(`rune_common::manifest_file::find_manifest`) decides what a directory's manifest
+is — `Rune.toml` if it has a `[package]`/`[workspace]` table, else `Cargo.toml`,
+`Rune.toml` winning if both are manifests — and every place that used to say
+`dir.join("Cargo.toml")` (workspace roots and members, path and git dependencies,
+`[patch]`, package hashing, declared inputs, `CARGO_MANIFEST_PATH`, `add`/`remove`,
+`metadata`, `locate-project`, JSON messages, scaffolding) asks it, so they cannot
+disagree. A settings-only `Rune.toml` beside a `Cargo.toml` is unchanged. Design
+points: a broken `Rune.toml` that *looks* like a manifest is reported, not skipped
+for the `Cargo.toml` beside it; a `[test]` settings table is tolerated in a
+`Rune.toml` manifest (as a list, `[[test]]`, it is the test targets and
+`rune config set test.*` refuses with the way out); `rune doctor` warns when two
+manifests compete; `rune new/init --manifest rune`, and `init` keeps an existing
+settings-only file's settings. 24 new tests (unit + end to end, including a
+`Rune.toml`-only git dependency and a mixed workspace). Real check: Rune's own
+workspace with all 11 `Cargo.toml` renamed — 182 units, `0 compiled` after wiping
+`target`, 332 tests pass, `Cargo.lock` identical, and the renamed copy restores every
+unit from the `Cargo.toml` original's cache (the file name is not in any key). Not
+done: Windows path handling (as everywhere), a `Rune.toml`-aware `rust-analyzer`
+recipe (rust-analyzer itself only looks for `Cargo.toml`), and registry crates
+(always `Cargo.toml`, as `cargo publish` writes them).
 
 **Cairn — the remote cache server (M5).** A new project next to Rune (`../cairn`, its
 own README): one Rust binary over a directory of plain files, speaking Rune's own

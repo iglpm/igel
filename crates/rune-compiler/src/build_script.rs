@@ -86,7 +86,10 @@ impl BuildScriptEnv {
         cmd.env("CARGO_PKG_NAME", &self.pkg_name);
         cmd.env("CARGO_PKG_VERSION", &self.pkg_version);
         cmd.env("CARGO_MANIFEST_DIR", &self.manifest_dir);
-        cmd.env("CARGO_MANIFEST_PATH", self.manifest_dir.join("Cargo.toml"));
+        cmd.env(
+            "CARGO_MANIFEST_PATH",
+            rune_common::manifest_file::manifest_in(&self.manifest_dir),
+        );
         let core = self
             .pkg_version
             .split(['-', '+'])

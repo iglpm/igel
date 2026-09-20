@@ -404,11 +404,11 @@ fn materialize(db: &Path, dir: &Path, commit: &str) -> Result<String> {
 }
 
 /// The directory of the package called `name` inside a checkout: the
-/// repository root if that is it, else the shallowest `Cargo.toml` (in path
+/// repository root if that is it, else the shallowest manifest (in path
 /// order) that declares it — like Cargo, which searches the whole repository.
 pub fn find_package(checkout: &GitCheckout, name: &str) -> Result<PathBuf> {
     let declares = |dir: &Path| -> bool {
-        std::fs::read_to_string(dir.join("Cargo.toml"))
+        std::fs::read_to_string(rune_common::manifest_file::manifest_in(dir))
             .ok()
             .and_then(|t| t.parse::<toml::Table>().ok())
             .and_then(|t| {

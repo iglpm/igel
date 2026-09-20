@@ -178,7 +178,7 @@ pub fn from_script_output(
         // Inside the package the package-wide hash already covers it (or the
         // package is immutable); only outside files add information — and the
         // manifest, which that hash deliberately leaves out.
-        let is_manifest = abs == manifest_dir.join("Cargo.toml");
+        let is_manifest = abs == rune_common::manifest_file::manifest_in(manifest_dir);
         if is_manifest || (!abs.starts_with(manifest_dir) && !abs.starts_with(out_dir)) {
             inputs.files.push(abs);
         }
@@ -186,7 +186,9 @@ pub fn from_script_output(
     // A script that declares no `rerun-if-changed` is rerun by Cargo whenever
     // *any* file of the package changes — the manifest included.
     if out.rerun_if_changed.is_empty() {
-        inputs.files.push(manifest_dir.join("Cargo.toml"));
+        inputs
+            .files
+            .push(rune_common::manifest_file::manifest_in(manifest_dir));
     }
 
     // Native libraries found outside the package: the linker will read them,
@@ -277,7 +279,7 @@ pub fn reads_manifest(dep_info: &Path, manifest: &Path) -> bool {
         .filter(|l| !l.starts_with('#'))
         .flat_map(|l| l.split_whitespace())
         .map(|t| t.trim_end_matches(':'))
-        .filter(|t| t.ends_with("Cargo.toml"))
+        .filter(|t| t.ends_with("Cargo.toml") || t.ends_with("Rune.toml"))
         .any(|t| {
             let p = Path::new(t);
             std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf()) == wanted

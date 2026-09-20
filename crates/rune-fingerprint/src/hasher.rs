@@ -145,7 +145,7 @@ fn compute_package_hash_uncached(
                 return false;
             }
             // A nested package is not part of this one.
-            !e.path().join("Cargo.toml").is_file()
+            !rune_common::manifest_file::has_manifest(e.path())
         });
     for entry in walker.filter_map(|e| e.ok()) {
         if !entry.file_type().is_file() {
@@ -162,7 +162,7 @@ fn compute_package_hash_uncached(
         // an unrelated section changes. When something *does* read the file
         // (`include_str!("../Cargo.toml")`, a build script), it is recorded as
         // a declared input by whoever observed the read.
-        if name == "Cargo.toml" && entry.depth() == 1 {
+        if rune_common::manifest_file::is_manifest_file_name(&name) && entry.depth() == 1 {
             continue;
         }
         // Lock files and Rune's own settings file don't affect compilation;

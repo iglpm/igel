@@ -11,7 +11,7 @@ use std::path::PathBuf;
     long_about = "Rune is an alternative build system and package manager for Rust that is \
         significantly faster through content-addressable caching (CAS), \
         parallel scheduling, streaming sparse registry resolution, and rmeta pipelining. \
-        It reads ordinary Cargo.toml manifests and accepts Cargo's flags."
+        It reads ordinary Cargo.toml manifests — or a Rune.toml with the same contents — and accepts Cargo's flags."
 )]
 pub struct Cli {
     /// Coloring of output
@@ -48,9 +48,9 @@ pub enum Commands {
     New(NewArgs),
     /// Create a new package in an existing directory
     Init(InitArgs),
-    /// Add a dependency to Cargo.toml and resolve lockfiles
+    /// Add a dependency to the manifest and resolve lockfiles
     Add(AddArgs),
-    /// Remove a dependency from Cargo.toml
+    /// Remove a dependency from the manifest
     #[command(visible_alias = "rm")]
     Remove(RemoveArgs),
     /// Update dependencies in lockfiles to latest compatible versions
@@ -63,7 +63,7 @@ pub enum Commands {
     Fetch(ManifestArgs),
     /// Resolve dependencies and write the lockfile
     GenerateLockfile(ManifestArgs),
-    /// Print the path of the workspace's Cargo.toml as JSON
+    /// Print the path of the workspace's manifest as JSON
     LocateProject(ManifestArgs),
     /// Output workspace and dependency metadata as JSON
     Metadata(MetadataArgs),
@@ -93,7 +93,7 @@ pub enum Commands {
 /// Flags shared by every command that resolves and builds.
 #[derive(Args, Debug, Clone, Default)]
 pub struct CommonArgs {
-    /// Path to Cargo.toml
+    /// Path to the manifest (Cargo.toml or Rune.toml), or a directory holding one
     #[arg(long, value_name = "PATH")]
     pub manifest_path: Option<PathBuf>,
 
@@ -338,7 +338,7 @@ pub struct DocArgs {
 
 #[derive(Args, Debug, Clone, Default)]
 pub struct ManifestArgs {
-    /// Path to Cargo.toml
+    /// Path to the manifest (Cargo.toml or Rune.toml), or a directory holding one
     #[arg(long, value_name = "PATH")]
     pub manifest_path: Option<PathBuf>,
 
@@ -366,6 +366,10 @@ pub struct NewArgs {
     /// Don't create a `.gitignore`
     #[arg(long)]
     pub no_gitignore: bool,
+    /// Which file holds the manifest: `cargo` (Cargo.toml, works with plain
+    /// `cargo` too) or `rune` (Rune.toml, Rune only)
+    #[arg(long, default_value = "cargo", value_parser = ["cargo", "rune"])]
+    pub manifest: String,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -383,6 +387,9 @@ pub struct InitArgs {
     pub edition: String,
     #[arg(long)]
     pub no_gitignore: bool,
+    /// `cargo` (Cargo.toml) or `rune` (Rune.toml)
+    #[arg(long, default_value = "cargo", value_parser = ["cargo", "rune"])]
+    pub manifest: String,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -747,7 +754,7 @@ pub struct AffectedArgs {
     #[arg(long, value_name = "FMT", default_value = "names", value_parser = ["names", "args", "json"])]
     pub format: String,
 
-    /// Path to Cargo.toml
+    /// Path to the manifest (Cargo.toml or Rune.toml), or a directory holding one
     #[arg(long, value_name = "PATH")]
     pub manifest_path: Option<PathBuf>,
 }

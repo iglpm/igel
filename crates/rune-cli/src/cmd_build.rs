@@ -261,7 +261,7 @@ pub fn install(args: InstallArgs) -> Result<()> {
     let mut common = args.common.clone();
     // Installed binaries are release builds unless a profile is named.
     common.release = args.common.profile.is_none();
-    common.manifest_path = Some(args.path.join("Cargo.toml"));
+    common.manifest_path = Some(rune_common::manifest_file::manifest_in(&args.path));
     let sess = Session::new(&common, "release")?;
 
     let targets = TargetSelection {

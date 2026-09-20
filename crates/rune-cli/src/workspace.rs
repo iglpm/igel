@@ -11,6 +11,8 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone)]
 pub struct Member {
     pub dir: PathBuf,
+    /// The file the manifest was read from (`Cargo.toml` or `Rune.toml`).
+    pub manifest_path: PathBuf,
     pub manifest: Manifest,
     pub name: String,
     pub version: semver::Version,
@@ -20,7 +22,7 @@ pub struct Member {
 
 impl Member {
     pub(crate) fn load(dir: &Path, ws: Option<&WorkspaceManifest>) -> Result<Self> {
-        let manifest_path = dir.join("Cargo.toml");
+        let manifest_path = rune_common::manifest_file::manifest_in(dir);
         let manifest = Manifest::from_path(&manifest_path)
             .with_context(|| format!("Failed to parse {}", manifest_path.display()))?;
         let pkg = manifest
@@ -34,6 +36,7 @@ impl Member {
         let meta = pkg.meta_in(ws);
         Ok(Self {
             dir: dir.to_path_buf(),
+            manifest_path,
             name: pkg.name.clone(),
             version,
             edition,
@@ -65,12 +68,12 @@ pub struct Workspace {
 
 impl Workspace {
     /// Finds and loads the workspace containing `manifest_path`, or the
-    /// nearest `Cargo.toml` at or above the current directory.
+    /// nearest manifest (`Cargo.toml` or `Rune.toml`) at or above the current directory.
     pub fn load(manifest_path: Option<&Path>) -> Result<Self> {
         let start_manifest = match manifest_path {
             Some(p) => {
                 let p = if p.is_dir() {
-                    p.join("Cargo.toml")
+                    rune_common::manifest_file::manifest_in(p)
                 } else {
                     p.to_path_buf()
                 };
@@ -81,7 +84,7 @@ impl Workspace {
                 let cwd = std::env::current_dir()?;
                 find_manifest_upwards(&cwd).with_context(|| {
                     format!(
-                        "could not find `Cargo.toml` in `{}` or any parent directory",
+                        "could not find `Cargo.toml` or `Rune.toml` in `{}` or any parent directory",
                         cwd.display()
                     )
                 })?
@@ -101,7 +104,7 @@ impl Workspace {
         let root_manifest = if root_dir == start_dir {
             start
         } else {
-            let p = root_dir.join("Cargo.toml");
+            let p = rune_common::manifest_file::manifest_in(&root_dir);
             Manifest::from_path(&p).with_context(|| format!("Failed to parse {}", p.display()))?
         };
 
@@ -136,7 +139,7 @@ impl Workspace {
         if dirs.is_empty() {
             bail!(
                 "`{}` is a virtual workspace with no members",
-                root_dir.join("Cargo.toml").display()
+                rune_common::manifest_file::manifest_in(&root_dir).display()
             );
         }
 
@@ -167,7 +170,7 @@ impl Workspace {
     }
 
     pub fn manifest_path(&self) -> PathBuf {
-        self.config.project_root.join("Cargo.toml")
+        rune_common::manifest_file::manifest_in(&self.config.project_root)
     }
 
     pub fn workspace_manifest(&self) -> Option<&WorkspaceManifest> {
@@ -242,8 +245,7 @@ impl Workspace {
 fn find_manifest_upwards(start: &Path) -> Option<PathBuf> {
     let mut cur = start.to_path_buf();
     loop {
-        let candidate = cur.join("Cargo.toml");
-        if candidate.is_file() {
+        if let Some(candidate) = rune_common::manifest_file::find_manifest(&cur) {
             return candidate.canonicalize().ok();
         }
         if !cur.pop() {
@@ -261,8 +263,7 @@ fn find_workspace_root(member_dir: &Path, member: &Manifest) -> Option<PathBuf> 
     }
     let mut cur = member_dir.parent()?.to_path_buf();
     loop {
-        let candidate = cur.join("Cargo.toml");
-        if candidate.is_file() {
+        if let Some(candidate) = rune_common::manifest_file::find_manifest(&cur) {
             if let Ok(m) = Manifest::from_path(&candidate) {
                 if let Some(ws) = &m.workspace {
                     let members = ws.resolve_members(&cur).unwrap_or_default();

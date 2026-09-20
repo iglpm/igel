@@ -26,7 +26,7 @@ fn load(m: &ManifestArgs) -> Result<(Workspace, bool)> {
 // add / remove
 // ---------------------------------------------------------------------------
 
-/// The member whose `Cargo.toml` `add`/`remove` should edit.
+/// The member whose manifest `add`/`remove` should edit.
 fn target_member(ws: &Workspace, package: Option<&str>) -> Result<usize> {
     if let Some(name) = package {
         return ws
@@ -50,7 +50,7 @@ fn target_member(ws: &Workspace, package: Option<&str>) -> Result<usize> {
 pub fn add(args: AddArgs) -> Result<()> {
     let (ws, offline) = load(&args.manifest)?;
     let mi = target_member(&ws, args.package.as_deref())?;
-    let manifest_path = ws.members[mi].dir.join("Cargo.toml");
+    let manifest_path = ws.members[mi].manifest_path.clone();
 
     let text = fs::read_to_string(&manifest_path)?;
     let mut doc: DocumentMut = text
@@ -153,7 +153,7 @@ pub fn add(args: AddArgs) -> Result<()> {
 pub fn remove(args: RemoveArgs) -> Result<()> {
     let (ws, offline) = load(&args.manifest)?;
     let mi = target_member(&ws, args.package.as_deref())?;
-    let manifest_path = ws.members[mi].dir.join("Cargo.toml");
+    let manifest_path = ws.members[mi].manifest_path.clone();
     let text = fs::read_to_string(&manifest_path)?;
     let mut doc: DocumentMut = text
         .parse()
@@ -342,11 +342,12 @@ pub fn generate_lockfile(args: ManifestArgs) -> Result<()> {
 }
 
 pub fn locate_project(args: ManifestArgs) -> Result<()> {
-    let root = crate::workspace::find_project_root(args.manifest_path.as_deref())
-        .context("could not find `Cargo.toml` in the current directory or any parent")?;
+    let root = crate::workspace::find_project_root(args.manifest_path.as_deref()).context(
+        "could not find `Cargo.toml` or `Rune.toml` in the current directory or any parent",
+    )?;
     println!(
         "{}",
-        serde_json::json!({ "root": root.join("Cargo.toml").display().to_string() })
+        serde_json::json!({ "root": rune_common::manifest_file::manifest_in(&root).display().to_string() })
     );
     Ok(())
 }
@@ -497,7 +498,7 @@ pub fn metadata(args: MetadataArgs) -> Result<()> {
             "dependencies": deps,
             "targets": targets,
             "features": m.manifest.features,
-            "manifest_path": m.dir.join("Cargo.toml").display().to_string(),
+            "manifest_path": m.manifest_path.display().to_string(),
             "edition": m.edition.as_str(),
             "authors": m.meta.authors.split(':').filter(|s| !s.is_empty()).collect::<Vec<_>>(),
         }));

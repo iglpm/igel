@@ -520,7 +520,7 @@ fn resolve_one_queue_item(
 ) -> Result<()> {
     // If local path dependency
     if let Some(dir) = local_dir {
-        let manifest_path = dir.join("Cargo.toml");
+        let manifest_path = rune_common::manifest_file::manifest_in(&dir);
         if let Ok(manifest) = rune_manifest::Manifest::from_path(&manifest_path) {
             // A package inherits from *its own* workspace — the one it is a
             // member of — which for a path dependency next door or a git

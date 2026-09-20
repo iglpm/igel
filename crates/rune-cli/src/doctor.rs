@@ -79,6 +79,9 @@ pub struct Environment {
     pub jobs: usize,
     pub cpus: usize,
     pub rustc_wrapper: Option<String>,
+    /// The project has a `Rune.toml` manifest *and* a `Cargo.toml` manifest: Rune
+    /// reads the first, plain `cargo` reads the second.
+    pub shadowed_cargo_toml: bool,
 }
 
 /// The file-system type of the mount `path` lives on, from `/proc/mounts` text.
@@ -231,6 +234,17 @@ pub fn diagnose(env: &Environment) -> Vec<Finding> {
         ));
     }
 
+    // --- manifests ----------------------------------------------------------
+    if env.shadowed_cargo_toml {
+        out.push(Finding::warn(
+            "both `Rune.toml` and `Cargo.toml` define this project",
+            "Rune reads `Rune.toml`; plain `cargo` reads `Cargo.toml`, so the two can drift apart \
+             (different dependencies or features, different builds).",
+            "keep one of them as the manifest — a `Rune.toml` with only settings (no `[package]` \
+             or `[workspace]`) is fine next to a `Cargo.toml`",
+        ));
+    }
+
     // --- the store ------------------------------------------------------------
     out.push(Finding::ok(format!("store holds {}", human(env.cas_bytes))));
     if env.cas_idle_bytes >= (1 << 30) && env.cas_idle_bytes * 4 >= env.cas_bytes {
@@ -266,6 +280,7 @@ mod tests {
             jobs: 16,
             cpus: 12,
             rustc_wrapper: None,
+            shadowed_cargo_toml: false,
         }
     }
 
@@ -333,6 +348,14 @@ mod tests {
             f.iter()
                 .any(|f| f.level == Level::Note && f.title.contains("full debuginfo"))
         );
+    }
+
+    #[test]
+    fn two_competing_manifests_are_flagged() {
+        let mut e = env();
+        e.shadowed_cargo_toml = true;
+        let f = diagnose(&e);
+        assert!(warnings(&f)[0].contains("both `Rune.toml` and `Cargo.toml`"));
     }
 
     #[test]
