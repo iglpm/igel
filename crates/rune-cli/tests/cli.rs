@@ -2236,16 +2236,32 @@ fn watch_runs_again_when_a_file_changes_and_shows_the_new_result() {
     // Wait for the first run to finish, then edit: the second run must see a
     // new warning that the first did not have.
     std::thread::sleep(std::time::Duration::from_millis(1500));
-    p.write("src/lib.rs", "pub fn f() { let unused_in_second_run = 1; }\n");
+    p.write(
+        "src/lib.rs",
+        "pub fn f() { let unused_in_second_run = 1; }\n",
+    );
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     while child.try_wait().unwrap().is_none() {
-        assert!(std::time::Instant::now() < deadline, "watch did not run a second time");
+        assert!(
+            std::time::Instant::now() < deadline,
+            "watch did not run a second time"
+        );
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
     let (mut out, mut err) = (String::new(), String::new());
-    child.stdout.take().unwrap().read_to_string(&mut out).unwrap();
-    child.stderr.take().unwrap().read_to_string(&mut err).unwrap();
+    child
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_string(&mut out)
+        .unwrap();
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut err)
+        .unwrap();
     let all = format!("{out}{err}");
     assert_eq!(all.matches("rune check").count(), 2, "{all}");
     assert!(all.contains("unused_in_second_run"), "{all}");
@@ -2267,14 +2283,27 @@ fn a_failing_build_script_that_needs_a_system_package_says_which() {
     let out = p.rune(&["build"]);
     assert!(!out.status.success());
     let t = text(&out);
-    assert!(t.contains("Could not find directory of OpenSSL installation"), "{t}");
-    assert!(t.contains("hint: this looks like the OpenSSL development files is missing"), "{t}");
+    assert!(
+        t.contains("Could not find directory of OpenSSL installation"),
+        "{t}"
+    );
+    assert!(
+        t.contains("hint: this looks like the OpenSSL development files is missing"),
+        "{t}"
+    );
     assert!(t.contains("OPENSSL_DIR"), "{t}");
 }
 
 fn git_in(dir: &Path, args: &[&str]) {
     let status = Command::new("git")
-        .args(["-c", "user.name=t", "-c", "user.email=t@example.com", "-c", "commit.gpgsign=false"])
+        .args([
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@example.com",
+            "-c",
+            "commit.gpgsign=false",
+        ])
         .args(args)
         .current_dir(dir)
         .status()
@@ -2304,13 +2333,19 @@ fn affected_lists_the_changed_packages_and_everything_that_depends_on_them() {
     assert!(affected(&[]).is_empty(), "a clean tree affects nothing");
 
     // An uncommitted edit in the middle of the chain.
-    p.write("c1/src/lib.rs", "include!(concat!(env!(\"OUT_DIR\"), \"/gen.rs\"));\npub fn value() -> u32 { 1 + GEN }\n");
+    p.write(
+        "c1/src/lib.rs",
+        "include!(concat!(env!(\"OUT_DIR\"), \"/gen.rs\"));\npub fn value() -> u32 { 1 + GEN }\n",
+    );
     assert_eq!(affected(&[]), ["app", "c1", "c2"]);
 
     // A new, untracked file counts.
     p.write("c0/src/extra.rs", "");
     assert_eq!(affected(&[]), ["app", "c0", "c1", "c2"]);
-    assert_eq!(affected(&["--format", "args"]), ["-p app -p c0 -p c1 -p c2"]);
+    assert_eq!(
+        affected(&["--format", "args"]),
+        ["-p app -p c0 -p c1 -p c2"]
+    );
     let json: Vec<String> = serde_json::from_str(&p.ok(&["affected", "--format", "json"])).unwrap();
     assert_eq!(json, ["app", "c0", "c1", "c2"]);
 
@@ -2325,8 +2360,14 @@ fn affected_lists_the_changed_packages_and_everything_that_depends_on_them() {
 fn scripts_run_with_clean_output_arguments_exit_codes_and_path_dependencies() {
     let p = Project::new();
     // A dependency the script names by path, so the test needs no network.
-    p.write("dep/Cargo.toml", "[package]\nname = \"greeter\"\nversion = \"0.1.0\"\nedition = \"2021\"\n");
-    p.write("dep/src/lib.rs", "pub fn hello(who: &str) -> String { format!(\"hello, {who}\") }\n");
+    p.write(
+        "dep/Cargo.toml",
+        "[package]\nname = \"greeter\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    p.write(
+        "dep/src/lib.rs",
+        "pub fn hello(who: &str) -> String { format!(\"hello, {who}\") }\n",
+    );
     p.write(
         "hello.rs",
         &format!(
@@ -2349,7 +2390,10 @@ fn scripts_run_with_clean_output_arguments_exit_codes_and_path_dependencies() {
     assert_eq!(String::from_utf8_lossy(&out.stdout), "hello, a+-b+--c\n");
 
     // Second run: same result, and nothing is rebuilt.
-    assert_eq!(String::from_utf8_lossy(&run(&["again"]).stdout), "hello, again\n");
+    assert_eq!(
+        String::from_utf8_lossy(&run(&["again"]).stdout),
+        "hello, again\n"
+    );
 
     // The exit code of the script is Rune's.
     assert_eq!(run(&["fail"]).status.code(), Some(7));
@@ -2369,12 +2413,18 @@ fn scripts_run_with_clean_output_arguments_exit_codes_and_path_dependencies() {
 #[test]
 fn a_script_with_a_compile_error_reports_it_with_the_right_line_number() {
     let p = Project::new();
-    p.write("bad.rs", "---cargo\n[dependencies]\n---\nfn main() {\n    let x: u32 = \"no\";\n}\n");
+    p.write(
+        "bad.rs",
+        "---cargo\n[dependencies]\n---\nfn main() {\n    let x: u32 = \"no\";\n}\n",
+    );
     let out = p.rune(&["script", "bad.rs"]);
     assert!(!out.status.success());
     let t = text(&out);
     assert!(t.contains("mismatched types"), "{t}");
-    assert!(t.contains("src/main.rs:5"), "the error is on line 5 of the file: {t}");
+    assert!(
+        t.contains("src/main.rs:5"),
+        "the error is on line 5 of the file: {t}"
+    );
 }
 
 #[test]
@@ -2417,7 +2467,10 @@ fn cached_tests_are_skipped_until_something_that_matters_changes() {
     // …the next does not run the binary at all…
     let (ok, t) = test(&["--cached"]);
     assert!(ok && t.contains("cached"), "{t}");
-    assert!(t.contains("1 passed"), "the remembered counts are shown: {t}");
+    assert!(
+        t.contains("1 passed"),
+        "the remembered counts are shown: {t}"
+    );
     assert_eq!(runs(), 3, "the binary was not executed");
     // …unless you insist,
     assert!(test(&["--cached=false"]).0);
@@ -2468,8 +2521,15 @@ fn a_shared_store_lets_another_machine_skip_what_was_already_built() {
     let ci = chain_project(6);
     let out = rune_with_env(&ci, &["build"], &[("RUNE_CAS_REMOTE", remote)]);
     assert!(out.status.success(), "{}", text(&out));
-    assert!(text(&out).contains("compiled") && !text(&out).contains("0 compiled"), "{}", text(&out));
-    assert!(shared.path().join("objects").is_dir(), "CI published to the shared store");
+    assert!(
+        text(&out).contains("compiled") && !text(&out).contains("0 compiled"),
+        "{}",
+        text(&out)
+    );
+    assert!(
+        shared.path().join("objects").is_dir(),
+        "CI published to the shared store"
+    );
 
     // A developer: another checkout, another path, empty local store, read-only remote.
     let dev = chain_project(6);
@@ -2477,11 +2537,17 @@ fn a_shared_store_lets_another_machine_skip_what_was_already_built() {
     let out = rune_with_env(
         &dev,
         &["build"],
-        &[("RUNE_CAS_REMOTE", remote), ("RUNE_CAS_REMOTE_WRITE", "false".as_ref())],
+        &[
+            ("RUNE_CAS_REMOTE", remote),
+            ("RUNE_CAS_REMOTE_WRITE", "false".as_ref()),
+        ],
     );
     let t = text(&out);
     assert!(out.status.success(), "{t}");
-    assert!(t.contains("0 compiled"), "everything came from the shared store: {t}");
+    assert!(
+        t.contains("0 compiled"),
+        "everything came from the shared store: {t}"
+    );
     // …and what was restored actually works, build-script output included.
     let ran = rune_with_env(&dev, &["run", "-p", "app"], &[]);
     assert!(text(&ran).contains("value=42"), "{}", text(&ran));

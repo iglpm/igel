@@ -83,7 +83,10 @@ fn begin_atomic(dst: &Path) -> io::Result<(PathBuf, fs::File)> {
     if let Some(parent) = dst.parent() {
         fs::create_dir_all(parent)?;
     }
-    let name = dst.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let name = dst
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
     let tmp = dst.with_file_name(format!(
         ".{name}.{}.{}.tmp",
         std::process::id(),
@@ -109,7 +112,11 @@ fn finish_atomic(tmp: &Path, dst: &Path, exec: bool) -> io::Result<()> {
 /// Runs `write` on a scratch file next to `dst`, then publishes it atomically.
 ///
 /// `exec`: keep the file executable (a compiled binary must stay runnable).
-fn atomic_write(dst: &Path, exec: bool, write: impl FnOnce(&mut fs::File) -> io::Result<()>) -> io::Result<()> {
+fn atomic_write(
+    dst: &Path,
+    exec: bool,
+    write: impl FnOnce(&mut fs::File) -> io::Result<()>,
+) -> io::Result<()> {
     let (tmp, mut file) = begin_atomic(dst)?;
     let written = write(&mut file);
     drop(file);
@@ -127,7 +134,10 @@ fn set_read_only(path: &Path, exec: bool) -> io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(if exec { 0o555 } else { 0o444 }))
+        fs::set_permissions(
+            path,
+            fs::Permissions::from_mode(if exec { 0o555 } else { 0o444 }),
+        )
     }
     #[cfg(not(unix))]
     {
@@ -188,7 +198,9 @@ impl Transport for DirTransport {
             return Ok(());
         }
         let mut from = fs::File::open(src)?;
-        atomic_write(&dst, is_executable(src), |to| io::copy(&mut from, to).map(|_| ()))
+        atomic_write(&dst, is_executable(src), |to| {
+            io::copy(&mut from, to).map(|_| ())
+        })
     }
 
     fn describe(&self) -> String {
@@ -205,7 +217,9 @@ struct Endpoint {
 }
 
 fn now_ms() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64)
 }
 
 /// How long a server that refused or timed out a connection is left alone.
@@ -251,12 +265,17 @@ impl HttpTransport {
             if base.cannot_be_a_base() {
                 return Err(format!("cas.remote `{u}` is not a usable URL"));
             }
-            endpoints.push(Endpoint { base, down_until: AtomicU64::new(0) });
+            endpoints.push(Endpoint {
+                base,
+                down_until: AtomicU64::new(0),
+            });
         }
         if endpoints.is_empty() {
             return Err("cas.remote lists no servers".into());
         }
-        let workers = std::thread::available_parallelism().map_or(2, |n| n.get()).clamp(2, 8);
+        let workers = std::thread::available_parallelism()
+            .map_or(2, |n| n.get())
+            .clamp(2, 8);
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(workers)
             .thread_name("rune-shared-store")
@@ -300,14 +319,18 @@ impl HttpTransport {
     }
 
     fn mark_down(&self, i: usize) {
-        self.endpoints[i].down_until.store(now_ms() + DOWN_FOR_MS, Ordering::Relaxed);
+        self.endpoints[i]
+            .down_until
+            .store(now_ms() + DOWN_FOR_MS, Ordering::Relaxed);
     }
 
     fn url(&self, i: usize, key: &str, rel: &str) -> reqwest::Url {
         let mut url = self.endpoints[i].base.clone();
         {
             let mut segs = url.path_segments_mut().expect("checked in new");
-            segs.pop_if_empty().extend(["v1", "o", key]).extend(rel.split('/'));
+            segs.pop_if_empty()
+                .extend(["v1", "o", key])
+                .extend(rel.split('/'));
         }
         url
     }
@@ -368,7 +391,11 @@ impl HttpTransport {
 impl Transport for HttpTransport {
     fn fetch(&self, key: &str, rel: &str) -> io::Result<Option<Vec<u8>>> {
         Ok(self.rt.block_on(self.try_servers(key, |i| async move {
-            match self.auth(self.client.get(self.url(i, key, rel))).send().await {
+            match self
+                .auth(self.client.get(self.url(i, key, rel)))
+                .send()
+                .await
+            {
                 Ok(resp) => {
                     self.note_status(i, resp.status());
                     if !resp.status().is_success() {
@@ -389,7 +416,11 @@ impl Transport for HttpTransport {
         Ok(self
             .rt
             .block_on(self.try_servers(key, |i| async move {
-                let mut resp = match self.auth(self.client.get(self.url(i, key, rel))).send().await {
+                let mut resp = match self
+                    .auth(self.client.get(self.url(i, key, rel)))
+                    .send()
+                    .await
+                {
                     Ok(r) => r,
                     Err(e) if self.classify(i, &e) => return Attempt::Down,
                     Err(_) => return Attempt::Failed,
@@ -430,7 +461,11 @@ impl Transport for HttpTransport {
     fn exists(&self, key: &str, rel: &str) -> bool {
         self.rt
             .block_on(self.try_servers(key, |i| async move {
-                match self.auth(self.client.head(self.url(i, key, rel))).send().await {
+                match self
+                    .auth(self.client.head(self.url(i, key, rel)))
+                    .send()
+                    .await
+                {
                     Ok(resp) => {
                         self.note_status(i, resp.status());
                         Attempt::Answered(resp.status().is_success().then_some(()))
@@ -456,7 +491,10 @@ impl Transport for HttpTransport {
                     continue;
                 }
                 let file = tokio::fs::File::open(src).await?;
-                let body = reqwest::Body::wrap_stream(tokio_util::io::ReaderStream::with_capacity(file, 256 * 1024));
+                let body = reqwest::Body::wrap_stream(tokio_util::io::ReaderStream::with_capacity(
+                    file,
+                    256 * 1024,
+                ));
                 let mut rb = self
                     .auth(self.client.put(self.url(i, key, rel)))
                     .header(reqwest::header::CONTENT_LENGTH, len)
@@ -476,7 +514,8 @@ impl Transport for HttpTransport {
                         if status.is_success() || status == reqwest::StatusCode::CONFLICT {
                             stored += 1;
                         } else {
-                            last_err = Some(format!("{} answered {status}", self.endpoints[i].base));
+                            last_err =
+                                Some(format!("{} answered {status}", self.endpoints[i].base));
                         }
                     }
                     Err(e) => {
@@ -488,13 +527,19 @@ impl Transport for HttpTransport {
             if stored > 0 {
                 Ok(())
             } else {
-                Err(io::Error::other(last_err.unwrap_or_else(|| "no shared-store server is reachable".into())))
+                Err(io::Error::other(last_err.unwrap_or_else(|| {
+                    "no shared-store server is reachable".into()
+                })))
             }
         })
     }
 
     fn describe(&self) -> String {
-        self.endpoints.iter().map(|e| e.base.to_string()).collect::<Vec<_>>().join(", ")
+        self.endpoints
+            .iter()
+            .map(|e| e.base.to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
     }
 }
 
@@ -553,11 +598,16 @@ fn pull_slot(t: &dyn Transport, key: &str, local: &Path, slot: Slot) -> io::Resu
         if let Some(size) = size {
             if fs::metadata(&dest)?.len() != size {
                 let _ = fs::remove_file(&dest);
-                return Err(io::Error::new(io::ErrorKind::InvalidData, format!("{rel} does not match its manifest")));
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("{rel} does not match its manifest"),
+                ));
             }
         }
     }
-    atomic_write(&local.join(slot.marker()), false, |f| io::Write::write_all(f, &marker))?;
+    atomic_write(&local.join(slot.marker()), false, |f| {
+        io::Write::write_all(f, &marker)
+    })?;
     Ok(true)
 }
 
@@ -570,7 +620,12 @@ fn push_slot(t: &dyn Transport, key: &str, local: &Path, slot: Slot) -> io::Resu
     let mut marker = Vec::new();
     fs::File::open(local.join(slot.marker()))?.read_to_end(&mut marker)?;
     for (rel, _, hash) in listed(slot, &marker)? {
-        t.store(key, &rel, &local.join(&rel), (hash.len() == 64).then_some(hash.as_str()))?;
+        t.store(
+            key,
+            &rel,
+            &local.join(&rel),
+            (hash.len() == 64).then_some(hash.as_str()),
+        )?;
     }
     t.store(key, slot.marker(), &local.join(slot.marker()), None)
 }
@@ -602,13 +657,16 @@ impl Publisher {
     pub fn start(threads: usize) -> Self {
         let (tx, rx) = std::sync::mpsc::channel::<(Remote, String, PathBuf, Slot)>();
         let rx = std::sync::Arc::new(std::sync::Mutex::new(rx));
-        let outstanding = std::sync::Arc::new((std::sync::Mutex::new(0usize), std::sync::Condvar::new()));
+        let outstanding =
+            std::sync::Arc::new((std::sync::Mutex::new(0usize), std::sync::Condvar::new()));
         for _ in 0..threads.max(1) {
             let (rx, outstanding) = (rx.clone(), outstanding.clone());
             std::thread::spawn(move || {
                 loop {
                     let job = rx.lock().unwrap().recv();
-                    let Ok((remote, key, local, slot)) = job else { return };
+                    let Ok((remote, key, local, slot)) = job else {
+                        return;
+                    };
                     remote.push(&key, &local, slot);
                     let (count, cv) = &*outstanding;
                     *count.lock().unwrap() -= 1;
@@ -624,7 +682,13 @@ impl Publisher {
 
     pub fn submit(&self, remote: Remote, key: String, local: PathBuf, slot: Slot) {
         *self.outstanding.0.lock().unwrap() += 1;
-        if self.tx.lock().unwrap().send((remote, key, local, slot)).is_err() {
+        if self
+            .tx
+            .lock()
+            .unwrap()
+            .send((remote, key, local, slot))
+            .is_err()
+        {
             *self.outstanding.0.lock().unwrap() -= 1;
         }
     }
@@ -650,7 +714,12 @@ impl Remote {
     }
 
     /// One or more Cairn servers.
-    pub fn http(urls: &[String], token: Option<String>, replicas: usize, write: bool) -> Result<Self, String> {
+    pub fn http(
+        urls: &[String],
+        token: Option<String>,
+        replicas: usize,
+        write: bool,
+    ) -> Result<Self, String> {
         Ok(Self {
             transport: Arc::new(HttpTransport::new(urls, token, replicas)?),
             write,
@@ -660,7 +729,12 @@ impl Remote {
 
     /// Parses a `cas.remote` value: a directory, or `http(s)://…` URLs separated
     /// by commas or spaces.
-    pub fn from_spec(spec: &str, write: bool, token: Option<String>, replicas: usize) -> Result<Self, String> {
+    pub fn from_spec(
+        spec: &str,
+        write: bool,
+        token: Option<String>,
+        replicas: usize,
+    ) -> Result<Self, String> {
         let trimmed = spec.trim();
         if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
             let urls: Vec<String> = trimmed
@@ -737,7 +811,12 @@ mod tests {
         let b = CasStore::new(lb.path().to_path_buf())
             .unwrap()
             .with_remote(remote.clone(), false);
-        Pair { _dirs: vec![ra, la, lb], remote, a, b }
+        Pair {
+            _dirs: vec![ra, la, lb],
+            remote,
+            a,
+            b,
+        }
     }
 
     fn artifact(name: &str, content: &str) -> (TempDir, PathBuf) {
@@ -775,7 +854,10 @@ mod tests {
         let out = tempdir().unwrap();
         let linked = p.b.link_to("keybin", out.path()).unwrap();
         let mode = |name: &str| {
-            let f = linked.iter().find(|f| f.file_name().unwrap() == name).unwrap();
+            let f = linked
+                .iter()
+                .find(|f| f.file_name().unwrap() == name)
+                .unwrap();
             fs::metadata(f).unwrap().permissions().mode() & 0o777
         };
         assert_eq!(mode("mybin-abc123"), 0o555, "runnable, read-only");
@@ -785,8 +867,12 @@ mod tests {
     #[test]
     fn values_and_directory_trees_are_shared_too() {
         let p = pair(true);
-        p.a.put_value("keyval", &vec!["a".to_string(), "b".to_string()]).unwrap();
-        assert_eq!(p.b.get_value::<Vec<String>>("keyval"), Some(vec!["a".into(), "b".into()]));
+        p.a.put_value("keyval", &vec!["a".to_string(), "b".to_string()])
+            .unwrap();
+        assert_eq!(
+            p.b.get_value::<Vec<String>>("keyval"),
+            Some(vec!["a".into(), "b".into()])
+        );
 
         let tree = tempdir().unwrap();
         fs::create_dir_all(tree.path().join("sub")).unwrap();
@@ -796,8 +882,14 @@ mod tests {
         p.a.flush_remote();
         let restored = tempdir().unwrap();
         assert!(p.b.restore_dir_tree("keytree", restored.path()).unwrap());
-        assert_eq!(fs::read_to_string(restored.path().join("gen.rs")).unwrap(), "const A: u8 = 1;");
-        assert_eq!(fs::read_to_string(restored.path().join("sub/x.txt")).unwrap(), "x");
+        assert_eq!(
+            fs::read_to_string(restored.path().join("gen.rs")).unwrap(),
+            "const A: u8 = 1;"
+        );
+        assert_eq!(
+            fs::read_to_string(restored.path().join("sub/x.txt")).unwrap(),
+            "x"
+        );
     }
 
     #[test]
@@ -847,7 +939,10 @@ mod tests {
             fs::set_permissions(&file, fs::Permissions::from_mode(0o644)).unwrap();
         }
         fs::write(&file, "truncated").unwrap();
-        assert!(p.b.get("keybad").is_none(), "size no longer matches the manifest");
+        assert!(
+            p.b.get("keybad").is_none(),
+            "size no longer matches the manifest"
+        );
         assert!(!p.b.contains("keybad"));
     }
 
@@ -860,7 +955,9 @@ mod tests {
         p.a.flush_remote();
         // Another writer for the same key (a racing CI job) does not replace it.
         let l = tempdir().unwrap();
-        let other = CasStore::new(l.path().to_path_buf()).unwrap().with_remote(p.remote.clone(), true);
+        let other = CasStore::new(l.path().to_path_buf())
+            .unwrap()
+            .with_remote(p.remote.clone(), true);
         other.put("keyimm", "foo", "1.0.0", &[two]).unwrap();
         other.flush_remote();
         let out = tempdir().unwrap();
@@ -874,12 +971,18 @@ mod tests {
         let (ra, lb) = (tempdir().unwrap(), tempdir().unwrap());
         let plain = CasStore::new(l.path().to_path_buf()).unwrap();
         let (_d, lib) = artifact("libfoo-abc.rlib", "seed");
-        plain.put("keyseed", "foo", "1.0.0", std::slice::from_ref(&lib)).unwrap();
+        plain
+            .put("keyseed", "foo", "1.0.0", std::slice::from_ref(&lib))
+            .unwrap();
         // Same local store, now configured with a remote: storing again publishes.
-        let with = CasStore::new(l.path().to_path_buf()).unwrap().with_remote(ra.path().to_path_buf(), true);
+        let with = CasStore::new(l.path().to_path_buf())
+            .unwrap()
+            .with_remote(ra.path().to_path_buf(), true);
         with.put("keyseed", "foo", "1.0.0", &[lib]).unwrap();
         with.flush_remote();
-        let reader = CasStore::new(lb.path().to_path_buf()).unwrap().with_remote(ra.path().to_path_buf(), false);
+        let reader = CasStore::new(lb.path().to_path_buf())
+            .unwrap()
+            .with_remote(ra.path().to_path_buf(), false);
         assert!(reader.get("keyseed").is_some());
     }
 
@@ -888,11 +991,15 @@ mod tests {
         let p = pair(true);
         for i in 0..20 {
             let (_d, lib) = artifact("libbulk-abc.rlib", &format!("payload {i}").repeat(1000));
-            p.a.put(&format!("keybulk{i:02}"), "bulk", "1.0.0", &[lib]).unwrap();
+            p.a.put(&format!("keybulk{i:02}"), "bulk", "1.0.0", &[lib])
+                .unwrap();
         }
         p.a.flush_stats(); // what the executor calls at the end of a build
         for i in 0..20 {
-            assert!(p.b.get(&format!("keybulk{i:02}")).is_some(), "entry {i} was not published");
+            assert!(
+                p.b.get(&format!("keybulk{i:02}")).is_some(),
+                "entry {i} was not published"
+            );
         }
     }
 }
@@ -939,19 +1046,33 @@ mod http_tests {
         let requests = Arc::new(AtomicUsize::new(0));
         let stop = Arc::new(AtomicBool::new(false));
         let exec: NameSet = Default::default();
-        let (f2, h2, r2, s2, e2) = (files.clone(), put_headers.clone(), requests.clone(), stop.clone(), exec.clone());
+        let (f2, h2, r2, s2, e2) = (
+            files.clone(),
+            put_headers.clone(),
+            requests.clone(),
+            stop.clone(),
+            exec.clone(),
+        );
         std::thread::spawn(move || {
             while !s2.load(Ordering::Relaxed) {
                 match listener.accept() {
                     Ok((stream, _)) => {
-                        let (f, h, r, s, e) = (f2.clone(), h2.clone(), r2.clone(), s2.clone(), e2.clone());
+                        let (f, h, r, s, e) =
+                            (f2.clone(), h2.clone(), r2.clone(), s2.clone(), e2.clone());
                         std::thread::spawn(move || serve(stream, token, f, h, r, s, e));
                     }
                     Err(_) => std::thread::sleep(Duration::from_millis(2)),
                 }
             }
         });
-        Fake { url, files, put_headers, exec, requests, stop }
+        Fake {
+            url,
+            files,
+            put_headers,
+            exec,
+            requests,
+            stop,
+        }
     }
 
     fn serve(
@@ -964,7 +1085,9 @@ mod http_tests {
         exec: NameSet,
     ) {
         stream.set_nonblocking(false).unwrap();
-        stream.set_read_timeout(Some(Duration::from_millis(200))).ok();
+        stream
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .ok();
         let mut reader = BufReader::new(stream.try_clone().unwrap());
         let mut out = stream;
         while !stop.load(Ordering::Relaxed) {
@@ -975,7 +1098,10 @@ mod http_tests {
                 Err(_) => continue,
             }
             let mut parts = line.split_whitespace();
-            let (method, path) = (parts.next().unwrap_or("").to_string(), parts.next().unwrap_or("").to_string());
+            let (method, path) = (
+                parts.next().unwrap_or("").to_string(),
+                parts.next().unwrap_or("").to_string(),
+            );
             let mut headers: HashMap<String, String> = HashMap::new();
             loop {
                 let mut h = String::new();
@@ -987,19 +1113,27 @@ mod http_tests {
                     headers.insert(k.trim().to_ascii_lowercase(), v.trim().to_string());
                 }
             }
-            let len: usize = headers.get("content-length").and_then(|v| v.parse().ok()).unwrap_or(0);
+            let len: usize = headers
+                .get("content-length")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
             let mut body = vec![0u8; len];
             reader.read_exact(&mut body).unwrap();
             requests.fetch_add(1, Ordering::Relaxed);
 
-            let authorised = token.is_none_or(|t| headers.get("authorization").map(String::as_str) == Some(&format!("Bearer {t}")));
+            let authorised = token.is_none_or(|t| {
+                headers.get("authorization").map(String::as_str) == Some(&format!("Bearer {t}"))
+            });
             let name = path.strip_prefix("/v1/o/").unwrap_or("").to_string();
             let (status, payload): (&str, Vec<u8>) = if !authorised {
                 ("401 Unauthorized", Vec::new())
             } else {
                 match method.as_str() {
                     "PUT" => {
-                        put_headers.lock().unwrap().push((name.clone(), headers.get("x-cairn-blake3").cloned()));
+                        put_headers
+                            .lock()
+                            .unwrap()
+                            .push((name.clone(), headers.get("x-cairn-blake3").cloned()));
                         let mut f = files.lock().unwrap();
                         if f.contains_key(&name) {
                             ("200 OK", Vec::new())
@@ -1012,7 +1146,14 @@ mod http_tests {
                         }
                     }
                     _ => match files.lock().unwrap().get(&name) {
-                        Some(b) => ("200 OK", if method == "HEAD" { Vec::new() } else { b.clone() }),
+                        Some(b) => (
+                            "200 OK",
+                            if method == "HEAD" {
+                                Vec::new()
+                            } else {
+                                b.clone()
+                            },
+                        ),
                         None => ("404 Not Found", Vec::new()),
                     },
                 }
@@ -1022,13 +1163,26 @@ mod http_tests {
             } else {
                 payload.len()
             };
-            let exec_line = if exec.lock().unwrap().contains(&name) { "x-cairn-exec: 1\r\n" } else { "" };
-            write!(out, "HTTP/1.1 {status}\r\ncontent-length: {claimed}\r\n{exec_line}\r\n").unwrap();
+            let exec_line = if exec.lock().unwrap().contains(&name) {
+                "x-cairn-exec: 1\r\n"
+            } else {
+                ""
+            };
+            write!(
+                out,
+                "HTTP/1.1 {status}\r\ncontent-length: {claimed}\r\n{exec_line}\r\n"
+            )
+            .unwrap();
             out.write_all(&payload).unwrap();
         }
     }
 
-    fn machine(urls: &[&str], token: Option<&str>, replicas: usize, write: bool) -> (TempDir, CasStore) {
+    fn machine(
+        urls: &[&str],
+        token: Option<&str>,
+        replicas: usize,
+        write: bool,
+    ) -> (TempDir, CasStore) {
         let dir = tempdir().unwrap();
         let remote = Remote::http(
             &urls.iter().map(|u| u.to_string()).collect::<Vec<_>>(),
@@ -1037,7 +1191,9 @@ mod http_tests {
             write,
         )
         .unwrap();
-        let store = CasStore::new(dir.path().to_path_buf()).unwrap().with_remote_store(remote);
+        let store = CasStore::new(dir.path().to_path_buf())
+            .unwrap()
+            .with_remote_store(remote);
         (dir, store)
     }
 
@@ -1064,8 +1220,17 @@ mod http_tests {
         assert_eq!(b.get_value::<Vec<u32>>("keyval"), Some(vec![1, 2, 3]));
         // Files first, marker last: the manifest is the final PUT for the key.
         assert!(server.requests.load(Ordering::Relaxed) > 0);
-        let names: Vec<String> = server.put_headers.lock().unwrap().iter().map(|(n, _)| n.clone()).collect();
-        let last = names.iter().rposition(|n| n.starts_with("keyfoo/")).unwrap();
+        let names: Vec<String> = server
+            .put_headers
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(n, _)| n.clone())
+            .collect();
+        let last = names
+            .iter()
+            .rposition(|n| n.starts_with("keyfoo/"))
+            .unwrap();
         assert_eq!(names[last], "keyfoo/manifest.json", "{names:?}");
     }
 
@@ -1081,12 +1246,24 @@ mod http_tests {
         let (_d2, rlib) = artifact("libmy-abc123.rlib", "rlib");
         a.put("keybin", "my", "1.0.0", &[bin, rlib]).unwrap();
         a.flush_remote();
-        assert!(server.exec.lock().unwrap().contains("keybin/mybin-abc123"), "the client announced it");
-        assert!(!server.exec.lock().unwrap().contains("keybin/libmy-abc123.rlib"));
+        assert!(
+            server.exec.lock().unwrap().contains("keybin/mybin-abc123"),
+            "the client announced it"
+        );
+        assert!(
+            !server
+                .exec
+                .lock()
+                .unwrap()
+                .contains("keybin/libmy-abc123.rlib")
+        );
         let out = tempdir().unwrap();
         let linked = b.link_to("keybin", out.path()).unwrap();
         let mode = |name: &str| {
-            let f = linked.iter().find(|f| f.file_name().unwrap() == name).unwrap();
+            let f = linked
+                .iter()
+                .find(|f| f.file_name().unwrap() == name)
+                .unwrap();
             fs::metadata(f).unwrap().permissions().mode() & 0o777
         };
         assert_eq!(mode("mybin-abc123"), 0o555);
@@ -1101,7 +1278,14 @@ mod http_tests {
         a.put("keyhash", "foo", "1.0.0", &[lib]).unwrap();
         a.flush_remote();
         let want = blake3::hash(b"verify me").to_hex().to_string();
-        let sent = server.put_headers.lock().unwrap().iter().find(|(n, _)| n == "keyhash/libfoo-abc.rlib").cloned().unwrap();
+        let sent = server
+            .put_headers
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(n, _)| n == "keyhash/libfoo-abc.rlib")
+            .cloned()
+            .unwrap();
         assert_eq!(sent.1.as_deref(), Some(want.as_str()));
     }
 
@@ -1111,7 +1295,8 @@ mod http_tests {
         let (_f, lib) = artifact("libfoo-abc.rlib", "x");
         // Wrong or missing token: publishing silently fails, nothing is stored.
         let (_d1, nope) = machine(&[&server.url], None, 1, true);
-        nope.put("keyauth", "foo", "1.0.0", std::slice::from_ref(&lib)).unwrap();
+        nope.put("keyauth", "foo", "1.0.0", std::slice::from_ref(&lib))
+            .unwrap();
         nope.flush_remote();
         assert!(server.files.lock().unwrap().is_empty());
         // The right token works, and a reader without it simply misses.
@@ -1144,9 +1329,19 @@ mod http_tests {
             a.put_value(&format!("keysh{i:02}"), &i).unwrap();
         }
         a.flush_remote();
-        let counts: Vec<usize> = servers.iter().map(|s| s.files.lock().unwrap().len()).collect();
-        assert_eq!(counts.iter().sum::<usize>(), 30, "each entry on exactly one server: {counts:?}");
-        assert!(counts.iter().all(|&c| c >= 3), "the load is spread: {counts:?}");
+        let counts: Vec<usize> = servers
+            .iter()
+            .map(|s| s.files.lock().unwrap().len())
+            .collect();
+        assert_eq!(
+            counts.iter().sum::<usize>(),
+            30,
+            "each entry on exactly one server: {counts:?}"
+        );
+        assert!(
+            counts.iter().all(|&c| c >= 3),
+            "the load is spread: {counts:?}"
+        );
         // A different machine with the same list finds every entry.
         let (_db, b) = machine(&urls, None, 1, false);
         for i in 0..30 {
@@ -1163,12 +1358,23 @@ mod http_tests {
         for i in 0..10 {
             a.put_value(&format!("keyrep{i}"), &i).unwrap();
         }
-        assert_eq!((s1.files.lock().unwrap().len(), s2.files.lock().unwrap().len()), (10, 10), "every entry on both");
+        assert_eq!(
+            (
+                s1.files.lock().unwrap().len(),
+                s2.files.lock().unwrap().len()
+            ),
+            (10, 10),
+            "every entry on both"
+        );
         drop(s1); // one server goes away
         std::thread::sleep(Duration::from_millis(50));
         let (_db, b) = machine(&urls, None, 2, false);
         for i in 0..10 {
-            assert_eq!(b.get_value::<i32>(&format!("keyrep{i}")), Some(i), "still served by the other");
+            assert_eq!(
+                b.get_value::<i32>(&format!("keyrep{i}")),
+                Some(i),
+                "still served by the other"
+            );
         }
         // Publishing keeps working against the survivor.
         let (_dc, c) = machine(&urls, None, 2, true);
@@ -1187,10 +1393,19 @@ mod http_tests {
             .map(|i| format!("keydead{i}"))
             .find(|k| t.order(k)[0] == dead_idx)
             .expect("some key ranks the dead server first");
-        live.files.lock().unwrap().insert(format!("{key}/value.json"), b"1".to_vec());
+        live.files
+            .lock()
+            .unwrap()
+            .insert(format!("{key}/value.json"), b"1".to_vec());
         assert!(t.is_up(dead_idx));
-        assert!(t.fetch(&key, "value.json").unwrap().is_some(), "served by the live one");
-        assert!(!t.is_up(dead_idx), "the failed connection took it out of rotation");
+        assert!(
+            t.fetch(&key, "value.json").unwrap().is_some(),
+            "served by the live one"
+        );
+        assert!(
+            !t.is_up(dead_idx),
+            "the failed connection took it out of rotation"
+        );
         // Later requests do not even try it.
         let before = Instant::now();
         for _ in 0..20 {
@@ -1228,17 +1443,26 @@ mod http_tests {
             }
         }
         assert_eq!(moved, 0, "keys owned by remaining servers did not move");
-        assert!(load.iter().all(|&n| (60..=140).contains(&n)), "balanced: {load:?}");
+        assert!(
+            load.iter().all(|&n| (60..=140).contains(&n)),
+            "balanced: {load:?}"
+        );
     }
 
     #[test]
     fn specs_are_parsed_into_the_right_kind_of_store() {
         let dir = Remote::from_spec("/mnt/team-cache", true, None, 1).unwrap();
         assert_eq!(dir.root(), Some(Path::new("/mnt/team-cache")));
-        let http = Remote::from_spec("http://a:7070, https://b:7070 http://c:7070", true, None, 2).unwrap();
+        let http = Remote::from_spec("http://a:7070, https://b:7070 http://c:7070", true, None, 2)
+            .unwrap();
         assert!(http.root().is_none());
         let d = http.describe();
-        assert!(d.contains("http://a:7070") && d.contains("https://b:7070") && d.contains("http://c:7070"), "{d}");
+        assert!(
+            d.contains("http://a:7070")
+                && d.contains("https://b:7070")
+                && d.contains("http://c:7070"),
+            "{d}"
+        );
         assert!(Remote::from_spec("http://", true, None, 1).is_err());
     }
 

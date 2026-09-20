@@ -155,7 +155,9 @@ const RULES: &[Rule] = &[
             suse: "libopenssl-devel",
             brew: "openssl@3",
         },
-        note: Some("or point OPENSSL_DIR at an installation, or use a crate feature that vendors OpenSSL"),
+        note: Some(
+            "or point OPENSSL_DIR at an installation, or use a crate feature that vendors OpenSSL",
+        ),
     },
     Rule {
         what: "`cmake`",
@@ -197,7 +199,10 @@ const RULES: &[Rule] = &[
     },
     Rule {
         what: "the Protocol Buffers compiler",
-        when: &[&["protoc"], &["not found", "could not find `protoc`", "no such file"]],
+        when: &[
+            &["protoc"],
+            &["not found", "could not find `protoc`", "no such file"],
+        ],
         packages: Packages {
             debian: "protobuf-compiler",
             fedora: "protobuf-compiler",
@@ -224,7 +229,9 @@ pub fn hint_for_failure(output: &str, family: Family) -> Option<String> {
                  Install the development package that provides it"
             );
             hint.push_str(match family {
-                Family::Debian => " (apt-file search {pc}.pc  finds its name; usually `lib<name>-dev`).",
+                Family::Debian => {
+                    " (apt-file search {pc}.pc  finds its name; usually `lib<name>-dev`)."
+                }
                 Family::Fedora => " (dnf provides '*/{pc}.pc'; usually `<name>-devel`).",
                 Family::Arch => " (pacman -F {pc}.pc).",
                 _ => ".",
@@ -269,29 +276,60 @@ mod tests {
 
     #[test]
     fn distributions_are_recognised_from_os_release() {
-        assert_eq!(Family::from_os_release("ID=ubuntu\nID_LIKE=debian\n"), Family::Debian);
-        assert_eq!(Family::from_os_release("ID=linuxmint\nID_LIKE=\"ubuntu debian\"\n"), Family::Debian);
+        assert_eq!(
+            Family::from_os_release("ID=ubuntu\nID_LIKE=debian\n"),
+            Family::Debian
+        );
+        assert_eq!(
+            Family::from_os_release("ID=linuxmint\nID_LIKE=\"ubuntu debian\"\n"),
+            Family::Debian
+        );
         assert_eq!(Family::from_os_release("ID=fedora\n"), Family::Fedora);
-        assert_eq!(Family::from_os_release("ID=cachyos\nID_LIKE=arch\n"), Family::Arch);
+        assert_eq!(
+            Family::from_os_release("ID=cachyos\nID_LIKE=arch\n"),
+            Family::Arch
+        );
         assert_eq!(Family::from_os_release("ID=alpine\n"), Family::Alpine);
-        assert_eq!(Family::from_os_release("ID=opensuse-tumbleweed\nID_LIKE=\"opensuse suse\"\n"), Family::Suse);
+        assert_eq!(
+            Family::from_os_release("ID=opensuse-tumbleweed\nID_LIKE=\"opensuse suse\"\n"),
+            Family::Suse
+        );
         assert_eq!(Family::from_os_release("ID=plan9\n"), Family::Unknown);
     }
 
     #[test]
     fn a_missing_c_compiler_names_the_package_per_distribution() {
         let out = "error occurred: Failed to find tool. Is `cc` installed?";
-        assert!(hint_for_failure(out, DEBIAN).unwrap().contains("sudo apt install build-essential"));
-        assert!(hint_for_failure(out, Family::Arch).unwrap().contains("pacman -S base-devel"));
-        assert!(hint_for_failure(out, Family::Fedora).unwrap().contains("dnf install gcc"));
-        assert!(hint_for_failure(out, Family::MacOs).unwrap().contains("xcode-select --install"));
+        assert!(
+            hint_for_failure(out, DEBIAN)
+                .unwrap()
+                .contains("sudo apt install build-essential")
+        );
+        assert!(
+            hint_for_failure(out, Family::Arch)
+                .unwrap()
+                .contains("pacman -S base-devel")
+        );
+        assert!(
+            hint_for_failure(out, Family::Fedora)
+                .unwrap()
+                .contains("dnf install gcc")
+        );
+        assert!(
+            hint_for_failure(out, Family::MacOs)
+                .unwrap()
+                .contains("xcode-select --install")
+        );
     }
 
     #[test]
     fn a_missing_pkg_config_binary_is_recognised() {
         let out = "Could not run `\"pkg-config\" \"--libs\" \"zlib\"`\nThe pkg-config command could not be found.\nNo such file or directory";
         let h = hint_for_failure(out, DEBIAN).unwrap();
-        assert!(h.contains("`pkg-config`") && h.contains("apt install pkg-config"), "{h}");
+        assert!(
+            h.contains("`pkg-config`") && h.contains("apt install pkg-config"),
+            "{h}"
+        );
     }
 
     #[test]
@@ -308,17 +346,33 @@ mod tests {
         let h = hint_for_failure(out, DEBIAN).unwrap();
         assert!(h.contains("libssl-dev"), "{h}");
         assert!(h.contains("OPENSSL_DIR"), "{h}");
-        assert!(hint_for_failure(out, Family::Fedora).unwrap().contains("openssl-devel"));
+        assert!(
+            hint_for_failure(out, Family::Fedora)
+                .unwrap()
+                .contains("openssl-devel")
+        );
     }
 
     #[test]
     fn cmake_libclang_and_protoc_are_recognised() {
         let cmake = "is `cmake` not installed?";
-        assert!(hint_for_failure(cmake, DEBIAN).unwrap().contains("apt install cmake"));
+        assert!(
+            hint_for_failure(cmake, DEBIAN)
+                .unwrap()
+                .contains("apt install cmake")
+        );
         let clang = "thread 'main' panicked: Unable to find libclang: \"couldn't find any valid shared libraries matching: ['libclang.so']\"";
-        assert!(hint_for_failure(clang, DEBIAN).unwrap().contains("libclang-dev"));
+        assert!(
+            hint_for_failure(clang, DEBIAN)
+                .unwrap()
+                .contains("libclang-dev")
+        );
         let protoc = "Could not find `protoc`. If `protoc` is installed, try setting the `PROTOC` environment variable";
-        assert!(hint_for_failure(protoc, DEBIAN).unwrap().contains("protobuf-compiler"));
+        assert!(
+            hint_for_failure(protoc, DEBIAN)
+                .unwrap()
+                .contains("protobuf-compiler")
+        );
     }
 
     #[test]

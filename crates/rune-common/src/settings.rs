@@ -344,9 +344,7 @@ impl Settings {
             let value = match (value, path_base) {
                 // A project-relative path is stored resolved, so callers never
                 // need to know which file it came from.
-                (Value::Path(p), Some(base))
-                    if Path::new(&p).is_relative() && !is_url_list(&p) =>
-                {
+                (Value::Path(p), Some(base)) if Path::new(&p).is_relative() && !is_url_list(&p) => {
                     Value::Path(base.join(p).to_string_lossy().into_owned())
                 }
                 (v, _) => v,
@@ -391,7 +389,8 @@ impl Settings {
     /// `cas.remote`: a store shared with other machines — a directory or one or
     /// more Cairn URLs, exactly as written.
     pub fn cas_remote(&self) -> Option<String> {
-        self.path("cas.remote").map(|p| p.to_string_lossy().into_owned())
+        self.path("cas.remote")
+            .map(|p| p.to_string_lossy().into_owned())
     }
 
     /// `cas.remote-token`: the bearer token for a Cairn server.
@@ -404,7 +403,8 @@ impl Settings {
 
     /// `cas.remote-replicas`: copies kept across several Cairn servers.
     pub fn cas_remote_replicas(&self) -> usize {
-        self.uint("cas.remote-replicas").map_or(1, |n| n.max(1) as usize)
+        self.uint("cas.remote-replicas")
+            .map_or(1, |n| n.max(1) as usize)
     }
 
     /// `cas.remote-write`: publish to the shared store.

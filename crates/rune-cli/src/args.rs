@@ -767,6 +767,10 @@ pub struct ScriptArgs {
     pub file: PathBuf,
 
     /// Arguments for the script
-    #[arg(trailing_var_arg = true, allow_hyphen_values = true, value_name = "ARGS")]
+    #[arg(
+        trailing_var_arg = true,
+        allow_hyphen_values = true,
+        value_name = "ARGS"
+    )]
     pub args: Vec<String>,
 }

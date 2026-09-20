@@ -17,7 +17,16 @@ use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
 /// Directories that never contain sources.
-const IGNORED_DIRS: &[&str] = &["target", "node_modules", ".git", ".rune", ".hg", ".jj", ".idea", ".vscode"];
+const IGNORED_DIRS: &[&str] = &[
+    "target",
+    "node_modules",
+    ".git",
+    ".rune",
+    ".hg",
+    ".jj",
+    ".idea",
+    ".vscode",
+];
 
 /// Decides what counts as a change.
 pub struct Snapshot {
@@ -98,7 +107,9 @@ fn split_command(text: &str) -> Vec<String> {
 
 /// What one round of commands did.
 enum Outcome {
-    Finished { ok: bool },
+    Finished {
+        ok: bool,
+    },
     /// Files changed while it ran; it was stopped.
     Interrupted,
 }
@@ -251,7 +262,13 @@ mod tests {
             std::fs::create_dir_all(p.path().join(dir)).unwrap();
             std::fs::write(p.path().join(dir).join("noise"), "x").unwrap();
         }
-        for file in ["src/.lib.rs.swp", "src/lib.rs~", "src/.#lib.rs", "src/#lib.rs#", "4913"] {
+        for file in [
+            "src/.lib.rs.swp",
+            "src/lib.rs~",
+            "src/.#lib.rs",
+            "src/#lib.rs#",
+            "4913",
+        ] {
             std::fs::write(p.path().join(file), "x").unwrap();
         }
         assert_eq!(base, sig(&p));

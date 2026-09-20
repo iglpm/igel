@@ -880,7 +880,11 @@ pub fn affected(args: crate::args::AffectedArgs) -> Result<()> {
         "json" => println!("{}", serde_json::to_string(&names)?),
         "args" => println!(
             "{}",
-            names.iter().map(|n| format!("-p {n}")).collect::<Vec<_>>().join(" ")
+            names
+                .iter()
+                .map(|n| format!("-p {n}"))
+                .collect::<Vec<_>>()
+                .join(" ")
         ),
         _ => names.iter().for_each(|n| println!("{n}")),
     }
@@ -893,7 +897,8 @@ pub fn script(args: crate::args::ScriptArgs) -> Result<()> {
         .with_context(|| format!("cannot read script `{}`", args.file.display()))?;
     let text = std::fs::read_to_string(&file)
         .with_context(|| format!("cannot read script `{}`", file.display()))?;
-    let parsed = crate::script::parse(&text).map_err(|e| anyhow::anyhow!("{}: {e}", file.display()))?;
+    let parsed =
+        crate::script::parse(&text).map_err(|e| anyhow::anyhow!("{}: {e}", file.display()))?;
     let manifest = crate::script::manifest(&file, &parsed.manifest)
         .map_err(|e| anyhow::anyhow!("{}: {e}", file.display()))?;
 
@@ -910,7 +915,10 @@ pub fn script(args: crate::args::ScriptArgs) -> Result<()> {
     write_if_changed(&dir.join("src/main.rs"), &parsed.source)?;
 
     let mut cmd = std::process::Command::new(std::env::current_exe()?);
-    cmd.arg("run").arg("--quiet").arg("--manifest-path").arg(dir.join("Cargo.toml"));
+    cmd.arg("run")
+        .arg("--quiet")
+        .arg("--manifest-path")
+        .arg(dir.join("Cargo.toml"));
     if args.release {
         cmd.arg("--release");
     }

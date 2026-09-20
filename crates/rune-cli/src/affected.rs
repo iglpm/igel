@@ -16,9 +16,7 @@ pub struct Pkg {
 /// Files that change how *everything* in the workspace is built.
 fn changes_everything(rel: &Path) -> bool {
     let name = rel.file_name().and_then(|n| n.to_str()).unwrap_or("");
-    let in_cargo_dir = rel
-        .components()
-        .any(|c| c.as_os_str() == ".cargo");
+    let in_cargo_dir = rel.components().any(|c| c.as_os_str() == ".cargo");
     matches!(name, "Cargo.lock" | "rust-toolchain" | "rust-toolchain.toml" | "Rune.toml")
         || (in_cargo_dir && matches!(name, "config" | "config.toml"))
         // The root manifest: `[workspace.dependencies]`, `[profile]`, `[patch]`.
@@ -52,7 +50,12 @@ pub fn affected(pkgs: &[Pkg], root: &Path, changed: &[PathBuf]) -> Vec<String> {
         }
     }
     if everything {
-        return pkgs.iter().map(|p| p.name.clone()).collect::<BTreeSet<_>>().into_iter().collect();
+        return pkgs
+            .iter()
+            .map(|p| p.name.clone())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
     }
 
     // Reverse edges, then everything reachable from the changed packages.
@@ -126,8 +129,15 @@ mod tests {
 
     #[test]
     fn a_file_belongs_to_the_deepest_package_containing_it() {
-        assert_eq!(run(&["crates/a/e/src/lib.rs"]), ["e"], "e is nested in a but is its own package");
-        assert_eq!(run(&["crates/a/src/lib.rs", "crates/a/e/x.rs"]), ["a", "b", "c", "e"]);
+        assert_eq!(
+            run(&["crates/a/e/src/lib.rs"]),
+            ["e"],
+            "e is nested in a but is its own package"
+        );
+        assert_eq!(
+            run(&["crates/a/src/lib.rs", "crates/a/e/x.rs"]),
+            ["a", "b", "c", "e"]
+        );
     }
 
     #[test]
@@ -137,7 +147,13 @@ mod tests {
 
     #[test]
     fn workspace_wide_files_affect_everything() {
-        for f in ["Cargo.lock", "Cargo.toml", "rust-toolchain.toml", ".cargo/config.toml", "Rune.toml"] {
+        for f in [
+            "Cargo.lock",
+            "Cargo.toml",
+            "rust-toolchain.toml",
+            ".cargo/config.toml",
+            "Rune.toml",
+        ] {
             assert_eq!(run(&[f]), ["a", "b", "c", "d", "e"], "{f}");
         }
         // …but a package's own manifest only affects that package's cone.
@@ -148,7 +164,11 @@ mod tests {
     fn absolute_paths_work_and_dependency_cycles_terminate() {
         let mut pkgs = workspace();
         pkgs[0].deps.push("c".into()); // a <-> b <-> c cycle through dev-dependencies
-        let got = affected(&pkgs, Path::new("/ws"), &[PathBuf::from("/ws/crates/b/x.rs")]);
+        let got = affected(
+            &pkgs,
+            Path::new("/ws"),
+            &[PathBuf::from("/ws/crates/b/x.rs")],
+        );
         assert_eq!(got, ["a", "b", "c"]);
     }
 }

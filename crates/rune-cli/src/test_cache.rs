@@ -128,7 +128,10 @@ mod tests {
     #[test]
     fn the_same_inputs_give_the_same_key() {
         let f = exe("binary");
-        assert_eq!(k(f.path(), "p1", &["--x"], &[]), k(f.path(), "p1", &["--x"], &[]));
+        assert_eq!(
+            k(f.path(), "p1", &["--x"], &[]),
+            k(f.path(), "p1", &["--x"], &[])
+        );
     }
 
     #[test]
@@ -136,19 +139,60 @@ mod tests {
         let a = exe("binary A");
         let b = exe("binary B");
         let base = k(a.path(), "p1", &["--x"], &[("RUST_LOG", "info")]);
-        assert_ne!(base, k(b.path(), "p1", &["--x"], &[("RUST_LOG", "info")]), "the binary");
-        assert_ne!(base, k(a.path(), "p2", &["--x"], &[("RUST_LOG", "info")]), "the package's files");
-        assert_ne!(base, k(a.path(), "p1", &["--y"], &[("RUST_LOG", "info")]), "the arguments");
-        assert_ne!(base, k(a.path(), "p1", &["--x"], &[("RUST_LOG", "debug")]), "RUST_*");
-        assert_ne!(base, k(a.path(), "p1", &["--x"], &[("RUST_LOG", "info"), ("CARGO_PKG_NAME", "x")]), "CARGO_*");
+        assert_ne!(
+            base,
+            k(b.path(), "p1", &["--x"], &[("RUST_LOG", "info")]),
+            "the binary"
+        );
+        assert_ne!(
+            base,
+            k(a.path(), "p2", &["--x"], &[("RUST_LOG", "info")]),
+            "the package's files"
+        );
+        assert_ne!(
+            base,
+            k(a.path(), "p1", &["--y"], &[("RUST_LOG", "info")]),
+            "the arguments"
+        );
+        assert_ne!(
+            base,
+            k(a.path(), "p1", &["--x"], &[("RUST_LOG", "debug")]),
+            "RUST_*"
+        );
+        assert_ne!(
+            base,
+            k(
+                a.path(),
+                "p1",
+                &["--x"],
+                &[("RUST_LOG", "info"), ("CARGO_PKG_NAME", "x")]
+            ),
+            "CARGO_*"
+        );
     }
 
     #[test]
     fn unrelated_environment_and_scratch_paths_do_not_matter() {
         let f = exe("binary");
         let base = k(f.path(), "p", &[], &[]);
-        assert_eq!(base, k(f.path(), "p", &[], &[("PATH", "/usr/bin"), ("HOME", "/root")]));
-        assert_eq!(base, k(f.path(), "p", &[], &[("CARGO_TARGET_TMPDIR", "/somewhere/else")]));
+        assert_eq!(
+            base,
+            k(
+                f.path(),
+                "p",
+                &[],
+                &[("PATH", "/usr/bin"), ("HOME", "/root")]
+            )
+        );
+        assert_eq!(
+            base,
+            k(
+                f.path(),
+                "p",
+                &[],
+                &[("CARGO_TARGET_TMPDIR", "/somewhere/else")]
+            )
+        );
     }
 
     #[test]

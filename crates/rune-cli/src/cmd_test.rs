@@ -217,9 +217,12 @@ pub fn run(args: TestArgs, mode: Mode) -> Result<()> {
         .collect();
 
     // `--cached`: remembered passes, keyed by everything Rune can see.
-    let test_cas = (!bench && args.cached.unwrap_or_else(|| sess.ws.config.settings.test_cache()))
-        .then(|| sess.cas())
-        .flatten();
+    let test_cas = (!bench
+        && args
+            .cached
+            .unwrap_or_else(|| sess.ws.config.settings.test_cache()))
+    .then(|| sess.cas())
+    .flatten();
     let package_files = std::sync::Mutex::new(
         rune_fingerprint::FingerprintCache::load(
             &sess.config().fingerprint_dir.join("source-cache.json"),
@@ -282,8 +285,13 @@ pub fn run(args: TestArgs, mode: Mode) -> Result<()> {
                                     .ok()
                                 };
                                 remember_as = package_hash.and_then(|ph| {
-                                    crate::test_cache::key(&exe, &ph, libtest_args, std::env::vars())
-                                        .ok()
+                                    crate::test_cache::key(
+                                        &exe,
+                                        &ph,
+                                        libtest_args,
+                                        std::env::vars(),
+                                    )
+                                    .ok()
                                 });
                                 if let Some(rec) = remember_as
                                     .as_ref()
