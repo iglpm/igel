@@ -73,6 +73,18 @@ impl DependencySpec {
         if self.path.is_none() && ws_dep.path.is_some() {
             self.path = ws_dep.path.clone();
         }
+        if self.git.is_none() && ws_dep.git.is_some() {
+            self.git = ws_dep.git.clone();
+            self.branch = ws_dep.branch.clone();
+            self.tag = ws_dep.tag.clone();
+            self.rev = ws_dep.rev.clone();
+        }
+        if self.registry.is_none() {
+            self.registry = ws_dep.registry.clone();
+        }
+        if self.package.is_none() {
+            self.package = ws_dep.package.clone();
+        }
         if self.features.is_empty() {
             self.features = ws_dep.features.clone();
         }
@@ -175,6 +187,33 @@ impl<'de> Deserialize<'de> for DependencySpec {
             }
         }
     }
+}
+
+/// A dependency as it applies to the package that declares it: relative paths
+/// made absolute and `workspace = true` inheritance merged in.
+///
+/// A `path` written on a member is relative to that member; one inherited from
+/// `[workspace.dependencies]` is relative to the workspace root. Both are made
+/// absolute against the directory they were *written in* before merging, so
+/// every later consumer can just use the result.
+pub fn effective_spec(
+    dep: &Dependency,
+    member_dir: &std::path::Path,
+    ws_root: &std::path::Path,
+    ws: Option<&crate::WorkspaceManifest>,
+) -> DependencySpec {
+    let mut spec = dep.spec.clone();
+    if let Some(rel) = spec.path.take() {
+        spec.path = Some(member_dir.join(rel));
+    }
+    if let Some(ws_dep) = ws.and_then(|w| w.dependencies.get(&dep.name)) {
+        let mut ws_dep = ws_dep.clone();
+        if let Some(rel) = ws_dep.path.take() {
+            ws_dep.path = Some(ws_root.join(rel));
+        }
+        spec.merge_workspace(&ws_dep);
+    }
+    spec
 }
 
 /// A full dependency combining name, kind, and specification.

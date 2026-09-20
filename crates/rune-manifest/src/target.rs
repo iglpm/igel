@@ -27,8 +27,9 @@ pub struct TargetSpec {
     pub name: Option<String>,
     /// Path to the target's main source file.
     pub path: Option<PathBuf>,
-    /// Crate types (e.g., `cdylib`, `rlib`).
-    #[serde(default)]
+    /// Crate types (e.g., `cdylib`, `rlib`). Cargo spells the key
+    /// `crate-type`; `crate_type` is accepted as it is by Cargo itself.
+    #[serde(default, rename = "crate-type", alias = "crate_type")]
     pub crate_types: Vec<String>,
     /// Required features for this target to be built.
     #[serde(default)]

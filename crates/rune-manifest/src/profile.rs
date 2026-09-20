@@ -79,6 +79,93 @@ fn resolve_inner(
     Ok(profile)
 }
 
+/// Which override tables of a profile apply to a unit.
+#[derive(Debug, Clone, Copy)]
+pub struct UnitRole<'a> {
+    /// The package the unit belongs to.
+    pub package: &'a str,
+    /// Its version, for `package."name@1.2.3"` specs.
+    pub version: &'a semver::Version,
+    /// Whether the package is a workspace member (`package."*"` only matches
+    /// packages that are *not*).
+    pub workspace_member: bool,
+    /// Build scripts, proc-macros and their dependencies (`build-override`).
+    pub host: bool,
+}
+
+/// The profile a specific unit is compiled with: the named profile plus, in
+/// Cargo's order of precedence, `build-override`, `package."*"` and
+/// `package.<name>`. Returns the base profile unchanged when nothing applies.
+pub fn resolve_unit_profile(
+    name: &str,
+    tables: &HashMap<String, ProfileOverride>,
+    role: UnitRole<'_>,
+) -> Result<Profile, ProfileError> {
+    let mut profile = resolve_profile(name, tables)?;
+
+    // Cargo's built-in `build-override`: build scripts, proc-macros and their
+    // dependencies run once per build on the host, so compiling them fast
+    // beats compiling them well (`opt-level = 0`, no debuginfo, 256 codegen
+    // units) — whatever the profile is. User tables below override this.
+    if role.host {
+        profile.opt_level = OptLevel::O0;
+        profile.debuginfo = DebugInfo::None;
+        profile.codegen_units = Some(256);
+        // Neither can these be linked with LTO or stripped.
+        profile.lto = LtoMode::Off;
+        profile.strip = None;
+    }
+
+    // The inheritance chain, root first, so a child's override wins.
+    let mut chain = vec![name.to_string()];
+    let mut cur = name.to_string();
+    while let Some(parent) = tables
+        .get(&cur)
+        .and_then(|t| t.extra.get("inherits"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .or_else(|| match cur.as_str() {
+            "test" => Some("dev".to_string()),
+            "bench" => Some("release".to_string()),
+            _ => None,
+        })
+    {
+        if chain.contains(&parent) {
+            break;
+        }
+        chain.insert(0, parent.clone());
+        cur = parent;
+    }
+
+    let matches_spec = |spec: &str| {
+        spec == role.package
+            || spec
+                .split_once('@')
+                .is_some_and(|(n, v)| n == role.package && v == role.version.to_string())
+    };
+    for level in &chain {
+        let Some(table) = tables.get(level) else {
+            continue;
+        };
+        if role.host {
+            if let Some(over) = &table.build_override {
+                apply(&mut profile, name, over)?;
+            }
+        }
+        if !role.workspace_member {
+            if let Some(over) = table.package.get("*") {
+                apply(&mut profile, name, over)?;
+            }
+        }
+        for (spec, over) in &table.package {
+            if spec != "*" && matches_spec(spec) {
+                apply(&mut profile, name, over)?;
+            }
+        }
+    }
+    Ok(profile)
+}
+
 fn apply(profile: &mut Profile, name: &str, table: &ProfileOverride) -> Result<(), ProfileError> {
     let invalid = |key: &str, message: &str| ProfileError::Invalid {
         profile: name.to_string(),
@@ -199,7 +286,15 @@ fn apply(profile: &mut Profile, name: &str, table: &ProfileOverride) -> Result<(
                     }
                 };
             }
-            // `inherits`, `package`, `build-override`, `split-debuginfo`, ...
+            "split-debuginfo" => {
+                profile.split_debuginfo = match value.as_str() {
+                    Some(s @ ("off" | "packed" | "unpacked")) => Some(s.to_string()),
+                    _ => {
+                        return Err(invalid(key, "expected \"off\", \"packed\" or \"unpacked\""));
+                    }
+                };
+            }
+            // `inherits`, `package`, `build-override`, ...
             // are either handled elsewhere or don't affect what we pass to rustc.
             _ => {}
         }
@@ -289,6 +384,72 @@ mod tests {
         assert_eq!(prof.lto, LtoMode::Thin, "inherits the parent's overrides");
         assert_eq!(prof.debuginfo, DebugInfo::Full);
         assert_eq!(prof.output_dir_name(), "profiling");
+    }
+
+    #[test]
+    fn package_and_build_overrides_follow_cargo_precedence() {
+        let p = profiles(
+            r#"
+            [profile.dev]
+            opt-level = 0
+            [profile.dev.package."*"]
+            opt-level = 2
+            [profile.dev.package.hot]
+            opt-level = 3
+            [profile.dev.build-override]
+            opt-level = 1
+            debug = false
+            "#,
+        );
+        let v = semver::Version::new(1, 0, 0);
+        let role = |package, workspace_member, host| UnitRole {
+            package,
+            version: &v,
+            workspace_member,
+            host,
+        };
+        let opt = |r| resolve_unit_profile("dev", &p, r).unwrap().opt_level;
+        // Workspace members are untouched by `"*"`.
+        assert_eq!(opt(role("mine", true, false)), OptLevel::O0);
+        // Dependencies get `"*"`, and a named override beats it.
+        assert_eq!(opt(role("dep", false, false)), OptLevel::O2);
+        assert_eq!(opt(role("hot", false, false)), OptLevel::O3);
+        // A build dependency: `"*"` (more specific) still beats build-override
+        // for non-members, but a member's build script gets build-override.
+        assert_eq!(opt(role("mine", true, true)), OptLevel::O1);
+        // Without an override, host units get Cargo's cheap built-in defaults.
+        let plain = profiles("[profile.release]\nopt-level = 3\n");
+        let host = resolve_unit_profile("release", &plain, role("dep", false, true)).unwrap();
+        assert_eq!(host.opt_level, OptLevel::O0);
+        assert_eq!(host.codegen_units, Some(256));
+        let target = resolve_unit_profile("release", &plain, role("dep", false, false)).unwrap();
+        assert_eq!(target.opt_level, OptLevel::O3);
+        assert_eq!(opt(role("dep", false, true)), OptLevel::O2);
+        let built = resolve_unit_profile("dev", &p, role("mine", true, true)).unwrap();
+        assert_eq!(built.debuginfo, DebugInfo::None);
+        // `name@version` specs only match that version.
+        let p2 = profiles("[profile.dev.package.\"dep@2.0.0\"]\nopt-level = 3\n");
+        assert_eq!(
+            resolve_unit_profile("dev", &p2, role("dep", false, false))
+                .unwrap()
+                .opt_level,
+            OptLevel::O0
+        );
+    }
+
+    #[test]
+    fn split_debuginfo_is_applied_and_part_of_the_fingerprint() {
+        let p = profiles("[profile.dev]\nsplit-debuginfo = \"packed\"\n");
+        let dev = resolve_profile("dev", &p).unwrap();
+        assert_eq!(dev.split_debuginfo.as_deref(), Some("packed"));
+        assert_ne!(
+            dev.codegen_fingerprint(),
+            resolve_profile("dev", &HashMap::new())
+                .unwrap()
+                .codegen_fingerprint()
+        );
+        let bad = profiles("[profile.dev]\nsplit-debuginfo = \"sideways\"\n");
+        assert!(resolve_profile("dev", &bad).is_err());
     }
 
     #[test]

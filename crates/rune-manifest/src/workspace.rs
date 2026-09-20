@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 /// Workspace package fields that can be inherited by member packages.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct WorkspacePackage {
     /// Workspace version.
@@ -23,6 +23,18 @@ pub struct WorkspacePackage {
     pub repository: Option<String>,
     /// Workspace rust-version.
     pub rust_version: Option<String>,
+    /// Workspace homepage.
+    pub homepage: Option<String>,
+    /// Workspace documentation URL.
+    pub documentation: Option<String>,
+    /// Workspace readme path.
+    pub readme: Option<String>,
+    /// Workspace license file path.
+    pub license_file: Option<String>,
+    /// Everything else that can be inherited (`keywords`, `categories`,
+    /// `publish`, `include`, `exclude`, ...); these don't reach the compiler.
+    #[serde(flatten)]
+    pub extra: HashMap<String, toml::Value>,
 }
 
 /// Workspace manifest definition.
@@ -48,6 +60,52 @@ pub struct WorkspaceManifest {
     /// Shared `[workspace.lints]`.
     #[serde(default)]
     pub lints: Option<toml::Value>,
+    /// Free-form `[workspace.metadata]`.
+    #[serde(default)]
+    pub metadata: Option<toml::Value>,
+}
+
+/// Finds the `[workspace]` a package at `dir` (with manifest `manifest`)
+/// belongs to: an explicit `package.workspace = "../.."`, else the nearest
+/// parent whose `members` include it. Package dependencies that live in some
+/// *other* workspace (a path dependency next door, a git repository with its
+/// own `[workspace]`) inherit their version, edition and dependencies from
+/// that workspace, not from the project being built.
+pub fn find_enclosing_workspace(
+    dir: &Path,
+    manifest: &crate::Manifest,
+) -> Option<(PathBuf, WorkspaceManifest)> {
+    let load = |root: &Path| -> Option<WorkspaceManifest> {
+        crate::Manifest::from_path(&root.join("Cargo.toml"))
+            .ok()
+            .and_then(|m| m.workspace)
+    };
+    if let Some(explicit) = manifest.package.as_ref().and_then(|p| p.workspace.as_ref()) {
+        let root = dir.join(explicit).canonicalize().ok()?;
+        return load(&root).map(|w| (root, w));
+    }
+    // A package that is itself a workspace root is its own workspace.
+    if let Some(ws) = &manifest.workspace {
+        return Some((dir.to_path_buf(), ws.clone()));
+    }
+    let mut cur = dir.parent()?.to_path_buf();
+    loop {
+        if cur.join("Cargo.toml").is_file() {
+            if let Some(ws) = load(&cur) {
+                let is_member = ws
+                    .resolve_members(&cur)
+                    .unwrap_or_default()
+                    .iter()
+                    .any(|d| d.canonicalize().unwrap_or_else(|_| d.clone()) == dir);
+                if is_member {
+                    return Some((cur, ws));
+                }
+            }
+        }
+        if !cur.pop() {
+            return None;
+        }
+    }
 }
 
 impl WorkspaceManifest {

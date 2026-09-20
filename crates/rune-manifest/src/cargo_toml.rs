@@ -43,12 +43,17 @@ pub struct PackageManifest {
     pub links: Option<String>,
     /// Auto-discovery of binaries.
     pub autobins: Option<bool>,
-    /// Auto-discovery of libraries.
-    pub autolibs: Option<bool>,
+    /// Auto-discovery of the library (`autolib`, Cargo 1.83+).
+    pub autolib: Option<bool>,
     /// Minimum supported Rust version.
     pub rust_version: Option<InheritableString>,
     /// Path to workspace root.
     pub workspace: Option<String>,
+    /// Feature resolver version (`"1"`, `"2"`, `"3"`); only meaningful on the
+    /// root package of a workspace, exactly as in Cargo.
+    pub resolver: Option<String>,
+    /// Binary `cargo run` picks when a package has several.
+    pub default_run: Option<String>,
     /// Description.
     #[serde(default)]
     pub description: Option<InheritableString>,
@@ -137,12 +142,18 @@ impl PackageManifest {
             name: self.name.clone(),
             authors,
             description,
-            homepage: text("homepage", None),
+            homepage: text("homepage", wsp.and_then(|p| p.homepage.as_ref())),
             repository: text("repository", wsp.and_then(|p| p.repository.as_ref())),
             license,
-            license_file: text("license-file", None),
+            license_file: text("license-file", wsp.and_then(|p| p.license_file.as_ref())),
             readme: match self.extra.get("readme") {
                 Some(toml::Value::String(s)) => s.clone(),
+                Some(toml::Value::Boolean(true)) => "README.md".to_string(),
+                Some(toml::Value::Table(t))
+                    if t.get("workspace").and_then(|v| v.as_bool()) == Some(true) =>
+                {
+                    wsp.and_then(|p| p.readme.clone()).unwrap_or_default()
+                }
                 _ => String::new(),
             },
             rust_version,
@@ -195,6 +206,13 @@ pub struct ProfileOverride {
     pub opt_level: Option<toml::Value>,
     /// Debug info.
     pub debug: Option<toml::Value>,
+    /// `[profile.X.package.<name>]` / `[profile.X.package."*"]` overrides.
+    #[serde(default)]
+    pub package: HashMap<String, ProfileOverride>,
+    /// `[profile.X.build-override]`: applies to build scripts, proc-macros and
+    /// everything only they depend on.
+    #[serde(default)]
+    pub build_override: Option<Box<ProfileOverride>>,
     #[serde(flatten)]
     pub extra: HashMap<String, toml::Value>,
 }
@@ -237,6 +255,8 @@ struct RawManifest {
     #[serde(default)]
     pub patch: HashMap<String, HashMap<String, DependencySpec>>,
     #[serde(default)]
+    pub replace: HashMap<String, DependencySpec>,
+    #[serde(default)]
     pub lints: Option<toml::Value>,
     pub lib: Option<TargetSpec>,
     #[serde(default)]
@@ -266,8 +286,10 @@ pub struct Manifest {
     pub target: HashMap<String, TargetDeps>,
     /// Profiles.
     pub profile: HashMap<String, ProfileOverride>,
-    /// Dependency patches.
+    /// Dependency patches (`[patch.<source>]`).
     pub patch: HashMap<String, HashMap<String, DependencySpec>>,
+    /// The deprecated `[replace]` table (`"name:version" = { ... }`).
+    pub replace: HashMap<String, DependencySpec>,
     /// The raw `[lints]` table.
     pub lints: Option<toml::Value>,
     /// The `[lib]` target.
@@ -297,6 +319,32 @@ impl Manifest {
         Ok(manifest)
     }
 
+    /// The feature resolver version this manifest asks for: the workspace's
+    /// (or root package's) `resolver`, else the one implied by the edition
+    /// (`1` before 2021, `2` for 2021, `3` for 2024), as in Cargo.
+    pub fn resolver_version(&self) -> u8 {
+        let explicit = self
+            .workspace
+            .as_ref()
+            .and_then(|w| w.resolver.as_deref())
+            .or_else(|| self.package.as_ref().and_then(|p| p.resolver.as_deref()));
+        match explicit {
+            Some("1") => 1,
+            Some("2") => 2,
+            Some("3") => 3,
+            _ => match self
+                .package
+                .as_ref()
+                .and_then(|p| p.edition_str())
+                .unwrap_or("2015")
+            {
+                "2024" => 3,
+                "2021" => 2,
+                _ => 1,
+            },
+        }
+    }
+
     /// `rustc` flags for this package's `[lints]`, following
     /// `lints.workspace = true` into `[workspace.lints]`.
     pub fn lint_args(&self, ws: Option<&WorkspaceManifest>) -> Vec<String> {
@@ -321,7 +369,7 @@ impl Manifest {
         let autoexamples = auto("autoexamples");
         let autotests = auto("autotests");
         let autobenches = auto("autobenches");
-        let autolib = pkg.autolibs.unwrap_or(true);
+        let autolib = pkg.autolib.unwrap_or(true);
 
         match &mut self.lib {
             Some(lib) => {
@@ -505,6 +553,7 @@ impl Manifest {
             target: raw.target,
             profile: profiles,
             patch: raw.patch,
+            replace: raw.replace,
             lints: raw.lints,
             lib: raw.lib,
             bin: raw.bin,
@@ -843,6 +892,76 @@ mod tests {
             ["renamed"],
             "no second `app` binary from the same file"
         );
+    }
+
+    #[test]
+    fn crate_type_autolib_replace_and_resolver_are_understood() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        write(
+            d,
+            "Cargo.toml",
+            r#"
+            [package]
+            name = "p"
+            version = "0.1.0"
+            edition = "2021"
+            autolib = false
+
+            [lib]
+            path = "src/x.rs"
+            crate-type = ["cdylib", "rlib"]
+
+            [replace]
+            "foo:1.0.0" = { git = "https://example.com/foo" }
+            "#,
+        );
+        write(d, "src/lib.rs", "");
+        write(d, "src/x.rs", "");
+        let m = Manifest::from_path(&d.join("Cargo.toml")).unwrap();
+        let lib = m.lib.as_ref().unwrap();
+        assert_eq!(lib.crate_types, ["cdylib", "rlib"]);
+        assert!(m.replace.contains_key("foo:1.0.0"));
+        assert_eq!(m.resolver_version(), 2, "edition 2021 implies resolver 2");
+
+        // `autolib = false` really disables the implicit library.
+        write(
+            d,
+            "Cargo.toml",
+            "[package]\nname = \"p\"\nversion = \"0.1.0\"\nautolib = false\n",
+        );
+        let m = Manifest::from_path(&d.join("Cargo.toml")).unwrap();
+        assert!(m.lib.is_none());
+        assert_eq!(m.resolver_version(), 1);
+
+        let ws = Manifest::from_str(
+            "[workspace]\nmembers = []\nresolver = \"3\"\n",
+            Path::new("Cargo.toml"),
+        )
+        .unwrap();
+        assert_eq!(ws.resolver_version(), 3);
+    }
+
+    #[test]
+    fn workspace_inheritance_covers_homepage_readme_and_license_file() {
+        let ws = Manifest::from_str(
+            "[workspace]\nmembers = []\n[workspace.package]\nhomepage = \"https://h\"\nreadme = \"R.md\"\nlicense-file = \"L\"\n",
+            Path::new("Cargo.toml"),
+        )
+        .unwrap()
+        .workspace
+        .unwrap();
+        let pkg = Manifest::from_str(
+            "[package]\nname = \"m\"\nhomepage.workspace = true\nreadme.workspace = true\nlicense-file.workspace = true\n",
+            Path::new("Cargo.toml"),
+        )
+        .unwrap()
+        .package
+        .unwrap();
+        let meta = pkg.meta_in(Some(&ws));
+        assert_eq!(meta.homepage, "https://h");
+        assert_eq!(meta.readme, "R.md");
+        assert_eq!(meta.license_file, "L");
     }
 
     #[test]
