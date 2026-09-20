@@ -65,8 +65,40 @@ pub fn get_compiler_version() -> String {
         .clone()
 }
 
-/// Directories never hashed as part of a package's inputs.
-const IGNORED_DIRS: &[&str] = &["target", ".git", ".hg", ".svn", ".rune", "node_modules"];
+/// Directories that are known *not* to be inputs of a package: build output,
+/// version-control metadata, editor state, and dependency caches of other
+/// ecosystems. `.cargo/` is here because its build-relevant content
+/// (`rustflags`, `[env]`, linker, wrappers, ...) is already part of every
+/// unit's key as *values*, so hashing the file too would only invalidate
+/// builds when a comment changes.
+///
+/// Notably absent: hidden directories in general. A crate can legitimately
+/// `include_str!(".version")` or read `.config/settings.toml` from its build
+/// script, so an arbitrary dot-file or dot-directory is an input until proven
+/// otherwise.
+const IGNORED_DIRS: &[&str] = &[
+    "target",
+    ".git",
+    ".hg",
+    ".svn",
+    ".rune",
+    ".cargo",
+    ".idea",
+    ".vscode",
+    "node_modules",
+];
+
+/// Files that are editor and OS droppings rather than inputs: swap files,
+/// backup files and Finder metadata. They churn constantly and no build reads
+/// them.
+fn is_editor_dropping(name: &str) -> bool {
+    name.ends_with('~')
+        || name == ".DS_Store"
+        || name.starts_with(".#")
+        || (name.starts_with('#') && name.ends_with('#'))
+        || (name.starts_with('.')
+            && (name.ends_with(".swp") || name.ends_with(".swo") || name.ends_with(".swx")))
+}
 
 /// Computes a hash over every input file of the package rooted at `package_dir`.
 ///
@@ -76,8 +108,9 @@ const IGNORED_DIRS: &[&str] = &["target", ".git", ".hg", ".svn", ".rune", "node_
 /// those changing must invalidate the cache. So every regular file in the
 /// package is hashed, except:
 ///
-/// * build output, VCS and other hidden directories (see [`IGNORED_DIRS`]),
-///   and hidden files such as editor swap files,
+/// * known non-input directories (see [`IGNORED_DIRS`]) and editor droppings
+///   (swap and backup files) — but *not* hidden files or directories in
+///   general,
 /// * nested packages (a subdirectory with its own `Cargo.toml` is a different
 ///   crate with its own cache key — workspace members live in such directories),
 /// * lock files and `Rune.toml`, which don't affect compilation of this crate.
@@ -108,9 +141,7 @@ fn compute_package_hash_uncached(
                 return true;
             }
             let name = e.file_name().to_string_lossy();
-            // Hidden directories (`.git`, `.idea`, `.rune`, ...) and known
-            // build-output directories are never crate inputs.
-            if name.starts_with('.') || IGNORED_DIRS.contains(&name.as_ref()) {
+            if IGNORED_DIRS.contains(&name.as_ref()) {
                 return false;
             }
             // A nested package is not part of this one.
@@ -121,9 +152,17 @@ fn compute_package_hash_uncached(
             continue;
         }
         let name = entry.file_name().to_string_lossy();
-        // Editor droppings and other hidden files churn constantly and are
-        // not sources (`.swp`, `.DS_Store`, `.#file`, `file~`).
-        if name.starts_with('.') || name.ends_with('~') {
+        if is_editor_dropping(&name) {
+            continue;
+        }
+        // The manifest itself is not an input: every compilation-relevant
+        // value in it (features, dependencies and their aliases, targets,
+        // profiles, lints, metadata) is already part of the unit's key, so
+        // hashing the file too would only rebuild a package when a comment or
+        // an unrelated section changes. When something *does* read the file
+        // (`include_str!("../Cargo.toml")`, a build script), it is recorded as
+        // a declared input by whoever observed the read.
+        if name == "Cargo.toml" && entry.depth() == 1 {
             continue;
         }
         // Lock files and Rune's own settings file don't affect compilation;
@@ -292,6 +331,10 @@ mod tests {
         write(d, "src/lib.rs", "pub fn f() {}");
         write(d, "data/schema.json", "{}");
         write(d, "target/debug/junk", "1");
+        write(d, ".git/HEAD", "ref: main");
+        write(d, ".cargo/config.toml", "# not an input");
+        write(d, ".version", "1");
+        write(d, ".config/settings.toml", "a = 1");
         write(d, "member/Cargo.toml", "[package]\nname=\"b\"\n");
         write(d, "member/src/lib.rs", "pub fn g() {}");
 
@@ -303,8 +346,18 @@ mod tests {
             compute_package_hash(d, cache).unwrap()
         };
 
-        // Ignored: build output, nested package, lockfile.
+        // Ignored: build output, VCS and tool directories, editor droppings,
+        // nested package, lockfile, and the manifest itself.
+        write(
+            d,
+            "Cargo.toml",
+            "[package]\nname=\"a\"\n# an unrelated edit\n",
+        );
         write(d, "target/debug/junk", "2");
+        write(d, ".git/HEAD", "ref: other");
+        write(d, ".cargo/config.toml", "# still not an input, changed");
+        write(d, ".src.rs.swp", "swap");
+        write(d, "src/lib.rs~", "backup");
         write(d, "member/src/lib.rs", "pub fn g() { changed() }");
         write(d, "Cargo.lock", "# lock");
         assert_eq!(rehash(&mut cache), base);
@@ -313,6 +366,15 @@ mod tests {
         write(d, "data/schema.json", "{\"changed\":true}");
         let after_data = rehash(&mut cache);
         assert_ne!(after_data, base);
+
+        // Seen: hidden files and directories are inputs like any other.
+        write(d, ".version", "2");
+        let after_dotfile = rehash(&mut cache);
+        assert_ne!(after_dotfile, after_data);
+        write(d, ".config/settings.toml", "a = 2");
+        let after_dotdir = rehash(&mut cache);
+        assert_ne!(after_dotdir, after_dotfile);
+        let after_data = after_dotdir;
 
         write(d, "src/lib.rs", "pub fn f() { 1 }");
         assert_ne!(rehash(&mut cache), after_data);
