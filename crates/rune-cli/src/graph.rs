@@ -2,38 +2,42 @@
 //!
 //! The pipeline:
 //!
-//! 1. **Resolve** the whole workspace (so the lockfile is complete and stable
-//!    no matter which packages a command selects), or reuse the previous
-//!    resolution if no manifest or feature flag changed.
-//! 2. **Prune** to the registry crates actually reachable from what was
-//!    requested, and only download those.
-//! 3. **Build nodes**: one per registry library, per local library, and per
-//!    requested target (binary, example, test harness, ...).
-//! 4. **Connect** them, then drop everything not reachable from the requested
-//!    targets.
+//! 1. **Resolve** versions for the whole workspace — every platform, every
+//!    feature, like `Cargo.lock` — so the lockfile is complete and stable no
+//!    matter what a command selects. Reused while no manifest changed.
+//! 2. **Resolve features** for *this* request: only the selected packages'
+//!    requested features count, host artifacts (build scripts, proc-macros,
+//!    and what only they use) get a feature set of their own, and target-gated
+//!    dependencies apply to the platform they are built for
+//!    (`rune_resolver::unit_features`). That fixes what must be compiled, so
+//!    only those registry crates are downloaded.
+//! 3. **Build units**: one per (package, role) library, per requested target
+//!    (binary, example, test harness, ...), wired with normal edges and
+//!    build-script edges.
+//! 4. Drop everything not reachable from the requested targets.
 
 use anyhow::{Context, Result, bail};
 use rayon::prelude::*;
 use rune_common::timing::phase;
+use rune_common::toolchain::{self, Role, TargetInfo};
 use rune_common::{
     CompilationUnit, CrateId, CrateSource, CrateType, Edition, PackageMeta, Profile, TargetKind,
-    TargetTriple,
+    TargetTriple, UnitExtras,
 };
 use rune_graph::{BuildGraph, NodeId};
 use rune_manifest::dependency::{DependencyKind, DependencySpec};
-use rune_manifest::{Manifest, TargetSpec};
-use rune_registry::CrateDownloader;
+use rune_manifest::{Manifest, TargetSpec, UnitRole, resolve_unit_profile};
 use rune_resolver::lockfile::{Lockfile, LockfileManager};
-use rune_resolver::resolver::{
-    DependencyResolver, PackageSource, ResolvedDependencyRef, ResolvedGraph, ResolvedPackage,
-    matches_target,
+use rune_resolver::resolver::{DependencyResolver, PackageSource, ResolvedGraph, ResolvedPackage};
+use rune_resolver::unit_features::{
+    self, DepDecl, FeatureOptions, FeatureResolution, PackageView, RootRequest,
 };
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::ui;
-use crate::workspace::{Member, Workspace, effective_spec};
+use crate::workspace::{Member, Workspace};
 
 // ---------------------------------------------------------------------------
 // Request types
@@ -117,6 +121,8 @@ pub struct Request<'a> {
     pub locked: bool,
     /// Run doctests (only meaningful for [`Mode::Test`]).
     pub doctests: bool,
+    /// Skip the `rust-version` check (`--ignore-rust-version`).
+    pub ignore_rust_version: bool,
 }
 
 /// One requested output of the build.
@@ -159,91 +165,235 @@ struct Locals {
     /// `list[i]` is `ws.members[member_of[i]]`, when it is a workspace member.
     member_of: Vec<Option<usize>>,
     by_dir: HashMap<PathBuf, usize>,
+    /// For a package that belongs to some *other* workspace (a path dependency
+    /// next door, a git repository with its own `[workspace]`): that
+    /// workspace, which its `workspace = true` fields inherit from.
+    foreign_ws: Vec<Option<(PathBuf, rune_manifest::WorkspaceManifest)>>,
+    /// Set for packages checked out from a git repository.
+    git_of: Vec<Option<rune_registry::git::GitCheckout>>,
 }
 
 impl Locals {
+    /// The workspace `list[li]` inherits from.
+    fn member_ws<'a>(
+        &'a self,
+        ws: &'a Workspace,
+        li: usize,
+    ) -> Option<&'a rune_manifest::WorkspaceManifest> {
+        match &self.foreign_ws[li] {
+            Some((_, w)) => Some(w),
+            None => self.member_of[li].and(ws.workspace_manifest()),
+        }
+    }
+
+    fn ws_root<'a>(&'a self, ws: &'a Workspace, li: usize) -> &'a Path {
+        match &self.foreign_ws[li] {
+            Some((root, _)) => root,
+            None => ws.root(),
+        }
+    }
+
+    /// A dependency of `list[li]` with paths made absolute and workspace
+    /// inheritance applied.
+    fn spec_for(
+        &self,
+        ws: &Workspace,
+        li: usize,
+        dep: &rune_manifest::Dependency,
+    ) -> DependencySpec {
+        rune_manifest::effective_spec(
+            dep,
+            &self.list[li].dir,
+            self.ws_root(ws, li),
+            self.member_ws(ws, li),
+        )
+    }
+
     /// Loads the workspace members plus every package reachable through a
-    /// `path = "..."` dependency (which may live outside the workspace).
+    /// `path = "..."` or `git = "..."` dependency (which may live outside the
+    /// workspace).
     fn load(ws: &Workspace) -> Result<Self> {
-        let mut list: Vec<Member> = ws.members.clone();
-        let mut member_of: Vec<Option<usize>> = (0..list.len()).map(Some).collect();
-        let mut by_dir: HashMap<PathBuf, usize> = list
-            .iter()
-            .enumerate()
-            .map(|(i, m)| (m.dir.clone(), i))
-            .collect();
+        let n = ws.members.len();
+        let mut this = Locals {
+            list: ws.members.clone(),
+            member_of: (0..n).map(Some).collect(),
+            by_dir: ws
+                .members
+                .iter()
+                .enumerate()
+                .map(|(i, m)| (m.dir.clone(), i))
+                .collect(),
+            foreign_ws: vec![None; n],
+            git_of: vec![None; n],
+        };
 
         let mut i = 0;
-        while i < list.len() {
-            let member_ws = member_of[i].and(ws.workspace_manifest());
-            let pkg_dir = list[i].dir.clone();
-            reject_unsupported_sources(&list[i], ws, member_ws)?;
-            let paths: Vec<PathBuf> = list[i]
+        while i < this.list.len() {
+            let is_member = this.member_of[i].is_some();
+            let specs: Vec<(String, DependencySpec)> = this.list[i]
                 .manifest
                 .dependencies
                 .values()
-                .filter_map(|dep| effective_spec(dep, &pkg_dir, ws.root(), member_ws).path)
+                .map(|dep| (dep.name.clone(), this.spec_for(ws, i, dep)))
                 .collect();
-            for path in paths {
-                let dir = path.canonicalize().unwrap_or(path);
-                if !by_dir.contains_key(&dir) {
-                    if !dir.join("Cargo.toml").is_file() {
+            for (name, spec) in specs {
+                if let Some(path) = spec.path {
+                    let dir = path.canonicalize().unwrap_or(path);
+                    if !this.by_dir.contains_key(&dir) && !dir.join("Cargo.toml").is_file() {
                         bail!(
                             "path dependency `{}` of `{}` does not contain a Cargo.toml",
                             dir.display(),
-                            list[i].name
+                            this.list[i].name
                         );
                     }
-                    let member = Member::load(&dir, None)?;
-                    by_dir.insert(dir, list.len());
-                    list.push(member);
-                    member_of.push(None);
+                    this.add(dir, None)?;
+                } else if let (Some(url), true) = (&spec.git, is_member || !spec.optional) {
+                    // A member's optional git dependencies are part of its
+                    // lockfile (which covers every feature); those of a
+                    // dependency are only fetched if something activates them,
+                    // which the resolver decides.
+                    let real = spec.package.clone().unwrap_or(name);
+                    let reference = rune_registry::git::GitRef::from_spec(
+                        spec.branch.as_deref(),
+                        spec.tag.as_deref(),
+                        spec.rev.as_deref(),
+                    );
+                    let co = rune_registry::git::checkout(url, &reference)
+                        .with_context(|| format!("git dependency `{real}` ({url})"))?;
+                    let dir = rune_registry::git::find_package(&co, &real)?;
+                    let dir = dir.canonicalize().unwrap_or(dir);
+                    this.add(dir, Some(co))?;
+                } else {
+                    // A registry-style dependency that a `[patch]` replaces:
+                    // load the patch's package (only if its version fits).
+                    let real = spec.package.clone().unwrap_or(name);
+                    let req = spec
+                        .version
+                        .clone()
+                        .unwrap_or_else(|| semver::VersionReq::STAR);
+                    let source = match spec.registry.as_deref() {
+                        None | Some("crates-io") => rune_resolver::PatchSource::CratesIo,
+                        Some(name) => rune_resolver::PatchSource::Registry(name.to_string()),
+                    };
+                    for entry in ws.patches.find(&real, &source) {
+                        if let Some((dir, _)) =
+                            entry.locate(&req).map_err(|e| anyhow::anyhow!("{e}"))?
+                        {
+                            let dir = dir.canonicalize().unwrap_or(dir);
+                            let git = rune_registry::git::locate_dir(&dir);
+                            this.add(dir, git)?;
+                            break;
+                        }
+                    }
                 }
             }
             i += 1;
         }
-        Ok(Self {
-            list,
-            member_of,
-            by_dir,
-        })
+        Ok(this)
+    }
+
+    /// Loads the package in `dir` if it is not loaded yet.
+    fn add(&mut self, dir: PathBuf, git: Option<rune_registry::git::GitCheckout>) -> Result<usize> {
+        if let Some(&li) = self.by_dir.get(&dir) {
+            return Ok(li);
+        }
+        let manifest_path = dir.join("Cargo.toml");
+        let manifest = Manifest::from_path(&manifest_path)
+            .with_context(|| format!("Failed to parse {}", manifest_path.display()))?;
+        let enclosing = rune_manifest::find_enclosing_workspace(&dir, &manifest);
+        let member = Member::load(&dir, enclosing.as_ref().map(|(_, w)| w))?;
+        let li = self.list.len();
+        self.by_dir.insert(dir, li);
+        self.list.push(member);
+        self.member_of.push(None);
+        self.foreign_ws.push(enclosing);
+        self.git_of.push(git);
+        Ok(li)
+    }
+
+    /// Loads packages the lockfile names but no manifest of ours reaches
+    /// directly — a git dependency of a registry crate, or of another git
+    /// package's optional feature.
+    fn extend_from_lock(&mut self, ws: &Workspace, lock: &Lockfile) -> Result<()> {
+        // Local packages of the lockfile that nothing loaded directly: a
+        // patched crate that only a registry dependency reaches.
+        for p in lock.packages.iter().filter(|p| p.source.is_none()) {
+            if self
+                .list
+                .iter()
+                .any(|m| m.name == p.name && m.version.to_string() == p.version)
+            {
+                continue;
+            }
+            let req = semver::VersionReq::parse(&format!("={}", p.version))
+                .unwrap_or(semver::VersionReq::STAR);
+            for entry in ws
+                .patches
+                .find(&p.name, &rune_resolver::PatchSource::CratesIo)
+            {
+                if let Some((dir, _)) = entry.locate(&req).map_err(|e| anyhow::anyhow!("{e}"))? {
+                    let dir = dir.canonicalize().unwrap_or(dir);
+                    let git = rune_registry::git::locate_dir(&dir);
+                    self.add(dir, git)?;
+                    break;
+                }
+            }
+        }
+        for p in &lock.packages {
+            let Some((url, query, _)) = p
+                .source
+                .as_deref()
+                .and_then(rune_registry::git::parse_lock_source)
+            else {
+                continue;
+            };
+            if self
+                .list
+                .iter()
+                .any(|m| m.name == p.name && m.version.to_string() == p.version)
+            {
+                continue;
+            }
+            let reference = rune_registry::git::GitRef::from_query(query.as_deref());
+            let co = rune_registry::git::checkout(&url, &reference)
+                .with_context(|| format!("git dependency `{}` ({url})", p.name))?;
+            let dir = rune_registry::git::find_package(&co, &p.name)?;
+            let dir = dir.canonicalize().unwrap_or(dir);
+            self.add(dir, Some(co))?;
+        }
+        Ok(())
     }
 }
 
-/// Fails early, with an actionable message, on dependency sources Rune can't
-/// resolve yet. Silently treating a `git = "..."` dependency as "whatever
-/// crates.io has under that name" would build the wrong code.
-fn reject_unsupported_sources(
-    member: &Member,
-    ws: &Workspace,
-    member_ws: Option<&rune_manifest::WorkspaceManifest>,
-) -> Result<()> {
-    for dep in member.manifest.dependencies.values() {
-        let spec = effective_spec(dep, &member.dir, ws.root(), member_ws);
-        if let Some(url) = &spec.git {
-            bail!(
-                "dependency `{}` of `{}` uses a git source ({url}), which Rune does not support yet; \
-                 use `path = \"...\"` to a checkout, or build this project with `cargo`",
-                dep.name,
-                member.name
-            );
+/// Tells the git layer which commits the lockfile pinned, so that a build
+/// resolves a branch to the commit it was locked to instead of wherever it has
+/// moved. `update` (`rune update`) ignores the pins.
+fn configure_git(ws: &Workspace, offline: bool, update: bool, lock: Option<&Lockfile>) {
+    let disk;
+    let lock = match lock {
+        Some(l) => Some(l),
+        None => {
+            disk = LockfileManager::load_fast(ws.root());
+            disk.as_ref()
         }
-        if let Some(registry) = &spec.registry {
-            bail!(
-                "dependency `{}` of `{}` uses the alternative registry `{registry}`, which Rune does \
-                 not support yet (only crates.io)",
-                dep.name,
-                member.name
-            );
-        }
-    }
-    if !member.manifest.patch.is_empty() {
-        ui::warn(format!(
-            "`[patch]` in {} is ignored: Rune does not support patching dependencies yet",
-            member.dir.join("Cargo.toml").display()
-        ));
-    }
-    Ok(())
+    };
+    let pins = lock
+        .map(|l| {
+            l.packages
+                .iter()
+                .filter_map(|p| {
+                    p.source
+                        .as_deref()
+                        .and_then(rune_registry::git::parse_lock_source)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    rune_registry::git::configure(rune_registry::git::GitOptions {
+        offline: offline || ws.config.settings.offline(),
+        update,
+        pins,
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -286,7 +436,18 @@ fn features_for_member(
             Some((pkg, feat)) if pkg.trim_end_matches('?') == member.name => {
                 out.push(feat.to_string());
             }
-            Some(_) => {} // aimed at another package (or a dependency's feature)
+            // `dep/feature`: a feature of one of this package's dependencies,
+            // handed to the feature resolver in `[features]` syntax.
+            Some((pkg, _))
+                if member
+                    .manifest
+                    .dependencies
+                    .values()
+                    .any(|d| d.name == pkg.trim_end_matches('?')) =>
+            {
+                out.push(f.clone());
+            }
+            Some(_) => {} // aimed at another package
             None => {
                 let declared = member.manifest.features.contains_key(f)
                     || member
@@ -311,19 +472,30 @@ fn features_for_member(
 fn resolution_roots(
     ws: &Workspace,
     locals: &Locals,
-    req: &Request,
+    _req: &Request,
 ) -> Result<Vec<(String, DependencySpec)>> {
     let mut roots = Vec::new();
-    let single = req.selected.len() == 1;
-    for (i, m) in ws.members.iter().enumerate() {
-        let (features, default_features) =
-            features_for_member(m, req.selected.contains(&i), single, req.features)?;
+    // The resolution behind the lockfile covers *every* feature of every
+    // member — like `Cargo.lock` — so that it does not change with the
+    // command line. Which features a build really enables is decided later,
+    // per selection, by the feature resolver.
+    for m in &ws.members {
+        let mut all: Vec<String> = m.manifest.features.keys().cloned().collect();
+        all.extend(
+            m.manifest
+                .dependencies
+                .values()
+                .filter(|d| d.spec.optional)
+                .map(|d| d.name.clone()),
+        );
+        all.sort();
+        all.dedup();
         roots.push((
             m.name.clone(),
             DependencySpec {
                 path: Some(m.dir.clone()),
-                features,
-                default_features,
+                features: all,
+                default_features: true,
                 ..Default::default()
             },
         ));
@@ -333,12 +505,11 @@ fn resolution_roots(
     // included, even for `build`: one resolution then serves every command and
     // the lockfile doesn't flip-flop between `build` and `test`.
     for (li, m) in locals.list.iter().enumerate() {
-        let member_ws = locals.member_of[li].and(ws.workspace_manifest());
         for dep in m.manifest.dependencies.values() {
             if dep.kind != DependencyKind::Dev {
                 continue;
             }
-            let spec = effective_spec(dep, &m.dir, ws.root(), member_ws);
+            let spec = locals.spec_for(ws, li, dep);
             let real = spec.package.clone().unwrap_or_else(|| dep.name.clone());
             roots.push((real, spec));
         }
@@ -346,8 +517,25 @@ fn resolution_roots(
     Ok(roots)
 }
 
-/// Hash of everything that determines a resolution's result.
-fn resolution_fingerprint(ws: &Workspace, locals: &Locals, req: &Request) -> String {
+/// With resolver 3 (edition 2024's default), resolution prefers dependency
+/// versions the project's own `rust-version` (else the active compiler) can
+/// build. Earlier resolvers take the newest release regardless.
+fn msrv_for_resolution(ws: &Workspace) -> Option<semver::Version> {
+    if ws.root_manifest.resolver_version() < 3 {
+        return None;
+    }
+    let lowest = ws
+        .members
+        .iter()
+        .filter_map(|m| rune_common::toolchain::parse_rust_version(&m.meta.rust_version))
+        .min();
+    lowest.or_else(|| Some(toolchain::global().version.clone()))
+}
+
+/// Hash of everything that determines a resolution's result: the manifests.
+/// The command line does not — version resolution is independent of the
+/// selected packages and features.
+fn resolution_fingerprint(ws: &Workspace, locals: &Locals, _req: &Request) -> String {
     let mut hasher = rune_common::hash::HashBuilder::new();
     hasher.update(env!("CARGO_PKG_VERSION").as_bytes());
     let mut paths: Vec<PathBuf> = vec![ws.manifest_path()];
@@ -360,26 +548,199 @@ fn resolution_fingerprint(ws: &Workspace, locals: &Locals, req: &Request) -> Str
             hasher.update(&contents);
         }
     }
-    // Feature flags only change the resolution of the packages they apply to,
-    // so the *selection* matters only when flags are in play; otherwise
-    // `rune build -p a` and `rune build` share one resolution.
-    let flags_in_play = !req.features.features.is_empty()
-        || req.features.all_features
-        || req.features.no_default_features;
-    if flags_in_play {
-        for &i in req.selected {
-            hasher.update(ws.members[i].name.as_bytes());
-        }
+    // `Cargo.lock` seeds the versions chosen, so a `cargo update` (or a
+    // teammate's change) is picked up rather than shadowed by our binary lock.
+    if let Ok(contents) = fs::read(ws.root().join("Cargo.lock")) {
+        hasher.update(b"\0Cargo.lock\0");
+        hasher.update(&contents);
     }
-    for f in &req.features.features {
-        hasher.update(f.as_bytes());
-        hasher.update(b",");
-    }
-    hasher.update(&[
-        req.features.all_features as u8,
-        req.features.no_default_features as u8,
-    ]);
     hasher.finish_blake3()
+}
+
+/// Restricts a resolution (with its dependency edges and kinds, which
+/// `rune tree` and `rune why` display) to what a refined lockfile kept.
+fn prune_resolved(mut resolved: ResolvedGraph, refined: &Lockfile) -> ResolvedGraph {
+    let kept: HashMap<String, &rune_resolver::LockPackage> = refined
+        .packages
+        .iter()
+        .map(|p| (format!("{} {}", p.name, p.version), p))
+        .collect();
+    resolved.packages.retain(|id, _| kept.contains_key(id));
+    let snapshot = resolved.clone();
+    for (id, pkg) in resolved.packages.iter_mut() {
+        let edges: HashSet<&String> = kept[id].dependencies.iter().collect();
+        pkg.dependencies.retain(|d| {
+            let real = d.package.as_deref().unwrap_or(&d.name);
+            snapshot
+                .find_matching(real, &d.req)
+                .is_some_and(|t| edges.contains(&format!("{} {}", t.name, t.version)))
+        });
+        pkg.features = kept[id].features.clone();
+    }
+    resolved
+}
+
+/// Tightens a freshly resolved lockfile to exactly what Cargo would lock.
+///
+/// The version resolver over-approximates which optional dependencies are
+/// active (it unifies features by package *name*, so a feature enabled for one
+/// version counts for all). Cargo's lockfile covers every platform and every
+/// feature of the workspace members, but only what those features really
+/// activate — so run the precise feature resolver over the result with those
+/// same semantics and keep only the packages and edges it reaches. Also
+/// records each package's resolved feature set.
+fn refine_lock(ws: &Workspace, locals: &Locals, lock: &Lockfile) -> Lockfile {
+    let uni = Universe::build(ws, locals, lock);
+    let mut roots = Vec::new();
+    for (mi, m) in ws.members.iter().enumerate() {
+        let Some(li) = locals.member_of.iter().position(|x| *x == Some(mi)) else {
+            continue;
+        };
+        let mut all: Vec<String> = m.manifest.features.keys().cloned().collect();
+        all.extend(
+            m.manifest
+                .dependencies
+                .values()
+                .filter(|d| d.spec.optional)
+                .map(|d| d.name.clone()),
+        );
+        roots.push(RootRequest {
+            package: li,
+            features: all,
+            default_features: true,
+            dev: true,
+        });
+    }
+    let res = unit_features::resolve(
+        &uni.views,
+        &roots,
+        &FeatureOptions {
+            // One universe, every platform: what a lockfile records.
+            resolver: 1,
+            platform_matches: &|_, _| true,
+            weak_activates: true,
+        },
+    );
+
+    let mut children: HashMap<usize, BTreeSet<String>> = HashMap::new();
+    for e in &res.edges {
+        children
+            .entry(e.from.0)
+            .or_default()
+            .insert(uni.id[e.to.0].clone());
+    }
+    let mut out = Lockfile::new();
+    out.version = lock.version;
+    for (&(pkg, _), feats) in &res.features {
+        let original = match uni.origin[pkg] {
+            Origin::Registry => uni.lock_pkg[pkg].map(|i| &lock.packages[i]),
+            Origin::Local(li) => {
+                let m = &locals.list[li];
+                lock.packages.iter().find(|p| {
+                    p.name == m.name
+                        && p.version == m.version.to_string()
+                        && !is_registry_source(p.source.as_deref())
+                })
+            }
+        };
+        let Some(original) = original else { continue };
+        let mut p = original.clone();
+        p.dependencies = children
+            .get(&pkg)
+            .map(|c| c.iter().cloned().collect())
+            .unwrap_or_default();
+        p.features = feats.clone();
+        out.add_or_replace(p);
+    }
+    out
+}
+
+/// Keeps `Cargo.lock` in step with the resolution, the way Cargo does: it is
+/// created if missing and rewritten when the *set of locked packages* changes
+/// (a dependency added or removed, `rune update`), and left alone when it
+/// already describes the same packages — so a project that already builds with
+/// Cargo never sees churn. `resolve.write-cargo-lock = false` turns this off.
+///
+/// Returns whether the file was written. With `locked`, a needed change is an
+/// error instead.
+pub fn sync_cargo_lock(ws: &Workspace, lock: &Lockfile, locked: bool) -> Result<bool> {
+    if !ws.config.settings.write_cargo_lock() {
+        return Ok(false);
+    }
+    let path = ws.root().join("Cargo.lock");
+    let existing = if path.is_file() {
+        match LockfileManager::read_cargo(&path) {
+            Ok(l) => Some(l),
+            Err(e) => {
+                ui::warn(format!(
+                    "leaving {} untouched: it could not be read ({e})",
+                    path.display()
+                ));
+                return Ok(false);
+            }
+        }
+    } else {
+        None
+    };
+    let identity = |l: &Lockfile| -> BTreeSet<(String, String, Option<String>, Option<String>)> {
+        l.packages
+            .iter()
+            .map(|p| {
+                (
+                    p.name.clone(),
+                    p.version.clone(),
+                    p.source.clone(),
+                    p.checksum.clone(),
+                )
+            })
+            .collect()
+    };
+    if existing.as_ref().map(identity) == Some(identity(lock)) {
+        return Ok(false);
+    }
+    if locked {
+        bail!(
+            "the lock file {} needs to be updated but `--locked` was passed to prevent this",
+            path.display()
+        );
+    }
+    let mut out = lock.clone();
+    // An existing file keeps its format version; a new one gets the newest
+    // format the active toolchain reads (4 since Rust 1.83), like Cargo.
+    let newest = if toolchain::global().satisfies_msrv("1.83") {
+        4
+    } else {
+        3
+    };
+    out.version = existing.as_ref().map_or(newest, |e| e.version.max(1));
+    LockfileManager::write_cargo(&out, &path).context("Failed to write Cargo.lock")?;
+    ui::action(
+        if existing.is_some() {
+            "updated"
+        } else {
+            "created"
+        },
+        "Cargo.lock",
+    );
+    Ok(true)
+}
+
+/// Whether a lockfile `source` names a registry (any protocol).
+fn is_registry_source(source: Option<&str>) -> bool {
+    source.is_some_and(|s| s.starts_with("registry+") || s.starts_with("sparse+"))
+}
+
+/// The canonical index URL for a lockfile `source`.
+fn index_of_lock_source(source: Option<&str>) -> String {
+    match source {
+        Some("registry+https://github.com/rust-lang/crates.io-index") | None => {
+            rune_common::CRATES_IO_INDEX.to_string()
+        }
+        Some(s) => s
+            .strip_prefix("registry+")
+            .map(|u| u.to_string())
+            .unwrap_or_else(|| s.to_string()),
+    }
 }
 
 fn resolved_from_lock(lock: &Lockfile) -> ResolvedGraph {
@@ -388,25 +749,21 @@ fn resolved_from_lock(lock: &Lockfile) -> ResolvedGraph {
         let Ok(version) = pkg.version.parse::<semver::Version>() else {
             continue;
         };
-        let is_registry = pkg
-            .source
-            .as_deref()
-            .is_some_and(|s| s.starts_with("registry+"));
+        let is_registry = is_registry_source(pkg.source.as_deref());
         packages.insert(
             format!("{} {}", pkg.name, version),
             ResolvedPackage {
                 name: pkg.name.clone(),
                 version,
                 source: if is_registry {
-                    PackageSource::Registry
+                    PackageSource::Registry(index_of_lock_source(pkg.source.as_deref()))
                 } else {
                     PackageSource::Path(PathBuf::new())
                 },
                 checksum: pkg.checksum.clone(),
-                // Edges are rebuilt from the extracted manifests, which know
-                // about `package = "..."` renames the lockfile can't express.
                 dependencies: Vec::new(),
                 features: pkg.features.clone(),
+                declared_features: pkg.feature_table.iter().cloned().collect(),
             },
         );
     }
@@ -435,6 +792,7 @@ pub fn whole_workspace_request<'a>(
         offline,
         locked: false,
         doctests: false,
+        ignore_rust_version: false,
     }
 }
 
@@ -448,6 +806,7 @@ pub fn resolve_fresh(
     refresh: bool,
 ) -> Result<(ResolvedGraph, Lockfile)> {
     let _timer = phase("resolve (fresh)");
+    configure_git(ws, offline, refresh, existing);
     let locals = Locals::load(ws)?;
     let profile = Profile::dev();
     let features = FeatureArgs::default();
@@ -461,11 +820,14 @@ pub fn resolve_fresh(
     } else {
         DependencyResolver::default_resolver()
     }
-    .offline(offline);
+    .offline(offline)
+    .with_patches(ws.patches.clone())
+    .with_msrv(msrv_for_resolution(ws));
     let resolved = resolver
         .resolve_with_workspace(ws.root(), &roots, existing, ws.workspace_manifest())
         .context("Dependency resolution failed")?;
-    let lock = resolved.to_lockfile();
+    let lock = refine_lock(ws, &locals, &resolved.to_lockfile());
+    let resolved = prune_resolved(resolved, &lock);
     Ok((resolved, lock))
 }
 
@@ -479,6 +841,7 @@ pub fn store_resolution(ws: &Workspace, lock: &Lockfile) -> Result<()> {
     let selected: Vec<usize> = (0..ws.members.len()).collect();
     let req = whole_workspace_request(&profile, false, &features, &targets, &selected);
     LockfileManager::sync_all(ws.root(), lock).context("Failed to write lockfiles")?;
+    sync_cargo_lock(ws, lock, false)?;
     let fingerprint = resolution_fingerprint(ws, &locals, &req);
     let path = ws.root().join(".rune").join("resolve.fingerprint");
     if let Some(parent) = path.parent() {
@@ -491,15 +854,20 @@ pub fn store_resolution(ws: &Workspace, lock: &Lockfile) -> Result<()> {
 /// Downloads every registry crate in `resolved` (in parallel). Returns how
 /// many were fetched or already present.
 pub fn download_all(resolved: &ResolvedGraph, offline: bool) -> Result<usize> {
-    let pkgs: Vec<(String, String, Option<String>)> = resolved
+    let pkgs: Vec<(String, String, Option<String>, String)> = resolved
         .packages
         .values()
-        .filter(|p| matches!(p.source, PackageSource::Registry))
-        .map(|p| (p.name.clone(), p.version.to_string(), p.checksum.clone()))
+        .filter_map(|p| match &p.source {
+            PackageSource::Registry(index) => Some((
+                p.name.clone(),
+                p.version.to_string(),
+                p.checksum.clone(),
+                index.clone(),
+            )),
+            _ => None,
+        })
         .collect();
-    let downloader = CrateDownloader::default_downloader().offline(offline);
-    downloader
-        .download_and_extract_many(&pkgs)
+    rune_registry::download_and_extract_grouped(&pkgs, offline)
         .context("Failed to download one or more registry crates")?;
     Ok(pkgs.len())
 }
@@ -519,6 +887,11 @@ fn resolve(ws: &Workspace, locals: &Locals, req: &Request) -> Result<(ResolvedGr
     if unchanged {
         if let Some(lock) = LockfileManager::load_binary(root) {
             if !lock.packages.is_empty() {
+                // Cheap check only: the lockfile can be missing (deleted, or a
+                // fresh checkout with only our cache present).
+                if !root.join("Cargo.lock").is_file() {
+                    sync_cargo_lock(ws, &lock, req.locked)?;
+                }
                 return Ok((resolved_from_lock(&lock), lock));
             }
         }
@@ -531,7 +904,10 @@ fn resolve(ws: &Workspace, locals: &Locals, req: &Request) -> Result<(ResolvedGr
 
     ui::action("resolving", "dependency graph");
     let _timer = phase("resolve");
-    let mut resolver = DependencyResolver::default_resolver().offline(req.offline);
+    let mut resolver = DependencyResolver::default_resolver()
+        .offline(req.offline)
+        .with_patches(ws.patches.clone())
+        .with_msrv(msrv_for_resolution(ws));
     let resolved = resolver
         .resolve_with_workspace(
             root,
@@ -541,8 +917,12 @@ fn resolve(ws: &Workspace, locals: &Locals, req: &Request) -> Result<(ResolvedGr
         )
         .context("Dependency resolution failed")?;
 
-    let lockfile = resolved.to_lockfile();
-    if req.locked && existing_lock.as_ref().map(registry_view) != Some(registry_view(&lockfile)) {
+    let lockfile = refine_lock(ws, locals, &resolved.to_lockfile());
+    let resolved = prune_resolved(resolved, &lockfile);
+    if req.locked
+        && existing_lock.as_ref().map(locked_registry_packages)
+            != Some(locked_registry_packages(&lockfile))
+    {
         bail!(
             "the lock file needs to be updated but `--locked` was passed to prevent this \
              (run `rune update` first)"
@@ -551,6 +931,10 @@ fn resolve(ws: &Workspace, locals: &Locals, req: &Request) -> Result<(ResolvedGr
     if existing_lock.as_ref() != Some(&lockfile) || LockfileManager::load_binary(root).is_none() {
         LockfileManager::sync_all(root, &lockfile).context("Failed to write lockfiles")?;
     }
+    sync_cargo_lock(ws, &lockfile, req.locked)?;
+    // Recorded *after* `Cargo.lock` was (re)written: the fingerprint covers
+    // its content, and our own write must not look like an outside change.
+    let fingerprint = resolution_fingerprint(ws, locals, req);
     if let Some(parent) = fingerprint_path.parent() {
         let _ = fs::create_dir_all(parent);
     }
@@ -560,14 +944,10 @@ fn resolve(ws: &Workspace, locals: &Locals, req: &Request) -> Result<(ResolvedGr
 }
 
 /// The registry part of a lockfile: what `--locked` compares.
-fn registry_view(lock: &Lockfile) -> BTreeMap<(String, String), Option<String>> {
+fn locked_registry_packages(lock: &Lockfile) -> BTreeMap<(String, String), Option<String>> {
     lock.packages
         .iter()
-        .filter(|p| {
-            p.source
-                .as_deref()
-                .is_some_and(|s| s.starts_with("registry+"))
-        })
+        .filter(|p| is_registry_source(p.source.as_deref()))
         .map(|p| ((p.name.clone(), p.version.clone()), p.checksum.clone()))
         .collect()
 }
@@ -815,56 +1195,429 @@ impl LibHarness for TargetSpec {
 }
 
 // ---------------------------------------------------------------------------
+// Roles: what is built for the target, and what for the host
+// ---------------------------------------------------------------------------
+
+/// The configuration one role (target or host) is compiled with.
+#[derive(Clone)]
+struct RoleCfg {
+    info: TargetInfo,
+    flags: Vec<String>,
+    linker: Option<String>,
+}
+
+/// Build scripts, proc-macros and everything only they use run on the *host*;
+/// the rest of the graph is built for the *target*. Without `--target` they are
+/// the same machine, but the roles can still differ in features and profile.
+struct Roles {
+    target: RoleCfg,
+    host: RoleCfg,
+    cross: bool,
+}
+
+impl Roles {
+    fn new(ws: &Workspace, req: &Request) -> Roles {
+        let tc = toolchain::global();
+        let cfg = &ws.cargo_config;
+        let cross = req.target.is_some();
+        let build = |arg: Option<&str>, role: Role| {
+            // The flags that apply can depend on the target's cfgs, and the
+            // cfgs on the flags (`-C target-feature`): ask once bare, pick
+            // the flags, then ask again with them.
+            let probe = TargetInfo::query(tc, arg, &[]);
+            let flags = toolchain::rustflags(cfg, &probe, role, cross);
+            let info = if flags.is_empty() {
+                probe
+            } else {
+                TargetInfo::query(tc, arg, &flags)
+            };
+            let linker = toolchain::linker(cfg, &info).map(|p| p.to_string_lossy().into_owned());
+            RoleCfg {
+                info,
+                flags,
+                linker,
+            }
+        };
+        let target = build(req.target, Role::Target);
+        let host = if cross {
+            build(None, Role::Host)
+        } else {
+            target.clone()
+        };
+        Roles {
+            target,
+            host,
+            cross,
+        }
+    }
+
+    fn of(&self, host: bool) -> &RoleCfg {
+        if host { &self.host } else { &self.target }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The package universe: everything the feature resolver reasons about
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy)]
+enum Origin {
+    /// `locals.list[i]`: a workspace member, path or patched package.
+    Local(usize),
+    /// A registry package, described by the lockfile until it is downloaded.
+    Registry,
+}
+
+struct Universe {
+    views: Vec<PackageView>,
+    origin: Vec<Origin>,
+    /// `name version`.
+    id: Vec<String>,
+    name: Vec<String>,
+    version: Vec<semver::Version>,
+    /// Index into `lock.packages`, for registry packages.
+    lock_pkg: Vec<Option<usize>>,
+}
+
+impl Universe {
+    fn build(ws: &Workspace, locals: &Locals, lock: &Lockfile) -> Universe {
+        let mut uni = Universe {
+            views: Vec::new(),
+            origin: Vec::new(),
+            id: Vec::new(),
+            name: Vec::new(),
+            version: Vec::new(),
+            lock_pkg: Vec::new(),
+        };
+        let mut by_id: HashMap<String, usize> = HashMap::new();
+
+        // Non-member local packages (a patched crate, a git package) can
+        // satisfy a registry-style dependency on their name.
+        let mut registry_by_name: HashMap<String, Vec<usize>> = HashMap::new();
+        for (li, m) in locals.list.iter().enumerate() {
+            by_id.insert(m.id(), li);
+            if locals.member_of[li].is_none() {
+                registry_by_name.entry(m.name.clone()).or_default().push(li);
+            }
+            uni.views.push(PackageView::default());
+            uni.origin.push(Origin::Local(li));
+            uni.id.push(m.id());
+            uni.name.push(m.name.clone());
+            uni.version.push(m.version.clone());
+            uni.lock_pkg.push(None);
+        }
+        // Registry packages from the lockfile. A package that is also a local
+        // one (a patch of the same version) is the local one.
+        for (i, lp) in lock.packages.iter().enumerate() {
+            if !is_registry_source(lp.source.as_deref()) {
+                continue;
+            }
+            let id = format!("{} {}", lp.name, lp.version);
+            if by_id.contains_key(&id) {
+                continue;
+            }
+            let Ok(version) = lp.version.parse::<semver::Version>() else {
+                continue;
+            };
+            let idx = uni.views.len();
+            by_id.insert(id.clone(), idx);
+            registry_by_name
+                .entry(lp.name.clone())
+                .or_default()
+                .push(idx);
+            uni.views.push(PackageView::default());
+            uni.origin.push(Origin::Registry);
+            uni.id.push(id);
+            uni.name.push(lp.name.clone());
+            uni.version.push(version);
+            uni.lock_pkg.push(Some(i));
+        }
+
+        // Views (they refer to other packages by index, so come last).
+        for idx in 0..uni.views.len() {
+            uni.views[idx] = match uni.origin[idx] {
+                Origin::Local(li) => local_view(ws, locals, li, &uni, &registry_by_name, lock),
+                Origin::Registry => {
+                    let lp = &lock.packages[uni.lock_pkg[idx].expect("registry has a lock entry")];
+                    registry_view(lp, &by_id)
+                }
+            };
+        }
+        uni
+    }
+}
+
+fn kind_of(k: u8) -> DependencyKind {
+    match k {
+        1 => DependencyKind::Dev,
+        2 => DependencyKind::Build,
+        _ => DependencyKind::Normal,
+    }
+}
+
+fn registry_view(lp: &rune_resolver::LockPackage, by_id: &HashMap<String, usize>) -> PackageView {
+    PackageView {
+        name: lp.name.clone(),
+        features: lp.feature_table.iter().cloned().collect(),
+        deps: lp
+            .decls
+            .iter()
+            // A registry package's own dev-dependencies never matter.
+            .filter(|d| d.kind != 1)
+            .map(|d| DepDecl {
+                alias: d.alias.clone(),
+                renamed: d.package.is_some(),
+                kind: kind_of(d.kind),
+                target: d.target.clone(),
+                optional: d.optional,
+                features: d.features.clone(),
+                default_features: d.default_features,
+                resolved: d.resolved.as_ref().and_then(|id| by_id.get(id).copied()),
+            })
+            .collect(),
+        // Learned from the manifest once downloaded.
+        proc_macro: false,
+    }
+}
+
+/// The registry package a declared dependency resolves to: what the lockfile
+/// says the depending package uses, else the newest locked version that fits.
+fn pick_registry(
+    candidates: &[usize],
+    uni: &Universe,
+    req: Option<&semver::VersionReq>,
+    locked_edges: &[String],
+) -> Option<usize> {
+    let fits = |i: usize| req.is_none_or(|r| r.matches(&uni.version[i]));
+    for id in locked_edges {
+        if let Some(&i) = candidates.iter().find(|&&i| uni.id[i] == *id) {
+            if fits(i) {
+                return Some(i);
+            }
+        }
+    }
+    candidates
+        .iter()
+        .copied()
+        .filter(|&i| fits(i))
+        .max_by(|&a, &b| uni.version[a].cmp(&uni.version[b]))
+}
+
+fn local_view(
+    ws: &Workspace,
+    locals: &Locals,
+    li: usize,
+    uni: &Universe,
+    registry_by_name: &HashMap<String, Vec<usize>>,
+    lock: &Lockfile,
+) -> PackageView {
+    let m = &locals.list[li];
+    let locked_edges: Vec<String> = lock
+        .packages
+        .iter()
+        .find(|p| {
+            p.name == m.name
+                && p.version == m.version.to_string()
+                && !is_registry_source(p.source.as_deref())
+        })
+        .map(|p| p.dependencies.clone())
+        .unwrap_or_default();
+
+    let mut deps: Vec<&rune_manifest::Dependency> = m.manifest.dependencies.values().collect();
+    deps.sort_by(|a, b| {
+        (&a.name, a.kind as u8, &a.target).cmp(&(&b.name, b.kind as u8, &b.target))
+    });
+    let deps = deps
+        .into_iter()
+        .map(|dep| {
+            let spec = locals.spec_for(ws, li, dep);
+            let resolved = if let Some(path) = &spec.path {
+                let dir = path.canonicalize().unwrap_or_else(|_| path.clone());
+                locals.by_dir.get(&dir).copied()
+            } else if let Some(url) = &spec.git {
+                // Already checked out when the locals were loaded.
+                let real = spec.package.as_deref().unwrap_or(&dep.name);
+                let reference = rune_registry::git::GitRef::from_spec(
+                    spec.branch.as_deref(),
+                    spec.tag.as_deref(),
+                    spec.rev.as_deref(),
+                );
+                rune_registry::git::checkout(url, &reference)
+                    .ok()
+                    .and_then(|co| rune_registry::git::find_package(&co, real).ok())
+                    .map(|d| d.canonicalize().unwrap_or(d))
+                    .and_then(|d| locals.by_dir.get(&d).copied())
+            } else {
+                let real = spec.package.as_deref().unwrap_or(&dep.name);
+                registry_by_name
+                    .get(real)
+                    .and_then(|c| pick_registry(c, uni, spec.version.as_ref(), &locked_edges))
+            };
+            DepDecl {
+                alias: dep.name.clone(),
+                renamed: spec.package.is_some(),
+                kind: dep.kind,
+                target: dep.target.clone(),
+                optional: spec.optional,
+                features: spec.features.clone(),
+                default_features: spec.default_features,
+                resolved,
+            }
+        })
+        .collect();
+    PackageView {
+        name: m.name.clone(),
+        features: m.manifest.features.clone(),
+        deps,
+        proc_macro: m.manifest.lib.as_ref().is_some_and(|l| l.proc_macro),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Planning
 // ---------------------------------------------------------------------------
 
-/// Which kinds of dependency a unit links against.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Deps {
-    NormalAndBuild,
-    WithDev,
-}
+/// A package built for one role: `(package index, for_host)`.
+type UnitRef = unit_features::UnitRef;
 
-fn dep_allowed(kind: DependencyKind, deps: Deps) -> bool {
-    match deps {
-        Deps::NormalAndBuild => kind != DependencyKind::Dev,
-        Deps::WithDev => true,
-    }
-}
-
-struct Builder<'a> {
+struct Planner<'a> {
     ws: &'a Workspace,
     locals: &'a Locals,
     req: &'a Request<'a>,
-    resolved: &'a ResolvedGraph,
-    /// `name version` → node, for registry crates.
-    registry_nodes: HashMap<String, NodeId>,
-    /// local index → plain library node.
-    lib_nodes: HashMap<usize, NodeId>,
+    uni: Universe,
+    lock: &'a Lockfile,
+    roles: Roles,
+    /// Downloaded registry packages: directory and manifest.
+    reg: HashMap<usize, (PathBuf, Manifest)>,
+    res: FeatureResolution,
+    /// Packages whose host build is *not* the same unit as their target build
+    /// (different features or profile, or cross-compiling).
+    distinct_host: HashSet<usize>,
+    edges_from: HashMap<UnitRef, Vec<usize>>,
     graph: BuildGraph,
-    target_triple: String,
+    /// (package, role) → library node.
+    lib_node: HashMap<UnitRef, NodeId>,
 }
 
-impl Builder<'_> {
-    fn local_features(&self, li: usize) -> Vec<String> {
-        let m = &self.locals.list[li];
-        self.resolved
-            .packages
-            .get(&m.id())
-            .map(|p| p.features.clone())
+impl Planner<'_> {
+    /// A host build collapses onto the target build of the same package
+    /// unless the two would differ.
+    fn canon(&self, u: UnitRef) -> UnitRef {
+        if u.1 && !self.distinct_host.contains(&u.0) {
+            (u.0, false)
+        } else {
+            u
+        }
+    }
+
+    fn features_of(&self, u: UnitRef) -> Vec<String> {
+        // A collapsed unit's features are the same in both roles.
+        self.res
+            .features
+            .get(&u)
+            .or_else(|| self.res.features.get(&(u.0, !u.1)))
+            .cloned()
             .unwrap_or_default()
     }
 
+    fn target_of(&self, host: bool) -> Option<TargetTriple> {
+        if host {
+            None
+        } else {
+            self.req.target.map(|t| TargetTriple(t.to_string()))
+        }
+    }
+
+    fn is_member(&self, pkg: usize) -> bool {
+        match self.uni.origin[pkg] {
+            Origin::Local(li) => self.locals.member_of[li].is_some(),
+            Origin::Registry => false,
+        }
+    }
+
+    /// The profile a package compiles with in a role (`None` = the request's).
+    fn profile_for(&self, pkg: usize, host: bool) -> Option<Profile> {
+        let tables = &self.ws.root_manifest.profile;
+        let role = UnitRole {
+            package: &self.uni.name[pkg],
+            version: &self.uni.version[pkg],
+            workspace_member: self.is_member(pkg),
+            host,
+        };
+        let p = resolve_unit_profile(&self.req.profile.name, tables, role).ok()?;
+        (p != *self.req.profile).then_some(p)
+    }
+
+    fn extras(&self, pkg: usize, host: bool) -> UnitExtras {
+        let canon_host = host && self.distinct_host.contains(&pkg);
+        let cfg = self.roles.of(host);
+        let script_profile = {
+            let tables = &self.ws.root_manifest.profile;
+            resolve_unit_profile(
+                &self.req.profile.name,
+                tables,
+                UnitRole {
+                    package: &self.uni.name[pkg],
+                    version: &self.uni.version[pkg],
+                    workspace_member: self.is_member(pkg),
+                    host: true,
+                },
+            )
+            .ok()
+        };
+        let declared_features = match self.uni.origin[pkg] {
+            Origin::Local(li) => {
+                let m = &self.locals.list[li].manifest;
+                let mut f: Vec<String> = m.features.keys().cloned().collect();
+                f.extend(
+                    m.dependencies
+                        .values()
+                        .filter(|d| d.spec.optional)
+                        .map(|d| d.name.clone()),
+                );
+                f.sort();
+                f.dedup();
+                f
+            }
+            Origin::Registry => Vec::new(),
+        };
+        UnitExtras {
+            for_host: canon_host,
+            profile: self.profile_for(pkg, host),
+            extra_crate_types: Vec::new(),
+            member: self.is_member(pkg),
+            rustflags: cfg.flags.clone(),
+            linker: cfg.linker.clone(),
+            script_rustflags: self.roles.host.flags.clone(),
+            script_linker: self.roles.host.linker.clone(),
+            script_profile,
+            script_owner: None,
+            target_spec: cfg.info.spec_hash.clone(),
+            declared_features,
+            env: self
+                .ws
+                .cargo_config
+                .env_entries()
+                .into_iter()
+                .map(|e| (e.name, e.value))
+                .collect(),
+            cross: self.roles.cross,
+        }
+    }
+
+    /// A unit for one target of a local package.
     #[allow(clippy::too_many_arguments)]
-    fn unit(
+    fn local_unit(
         &self,
         li: usize,
         kind: TargetKind,
         name: &str,
         crate_type: CrateType,
+        extra_crate_types: Vec<CrateType>,
         source: &Path,
         harness: bool,
         edition_override: Option<&str>,
+        host: bool,
     ) -> CompilationUnit {
         let m = &self.locals.list[li];
         let edition = edition_override
@@ -875,262 +1628,64 @@ impl Builder<'_> {
             .package
             .as_ref()
             .and_then(|p| p.resolve_build_script(&m.dir));
-        let crate_name = name.to_string();
+        let mut ext = self.extras(li, host);
+        ext.extra_crate_types = extra_crate_types;
+        // A git package is immutable, identified by its commit; anything else
+        // local is hashed by content.
+        let crate_source = match &self.locals.git_of[li] {
+            Some(co) => CrateSource::Git {
+                url: co.url.clone(),
+                commit: co.commit.clone(),
+                subdir: m
+                    .dir
+                    .strip_prefix(&co.dir)
+                    .ok()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .filter(|p| !p.is_empty()),
+                submodules: co.submodules.clone(),
+            },
+            None => CrateSource::Local,
+        };
         CompilationUnit {
-            crate_id: CrateId::local(
+            crate_id: CrateId::new(
                 if kind == TargetKind::Lib {
                     m.name.clone()
                 } else {
-                    crate_name.clone()
+                    name.to_string()
                 },
                 m.version.clone(),
+                crate_source,
             ),
             crate_type,
             source_root: m.dir.join(source),
             manifest_dir: m.dir.clone(),
-            features: self.local_features(li),
+            features: self.features_of((li, host)),
             profile_name: self.req.profile.name.clone(),
-            target: self.req.target.map(|t| TargetTriple(t.to_string())),
+            target: self.target_of(host),
             edition,
             is_build_script: false,
             check_only: self.req.mode == Mode::Check,
             links: m.manifest.package.as_ref().and_then(|p| p.links.clone()),
             build_script,
             meta: m.meta.clone(),
-            lint_args: m
-                .manifest
-                .lint_args(self.locals.member_of[li].and(self.ws.workspace_manifest())),
-            target_name: crate_name,
+            lint_args: m.manifest.lint_args(self.locals.member_ws(self.ws, li)),
+            target_name: name.to_string(),
             kind,
             harness,
+            ext,
         }
     }
 
-    /// Resolves one declared dependency to a graph node and its `--extern`
-    /// alias (only when the dependency is renamed with `package = "..."`).
-    fn dep_target(
-        &self,
-        li: usize,
-        dep: &rune_manifest::Dependency,
-    ) -> Option<(NodeId, Option<String>)> {
-        let m = &self.locals.list[li];
-        let member_ws = self.locals.member_of[li].and(self.ws.workspace_manifest());
-        let spec = effective_spec(dep, &m.dir, self.ws.root(), member_ws);
-        let alias = spec.package.as_ref().map(|_| dep.name.clone());
-
-        if let Some(path) = &spec.path {
-            let dir = path.canonicalize().unwrap_or_else(|_| path.clone());
-            let target_li = *self.locals.by_dir.get(&dir)?;
-            return self.lib_nodes.get(&target_li).map(|&n| (n, alias));
-        }
-        let real = spec.package.as_deref().unwrap_or(&dep.name);
-        let req = spec
-            .version
-            .as_ref()
-            .map(|v| v.to_string())
-            .unwrap_or_else(|| "*".to_string());
-        let pkg = self.resolved.find_matching(real, &req)?;
-        self.registry_nodes
-            .get(&format!("{} {}", pkg.name, pkg.version))
-            .map(|&n| (n, alias))
-    }
-
-    /// Adds edges from `node` to everything package `li` depends on.
-    fn connect(&mut self, node: NodeId, li: usize, deps: Deps) -> Vec<(String, NodeId)> {
-        let m = &self.locals.list[li];
-        let mut externs = Vec::new();
-        let deps_list: Vec<&rune_manifest::Dependency> = {
-            let mut v: Vec<_> = m.manifest.dependencies.values().collect();
-            v.sort_by(|a, b| (&a.name, a.kind as u8).cmp(&(&b.name, b.kind as u8)));
-            v
-        };
-        for dep in deps_list {
-            if !dep_allowed(dep.kind, deps) {
-                continue;
-            }
-            if !matches_target(dep.target.as_deref(), &self.target_triple) {
-                continue;
-            }
-            let Some((target_node, alias)) = self.dep_target(li, dep) else {
-                continue; // an inactive optional dependency has no node
-            };
-            if target_node == node {
-                continue;
-            }
-            self.graph
-                .add_edge_with_extern(node, target_node, alias.as_deref());
-            let extern_name =
-                alias.unwrap_or_else(|| self.graph.node(target_node).unit.rustc_crate_name());
-            externs.push((extern_name, target_node));
-        }
-        externs
-    }
-}
-
-/// Registry crates (and local packages) that `roots` need, following the
-/// lockfile's dependency edges.
-fn reachable_registry(lock: &Lockfile, seeds: impl IntoIterator<Item = String>) -> HashSet<String> {
-    let index: HashMap<String, &rune_resolver::LockPackage> = lock
-        .packages
-        .iter()
-        .map(|p| (format!("{} {}", p.name, p.version), p))
-        .collect();
-    let mut seen: HashSet<String> = HashSet::new();
-    let mut stack: Vec<String> = seeds.into_iter().collect();
-    while let Some(id) = stack.pop() {
-        if !seen.insert(id.clone()) {
-            continue;
-        }
-        if let Some(pkg) = index.get(&id) {
-            for dep in &pkg.dependencies {
-                // Entries are "name version"; tolerate the bare-name form
-                // Cargo.lock uses when unambiguous.
-                let id = match dep.split_once(' ') {
-                    Some(_) => dep.clone(),
-                    None => match lock.find_package(dep) {
-                        Some(p) => format!("{} {}", p.name, p.version),
-                        None => continue,
-                    },
-                };
-                stack.push(id);
-            }
-        }
-    }
-    seen
-}
-
-/// Plans the build for `req`.
-pub fn plan(ws: &Workspace, req: &Request) -> Result<Plan> {
-    let total = phase("plan");
-    let locals = Locals::load(ws)?;
-    let (mut resolved, lock) = resolve(ws, &locals, req)?;
-
-    let target_triple = req
-        .target
-        .map(str::to_string)
-        .or_else(|| TargetTriple::host().map(|t| t.0))
-        .unwrap_or_else(|| "x86_64-unknown-linux-gnu".to_string());
-
-    // -- Which local packages are needed, and which registry crates that implies.
-    let include_dev_for_selected = matches!(req.mode, Mode::Test | Mode::Bench)
-        || req.targets.all_targets
-        || req.targets.examples
-        || req.targets.tests
-        || req.targets.benches
-        || !req.targets.example.is_empty()
-        || !req.targets.test.is_empty()
-        || !req.targets.bench.is_empty();
-
-    let selected_locals: HashSet<usize> = req
-        .selected
-        .iter()
-        .filter_map(|&mi| locals.member_of.iter().position(|m| *m == Some(mi)))
-        .collect();
-
-    let mut needed_locals: HashSet<usize> = selected_locals.clone();
-    let mut registry_seeds: Vec<String> = Vec::new();
-    let mut stack: Vec<usize> = selected_locals.iter().copied().collect();
-    while let Some(li) = stack.pop() {
-        let m = &locals.list[li];
-        let member_ws = locals.member_of[li].and(ws.workspace_manifest());
-        let with_dev = include_dev_for_selected && selected_locals.contains(&li);
-        for dep in m.manifest.dependencies.values() {
-            if dep.kind == DependencyKind::Dev && !with_dev {
-                continue;
-            }
-            if !matches_target(dep.target.as_deref(), &target_triple) {
-                continue;
-            }
-            let spec = effective_spec(dep, &m.dir, ws.root(), member_ws);
-            if let Some(path) = &spec.path {
-                let dir = path.canonicalize().unwrap_or_else(|_| path.clone());
-                if let Some(&target_li) = locals.by_dir.get(&dir) {
-                    if needed_locals.insert(target_li) {
-                        stack.push(target_li);
-                    }
-                }
-            } else {
-                let real = spec.package.as_deref().unwrap_or(&dep.name);
-                let req_s = spec
-                    .version
-                    .as_ref()
-                    .map(|v| v.to_string())
-                    .unwrap_or_else(|| "*".to_string());
-                if let Some(pkg) = resolved.find_matching(real, &req_s) {
-                    registry_seeds.push(format!("{} {}", pkg.name, pkg.version));
-                }
-            }
-        }
-    }
-    let reachable = reachable_registry(&lock, registry_seeds);
-
-    // -- Download and read the manifests of the registry crates we need.
-    let registry_pkgs: Vec<(String, String, Option<String>)> = {
-        let mut v: Vec<_> = resolved
-            .packages
-            .values()
-            .filter(|p| {
-                matches!(p.source, PackageSource::Registry)
-                    && reachable.contains(&format!("{} {}", p.name, p.version))
-            })
-            .map(|p| (p.name.clone(), p.version.to_string(), p.checksum.clone()))
-            .collect();
-        v.sort();
-        v
-    };
-    let dl_timer = phase("download");
-    let downloader = CrateDownloader::default_downloader().offline(req.offline);
-    let extracted_paths = downloader
-        .download_and_extract_many(&registry_pkgs)
-        .context("Failed to download one or more registry crates")?;
-    drop(dl_timer);
-
-    let manifest_timer = phase("read manifests");
-    let manifests: Vec<Option<Manifest>> = extracted_paths
-        .par_iter()
-        .map(|dir| Manifest::from_path(&dir.join("Cargo.toml")).ok())
-        .collect();
-    drop(manifest_timer);
-
-    // -- Registry edge information, from the extracted manifests + lockfile.
-    {
-        let mut extracted_dirs: HashMap<(String, String), PathBuf> = HashMap::new();
-        for ((name, version, _), dir) in registry_pkgs.iter().zip(&extracted_paths) {
-            extracted_dirs.insert((name.clone(), version.clone()), dir.clone());
-        }
-        // Rebuild edges from manifests when they were not produced by a full
-        // resolution (fast path): this is what recovers `package = ...` aliases.
-        let needs_repair = resolved
-            .packages
-            .values()
-            .filter(|p| matches!(p.source, PackageSource::Registry))
-            .all(|p| p.dependencies.is_empty());
-        if needs_repair {
-            repair_registry_dependency_aliases(&mut resolved, &lock, &extracted_dirs);
-        }
-    }
-    // -- Registry nodes.
-    let mut builder = Builder {
-        ws,
-        locals: &locals,
-        req,
-        resolved: &resolved,
-        registry_nodes: HashMap::new(),
-        lib_nodes: HashMap::new(),
-        graph: BuildGraph::new(),
-        target_triple: target_triple.clone(),
-    };
-
-    let target = req.target.map(|t| TargetTriple(t.to_string()));
-    for (((name, version, _), dir), manifest) in
-        registry_pkgs.iter().zip(&extracted_paths).zip(&manifests)
-    {
-        let pkg_meta = manifest.as_ref().and_then(|m| m.package.as_ref());
+    /// The library unit of a registry package.
+    fn registry_unit(&self, idx: usize, host: bool) -> Option<CompilationUnit> {
+        let (dir, manifest) = self.reg.get(&idx)?;
+        let lp = &self.lock.packages[self.uni.lock_pkg[idx]?];
+        let pkg_meta = manifest.package.as_ref();
         let edition = pkg_meta
             .map(|p| p.edition_in(None))
             .and_then(|e| e.parse().ok())
             .unwrap_or(Edition::E2015);
-        let lib = manifest.as_ref().and_then(|m| m.lib.as_ref());
+        let lib = manifest.lib.as_ref();
         let is_proc_macro = lib.is_some_and(|l| l.proc_macro);
         let lib_src = lib
             .and_then(|l| l.path.clone())
@@ -1140,19 +1695,15 @@ pub fn plan(ws: &Workspace, req: &Request) -> Result<Plan> {
         } else {
             dir.join("src/lib.rs")
         };
-        let features = resolved
-            .packages
-            .get(&format!("{name} {version}"))
-            .map(|p| p.features.clone())
-            .unwrap_or_default();
-        let parsed_version: semver::Version =
-            version.parse().unwrap_or(semver::Version::new(0, 0, 0));
-
-        let unit = CompilationUnit {
+        lib?;
+        Some(CompilationUnit {
             crate_id: CrateId::new(
-                name.clone(),
-                parsed_version,
-                CrateSource::Registry("https://index.crates.io".to_string()),
+                self.uni.name[idx].clone(),
+                self.uni.version[idx].clone(),
+                CrateSource::Registry {
+                    index: index_of_lock_source(lp.source.as_deref()),
+                    checksum: lp.checksum.clone(),
+                },
             ),
             crate_type: if is_proc_macro {
                 CrateType::ProcMacro
@@ -1161,12 +1712,12 @@ pub fn plan(ws: &Workspace, req: &Request) -> Result<Plan> {
             },
             source_root,
             manifest_dir: dir.clone(),
-            features,
-            profile_name: req.profile.name.clone(),
-            target: target.clone(),
+            features: self.features_of((idx, host)),
+            profile_name: self.req.profile.name.clone(),
+            target: self.target_of(host),
             edition,
             is_build_script: false,
-            check_only: req.mode == Mode::Check,
+            check_only: self.req.mode == Mode::Check,
             links: pkg_meta.and_then(|p| p.links.clone()),
             build_script: pkg_meta.and_then(|p| p.resolve_build_script(dir)),
             meta: pkg_meta
@@ -1176,82 +1727,317 @@ pub fn plan(ws: &Workspace, req: &Request) -> Result<Plan> {
             target_name: lib.and_then(|l| l.name.clone()).unwrap_or_default(),
             kind: TargetKind::Lib,
             harness: false,
-        };
-        let id = builder.graph.add_node(unit);
-        builder
-            .registry_nodes
-            .insert(format!("{name} {version}"), id);
+            ext: self.extras(idx, host),
+        })
     }
 
-    // -- Local library nodes (for every needed local package).
-    let mut needed_sorted: Vec<usize> = needed_locals.iter().copied().collect();
-    needed_sorted.sort_unstable();
-    for &li in &needed_sorted {
-        let m = &locals.list[li];
-        let Some(lib) = &m.manifest.lib else { continue };
-        let is_proc_macro = lib.proc_macro;
-        let path = lib
-            .path
-            .clone()
-            .unwrap_or_else(|| PathBuf::from("src/lib.rs"));
-        let name = lib.name.clone().unwrap_or_else(|| m.name.replace('-', "_"));
-        let unit = builder.unit(
-            li,
-            TargetKind::Lib,
-            &name,
-            if is_proc_macro {
-                CrateType::ProcMacro
-            } else {
-                CrateType::Lib
-            },
-            &path,
-            false,
-            lib.edition.as_deref(),
-        );
-        let id = builder.graph.add_node(unit);
-        builder.lib_nodes.insert(li, id);
-    }
-    // Wire library dependencies.
-    for &li in &needed_sorted {
-        if let Some(&node) = builder.lib_nodes.get(&li) {
-            let with_dev = false;
-            let _ = with_dev;
-            builder.connect(node, li, Deps::NormalAndBuild);
+    /// Adds `node`'s dependency edges for package role `role`, returning the
+    /// `--extern` names it links. With `add`, edges are actually created;
+    /// without, this only reports what they would be (for doctests).
+    fn wire(
+        &mut self,
+        node: Option<NodeId>,
+        role: UnitRef,
+        with_dev: bool,
+        add: bool,
+    ) -> Vec<(String, NodeId)> {
+        let role = self.canon(role);
+        let mut externs = Vec::new();
+        let edge_ids = self.edges_from.get(&role).cloned().unwrap_or_default();
+        for ei in edge_ids {
+            let e = self.res.edges[ei].clone();
+            let decl = self.uni.views[e.from.0].deps[e.dep].clone();
+            if decl.kind == DependencyKind::Dev && !with_dev {
+                continue;
+            }
+            let Some(&child) = self.lib_node.get(&self.canon(e.to)) else {
+                continue; // a package with no library has nothing to link
+            };
+            if Some(child) == node {
+                continue;
+            }
+            let alias = decl.renamed.then(|| decl.alias.clone());
+            if add {
+                if let Some(node) = node {
+                    if decl.kind == DependencyKind::Build {
+                        self.graph.add_build_edge(node, child, alias.as_deref());
+                    } else {
+                        self.graph
+                            .add_edge_with_extern(node, child, alias.as_deref());
+                    }
+                }
+            }
+            if decl.kind != DependencyKind::Build {
+                let extern_name =
+                    alias.unwrap_or_else(|| self.graph.node(child).unit.rustc_crate_name());
+                externs.push((extern_name, child));
+            }
         }
+        externs
     }
+}
 
-    let registry_ids: Vec<(String, NodeId)> = builder
-        .registry_nodes
-        .iter()
-        .map(|(k, &v)| (k.clone(), v))
-        .collect();
-    for (pkg_id, node_id) in registry_ids {
-        let Some(pkg) = resolved.packages.get(&pkg_id) else {
+/// The set of `links` values in a graph must be unique per package: two
+/// packages linking the same native library would collide at link time.
+fn check_links_conflicts(graph: &BuildGraph) -> Result<()> {
+    let mut seen: HashMap<String, (String, semver::Version)> = HashMap::new();
+    for node in graph.nodes() {
+        let Some(links) = &node.unit.links else {
             continue;
         };
-        for dep in &pkg.dependencies {
-            if dep.kind == DependencyKind::Dev {
-                continue;
+        let pkg = (
+            node.unit.crate_id.name.clone(),
+            node.unit.crate_id.version.clone(),
+        );
+        if let Some(prev) = seen.get(links) {
+            if *prev != pkg {
+                bail!(
+                    "multiple packages link to the native library `{links}`, but a native library can be linked only once\n  \
+                     package `{} v{}` links to `{links}`\n  package `{} v{}` also links to `{links}`",
+                    prev.0,
+                    prev.1,
+                    pkg.0,
+                    pkg.1
+                );
             }
-            let actual_pkg_name = dep.package.as_deref().unwrap_or(&dep.name);
-            let Some(target_pkg) = resolved.find_matching(actual_pkg_name, &dep.req) else {
-                continue;
-            };
-            let Some(&dep_id) = builder
-                .registry_nodes
-                .get(&format!("{} {}", target_pkg.name, target_pkg.version))
-            else {
-                continue;
-            };
-            if dep_id == node_id {
-                continue;
-            }
-            // Only a renamed dependency needs an explicit `--extern` name;
-            // otherwise the dependency's own crate name is right (and can
-            // differ from its package name).
-            let alias = dep.package.as_ref().map(|_| dep.name.as_str());
-            builder.graph.add_edge_with_extern(node_id, dep_id, alias);
+        } else {
+            seen.insert(links.clone(), pkg);
         }
+    }
+    Ok(())
+}
+
+/// Every package selected or built must be compilable by the active
+/// compiler, unless the user says otherwise.
+fn check_rust_versions(
+    uni: &Universe,
+    locals: &Locals,
+    reg: &HashMap<usize, (PathBuf, Manifest)>,
+    res: &FeatureResolution,
+    req: &Request,
+) -> Result<()> {
+    if req.ignore_rust_version {
+        return Ok(());
+    }
+    let tc = toolchain::global();
+    let mut seen = HashSet::new();
+    for &(pkg, _) in res.features.keys() {
+        if !seen.insert(pkg) {
+            continue;
+        }
+        let msrv = match uni.origin[pkg] {
+            Origin::Local(li) => locals.list[li].meta.rust_version.clone(),
+            Origin::Registry => reg
+                .get(&pkg)
+                .and_then(|(_, m)| m.package.as_ref())
+                .map(|p| p.meta_in(None).rust_version)
+                .unwrap_or_default(),
+        };
+        if !msrv.is_empty() && !tc.satisfies_msrv(&msrv) {
+            bail!(
+                "package `{} v{}` cannot be built because it requires rustc {msrv} or newer, \
+                 while the currently active rustc version is {} (pass `--ignore-rust-version` to try anyway)",
+                uni.name[pkg],
+                uni.version[pkg],
+                tc.version
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Plans the build for `req`.
+pub fn plan(ws: &Workspace, req: &Request) -> Result<Plan> {
+    let total = phase("plan");
+    configure_git(ws, req.offline, false, None);
+    let mut locals = Locals::load(ws)?;
+    let (_resolved, lock) = resolve(ws, &locals, req)?;
+    locals.extend_from_lock(ws, &lock)?;
+    let locals = locals;
+    let roles = Roles::new(ws, req);
+    let uni = Universe::build(ws, &locals, &lock);
+    let resolver_version = ws.root_manifest.resolver_version();
+
+    // -- What is requested, and does it involve development dependencies?
+    let include_dev = matches!(req.mode, Mode::Test | Mode::Bench)
+        || req.targets.all_targets
+        || req.targets.examples
+        || req.targets.tests
+        || req.targets.benches
+        || !req.targets.example.is_empty()
+        || !req.targets.test.is_empty()
+        || !req.targets.bench.is_empty();
+
+    let mut roots: Vec<RootRequest> = Vec::new();
+    let single = req.selected.len() == 1;
+    for &mi in req.selected {
+        let Some(li) = locals.member_of.iter().position(|m| *m == Some(mi)) else {
+            continue;
+        };
+        let (features, default_features) =
+            features_for_member(&locals.list[li], true, single, req.features)?;
+        roots.push(RootRequest {
+            package: li,
+            features,
+            default_features,
+            dev: include_dev,
+        });
+    }
+
+    // -- Feature resolution, pass 1: which packages does this build reach in
+    // either role? (Proc-macro-ness of registry crates isn't known before
+    // their manifests are, so this may over-approximate roles, never packages.)
+    let mut uni = uni;
+    let either_role =
+        |t: &str, _host: bool| roles.target.info.matches(t) || roles.host.info.matches(t);
+    let pass1 = unit_features::resolve(
+        &uni.views,
+        &roots,
+        &FeatureOptions {
+            resolver: resolver_version,
+            platform_matches: &either_role,
+            weak_activates: false,
+        },
+    );
+
+    // -- Download and read the manifests of the registry crates we need.
+    let mut needed: Vec<usize> = pass1
+        .features
+        .keys()
+        .map(|(p, _)| *p)
+        .filter(|&p| matches!(uni.origin[p], Origin::Registry))
+        .collect();
+    needed.sort_unstable();
+    needed.dedup();
+    let registry_pkgs: Vec<(String, String, Option<String>, String)> = needed
+        .iter()
+        .map(|&p| {
+            let lp = &lock.packages[uni.lock_pkg[p].expect("registry has a lock entry")];
+            (
+                lp.name.clone(),
+                lp.version.clone(),
+                lp.checksum.clone(),
+                index_of_lock_source(lp.source.as_deref()),
+            )
+        })
+        .collect();
+    let dl_timer = phase("download");
+    let extracted_paths = rune_registry::download_and_extract_grouped(&registry_pkgs, req.offline)
+        .context("Failed to download one or more registry crates")?;
+    drop(dl_timer);
+
+    let manifest_timer = phase("read manifests");
+    let manifests: Vec<Option<Manifest>> = extracted_paths
+        .par_iter()
+        .map(|dir| Manifest::from_path(&dir.join("Cargo.toml")).ok())
+        .collect();
+    drop(manifest_timer);
+    let mut reg: HashMap<usize, (PathBuf, Manifest)> = HashMap::new();
+    for ((&p, dir), manifest) in needed.iter().zip(&extracted_paths).zip(manifests) {
+        if let Some(m) = manifest {
+            uni.views[p].proc_macro = m.lib.as_ref().is_some_and(|l| l.proc_macro);
+            reg.insert(p, (dir.clone(), m));
+        }
+    }
+
+    // -- Feature resolution, pass 2: exact roles and platforms.
+    let exact = |t: &str, host: bool| roles.of(host).info.matches(t);
+    let res = unit_features::resolve(
+        &uni.views,
+        &roots,
+        &FeatureOptions {
+            resolver: resolver_version,
+            platform_matches: &exact,
+            weak_activates: false,
+        },
+    );
+    check_rust_versions(&uni, &locals, &reg, &res, req)?;
+
+    let mut planner = Planner {
+        ws,
+        locals: &locals,
+        req,
+        uni,
+        lock: &lock,
+        roles,
+        reg,
+        res,
+        distinct_host: HashSet::new(),
+        edges_from: HashMap::new(),
+        graph: BuildGraph::new(),
+        lib_node: HashMap::new(),
+    };
+
+    // -- Which packages need a separate host build?
+    {
+        let pkgs: HashSet<usize> = planner.res.features.keys().map(|(p, _)| *p).collect();
+        for pkg in pkgs {
+            let host = planner.res.features.get(&(pkg, true));
+            let target = planner.res.features.get(&(pkg, false));
+            let distinct = match (host, target) {
+                (Some(_), _) if planner.roles.cross => true,
+                (Some(h), Some(t)) => {
+                    h != t || planner.profile_for(pkg, true) != planner.profile_for(pkg, false)
+                }
+                _ => false,
+            };
+            if distinct {
+                planner.distinct_host.insert(pkg);
+            }
+        }
+        let edges = planner.res.edges.clone();
+        for (i, e) in edges.iter().enumerate() {
+            let from = planner.canon(e.from);
+            planner.edges_from.entry(from).or_default().push(i);
+        }
+    }
+
+    // -- Library nodes: one per (package, role).
+    let unit_keys: Vec<UnitRef> = planner.res.features.keys().copied().collect();
+    for (pkg, host) in unit_keys {
+        let key = planner.canon((pkg, host));
+        if planner.lib_node.contains_key(&key) {
+            continue;
+        }
+        let unit = match planner.uni.origin[pkg] {
+            Origin::Registry => planner.registry_unit(pkg, key.1),
+            Origin::Local(li) => {
+                let m = &locals.list[li];
+                m.manifest.lib.as_ref().map(|lib| {
+                    let (crate_type, extras) = crate_types_of(lib);
+                    let path = lib
+                        .path
+                        .clone()
+                        .unwrap_or_else(|| PathBuf::from("src/lib.rs"));
+                    let name = lib.name.clone().unwrap_or_else(|| m.name.replace('-', "_"));
+                    planner.local_unit(
+                        li,
+                        TargetKind::Lib,
+                        &name,
+                        crate_type,
+                        extras,
+                        &path,
+                        false,
+                        lib.edition.as_deref(),
+                        key.1,
+                    )
+                })
+            }
+        };
+        if let Some(unit) = unit {
+            let id = planner.graph.add_node(unit);
+            planner.lib_node.insert(key, id);
+        }
+    }
+    // Wire the libraries' dependencies (no dev-dependencies: they belong to
+    // a package's own tests, examples and benches).
+    let lib_nodes: Vec<(UnitRef, NodeId)> = {
+        let mut v: Vec<_> = planner.lib_node.iter().map(|(k, v)| (*k, *v)).collect();
+        v.sort_by_key(|(_, n)| n.0);
+        v
+    };
+    for (key, node) in lib_nodes {
+        planner.wire(Some(node), key, false, true);
     }
 
     // -- Requested targets.
@@ -1264,30 +2050,30 @@ pub fn plan(ws: &Workspace, req: &Request) -> Result<Plan> {
             continue;
         };
         let member = &locals.list[li];
-        let active = builder.local_features(li);
+        let active = planner.features_of((li, false));
         let picks = pick_targets(member, req, &active)?;
 
         // Package binaries are build-order dependencies of tests and benches.
         let mut bin_nodes: HashMap<String, NodeId> = HashMap::new();
+        let mut nodes_for_picks: Vec<(usize, NodeId)> = Vec::new();
 
-        let mut nodes_for_picks: Vec<(usize, NodeId, Vec<(String, NodeId)>)> = Vec::new();
         // First pass: binaries (plain) so tests can depend on them.
         for (pi, pick) in picks.iter().enumerate() {
-            let crate_type = match pick.kind {
-                TargetKind::Lib => CrateType::Lib,
-                _ => CrateType::Bin,
-            };
             let proc_macro = pick.kind == TargetKind::Lib
                 && member.manifest.lib.as_ref().is_some_and(|l| l.proc_macro);
-            let crate_type = if proc_macro {
-                CrateType::ProcMacro
-            } else {
-                crate_type
+            let (crate_type, extras) = match pick.kind {
+                TargetKind::Lib if proc_macro => (CrateType::ProcMacro, Vec::new()),
+                TargetKind::Lib => pick
+                    .spec
+                    .as_ref()
+                    .map(crate_types_of)
+                    .unwrap_or((CrateType::Lib, Vec::new())),
+                _ => (CrateType::Bin, Vec::new()),
             };
             let is_plain_lib = pick.kind == TargetKind::Lib && !pick.harness;
             if is_plain_lib {
                 // Already created above; just request it.
-                if let Some(&n) = builder.lib_nodes.get(&li) {
+                if let Some(&n) = planner.lib_node.get(&(li, false)) {
                     requested.push(Requested {
                         node: n,
                         member: mi,
@@ -1298,20 +2084,25 @@ pub fn plan(ws: &Workspace, req: &Request) -> Result<Plan> {
                 }
                 continue;
             }
-            let unit = builder.unit(
+            // A harness compiles the library's own source with `--test`; it
+            // has no library crate types of its own.
+            let extras = if pick.harness { Vec::new() } else { extras };
+            let unit = planner.local_unit(
                 li,
                 pick.kind,
                 &pick.name,
                 crate_type,
+                extras,
                 &pick.path,
                 pick.harness,
                 pick.spec.as_ref().and_then(|s| s.edition.as_deref()),
+                false,
             );
-            let node = builder.graph.add_node(unit);
+            let node = planner.graph.add_node(unit);
             if pick.kind == TargetKind::Bin && !pick.harness {
                 bin_nodes.insert(pick.name.clone(), node);
             }
-            nodes_for_picks.push((pi, node, Vec::new()));
+            nodes_for_picks.push((pi, node));
         }
         // Test/bench units need every package binary built first.
         let needs_bins = picks
@@ -1329,49 +2120,46 @@ pub fn plan(ws: &Workspace, req: &Request) -> Result<Plan> {
                     .path
                     .clone()
                     .unwrap_or_else(|| PathBuf::from("src/main.rs"));
-                let unit = builder.unit(
+                let unit = planner.local_unit(
                     li,
                     TargetKind::Bin,
                     &name,
                     CrateType::Bin,
+                    Vec::new(),
                     &path,
                     false,
                     bin.edition.as_deref(),
+                    false,
                 );
-                let node = builder.graph.add_node(unit);
+                let node = planner.graph.add_node(unit);
                 bin_nodes.insert(name, node);
                 // Wire the binary itself.
-                builder.connect(node, li, Deps::NormalAndBuild);
-                if let Some(&lib) = builder.lib_nodes.get(&li) {
-                    builder.graph.add_edge(node, lib);
+                planner.wire(Some(node), (li, false), false, true);
+                if let Some(&lib) = planner.lib_node.get(&(li, false)) {
+                    planner.graph.add_edge(node, lib);
                 }
             }
         }
 
         let mut harness_lib_externs: Option<Vec<(String, NodeId)>> = None;
-        for (pi, node, _) in nodes_for_picks {
+        for (pi, node) in nodes_for_picks {
             let pick = &picks[pi];
-            let deps_kind = if pick.harness
+            let with_dev = pick.harness
                 || matches!(
                     pick.kind,
                     TargetKind::Example | TargetKind::Test | TargetKind::Bench
-                ) {
-                Deps::WithDev
-            } else {
-                Deps::NormalAndBuild
-            };
-            let mut externs = builder.connect(node, li, deps_kind);
-            let own_lib = builder.lib_nodes.get(&li).copied();
-            let depends_on_own_lib = !(pick.kind == TargetKind::Lib);
-            if depends_on_own_lib {
+                );
+            let mut externs = planner.wire(Some(node), (li, false), with_dev, true);
+            let own_lib = planner.lib_node.get(&(li, false)).copied();
+            if pick.kind != TargetKind::Lib {
                 if let Some(lib) = own_lib {
-                    builder.graph.add_edge(node, lib);
-                    externs.push((builder.graph.node(lib).unit.rustc_crate_name(), lib));
+                    planner.graph.add_edge(node, lib);
+                    externs.push((planner.graph.node(lib).unit.rustc_crate_name(), lib));
                 }
             }
             if matches!(pick.kind, TargetKind::Test | TargetKind::Bench) {
                 for &bin in bin_nodes.values() {
-                    builder.graph.add_edge(node, bin);
+                    planner.graph.add_edge(node, bin);
                 }
             }
             if pick.kind == TargetKind::Lib && pick.harness {
@@ -1392,33 +2180,18 @@ pub fn plan(ws: &Workspace, req: &Request) -> Result<Plan> {
             && req.doctests
             && (req.targets.doc_only || !req.targets.any_explicit() || req.targets.all_targets)
         {
-            if let (Some(lib), Some(&lib_node)) = (&member.manifest.lib, builder.lib_nodes.get(&li))
+            if let (Some(lib), Some(&lib_node)) =
+                (&member.manifest.lib, planner.lib_node.get(&(li, false)))
             {
                 if lib.doctest && !lib.proc_macro {
                     let mut externs = match harness_lib_externs.take() {
                         Some(e) => e,
-                        None => {
-                            // No lib harness node (e.g. `--doc`): compute the
-                            // dependency list without adding a compile unit.
-                            let placeholder = builder.graph.add_node(builder.unit(
-                                li,
-                                TargetKind::Lib,
-                                &lib.name.clone().unwrap_or_default(),
-                                CrateType::Lib,
-                                Path::new("src/lib.rs"),
-                                true,
-                                None,
-                            ));
-                            let e = builder.connect(placeholder, li, Deps::WithDev);
-                            // The placeholder exists only to gather edges; its
-                            // dependencies become roots so they get built.
-                            extra_roots
-                                .extend(builder.graph.node(placeholder).dependencies.clone());
-                            e
-                        }
+                        // No lib harness node (e.g. `--doc`): work out the
+                        // dependency list without adding a compile unit.
+                        None => planner.wire(None, (li, false), true, false),
                     };
                     externs.push((
-                        builder.graph.node(lib_node).unit.rustc_crate_name(),
+                        planner.graph.node(lib_node).unit.rustc_crate_name(),
                         lib_node,
                     ));
                     extra_roots.push(lib_node);
@@ -1430,7 +2203,7 @@ pub fn plan(ws: &Workspace, req: &Request) -> Result<Plan> {
                                 .clone()
                                 .unwrap_or_else(|| PathBuf::from("src/lib.rs")),
                         ),
-                        crate_name: builder.graph.node(lib_node).unit.rustc_crate_name(),
+                        crate_name: planner.graph.node(lib_node).unit.rustc_crate_name(),
                         externs,
                         features: active.clone(),
                         edition: member.edition,
@@ -1446,7 +2219,7 @@ pub fn plan(ws: &Workspace, req: &Request) -> Result<Plan> {
     // -- Prune to what was asked for.
     let mut roots: Vec<NodeId> = requested.iter().map(|r| r.node).collect();
     roots.extend(extra_roots.iter().copied());
-    let (mut graph, map) = builder.graph.subgraph(&roots);
+    let (mut graph, map) = planner.graph.subgraph(&roots);
     for r in &mut requested {
         r.node = map[&r.node];
     }
@@ -1460,12 +2233,77 @@ pub fn plan(ws: &Workspace, req: &Request) -> Result<Plan> {
     if req.mode == Mode::Check {
         exempt_real_link_requirements_from_check(&mut graph);
     }
+    assign_script_owners(&mut graph);
+    check_links_conflicts(&graph)?;
     drop(total);
     Ok(Plan {
         graph,
         requested,
         doc_tests,
     })
+}
+
+/// `[lib] crate-type`: the primary crate type and any additional ones. A
+/// library that produces an `rlib` is primarily that, since it is what
+/// dependents link.
+fn crate_types_of(lib: &TargetSpec) -> (CrateType, Vec<CrateType>) {
+    let parse = |s: &str| match s {
+        "lib" | "rlib" => Some(CrateType::Lib),
+        "dylib" => Some(CrateType::Dylib),
+        "cdylib" => Some(CrateType::Cdylib),
+        "staticlib" => Some(CrateType::Staticlib),
+        "proc-macro" => Some(CrateType::ProcMacro),
+        _ => None,
+    };
+    let mut types: Vec<CrateType> = lib
+        .crate_types
+        .iter()
+        .filter_map(|s| parse(s))
+        .collect::<Vec<_>>();
+    if lib.proc_macro && !types.contains(&CrateType::ProcMacro) {
+        types.push(CrateType::ProcMacro);
+    }
+    types.dedup();
+    if types.is_empty() {
+        return (CrateType::Lib, Vec::new());
+    }
+    if types.contains(&CrateType::ProcMacro) {
+        return (CrateType::ProcMacro, Vec::new());
+    }
+    let primary = if types.contains(&CrateType::Lib) {
+        CrateType::Lib
+    } else {
+        types[0]
+    };
+    let extras = types.into_iter().filter(|t| *t != primary).collect();
+    (primary, extras)
+}
+
+/// A package's build script runs once; every other unit of the package (its
+/// binaries, tests, examples) shares the library's run and `OUT_DIR`.
+fn assign_script_owners(graph: &mut BuildGraph) {
+    let mut assignments: Vec<(NodeId, String)> = Vec::new();
+    for node in graph.nodes() {
+        let u = &node.unit;
+        if u.build_script.is_none() || u.kind == TargetKind::Lib {
+            continue;
+        }
+        let owner = node.dependencies.iter().find_map(|&d| {
+            let o = &graph.node(d).unit;
+            (o.kind == TargetKind::Lib
+                && !o.harness
+                && o.build_script.is_some()
+                && o.manifest_dir == u.manifest_dir
+                && o.ext.for_host == u.ext.for_host)
+                .then(|| rune_scheduler::executor::script_key(o))
+        });
+        if let Some(owner) = owner {
+            assignments.push((node.id, owner));
+        }
+    }
+    for (id, owner) in assignments {
+        graph.node_mut(id).unit.ext.script_owner = Some(owner);
+    }
 }
 
 fn check_named_targets(req: &Request, locals: &Locals, _ws: &Workspace) -> Result<()> {
@@ -1535,94 +2373,5 @@ fn exempt_real_link_requirements_from_check(graph: &mut BuildGraph) {
     }
     for id in must_be_real {
         graph.node_mut(id).unit.check_only = false;
-    }
-}
-
-/// Rebuilds dependency edges (with correct `package = "..."` alias info) for
-/// every registry package restored from a lockfile, by reading each package's
-/// own manifest from its extracted directory and cross-referencing against the
-/// lockfile's already-correct (but alias-blind) `name version` edge list to
-/// confirm which of its declared dependencies were actually activated.
-fn repair_registry_dependency_aliases(
-    resolved_graph: &mut ResolvedGraph,
-    lock: &Lockfile,
-    extracted_dirs: &HashMap<(String, String), PathBuf>,
-) {
-    let locked_by_id: HashMap<(String, String), &rune_resolver::LockPackage> = lock
-        .packages
-        .iter()
-        .map(|p| ((p.name.clone(), p.version.clone()), p))
-        .collect();
-
-    for pkg in resolved_graph.packages.values_mut() {
-        if !matches!(pkg.source, PackageSource::Registry) {
-            continue;
-        }
-        let key = (pkg.name.clone(), pkg.version.to_string());
-        let Some(locked) = locked_by_id.get(&key) else {
-            continue;
-        };
-        let Some(src_dir) = extracted_dirs.get(&key) else {
-            continue;
-        };
-        let Ok(manifest) = Manifest::from_path(&src_dir.join("Cargo.toml")) else {
-            continue;
-        };
-
-        let mut deps = Vec::new();
-        let mut seen = HashSet::new();
-        // The manifest parser keys `dependencies` by `"kind:target:name"` (so
-        // e.g. the unix and wasi variants of a `libc` dependency don't
-        // collide); that composite string is a map key, never a name.
-        let mut manifest_deps: Vec<&rune_manifest::Dependency> =
-            manifest.dependencies.values().collect();
-        manifest_deps.sort_by(|a, b| (&a.name, a.kind as u8).cmp(&(&b.name, b.kind as u8)));
-        for dep in manifest_deps {
-            if dep.kind == DependencyKind::Dev {
-                continue;
-            }
-            if !seen.insert((dep.name.clone(), dep.spec.package.clone(), dep.kind as u8)) {
-                continue;
-            }
-            let actual_name = dep.spec.package.as_deref().unwrap_or(&dep.name);
-            let Some(locked_version) =
-                locked
-                    .dependencies
-                    .iter()
-                    .find_map(|dep_id| match dep_id.rsplit_once(' ') {
-                        Some((n, v)) => (n == actual_name).then(|| v.to_string()),
-                        None => (dep_id == actual_name)
-                            .then(|| lock.find_package(actual_name).map(|p| p.version.clone()))
-                            .flatten(),
-                    })
-            else {
-                continue;
-            };
-            // A crate can rename the same real package under several
-            // mutually-exclusive optional aliases pinned to disjoint version
-            // ranges (e.g. signal-hook-mio's `mio-0_6`/`mio-0_7`/`mio-0_8`/
-            // `mio-1_0`). Only one alias's range can match the single version
-            // present in the lockfile; the others must be dropped or they all
-            // become edges to that one locked version.
-            if let Some(req) = &dep.spec.version {
-                let Ok(version) = locked_version.parse::<semver::Version>() else {
-                    continue;
-                };
-                if !req.matches(&version) {
-                    continue;
-                }
-            }
-
-            deps.push(ResolvedDependencyRef {
-                name: dep.name.clone(),
-                req: format!("={locked_version}"),
-                kind: dep.kind,
-                optional: dep.spec.optional,
-                features: dep.spec.features.clone(),
-                default_features: dep.spec.default_features,
-                package: dep.spec.package.clone(),
-            });
-        }
-        pkg.dependencies = deps;
     }
 }

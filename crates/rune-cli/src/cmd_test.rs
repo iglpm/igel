@@ -128,6 +128,7 @@ pub fn run(args: TestArgs, mode: Mode) -> Result<()> {
             targets: &targets,
             offline: sess.offline,
             locked: sess.locked,
+            ignore_rust_version: sess.ignore_rust_version,
             doctests: want_doctests,
         },
     )?;
@@ -255,7 +256,7 @@ pub fn run(args: TestArgs, mode: Mode) -> Result<()> {
                             harness,
                         } => {
                             let member = &sess.ws.members[member];
-                            let mut cmd = Command::new(&exe);
+                            let mut cmd = sess.command_for(&exe);
                             if harness {
                                 cmd.args(libtest_args);
                             } else if bench {
@@ -692,12 +693,11 @@ fn run_doctest(
 ) -> TestResult {
     let start = Instant::now();
     let member = &sess.ws.members[doc.member];
-    let rustdoc = std::env::var_os("RUSTDOC")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("rustdoc"));
+    let rustdoc = rune_common::toolchain::global().rustdoc.clone();
     let deps_dir = sess.config().deps_dir(sess.profile.output_dir_name());
 
     let mut cmd = Command::new(&rustdoc);
+    cmd.args(sess.rustdoc_flags());
     cmd.current_dir(&member.dir)
         .arg("--test")
         .arg(&doc.lib_source)

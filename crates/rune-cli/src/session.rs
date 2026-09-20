@@ -31,6 +31,7 @@ pub struct Session {
     pub verbose: bool,
     pub quiet: bool,
     pub force_rebuild: bool,
+    pub ignore_rust_version: bool,
 }
 
 impl Session {
@@ -81,6 +82,15 @@ impl Session {
             );
         }
 
+        let default_target = ws
+            .cargo_config
+            .string(&["build", "target"])
+            .or_else(|| {
+                ws.cargo_config
+                    .string_list(&["build", "target"])
+                    .and_then(|l| l.into_iter().next())
+            })
+            .filter(|t| !t.is_empty());
         let selected = ws.select(&common.package, common.workspace, &common.exclude)?;
         let features = FeatureArgs::parse(
             &common.features,
@@ -94,12 +104,14 @@ impl Session {
             jobs,
             offline,
             locked,
-            target: common.target.clone(),
+            // `--target`, else `CARGO_BUILD_TARGET` / `build.target`.
+            target: common.target.clone().or(default_target),
             features,
             selected,
             verbose: common.verbose,
             quiet: common.quiet,
             force_rebuild,
+            ignore_rust_version: common.ignore_rust_version,
         })
     }
 
@@ -112,13 +124,23 @@ impl Session {
         if !self.ws.config.settings.cas_enabled() {
             return None;
         }
-        CasStore::new(self.ws.config.cas_dir.clone()).ok()
+        CasStore::new(self.ws.config.cas_dir.clone())
+            .ok()
+            .map(|c| c.with_verify(self.ws.config.settings.cas_verify()))
     }
 
     pub fn executor(&self) -> BuildExecutor {
         let mut executor =
             BuildExecutor::new(self.ws.config.clone(), self.profile.clone(), self.jobs)
                 .with_force_rebuild(self.force_rebuild)
+                .with_config_env(
+                    self.ws
+                        .cargo_config
+                        .env_entries()
+                        .into_iter()
+                        .map(|e| (e.name, e.value, e.force))
+                        .collect(),
+                )
                 .with_color(colored::control::SHOULD_COLORIZE.should_colorize());
         if let Some(cas) = self.cas() {
             executor = executor.with_cas(cas);
@@ -145,6 +167,39 @@ impl Session {
     /// Prints the profile name the way summaries show it.
     pub fn profile_label(&self) -> String {
         self.profile.name.clone()
+    }
+}
+
+impl Session {
+    /// A command that runs `exe`: directly, or — when cross-compiling and
+    /// `[target.<triple>] runner` is configured — through that runner (`qemu-aarch64`,
+    /// `wine`, a device shim), exactly like `cargo run`/`cargo test` do.
+    pub fn command_for(&self, exe: &std::path::Path) -> std::process::Command {
+        if let Some(target) = &self.target {
+            let tc = rune_common::toolchain::global();
+            let info = rune_common::toolchain::TargetInfo::query(tc, Some(target), &[]);
+            if let Some(runner) = rune_common::toolchain::runner(&self.ws.cargo_config, &info) {
+                let mut cmd = std::process::Command::new(&runner[0]);
+                cmd.args(&runner[1..]).arg(exe);
+                return cmd;
+            }
+        }
+        std::process::Command::new(exe)
+    }
+
+    /// `RUSTDOCFLAGS` / `build.rustdocflags` / `target.<triple>.rustdocflags`.
+    pub fn rustdoc_flags(&self) -> Vec<String> {
+        if let Ok(v) = std::env::var("RUSTDOCFLAGS") {
+            return v.split_whitespace().map(str::to_string).collect();
+        }
+        let cfg = &self.ws.cargo_config;
+        if let Some(target) = &self.target {
+            if let Some(f) = cfg.string_list(&["target", target, "rustdocflags"]) {
+                return f;
+            }
+        }
+        cfg.string_list(&["build", "rustdocflags"])
+            .unwrap_or_default()
     }
 }
 

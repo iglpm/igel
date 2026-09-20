@@ -1,6 +1,8 @@
 //! Discovery and loading of the Cargo workspace a command operates on.
 
 use anyhow::{Context, Result, bail};
+use rune_common::cargo_config::CargoConfig;
+use rune_common::toolchain::{self, Toolchain};
 use rune_common::{Edition, PackageMeta, RuneConfig, settings::Settings};
 use rune_manifest::{Manifest, WorkspaceManifest};
 use std::path::{Path, PathBuf};
@@ -49,6 +51,10 @@ impl Member {
 /// A loaded workspace: the root manifest, every member, and user settings.
 pub struct Workspace {
     pub config: RuneConfig,
+    /// `[patch]` / `[replace]` from the root manifest and configuration.
+    pub patches: rune_resolver::Patches,
+    /// `.cargo/config.toml` files (and `CARGO_*` overrides) that apply.
+    pub cargo_config: CargoConfig,
     pub root_manifest: Manifest,
     /// Every workspace member (a lone package is a one-member workspace),
     /// sorted by directory.
@@ -102,6 +108,17 @@ impl Workspace {
         let settings = Settings::load(Some(&root_dir))?;
         let config = RuneConfig::new(&root_dir).with_settings(settings);
 
+        // Configuration files are found from the working directory upward,
+        // as Cargo does. The compiler (`RUSTC`, wrappers, `rust-toolchain`)
+        // is fixed for the whole process from here on.
+        let cwd = std::env::current_dir().unwrap_or_else(|_| root_dir.clone());
+        let cargo_config = CargoConfig::load(&cwd);
+        toolchain::set_global(Toolchain::discover(&cargo_config, &root_dir));
+        // Alternative registries, mirrors and vendored sources.
+        rune_registry::source::configure(rune_registry::source::RegistryDefs::from_config(
+            cargo_config.root(),
+        ));
+
         // Root package first (if any), then members; deduplicated by directory.
         let ws_manifest = root_manifest.workspace.as_ref();
         let mut dirs: Vec<PathBuf> = Vec::new();
@@ -130,8 +147,15 @@ impl Workspace {
         members.sort_by(|a, b| a.dir.cmp(&b.dir));
 
         let current = members.iter().position(|m| m.dir == start_dir);
+        let patches = rune_resolver::Patches::collect(
+            &root_dir,
+            &root_manifest,
+            cargo_config.table(&["patch"]),
+        );
         Ok(Self {
             config,
+            patches,
+            cargo_config,
             root_manifest,
             members,
             current,
@@ -255,33 +279,6 @@ fn find_workspace_root(member_dir: &Path, member: &Manifest) -> Option<PathBuf> 
             return None;
         }
     }
-}
-
-/// Merges `[workspace.dependencies]` into a member's dependency spec and
-/// rebases relative `path`s to absolute ones.
-///
-/// A `path` written on a member is relative to that member; one inherited from
-/// `[workspace.dependencies]` is relative to the workspace root. Both are made
-/// absolute against the directory they were *written in* before merging, so
-/// every later consumer can just use the result.
-pub fn effective_spec(
-    dep: &rune_manifest::Dependency,
-    member_dir: &Path,
-    ws_root: &Path,
-    ws: Option<&WorkspaceManifest>,
-) -> rune_manifest::DependencySpec {
-    let mut spec = dep.spec.clone();
-    if let Some(rel) = spec.path.take() {
-        spec.path = Some(member_dir.join(rel));
-    }
-    if let Some(ws_dep) = ws.and_then(|w| w.dependencies.get(&dep.name)) {
-        let mut ws_dep = ws_dep.clone();
-        if let Some(rel) = ws_dep.path.take() {
-            ws_dep.path = Some(ws_root.join(rel));
-        }
-        spec.merge_workspace(&ws_dep);
-    }
-    spec
 }
 
 /// Finds the directory a project's `Rune.toml` belongs in: the workspace root

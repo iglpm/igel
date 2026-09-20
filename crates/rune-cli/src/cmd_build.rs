@@ -41,6 +41,7 @@ pub fn plan_for(sess: &Session, mode: Mode, targets: &TargetSelection) -> Result
             targets,
             offline: sess.offline,
             locked: sess.locked,
+            ignore_rust_version: sess.ignore_rust_version,
             doctests: false,
         },
     )
@@ -151,7 +152,7 @@ pub fn run(args: RunArgs) -> Result<()> {
     let member = &sess.ws.members[node.member];
 
     ui::action("running", exe.display());
-    let mut cmd = std::process::Command::new(&exe);
+    let mut cmd = sess.command_for(&exe);
     cmd.args(&args.args);
     apply_run_env(&mut cmd, member, &sess);
     exec(cmd)
@@ -326,9 +327,22 @@ pub fn doc(args: DocArgs) -> Result<()> {
 
     let doc_dir = sess.config().target_dir.join("doc");
     std::fs::create_dir_all(&doc_dir)?;
-    let rustdoc = std::env::var_os("RUSTDOC")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("rustdoc"));
+    let tc = rune_common::toolchain::global();
+    let rustdoc = tc.rustdoc.clone();
+    let doc_flags = sess.rustdoc_flags();
+    // Documentation has an identity of its own: the rustdoc that renders it and
+    // its flags, on top of everything that identifies the crate's compilation.
+    let rustdoc_id = format!(
+        "{}|{}|{}",
+        rune_common::toolchain::program_fingerprint(&rustdoc),
+        std::process::Command::new(&rustdoc)
+            .arg("--version")
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_default(),
+        doc_flags.join("\x1f")
+    );
+    let stamp_dir = doc_dir.join(".rune-stamps");
     let deps_dir = sess.config().deps_dir(sess.profile.output_dir_name());
 
     let topo = plan
@@ -346,8 +360,41 @@ pub fn doc(args: DocArgs) -> Result<()> {
         if args.no_deps && !requested.contains(&id) {
             continue;
         }
+        // `[lib] doc = false` opts a library out of documentation.
+        if sess
+            .ws
+            .members
+            .iter()
+            .find(|m| m.dir == unit.manifest_dir)
+            .and_then(|m| m.manifest.lib.as_ref())
+            .is_some_and(|lib| !lib.doc)
+        {
+            continue;
+        }
         if unit.crate_type == rune_common::CrateType::ProcMacro && !requested.contains(&id) {
             continue; // documenting proc-macro dependencies needs extra plumbing
+        }
+        // Unchanged since the last `rune doc`? Then so is its documentation.
+        let mut hb = rune_common::hash::HashBuilder::new();
+        hb.update(
+            result
+                .cache_keys
+                .get(&id)
+                .map_or("", String::as_str)
+                .as_bytes(),
+        );
+        hb.update(rustdoc_id.as_bytes());
+        let stamp_name = format!("{}-{}", unit.rustc_crate_name(), &hb.finish_blake3()[..16]);
+        let stamp = stamp_dir.join(&stamp_name);
+        if stamp.is_file() && doc_dir.join(unit.rustc_crate_name()).is_dir() {
+            if requested.contains(&id) {
+                ui::action(
+                    "documenting",
+                    format!("{} (up to date)", unit.crate_id.name),
+                );
+            }
+            documented += 1;
+            continue;
         }
         let externs = rune_scheduler::executor::extern_deps_for(
             &plan.graph,
@@ -357,6 +404,10 @@ pub fn doc(args: DocArgs) -> Result<()> {
             rune_scheduler::executor::ExternMode::Link,
         );
         let mut cmd = std::process::Command::new(&rustdoc);
+        if let (Some(target), false) = (&unit.target, unit.ext.for_host) {
+            cmd.arg("--target").arg(&target.0);
+        }
+        cmd.args(&doc_flags);
         cmd.arg(&unit.source_root)
             .arg("--crate-name")
             .arg(unit.rustc_crate_name())
@@ -401,6 +452,20 @@ pub fn doc(args: DocArgs) -> Result<()> {
         if requested.contains(&id) {
             ui::action("documenting", &unit.crate_id.name);
         }
+        // Record the identity this output corresponds to; older stamps of the
+        // same crate no longer describe it.
+        let _ = std::fs::create_dir_all(&stamp_dir);
+        if let Ok(entries) = std::fs::read_dir(&stamp_dir) {
+            for e in entries.flatten() {
+                if e.file_name()
+                    .to_string_lossy()
+                    .starts_with(&format!("{}-", unit.rustc_crate_name()))
+                {
+                    let _ = std::fs::remove_file(e.path());
+                }
+            }
+        }
+        let _ = std::fs::write(&stamp, "");
         documented += 1;
     }
     ui::summary(format!(

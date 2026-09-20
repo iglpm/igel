@@ -512,7 +512,7 @@ pub fn metadata(args: MetadataArgs) -> Result<()> {
         let mut pkgs: Vec<_> = resolved
             .packages
             .values()
-            .filter(|p| matches!(p.source, rune_resolver::resolver::PackageSource::Registry))
+            .filter(|p| p.source.is_registry())
             .collect();
         pkgs.sort_by(|a, b| (&a.name, &a.version).cmp(&(&b.name, &b.version)));
         for p in pkgs {

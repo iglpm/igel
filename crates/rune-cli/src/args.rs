@@ -121,6 +121,10 @@ pub struct CommonArgs {
     #[arg(long, value_name = "NAME", conflicts_with = "release")]
     pub profile: Option<String>,
 
+    /// Ignore `rust-version` specifications in packages
+    #[arg(long)]
+    pub ignore_rust_version: bool,
+
     /// Build for the given target triple
     #[arg(long, value_name = "TRIPLE")]
     pub target: Option<String>,
