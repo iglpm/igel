@@ -91,6 +91,12 @@ pub struct UnitRole<'a> {
     pub workspace_member: bool,
     /// Build scripts, proc-macros and their dependencies (`build-override`).
     pub host: bool,
+    /// The package is an immutable registry/git dependency and the user has not
+    /// asked for full dependency debuginfo: unless some profile says
+    /// otherwise, compile it with `debug = "line-tables-only"` in the dev
+    /// profile. Debuginfo is a large share of a cold build's time and is
+    /// rarely used inside dependencies.
+    pub lean_debuginfo: bool,
 }
 
 /// The profile a specific unit is compiled with: the named profile plus, in
@@ -135,6 +141,20 @@ pub fn resolve_unit_profile(
         }
         chain.insert(0, parent.clone());
         cur = parent;
+    }
+
+    // Cargo's implicit `debug = true` for dev is what makes dependencies slow
+    // to build. An explicit `debug` anywhere in the chain means the user chose.
+    let explicit_debug = chain
+        .iter()
+        .any(|level| tables.get(level).is_some_and(|t| t.debug.is_some()));
+    if role.lean_debuginfo
+        && !role.host
+        && !explicit_debug
+        && chain.first().is_some_and(|root| root == "dev")
+        && profile.debuginfo == DebugInfo::Full
+    {
+        profile.debuginfo = DebugInfo::LineTablesOnly;
     }
 
     let matches_spec = |spec: &str| {
@@ -407,6 +427,7 @@ mod tests {
             version: &v,
             workspace_member,
             host,
+            lean_debuginfo: false,
         };
         let opt = |r| resolve_unit_profile("dev", &p, r).unwrap().opt_level;
         // Workspace members are untouched by `"*"`.
@@ -487,5 +508,97 @@ mod tests {
         let mut renamed = base.clone();
         renamed.name = "custom".into();
         assert_eq!(base.codegen_fingerprint(), renamed.codegen_fingerprint());
+    }
+
+    fn debuginfo_of(
+        manifest: &str,
+        profile: &str,
+        lean: bool,
+        member: bool,
+        host: bool,
+    ) -> DebugInfo {
+        let p = profiles(manifest);
+        let v = semver::Version::new(1, 0, 0);
+        let role = UnitRole {
+            package: "dep",
+            version: &v,
+            workspace_member: member,
+            host,
+            lean_debuginfo: lean,
+        };
+        resolve_unit_profile(profile, &p, role).unwrap().debuginfo
+    }
+
+    #[test]
+    fn dependencies_default_to_line_tables_in_dev() {
+        // The implicit `debug = true` of dev is what is trimmed for dependencies…
+        assert_eq!(
+            debuginfo_of("", "dev", true, false, false),
+            DebugInfo::LineTablesOnly
+        );
+        assert_eq!(
+            debuginfo_of("", "test", true, false, false),
+            DebugInfo::LineTablesOnly
+        );
+        // …only when asked for (the planner sets this for registry/git packages).
+        assert_eq!(
+            debuginfo_of("", "dev", false, false, false),
+            DebugInfo::Full
+        );
+        // Release has no debuginfo to trim.
+        assert_eq!(
+            debuginfo_of("", "release", true, false, false),
+            DebugInfo::None
+        );
+    }
+
+    #[test]
+    fn an_explicit_debug_setting_always_wins() {
+        for manifest in [
+            "[profile.dev]\ndebug = true\n",
+            "[profile.dev]\ndebug = 2\n",
+            "[profile.dev.package.\"*\"]\ndebug = true\n",
+            "[profile.dev.package.dep]\ndebug = \"full\"\n",
+        ] {
+            assert_eq!(
+                debuginfo_of(manifest, "dev", true, false, false),
+                DebugInfo::Full,
+                "{manifest}"
+            );
+        }
+        assert_eq!(
+            debuginfo_of(
+                "[profile.dev.package.\"*\"]\ndebug = false\n",
+                "dev",
+                true,
+                false,
+                false
+            ),
+            DebugInfo::None
+        );
+    }
+
+    #[test]
+    fn a_custom_profile_inheriting_dev_is_trimmed_unless_it_sets_debug() {
+        let inherits = "[profile.custom]\ninherits = \"dev\"\n";
+        assert_eq!(
+            debuginfo_of(inherits, "custom", true, false, false),
+            DebugInfo::LineTablesOnly
+        );
+        let explicit = "[profile.custom]\ninherits = \"dev\"\ndebug = true\n";
+        assert_eq!(
+            debuginfo_of(explicit, "custom", true, false, false),
+            DebugInfo::Full
+        );
+        let dev_explicit = "[profile.dev]\ndebug = true\n[profile.custom]\ninherits = \"dev\"\n";
+        assert_eq!(
+            debuginfo_of(dev_explicit, "custom", true, false, false),
+            DebugInfo::Full
+        );
+    }
+
+    #[test]
+    fn host_units_keep_their_own_defaults() {
+        assert_eq!(debuginfo_of("", "dev", true, false, true), DebugInfo::None);
     }
 }

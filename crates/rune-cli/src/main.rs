@@ -1,12 +1,18 @@
 //! The Rune command-line interface.
 
+mod affected;
 mod args;
 mod cmd_build;
 mod cmd_deps;
 mod cmd_misc;
 mod cmd_test;
+mod cmd_watch;
+mod doctor;
 mod graph;
+mod messages;
+mod script;
 mod session;
+mod test_cache;
 mod ui;
 mod workspace;
 
@@ -49,6 +55,10 @@ fn main() {
         Commands::Clean(a) => cmd_misc::clean(a),
         Commands::Config(c) => cmd_misc::config(c),
         Commands::Cas(c) => cmd_misc::cas(c),
+        Commands::Doctor => cmd_misc::doctor(),
+        Commands::Watch(a) => cmd_watch::watch(a),
+        Commands::Affected(a) => cmd_misc::affected(a),
+        Commands::Script(a) => cmd_misc::script(a),
         Commands::Lockfile(c) => cmd_misc::lockfile(c),
     };
 

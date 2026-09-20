@@ -13,6 +13,30 @@ use std::io::{self, Write};
 use std::sync::OnceLock;
 use tracing_subscriber::{EnvFilter, fmt};
 
+/// When set, stdout carries machine-readable output only (`--message-format
+/// json`), so the human-readable action and summary lines go to stderr.
+static MACHINE_OUTPUT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Reserves stdout for machine-readable output.
+pub fn set_machine_output(on: bool) {
+    MACHINE_OUTPUT.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// `--quiet`: no action or summary lines at all.
+static QUIET: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_quiet(on: bool) {
+    QUIET.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn quiet() -> bool {
+    QUIET.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+fn machine_output() -> bool {
+    MACHINE_OUTPUT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// The `MultiProgress` shared between the active build's progress bars and
 /// the tracing writer below, so log lines never tear up the bars.
 static MULTI_PROGRESS: OnceLock<MultiProgress> = OnceLock::new();
@@ -77,12 +101,26 @@ fn marker() -> ColoredString {
 /// `added`). Lowercase by convention — set the verb lowercase at the call
 /// site.
 pub fn action(verb: &str, message: impl Display) {
-    println!("{} {} {}", marker(), brand(verb), message);
+    if quiet() {
+        return;
+    }
+    if machine_output() {
+        eprintln!("{} {} {}", marker(), brand(verb), message);
+    } else {
+        println!("{} {} {}", marker(), brand(verb), message);
+    }
 }
 
 /// The final summary line for a completed build.
 pub fn summary(message: impl Display) {
-    println!("{} {}", "✓".green().bold(), message);
+    if quiet() {
+        return;
+    }
+    if machine_output() {
+        eprintln!("{} {}", "✓".green().bold(), message);
+    } else {
+        println!("{} {}", "✓".green().bold(), message);
+    }
 }
 
 /// A non-fatal warning.

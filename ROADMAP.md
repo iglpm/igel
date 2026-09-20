@@ -9,8 +9,9 @@ order in which to close the gaps.
 Legend: ✅ done and verified (by automated tests unless a note says otherwise) · 🟡 partial (what exists and what is
 missing is stated) · ⬜ not started.
 
-_Status as of the spec-conformance update (Sep 2026). Everything below was
-developed and verified on Linux x86_64; Windows and macOS have not been run._
+_Status as of the performance-and-reliability update (Sep 2026, §8). Everything
+below was developed and verified on Linux x86_64; Windows and macOS have not been
+run._
 
 ---
 
@@ -25,7 +26,15 @@ developed and verified on Linux x86_64; Windows and macOS have not been run._
   `install`, `clean`, `tree`, `why`, `add`, `remove`, `update`, `fetch`,
   `generate-lockfile`, `metadata`, `locate-project`, `config`, `cas`, `lockfile`.
 - Cargo's selection flags, `--locked/--offline/--frozen`, `--target`,
-  `--ignore-rust-version`, `--timings`.
+  `--ignore-rust-version`, `--timings` (with a Chrome trace of the schedule),
+  `--deps-only`, `--message-format json`.
+- Several `rune` processes on one project at once: no directory lock, atomic file
+  replacement, per-unit locks, results shared through the store (§8).
+- `rune doctor` (toolchain/linker/profile/machine diagnosis), `rune cas du`,
+  `rune watch`, `rune affected --since`, `rune script` (single-file scripts), and
+  install advice when a build script fails on a missing system package, opt-in
+  cached test results, and a shared store (`cas.remote`, a directory or **Cairn**
+  servers — the companion project in `../cairn`) for CI and teams.
 
 **Manifests, workspaces, targets** — the full compilation-relevant manifest;
 workspace inheritance (also from *foreign* workspaces); all target kinds and
@@ -65,7 +74,7 @@ set, dependency edges, ordering and format (a regenerated lock differs only
 where crates.io has published newer releases than the ones pinned).
 
 **Proof points**
-- ~210 automated tests (`cargo test --workspace` and `rune test` both pass),
+- 308 automated tests (`cargo test --workspace` and `rune test` both pass),
   including end-to-end tests for build scripts, host/target roles, features per
   selection, git (tag/branch/rev/submodules/foreign workspaces), patches,
   local/vendored/authenticated registries, wrappers, runners, config, CAS
@@ -195,23 +204,341 @@ vendor`/`rune vendor`, `[hints]`.
 
 ---
 
-## 4. Milestones
+## 4. Cargo pain points, and what Rune should do about them
+
+Rune only earns its place if it is *noticeably* better than Cargo where Cargo
+hurts. This section collects what Rust users actually complain about, checks it
+against what Rune does today, and says what to build. Evidence comes from the
+Rust project's own surveys and Cargo's design discussions (links in §10);
+entries without a source are my own suggestions and are marked *(idea)*.
+
+"Rune today" describes the code **as of the start of the 2026-09-20 work**;
+the table below says what has been done since. Items marked *verify* still need
+a test or benchmark before they are claimed in the README.
+
+| Item | Status |
+| --- | --- |
+| P2 check ⇄ build sharing | 🟡 measured: 6 of 9 units shared in a probe (all registry crates); local crates and proc-macros are compiled twice. |
+| P3 concurrent processes | ✅ fixed and tested (§8): it was a real bug — 3 of 4 concurrent builds failed. |
+| P4 debuginfo | ✅ dependencies default to `line-tables-only` (−10 % cold build); `rune doctor` covers linkers. Link-step caching ⬜. |
+| P5 self-diagnosis | 🟡 `rune doctor`, `--timings` trace. The "slow build" hint ⬜. |
+| P6 disk | 🟡 `rune cas du` ✅; gc by last use already existed; pinning, zstd ⬜. |
+| P7 CI/Docker | 🟡 `rune build --deps-only` ✅; `cas export/import` ⬜. |
+| P8 path in keys | 🟡 verified: keys do **not** contain the checkout path (a shared store works across paths). Artifacts still embed absolute paths in debuginfo/panics; remapping is only needed for byte-identical builds. |
+| P17 machine interface | 🟡 `--message-format json` ✅; `rune unit-graph`, `rune-api` ⬜. |
+| P1 early cutoff | ⛔ not possible on stable (see P1): `.rmeta` changes on any edit. |
+| P9 cached tests | 🟡 opt-in `--cached` ✅ (285 tests: 8 s → 0.26 s); default-on needs G1. |
+| P15 sandbox, P10–P14, P16 | ⬜ |
+
+### 4.1 Build speed and feedback loop
+
+**P1 — Waiting for the incremental rebuild after a small edit.** By far the most
+common complaint in the 2025 compiler-performance survey (3,700+ responses; 55 %
+wait more than 10 s after a change). Three causes were named: a change deep in a
+workspace recompiles everything above it, linking always starts from scratch, and
+derive-macro expansion is not cached.
+- *Rune today:* content hashing, a ~0.02 s no-op build, `.rmeta` pipelining,
+  critical-path scheduling; switching branches or reverting an edit is a CAS hit.
+  But a dependent's key includes the dependency's *key*, so any edit inside a
+  crate (even a private function body) changes the keys of everything above it.
+- *Finding (2026-09-20): the planned fix is not possible on stable Rust.* Early
+  cutoff needs a hash of a crate's *interface* that ignores body edits. The obvious
+  candidate, the `.rmeta`, is not one: compiling a lib, then changing only a private
+  function body — or only whitespace, or appending a comment — changes the `.rmeta`
+  every time, because it embeds the source map (file hashes, spans). So a
+  "dependents keep their result if the `.rmeta` is unchanged" rule can never fire.
+  What would work needs compiler support (a stable, span-free interface hash, or
+  `-Zbinary-dep-depinfo`-style tracking on nightly); until then dependents of an
+  edited crate are rebuilt, exactly as with Cargo. What Rune *can* do: keep the
+  rebuild small — measured on Rune itself, an edit to a leaf crate rebuilds in
+  0.8 s and an edit deep in the graph (10 dependent units) in 1.3 s, with ~60 ms
+  of Rune overhead; a no-op build takes 59 ms.
+
+**P2 — `cargo check` and `cargo build` do not share work.** Named explicitly in
+the survey ("requiring redundant compilation when developers run check multiple
+times before building").
+- *Rune today:* measured on a small project (9 units): `build` after `check`
+  compiled 3 and restored 6; `check` after `build` likewise. The shared ones are
+  the registry crates; local crates and the proc-macro are built twice.
+- *Plan:* let a `check` unit take the `.rmeta` of the equivalent `build` unit
+  (and vice versa) so `check` after `build` compiles nothing, and test it.
+
+**P3 — The IDE and the terminal block each other.** 35 %+ of survey respondents
+say IDE and Cargo "block one another"; the rust-analyzer issue tracker is full of
+"Blocking waiting for file lock on build directory / package cache" reports, and
+the standard workaround is a *second* target directory (double the disk, double
+the CPU). Cargo's answer is `-Zfine-grain-locking` (nightly, still being
+split into separate locks).
+- *Rune today:* it was **not** safe: a probe of 4 concurrent `rune build`s on one
+  project failed 3 of 4 (files deleted under a running compiler, corrupted
+  build-script binaries). Fixed — see §8.
+- *Done:* (a) concurrency tests (6 parallel builds; interleaved check/build);
+  (b) no global lock — per-unit locks so two processes wanting the same unit wait
+  for one compile and the others proceed; (c) `--message-format json` and the
+  rust-analyzer setting in the README (format tested, live rust-analyzer not yet).
+
+**P4 — Linking is slow and always from scratch; debuginfo is expensive.** The
+survey measured 2–30 % faster edit cycles from `debug = "line-tables-only"`, yet
+25 % of those who kept full debuginfo never use a debugger. Faster linkers
+(`mold`, `lld`, `wild`) give several-fold gains on big binaries but need manual
+setup in `.cargo/config.toml`.
+- *Rune today:* `target.<t>.linker` and rustflags are honoured and part of the
+  identity, so a user *can* opt in. **Done:** registry/git dependencies default to
+  `line-tables-only` in dev (`build.dependency-debuginfo` turns it off): a cold
+  build of Rune itself went from 36.7 s to 33.1 s (median of 4 interleaved runs),
+  and 29.7 s → 23.9 s when the workspace crates were trimmed too. `rune doctor`
+  (F1) now detects an installed `mold`/`wild`/`lld` and prints the exact config.
+- *Still to do:* Optionally a
+  `build.linker = "auto"` setting that picks the fastest available linker and
+  keys its identity. Cache the *link step* in the CAS (key = all object keys +
+  linker identity + link args) so relinking an unchanged set of objects is free.
+
+**P5 — Nobody knows the knobs exist.** 42 % of survey respondents had tried no
+build-performance mechanism at all.
+- *Plan:* make the slow case self-diagnosing: after a build slower than a
+  threshold, print one line ("3 units = 70 % of the time; run `rune doctor`"),
+  and turn `--timings` into an HTML/Chrome-trace report with the critical path
+  highlighted and a "split this crate?" hint for a single dominant unit *(idea)*.
+
+### 4.2 Disk, CI and containers
+
+**P6 — Target directories eat the disk.** High disk usage was the *second* most
+reported problem in the 2025 State of Rust survey (22 % of respondents; slow
+compilation 27 %). The Cargo team is experimenting with `-Zembed-metadata=no` to
+shrink `rlib`s.
+- *Rune today:* CAS objects are hardlinked into `target/`, so a project's
+  `target/` is nearly free — but the CAS itself is unbounded (~16 GB on the
+  author's machine); `rune cas gc --max-size` exists.
+- *Plan:* `rune cas du` (by package / profile / age), gc by *last use* rather
+  than size alone, `rune clean --unused-for 30d`, pinning of the current
+  project's keys so gc never evicts what `Cargo.lock` needs, zstd for cold
+  objects, and adopting `embed-metadata=no` once it is stable.
+
+**P7 — CI rebuilds the world; Docker layers cannot cache dependencies.** 25 % of
+CI users call performance a major problem and ~36 % of those use no cache at all.
+Cargo has no `--only-deps`, and its mtime-based fingerprints break Docker layer
+reuse, which is why `cargo-chef` exists (5× faster Docker builds in its author's
+measurements).
+- *Done:* `rune build --deps-only` (all registry/git units, no workspace
+  members) — replaces `cargo-chef` and needs no recipe file; content-hash keys are
+  independent of mtimes, so the layer is stable. *Still to do:* `rune cas
+  export/import <bundle>` for exactly the keys a lockfile needs (CI cache
+  save/restore as one file). Remote CAS is M5.
+
+**P8 — Cache keys that contain the checkout path.** `sccache` documents that the
+working directory is part of its key, so copies of a project or several `git
+worktree`s (very common with parallel coding agents) never share results; and a
+single shared `CARGO_TARGET_DIR` serialises them behind Cargo's lock.
+- *Rune today:* keys are content-based, but *checked*: Rune passes no
+  `--remap-path-prefix` / `trim-paths`, so absolute paths are baked into debuginfo
+  and panic messages. Registry units live under `RUNE_HOME`, so machines with a
+  different home or `RUNE_HOME` produce different bytes for the same key.
+  That does not break a local CAS but **would break a remote one (M5)**.
+- *Plan:* remap the workspace, `RUNE_HOME` registry/git roots and the sysroot to
+  fixed prefixes (and implement `trim-paths`, G8); add a test that the same
+  project at two paths yields byte-identical artifacts and one shared key.
+  Worktrees then share automatically.
+
+**P9 — Test results are never cached.** Listed in the Cargo vision post; every
+`cargo test` re-runs every test even when nothing that could affect it changed.
+- *Done (opt-in):* `rune test --cached` / `test.cache`. A passing libtest binary is
+  remembered under blake3(binary bytes, package-directory hash, arguments,
+  `RUST_*`/`CARGO_*`/`RUNE_*` environment); failures are never stored; doc-tests
+  are not cached. Measured on Rune's own suite: 285 tests, ~8 s → 0.26 s when
+  nothing changed. Tested end to end (code change, fixture change, arguments,
+  `--cached=false`, failures).
+- *Still to do:* it is only sound for tests whose inputs Rune can see, so the flag
+  stays opt-in. Making it default needs G1 (recording what a test actually reads,
+  via the sandbox/tracer) to classify a test binary as hermetic; then
+  `[package.metadata.rune] cache-tests = true` per package could replace the flag,
+  and the key could use the *recorded* environment instead of a prefix list.
+
+### 4.3 Dependencies and resolution
+
+**P10 — Feature unification surprises and the `workspace-hack` workaround.**
+Cargo unifies features across a workspace build, so the same crate is built
+several times with different features; `cargo-hakari` exists to force a
+"workspace-hack" crate that unifies them (reported 50 %+ faster consecutive
+builds in big workspaces), at the cost of a generated crate in every manifest.
+Cargo's RFC 3692 (feature unification) is still evolving.
+- *Rune today:* features are resolved per selection, so `-p a` does not pick up
+  features only `b` wants; different feature sets are different units and all
+  live in the CAS, so alternating between them is cheap.
+- *Plan:* `rune build --unify-features=workspace` computes a hakari-style
+  unification *in memory* (no extra crate, no manifest changes), and `rune
+  features <crate>` explains why a feature is on ("enabled by X via Y"). Reuse
+  the machinery behind `rune why`.
+
+**P11 — Unused dependencies.** `cargo-machete` is fast but text-based (false
+positives with proc-macros and build scripts); `cargo-udeps` is accurate but
+needs nightly and a full compile.
+- *Plan:* `rune unused` built on stable rustc's `unused-crate-dependencies` lint
+  plus Rune's own dependency graph, run as part of a normal build/check so it is
+  nearly free on a warm CAS. Also flags unused *features* and dev/build
+  dependencies used by nothing *(idea)*.
+
+**P12 — Upgrading is costly and finding good crates takes insider knowledge**
+(both named in the Cargo vision post).
+- *Plan:* `rune outdated` and `rune upgrade [--incompatible]` (with MSRV
+  awareness, as resolver 3 already has), `rune add` printing licence, MSRV, last
+  release, download trend and enabled features before writing the manifest, and
+  an optional `rune semver-check` wrapping `cargo-semver-checks` for libraries.
+
+**P13 — Resolver: no backtracking, error messages.** Already G2. Cargo itself is
+migrating to PubGrub; adopt it for the same reason (readable "no version of X
+satisfies A and B" explanations).
+
+**P14 — Public/private dependencies and artifact dependencies.** Both are
+long-running Cargo efforts (RFC 1977 public-dependency; RFC 3028 binary/artifact
+dependencies).
+- *Plan:* parse and preserve `public = true` and lint leaks of private types in
+  public API once rustc supports it; artifact dependencies (`artifact = "bin"`)
+  as a second-tier feature — Rune's unit model (host/target roles) already
+  matches what they need (G8).
+
+### 4.4 Security and trust
+
+**P15 — Build scripts and proc-macros run with the developer's full
+privileges.** Stable Cargo has no way to turn either off or confine them; the
+2026 `arrayref`/`internment` incident shows the attack is real (a poisoned
+proc-macro dependency ran at build time). `cargo audit` also misses *deleted*
+malicious versions and has no exploitability data.
+- *Rune today:* G1's sandbox is planned for **hermeticity**; declared-input
+  enforcement is there for immutable sources only.
+- *Plan:* promote the sandbox to a **security feature** as well as a
+  correctness one: `--sandbox` runs build scripts and proc-macros with no network
+  and a read-only filesystem except `OUT_DIR`, with an allow-list in
+  `[workspace.metadata.rune.sandbox]` for crates that legitimately need more
+  (`openssl-sys`, `bindgen`). `rune tree --exec-surface` lists every crate that
+  runs code at build time (build script, proc-macro, native `-sys`). Add a
+  `resolve.min-release-age` setting (do not pick a version published in the last
+  N days) and a warning when a locked version no longer exists in the index.
+
+**P16 — Provenance.** *(idea)* Because keys already record everything that went
+into an artifact, Rune is well placed to emit an SBOM (`rune sbom`, CycloneDX
+and SPDX) and a build attestation (in-toto/SLSA) straight from the graph,
+plus `rune build --verify-reproducible` (build twice, compare bytes, report the
+non-deterministic crates).
+
+### 4.5 Extensibility
+
+**P17 — Cargo is almost all porcelain.** The Cargo vision post says the lack of
+programmatic interfaces blocks Docker, corporate and tooling integrations.
+- *Done:* `--message-format json` for build/check (compiler messages replayed
+  from the store on cache hits, artifact paths, `fresh`, `build-finished`).
+- *Still to do:* the same for `test`, unit keys in the output, a versioned schema,
+  `rune unit-graph` (units, keys, edges, cache status), `rune build-plan`, and a
+  library crate (`rune-api`) with the same data. This unblocks rust-analyzer
+  (P3), CI dashboards and `rune affected` (F6).
+
+### 4.6 Priority
+
+Cheapest and most valuable first:
+
+1. ✅ **Concurrency tests + per-unit locks** (P3) — was a correctness bug.
+2. **Path remapping / `trim-paths`** (P8) — precondition for the remote CAS and
+   for worktree sharing.
+3. ✅ **`rune build --deps-only`** (P7) — small, and beats `cargo-chef`.
+4. ✅ **`--message-format=json`** (P3, P17); rust-analyzer recipe written, unverified live.
+5. **check ⇄ build metadata sharing** (P2) — partly there; finish and test.
+6. ✅ **`rune doctor` and `rune cas du`** (P4–P6).
+7. Bigger bets: interface early-cutoff (P1), sandbox-as-security (P15), cached
+   tests (P9), remote CAS (M5).
+
+---
+
+## 5. Feature ideas
+
+Beyond fixing Cargo's pain points: things a Rune-shaped tool can do *because*
+every unit has a complete identity. Ordered roughly by value/cost.
+
+**F1 — `rune doctor`.** ✅ *(first version)* Inspects toolchain, linker,
+debuginfo, jobs, store size/idleness, RAM-backed `RUNE_HOME`, `RUSTC_WRAPPER` and
+the `git`/`cc`/`pkg-config` binaries Rune shells out to, and prints concrete
+fixes (P4–P6). Every rule is unit-tested. To add: profile/opt-level advice, a
+"this build was slow because…" hint after a slow build.
+
+**F2 — `rune explain-miss <unit>` / `rune why-rebuilt`.** Diff the identity
+breakdown of the last stored key against the current one: "rebuilt because
+`RUSTFLAGS` changed", "…because `build.rs` read `/usr/include/foo.h`, size
+differs". Needs G4's recorded breakdown. This is the single feature that makes
+the cache trustworthy to users.
+
+**F3 — Remote / read-through CAS.** ✅ *(shared directory and HTTP; see §8 and the companion project **Cairn**, `../cairn`)* Done: a shared directory; an HTTP backend with bearer tokens (read/write roles), client-side sharding by rendezvous hashing with replicas, failover and a circuit breaker; and the Cairn server (integrity checks, LRU eviction, peers with read-through and replication, metrics). Still to do: TLS in Cairn itself (today: a reverse proxy), signed manifests, S3-compatible backends, cluster-wide eviction, `rune cas export/import`. A "trusted peer" mode lets a team share proc-macro and `-sys` builds, the most expensive units.
+
+**F4 — `rune watch`.** ✅ *(polling; `-x` commands, restart on change, `--ignore`)* Rebuild/check/test on save using the same CAS, so
+reverting an edit or switching branches is instantaneous (a `bacon`/`cargo-watch`
+replacement that understands keys instead of polling timestamps).
+
+**F5 — Single-file scripts.** ✅ `rune script file.rs` with a `---cargo` front-matter
+block for dependencies (the format Cargo is stabilising), compiled through the
+normal pipeline and cached in the CAS; `#!/usr/bin/env rune` shebang. Runs in
+milliseconds after the first time.
+
+**F6 — `rune affected --since <git-ref>`.** ✅ *(package level: owner + transitive dependents; `--partition N/M` still to do)* Given a diff, print the packages
+whose unit keys change — exactly, not by path heuristics — so CI can build and
+test only what a PR can influence, and `--partition N/M` to shard tests over CI
+machines.
+
+**F7 — A better test runner.** Per-test parallelism, retries and flaky-test
+marking, JUnit/JSON output, slowest-tests summary, `--fail-fast` iteration mode
+(all named in the Cargo vision post or done today by `cargo-nextest`). Runs
+inside the pipelined runner already in `rune test`.
+
+**F8 — `-Zbuild-std` in the CAS.** Cargo rebuilds `core`/`alloc`/`std` per
+project; keyed by compiler + target + flags they are perfect CAS objects. Makes
+embedded, WASM and custom-target work (G7) fast.
+
+**F9 — Friendlier build-script failures.** ✅ *(C compiler, `pkg-config`, one missing `.pc` library, OpenSSL, `cmake`, `libclang`, `protoc`; apt/dnf/pacman/apk/zypper/brew)* When `pkg-config`, `cmake` or
+a C compiler is missing, recognise the failure and say which package to install
+for the detected distro ("`openssl-sys` needs `libssl-dev` / `openssl-devel`").
+Among the commonest first-run failures for newcomers.
+
+**F10 — Timings and regression tracking.** Export Chrome-trace / OpenTelemetry
+spans; `rune timings --compare <ref>` to fail CI when the build gets slower by a
+threshold; feed the same data into the scheduler (already weighted by measured
+compile times).
+
+**F11 — Packaging tooling.** `rune package --list`, `rune publish --dry-run`
+that *builds the packaged tarball* to catch files missing from `include`,
+`rune vendor` (also G8), `rune yank`/`owner`/`login` (G3), plus `rune audit`,
+`deny`, `outdated`, `coverage` (M3).
+
+**F12 — Workspace ergonomics.** `rune graph` (DOT/Mermaid of packages and
+units), `rune run -p x` from anywhere, `[workspace.metadata.rune]` for
+Rune-only settings so plain `cargo` users are unaffected, `rune new --template`
+(including the "mod-level templates" idea from the vision post).
+
+**F13 — Toolchain handling.** Offer to install a missing `rust-toolchain.toml`
+toolchain or target (`rustup target add`) with a clear message instead of a raw
+rustc error; verify the `rust-toolchain` path in the test suite (§28, currently
+checked by hand).
+
+**F14 — Programmatic API.** `rune-api` crate exposing planning, the unit graph
+and cache lookups for IDEs, Bazel-style wrappers and corporate tooling (see P17).
+
+---
+
+## 6. Milestones
 
 | | Goal | Delivers |
 | --- | --- | --- |
 | **M1** | Hermeticity | G1: sandboxed/recorded build-script reads, non-hermetic class, full native tool identity. |
 | **M2** | Ecosystem confidence | G2 + a compatibility corpus: build the top ~500 crates (and their tests) with Rune vs Cargo in CI; fix every divergence; backtracking resolver. |
-| **M3** | Registry & tooling | G3 + `publish`/`audit`/`outdated`/`deny`/`coverage` (the tooling promised in `spec.md`). |
-| **M4** | Observability | G4 + `rune cas inspect`, `rune explain-miss`, structured diagnostics. |
-| **M5** | Sharing | Remote/read-through CAS for CI and teams; G5 shared documentation. |
-| **M6** | Platforms | G6 + G7 + CI on Windows/macOS. |
+| **M3** | Registry & tooling | G3 + `publish`/`audit`/`outdated`/`deny`/`coverage` (F11). |
+| **M4** | Observability | G4 + `rune cas inspect`, `rune explain-miss` (F2), structured diagnostics. |
+| **M5** | Sharing | *Done:* shared-directory store ✅, HTTP backend ✅, **Cairn** server with peers/replication/sharding ✅, `--deps-only` ✅. *Open:* signed manifests, TLS in Cairn, S3 backend, `cas export/import` (P7); G5 shared documentation. |
+| **M6** | Platforms | G6 + G7 + CI on Windows/macOS; `-Zbuild-std` in the CAS (F8). |
+| **M7** | Daily driver | *Started:* P3 concurrency ✅, P4–P6 `rune doctor`/`cas du`/dependency debuginfo ✅, `--message-format=json` ✅, `--deps-only` ✅. `rune watch` ✅, scripts ✅, `rune affected` ✅, build-script hints ✅. *Open:* P2 completion, better test runner (F7), JSON for `test`. Start this before M4–M6: it is what users feel first. |
+| **M8** | Supply chain | P15/P16: sandbox as a security boundary, exec-surface report, `min-release-age`, SBOM/attestation, reproducibility check. Builds on M1. |
+| **M9** | Faster than Cargo on edits | P9 cached tests: opt-in ✅, default-on after M1. P1 early cutoff is blocked on compiler support, see P1. |
 
 ---
 
-## 5. How to verify the current state
+## 7. How to verify the current state
 
 ```bash
-cargo test --workspace                       # ~210 tests, no network needed
+cargo test --workspace                       # 308 tests, no network needed
 cargo clippy --workspace --all-targets
 
 # Rune builds and tests itself against live crates.io (use a scratch copy
@@ -232,7 +559,135 @@ registry cache, git checkouts).
 
 ---
 
-## 6. What changed in the spec-conformance update
+## 8. What changed in the performance-and-reliability update
+
+**Reliability — concurrent processes (P3), a real bug.** Four `rune build`s
+started at once on one project: three failed (`failed to open object file`,
+`memory map must have a non-zero length`, `undefined hidden symbol` from a
+half-written build-script binary). Causes: every process wrote the same
+hash-named files into the shared `deps/` directory; "remove stale outputs, then
+recompile" and "remove, then hard-link a CAS hit" both leave a window in which
+the file does not exist for a compiler in another process. Fixed by (1) replacing
+every materialised file atomically (link/copy to a temp name, `rename`), (2) a
+per-unit advisory `flock` on the unit's output identity — only processes building
+the *same unit* wait, everything else overlaps — and (3) after waiting, taking the
+finished result from the store instead of compiling again. Regression tests: six
+concurrent builds of an 8-crate chain with build scripts, and interleaved
+`check`/`build`; both failed before the change. Measured on `serde`: 4 concurrent
+builds compiled 10 units in total instead of 36 and all succeeded.
+
+**Cold builds — what was measured (the 0.1 % CPU / 80 MB observation).** That
+figure is Rune's *own* process; the compilers are children. Measured properly, a
+cold build of Rune's 182 units on a 12-thread machine (i5-10400F: 6 cores + SMT)
+kept the CPU at ~99 % for the first 13 s and ~80 % overall. The wall time (28.7 s)
+was **equal to the length of one dependency chain** — `unicode-ident →
+proc-macro2 → quote → syn → tracing-attributes → tracing → h2 → hyper →
+hyper-util → reqwest → rune-registry → rune-resolver → rune` — so more jobs
+cannot help once the machine is full; only shortening that chain can. Run alone
+(`-j 1`) the same units take 2–3× less time than inside the parallel build (`syn`
+3.6 s vs 8.8 s), which is SMT and shared-cache contention.
+
+What was tried:
+
+| Change | Result |
+| --- | --- |
+| Critical-path priority was inverted (it ranked a unit by the chain *before* it); now the longest chain *after* it, with pipelined edges costed at 40 % of the dependency. Unseen units estimated from source size instead of a flat 1 s; timings shared across projects in `<cas>/timings.json`. | **Correct, tested, no measurable cold-build gain** on this graph (median 29.6 s vs 29.6 s over 6 interleaved runs). Kept: it is what the scheduler claimed to do, and matters for graphs with a long tail. |
+| Lowering the CPU priority (`nice`) of units off the critical chain. | **No gain** (SMT siblings share execution units regardless of priority). Removed again. |
+| Dependencies compile with `line-tables-only` instead of full debuginfo in dev. | **−10 %** cold build (36.7 s → 33.1 s, median of 4 interleaved runs). Kept, as the default for registry/git dependencies only; `build.dependency-debuginfo = true` restores Cargo's behaviour. |
+| Same, for *all* crates including the workspace's own. | −20 % (29.7 s → 23.9 s) — not done by default: it changes what you see when debugging your own code. |
+
+Benchmark noise on this machine was ±10 % between identical runs, so every number
+above is a median of interleaved runs, not a single measurement.
+
+**New surface:** `rune build --deps-only`; `--message-format json` (Cargo-shaped
+`compiler-message`/`compiler-artifact`/`build-finished`, diagnostics stored in the
+CAS and replayed on hits); `rune doctor`; `rune cas du`; `--timings` writes
+`.rune/fingerprints/trace.json` (Chrome trace of the schedule); tests
+(308 in total).
+
+**Second batch (same day):** `rune watch`, `rune affected`, `rune script`, install
+hints for failed build scripts (see F4–F6, F9), opt-in cached test results (P9), a shared store (F3), and a fix so a `KeyUpdate` recomputes
+only the units that depend on the changed one instead of every pending unit.
+Measured along the way: no-op build 59 ms; edit-and-rebuild 0.8 s (leaf) / 1.3 s
+(deep, 10 units); a script whose dependencies are in the store runs in 0.14 s; a
+first-ever fetch of 219 crates takes ~5 s (≈2 s index, ≈3 s downloads, network
+bound) — overlapping downloads with compilation could hide most of that on a truly
+cold first build (~10 %), but needs the planner to work from partial information,
+so it is a larger change than it looks. Early cutoff (P1) turned out to be
+impossible on stable Rust (see P1).
+
+**Shared store (F3, M5).** `cas.remote` / `cas.remote-write`: a directory (network
+share, CI volume) consulted on a local miss and published to after a store, slot by
+slot with the marker file last, so readers never see half an entry and any number
+of writers can race (first publisher wins). Measured on Rune's own 182 units
+(770 MB): a developer with an empty local store and a read-only remote restored
+everything in 0.72 s (a cold build takes ~30 s), and the restored binary ran.
+Publishing initially cost the CI build ~10 % (synchronous copies inside a compiler
+slot); moved to a two-thread background pool flushed at the end of the build, it is
+~1 % (3 runs each, inside the noise). Verified end to end that a different checkout
+path and a separate `RUNE_HOME` still hit: keys contain no checkout path. The HTTP
+backend and the Cairn server (next paragraphs) followed; not done: signing, S3,
+eviction of a shared *directory*.
+
+**Cairn — the remote cache server (M5).** A new project next to Rune (`../cairn`, its
+own README): one Rust binary over a directory of plain files, speaking Rune's own
+layout (`GET`/`PUT /v1/o/{key}/{file}`). It refuses a marker file unless the slot it
+names is complete, verifies an announced BLAKE3 hash while an upload streams, is
+immutable (first writer wins, `409` otherwise), has `read`/`write`/`admin` tokens
+(only hashes stored), LRU eviction, Prometheus metrics, and `verify`/`gc`/`stats`
+commands. **Multi-server:** nodes are peers (`read_through` on a miss with one fetch
+per key however many clients wait; `replicate` in the background with retries;
+`max_hops` so mutual peers terminate), and Rune shards across servers itself
+(`cas.remote = http://a,http://b`, rendezvous hashing, `cas.remote-replicas`,
+failover, a 30 s circuit breaker). 46 tests, including a contract suite that drives
+Rune's real client against real servers; Cairn builds and tests with Rune (146 units,
+24 s, 46 tests). Measured on Rune's 182 units (811 MB): CI publishes at no visible
+cost; a fresh developer restores everything in **0.65 s**; with two replicated
+nodes and one killed, still 0.65 s.
+
+Three findings from getting there — each would have shipped otherwise:
+- **The restored binary was not executable.** Rewriting the shared-store code around
+  a transport abstraction wrote pulled files through a fresh file, dropping the
+  execute bit, so `rune run` said "Permission denied" for anything from a shared
+  store (directory *or* HTTP). Fixed end to end (an `X-Cairn-Exec` header; `0555`
+  vs `0444`; carried through peers) with regression tests in both projects. It was
+  caught only by running the real acceptance, not by the unit tests.
+- **Nagle's algorithm made restores 10× slower.** Restoring 182 units over HTTP took
+  7.3 s while CPU sat idle on both sides. Cause: the server wrote response headers
+  and body separately without `TCP_NODELAY`, so each small request waited ~40 ms for
+  the client's delayed ACK (a big `curl` download ran at 4.4 GB/s, which hid it).
+  With `TCP_NODELAY` on both ends: **0.65 s**, the same as a local directory.
+- **`reqwest::blocking` is single-threaded underneath** (one I/O thread for every
+  connection). A pool of blocking clients helped (7.3 → 3.4 s) but the real fix for
+  scaling was a private multi-thread runtime driven with `block_on`.
+
+**`rustc_driver` / `rustc_interface` (evaluated, not adopted).** Rune runs `rustc`
+as a child process. Linking `rustc_driver` and compiling in-process was evaluated
+and rejected for now:
+- *Gain:* a `rustc` process costs ~9 ms to start (~15 ms for a trivial crate). Over
+  Rune's 182 units that is ~1.6 s of ~231 s CPU (0.7 %), about 0.1 s of a 28 s cold
+  build's critical chain, and nothing on warm builds (nothing is spawned).
+- *Cost:* both crates are compiler internals (`#![feature(rustc_private)]`): they
+  need a nightly and the `rustc-dev` component and change with every nightly, so
+  Rune could no longer build itself or serve projects on the stable toolchain.
+- *Hazards:* `env!` and proc-macros read the **process** environment, so parallel
+  in-process compiles with different `CARGO_*` values could produce wrong output —
+  a correctness violation (§70); diagnostics go to the process's stderr unless a
+  custom `Emitter` is written against unstable internals; an ICE or an LLVM abort
+  takes Rune down with it; sessions leak memory.
+- *If this is ever revisited:* the only sound shape is a pool of worker processes
+  each hosting `rustc_driver` behind an opt-in cargo feature, so env and stderr
+  stay per-process. That saves the same ~9 ms and adds all the maintenance above.
+
+**Not done, and why:** default-on cached tests (P9) need
+the sandbox (G1) to know what a test reads; path remapping (P8)
+changes what users see in backtraces and only matters once a remote CAS exists;
+the sandbox (P15) is a large, platform-specific piece of work. Each is in §4 with
+its plan.
+
+---
+
+## 9. What changed in the spec-conformance update
 
 Fixed along the way (all covered by tests): `rune new` scaffolded an unbuildable
 project (wrote the manifest to `Rune.toml`); `[lib] crate-type` was silently

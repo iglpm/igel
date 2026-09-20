@@ -35,6 +35,8 @@ pub enum ValueKind {
     Path,
     /// A byte size such as `20GB`, `512MiB`, or a plain number of bytes.
     Size,
+    /// Free text (a token, a list of URLs).
+    Text,
 }
 
 impl ValueKind {
@@ -43,6 +45,7 @@ impl ValueKind {
             ValueKind::Bool => "a boolean (true/false)",
             ValueKind::Uint => "a non-negative integer",
             ValueKind::Path => "a path",
+            ValueKind::Text => "text",
             ValueKind::Size => "a size such as `20GB` or `512MiB`",
         }
     }
@@ -55,6 +58,7 @@ pub enum Value {
     Uint(u64),
     Path(String),
     Size(u64),
+    Text(String),
 }
 
 impl fmt::Display for Value {
@@ -64,6 +68,7 @@ impl fmt::Display for Value {
             Value::Uint(n) => write!(f, "{n}"),
             Value::Path(p) => write!(f, "{p}"),
             Value::Size(n) => f.write_str(&format_size(*n)),
+            Value::Text(t) => write!(f, "{t}"),
         }
     }
 }
@@ -90,6 +95,16 @@ pub const KEYS: &[KeyDef] = &[
                       builds reuse cached artifacts just like dev builds do.",
     },
     KeyDef {
+        name: "build.dependency-debuginfo",
+        kind: ValueKind::Bool,
+        default: "false",
+        description: "Compile registry and git dependencies with full debuginfo in the dev profile. \
+                      Off by default: dependencies get `line-tables-only` (backtraces and \
+                      breakpoints keep working, local-variable inspection inside dependency code \
+                      does not), which makes cold builds about 20% faster. A `debug` key in a \
+                      profile always wins, and your own crates are never affected.",
+    },
+    KeyDef {
         name: "build.jobs",
         kind: ValueKind::Uint,
         default: "CPUs + one third",
@@ -112,6 +127,38 @@ pub const KEYS: &[KeyDef] = &[
         kind: ValueKind::Path,
         default: "~/.rune/cas",
         description: "Location of the content-addressable store.",
+    },
+    KeyDef {
+        name: "cas.remote",
+        kind: ValueKind::Path,
+        default: "none",
+        description: "A store shared with other machines, consulted before compiling and \
+                      published to after: a directory (network share, CI cache volume) or the \
+                      URL of a Cairn server (`http://host:7070`). Several URLs separated by \
+                      commas shard entries across the servers. Share only between machines you \
+                      would run each other's binaries on.",
+    },
+    KeyDef {
+        name: "cas.remote-token",
+        kind: ValueKind::Text,
+        default: "none",
+        description: "Bearer token for a Cairn server. Prefer the RUNE_CAS_REMOTE_TOKEN \
+                      environment variable: anything in Rune.toml is readable by everyone who can \
+                      read the project.",
+    },
+    KeyDef {
+        name: "cas.remote-replicas",
+        kind: ValueKind::Uint,
+        default: "1",
+        description: "With several Cairn URLs in `cas.remote`: how many servers hold each entry \
+                      (2 keeps everything available when one server is down).",
+    },
+    KeyDef {
+        name: "cas.remote-write",
+        kind: ValueKind::Bool,
+        default: "true",
+        description: "Publish new entries to `cas.remote`. Set to false on machines that should \
+                      only read the shared store (e.g. developers, when only CI writes).",
     },
     KeyDef {
         name: "cas.max-size",
@@ -141,6 +188,15 @@ pub const KEYS: &[KeyDef] = &[
         description: "Create and update `Cargo.lock` when the set of locked packages changes, as \
                       Cargo does, so the project keeps working with plain `cargo`. A lockfile \
                       that is already up to date is never touched.",
+    },
+    KeyDef {
+        name: "test.cache",
+        kind: ValueKind::Bool,
+        default: "false",
+        description: "Skip test binaries that passed before with an identical binary, package \
+                      files, arguments and RUST_/CARGO_/RUNE_ environment (`rune test --cached`). \
+                      Only enable it if your tests depend on nothing else: no network, clock, or \
+                      files outside the package.",
     },
     KeyDef {
         name: "test.doctests",
@@ -288,7 +344,9 @@ impl Settings {
             let value = match (value, path_base) {
                 // A project-relative path is stored resolved, so callers never
                 // need to know which file it came from.
-                (Value::Path(p), Some(base)) if Path::new(&p).is_relative() => {
+                (Value::Path(p), Some(base))
+                    if Path::new(&p).is_relative() && !is_url_list(&p) =>
+                {
                     Value::Path(base.join(p).to_string_lossy().into_owned())
                 }
                 (v, _) => v,
@@ -328,6 +386,41 @@ impl Settings {
             Some((Value::Path(p), _)) => Some(expand_home(p)),
             _ => None,
         }
+    }
+
+    /// `cas.remote`: a store shared with other machines — a directory or one or
+    /// more Cairn URLs, exactly as written.
+    pub fn cas_remote(&self) -> Option<String> {
+        self.path("cas.remote").map(|p| p.to_string_lossy().into_owned())
+    }
+
+    /// `cas.remote-token`: the bearer token for a Cairn server.
+    pub fn cas_remote_token(&self) -> Option<String> {
+        match self.values.get("cas.remote-token") {
+            Some((Value::Text(t), _)) => Some(t.clone()),
+            _ => None,
+        }
+    }
+
+    /// `cas.remote-replicas`: copies kept across several Cairn servers.
+    pub fn cas_remote_replicas(&self) -> usize {
+        self.uint("cas.remote-replicas").map_or(1, |n| n.max(1) as usize)
+    }
+
+    /// `cas.remote-write`: publish to the shared store.
+    pub fn cas_remote_write(&self) -> bool {
+        self.bool("cas.remote-write", true)
+    }
+
+    /// `test.cache`: remember passing test runs.
+    pub fn test_cache(&self) -> bool {
+        self.bool("test.cache", false)
+    }
+
+    /// `build.dependency-debuginfo`: give registry/git dependencies full
+    /// debuginfo in dev builds (instead of `line-tables-only`).
+    pub fn dependency_debuginfo(&self) -> bool {
+        self.bool("build.dependency-debuginfo", false)
     }
 
     /// `build.release-rebuild-all`: rebuild every crate for release builds
@@ -543,6 +636,10 @@ fn from_toml(def: &KeyDef, item: &Item) -> Result<Value, &'static str> {
             .as_str()
             .map(|s| Value::Path(s.to_string()))
             .ok_or(expected),
+        ValueKind::Text => value
+            .as_str()
+            .map(|s| Value::Text(s.to_string()))
+            .ok_or(expected),
         ValueKind::Size => match value {
             TomlValue::Integer(n) => u64::try_from(*n.value())
                 .map(Value::Size)
@@ -558,6 +655,7 @@ fn to_toml(value: &Value) -> TomlValue {
         Value::Bool(b) => TomlValue::from(*b),
         Value::Uint(n) => TomlValue::from(*n as i64),
         Value::Path(p) => TomlValue::from(p.as_str()),
+        Value::Text(t) => TomlValue::from(t.as_str()),
         // Sizes are stored as the friendly string the user typed, normalized.
         Value::Size(n) => TomlValue::from(format_size(*n)),
     }
@@ -580,6 +678,8 @@ pub fn parse_value(def: &KeyDef, raw: &str) -> Result<Value, SettingsError> {
         ValueKind::Uint => raw.parse::<u64>().map(Value::Uint).map_err(|_| bad()),
         ValueKind::Path if !raw.is_empty() => Ok(Value::Path(raw.to_string())),
         ValueKind::Path => Err(bad()),
+        ValueKind::Text if !raw.is_empty() => Ok(Value::Text(raw.to_string())),
+        ValueKind::Text => Err(bad()),
         ValueKind::Size => parse_size(raw).map(Value::Size).ok_or_else(bad),
     }
 }
@@ -640,6 +740,12 @@ pub fn env_var_name(key: &str) -> String {
             })
             .collect::<String>()
     )
+}
+
+/// Whether a `cas.remote` value is one or more URLs rather than a directory.
+pub fn is_url_list(s: &str) -> bool {
+    let s = s.trim_start();
+    s.starts_with("http://") || s.starts_with("https://")
 }
 
 fn expand_home(p: &str) -> PathBuf {

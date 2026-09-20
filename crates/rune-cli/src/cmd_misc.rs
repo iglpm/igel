@@ -494,6 +494,55 @@ pub fn cas(cmd: CasCommands) -> Result<()> {
                 println!("  max size     {}", format_size(max));
             }
         }
+        CasCommands::Du(args) => {
+            let u = rune_cas::usage::usage(&cas);
+            ui::heading("content-addressable store usage");
+            println!("  location     {}", config.cas_dir.display());
+            println!("  entries      {}", u.entries);
+            println!("  size         {}", format_size_human(u.bytes));
+            if u.packages.is_empty() {
+                return Ok(());
+            }
+            println!();
+            println!(
+                "  {:<32} {:>8} {:>10}  last used",
+                "package", "entries", "size"
+            );
+            for p in u.packages.iter().take(args.top) {
+                println!(
+                    "  {:<32} {:>8} {:>10}  {}",
+                    p.name,
+                    p.entries,
+                    format_size_human(p.bytes),
+                    format_idle(p.idle_secs)
+                );
+            }
+            if u.packages.len() > args.top {
+                let rest: u64 = u.packages[args.top..].iter().map(|p| p.bytes).sum();
+                println!(
+                    "  … {} more packages, {}",
+                    u.packages.len() - args.top,
+                    format_size_human(rest)
+                );
+            }
+            println!();
+            for b in &u.idle {
+                if b.entries > 0 {
+                    println!(
+                        "  {:>10} unused for {:<8} ({} entries)",
+                        format_size_human(b.bytes),
+                        format_idle_threshold(b.min_idle_secs),
+                        b.entries
+                    );
+                }
+            }
+            if let Some(b) = u.idle.iter().rev().find(|b| b.entries > 0) {
+                ui::detail(format!(
+                    "free it with: rune cas gc --max-age {}",
+                    b.min_idle_secs
+                ));
+            }
+        }
         CasCommands::Gc(args) => {
             let max_size = match &args.max_size {
                 Some(s) => Some(parse_size(s).with_context(|| format!("invalid size `{s}`"))?),
@@ -620,4 +669,262 @@ mod tests {
         assert_eq!(format_size_human(512), "512 B");
         assert_eq!(format_size_human(2048), "2.00 KiB");
     }
+}
+
+/// "3 min ago", "2 days ago", … for a duration in seconds.
+fn format_idle(secs: u64) -> String {
+    match secs {
+        0..=59 => "just now".to_string(),
+        60..=3_599 => format!("{} min ago", secs / 60),
+        3_600..=86_399 => format!("{} h ago", secs / 3_600),
+        _ => format!("{} days ago", secs / 86_400),
+    }
+}
+
+fn format_idle_threshold(secs: u64) -> String {
+    match secs {
+        0..=3_599 => format!("{} min", secs / 60),
+        3_600..=86_399 => format!("{} h", secs / 3_600),
+        86_400 => "1 day".to_string(),
+        _ => format!("{} days", secs / 86_400),
+    }
+}
+
+#[cfg(test)]
+mod du_format_tests {
+    use super::*;
+
+    #[test]
+    fn idle_times_read_naturally() {
+        assert_eq!(format_idle(5), "just now");
+        assert_eq!(format_idle(600), "10 min ago");
+        assert_eq!(format_idle(7_200), "2 h ago");
+        assert_eq!(format_idle(3 * 86_400), "3 days ago");
+        assert_eq!(format_idle_threshold(86_400), "1 day");
+        assert_eq!(format_idle_threshold(30 * 86_400), "30 days");
+    }
+}
+
+/// `rune doctor`.
+pub fn doctor() -> Result<()> {
+    use crate::doctor::{Environment, Level, diagnose, fs_type_of};
+
+    let root = find_project_root(None);
+    let settings = Settings::load(root.as_deref())?;
+    let config =
+        RuneConfig::new(root.clone().unwrap_or_else(|| PathBuf::from("."))).with_settings(settings);
+
+    // rustc -vV
+    let vv =
+        std::process::Command::new(std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into()))
+            .arg("-vV")
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned());
+    let field = |name: &str| {
+        vv.as_deref()?
+            .lines()
+            .find_map(|l| l.strip_prefix(name))
+            .map(|v| v.trim().to_string())
+    };
+    let host = field("host:");
+
+    // Project-level configuration, when we are inside a project.
+    let ws = crate::workspace::Workspace::load(None).ok();
+    let mut rustflags = crate::session::rustflags_from_env_public();
+    let mut configured_linker = None;
+    let mut dev_debug_full_explicit = false;
+    if let Some(ws) = &ws {
+        rustflags.extend(
+            ws.cargo_config
+                .string_list(&["build", "rustflags"])
+                .unwrap_or_default(),
+        );
+        if let Some(h) = &host {
+            configured_linker = ws.cargo_config.string(&["target", h, "linker"]);
+            rustflags.extend(
+                ws.cargo_config
+                    .string_list(&["target", h, "rustflags"])
+                    .unwrap_or_default(),
+            );
+        }
+        dev_debug_full_explicit = ws
+            .root_manifest
+            .profile
+            .get("dev")
+            .and_then(|t| t.debug.as_ref())
+            .is_some_and(|d| {
+                matches!(d, toml::Value::Boolean(true) | toml::Value::Integer(2))
+                    || d.as_str() == Some("full")
+            });
+    }
+
+    let cas = CasStore::new(config.cas_dir.clone())?;
+    let usage = rune_cas::usage::usage(&cas);
+    let idle_30d = usage
+        .idle
+        .iter()
+        .find(|b| b.min_idle_secs == 30 * 86_400)
+        .map_or(0, |b| b.bytes);
+    let home = config
+        .cas_dir
+        .parent()
+        .unwrap_or(&config.cas_dir)
+        .to_path_buf();
+    let mounts = std::fs::read_to_string("/proc/mounts").unwrap_or_default();
+
+    let env = Environment {
+        rustc_release: field("release:"),
+        host,
+        on_path: Box::new(which_on_path),
+        rustflags,
+        configured_linker,
+        dev_debug_full_explicit,
+        full_dependency_debuginfo: config.settings.dependency_debuginfo(),
+        home: home.display().to_string(),
+        home_fs: fs_type_of(&home, &mounts),
+        cas_bytes: usage.bytes,
+        cas_idle_bytes: idle_30d,
+        jobs: config.jobs,
+        cpus: std::thread::available_parallelism().map_or(1, |n| n.get()),
+        rustc_wrapper: std::env::var("RUSTC_WRAPPER")
+            .ok()
+            .filter(|w| !w.is_empty()),
+    };
+
+    let findings = diagnose(&env);
+    let warnings = findings.iter().filter(|f| f.level == Level::Warn).count();
+    for f in &findings {
+        match f.level {
+            Level::Ok => println!("  {} {}", "✓".green().bold(), f.title),
+            Level::Note => println!("  {} {}", "·".dimmed(), f.title),
+            Level::Warn => println!("  {} {}", "!".yellow().bold(), f.title.bold()),
+        }
+        if f.level != Level::Ok {
+            if let Some(d) = &f.detail {
+                println!("      {d}");
+            }
+        }
+        if let Some(fix) = &f.fix {
+            for (i, line) in fix.lines().enumerate() {
+                println!("      {}{line}", if i == 0 { "fix: " } else { "     " });
+            }
+        }
+    }
+    println!();
+    if warnings == 0 {
+        ui::summary("nothing to fix");
+    } else {
+        ui::summary(format!("{warnings} thing(s) worth fixing"));
+    }
+    Ok(())
+}
+
+/// Whether an executable called `tool` is in a `PATH` directory.
+fn which_on_path(tool: &str) -> bool {
+    std::env::var_os("PATH").is_some_and(|paths| {
+        std::env::split_paths(&paths).any(|dir| {
+            let p = dir.join(tool);
+            p.is_file()
+        })
+    })
+}
+
+/// `rune affected`.
+pub fn affected(args: crate::args::AffectedArgs) -> Result<()> {
+    let ws = crate::workspace::Workspace::load(args.manifest_path.as_deref())?;
+    let root = ws.config.project_root.clone();
+
+    let git = |extra: &[&str]| -> Result<Vec<PathBuf>> {
+        let out = std::process::Command::new("git")
+            .args(extra)
+            .current_dir(&root)
+            .output()
+            .context("failed to run `git` (needed by `rune affected`)")?;
+        if !out.status.success() {
+            bail!(
+                "`git {}` failed: {}",
+                extra.join(" "),
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        Ok(String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(PathBuf::from)
+            .collect())
+    };
+    // `--relative` makes paths relative to the project root even when the
+    // repository is larger than the workspace.
+    let mut changed = git(&["diff", "--name-only", "--relative", &args.since])?;
+    changed.extend(git(&["ls-files", "--others", "--exclude-standard"])?);
+
+    let pkgs: Vec<crate::affected::Pkg> = ws
+        .members
+        .iter()
+        .map(|m| crate::affected::Pkg {
+            name: m.name.clone(),
+            dir: m.dir.clone(),
+            deps: m
+                .manifest
+                .dependencies
+                .values()
+                .map(|d| d.spec.package.clone().unwrap_or_else(|| d.name.clone()))
+                .collect(),
+        })
+        .collect();
+    let names = crate::affected::affected(&pkgs, &root, &changed);
+
+    match args.format.as_str() {
+        "json" => println!("{}", serde_json::to_string(&names)?),
+        "args" => println!(
+            "{}",
+            names.iter().map(|n| format!("-p {n}")).collect::<Vec<_>>().join(" ")
+        ),
+        _ => names.iter().for_each(|n| println!("{n}")),
+    }
+    Ok(())
+}
+
+/// `rune script`.
+pub fn script(args: crate::args::ScriptArgs) -> Result<()> {
+    let file = std::fs::canonicalize(&args.file)
+        .with_context(|| format!("cannot read script `{}`", args.file.display()))?;
+    let text = std::fs::read_to_string(&file)
+        .with_context(|| format!("cannot read script `{}`", file.display()))?;
+    let parsed = crate::script::parse(&text).map_err(|e| anyhow::anyhow!("{}: {e}", file.display()))?;
+    let manifest = crate::script::manifest(&file, &parsed.manifest)
+        .map_err(|e| anyhow::anyhow!("{}: {e}", file.display()))?;
+
+    // One package directory per script, named after it and keyed by its path.
+    let mut h = rune_common::hash::HashBuilder::new();
+    h.update(file.to_string_lossy().as_bytes());
+    let id: String = h.finish_blake3().chars().take(12).collect();
+    let dir = rune_common::settings::rune_home()
+        .join("scripts")
+        .join(format!("{}-{id}", crate::script::package_name(&file)));
+    std::fs::create_dir_all(dir.join("src"))?;
+    // Rewritten only when different: an untouched script is an untouched package.
+    write_if_changed(&dir.join("Cargo.toml"), &manifest)?;
+    write_if_changed(&dir.join("src/main.rs"), &parsed.source)?;
+
+    let mut cmd = std::process::Command::new(std::env::current_exe()?);
+    cmd.arg("run").arg("--quiet").arg("--manifest-path").arg(dir.join("Cargo.toml"));
+    if args.release {
+        cmd.arg("--release");
+    }
+    if args.offline {
+        cmd.arg("--offline");
+    }
+    cmd.arg("--").args(&args.args);
+    let status = cmd.status().context("failed to start the script")?;
+    std::process::exit(status.code().unwrap_or(1));
+}
+
+fn write_if_changed(path: &Path, content: &str) -> Result<()> {
+    if std::fs::read_to_string(path).is_ok_and(|old| old == content) {
+        return Ok(());
+    }
+    std::fs::write(path, content).with_context(|| format!("cannot write {}", path.display()))
 }

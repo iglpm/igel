@@ -44,6 +44,11 @@ pub struct CasStore {
     /// this additionally catches bit rot and tampering, at the cost of reading
     /// every restored file.
     verify: bool,
+    /// A store shared with other machines, consulted on a local miss and
+    /// published to after a store (`cas.remote`).
+    remote: Option<crate::remote::Remote>,
+    /// Copies new entries to `remote` off the compilers' critical path.
+    publisher: Option<Arc<crate::remote::Publisher>>,
 }
 
 #[derive(Debug, Default)]
@@ -123,6 +128,17 @@ fn already_linked(_src: &Path, _dest: &Path) -> bool {
     false
 }
 
+#[cfg(unix)]
+fn same_file(a: &fs::Metadata, b: &fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    a.ino() == b.ino() && a.dev() == b.dev()
+}
+
+#[cfg(not(unix))]
+fn same_file(_a: &fs::Metadata, _b: &fs::Metadata) -> bool {
+    false
+}
+
 impl CasStore {
     /// Create a new CAS store, initializing directories if needed.
     pub fn new(root: PathBuf) -> Result<Self> {
@@ -140,7 +156,55 @@ impl CasStore {
             stats_lock: Arc::new(Mutex::new(())),
             pending: Arc::new(PendingStats::default()),
             verify: false,
+            remote: None,
+            publisher: None,
         })
+    }
+
+    /// Consults (and, if `write`, publishes to) a store shared with other
+    /// machines. See [`crate::remote`].
+    pub fn with_remote(self, root: PathBuf, write: bool) -> Self {
+        self.with_remote_store(crate::remote::Remote::new(root, write))
+    }
+
+    /// Like [`Self::with_remote`], for any kind of shared store.
+    pub fn with_remote_store(mut self, remote: crate::remote::Remote) -> Self {
+        if remote.writes() {
+            self.publisher = Some(Arc::new(crate::remote::Publisher::start(2)));
+        }
+        self.remote = Some(remote);
+        self
+    }
+
+    /// Makes `slot` of `cache_key` local if only the shared store has it.
+    fn pull(&self, cache_key: &str, slot: crate::remote::Slot) -> bool {
+        self.remote
+            .as_ref()
+            .is_some_and(|r| r.pull(cache_key, &self.object_dir(cache_key), slot))
+    }
+
+    /// Publishes `slot` of `cache_key` to the shared store: in the background
+    /// for the big slots, at once for a small value (so a process that ends
+    /// right after storing one does not lose it).
+    fn publish(&self, cache_key: &str, slot: crate::remote::Slot) {
+        let Some(r) = &self.remote else { return };
+        if !r.writes() {
+            return;
+        }
+        let dir = self.object_dir(cache_key);
+        match (&self.publisher, slot) {
+            (Some(p), crate::remote::Slot::Artifacts | crate::remote::Slot::Tree) => {
+                p.submit(r.clone(), cache_key.to_string(), dir, slot)
+            }
+            _ => r.push(cache_key, &dir, slot),
+        }
+    }
+
+    /// Waits for background publishing to the shared store to finish.
+    pub fn flush_remote(&self) {
+        if let Some(p) = &self.publisher {
+            p.flush();
+        }
     }
 
     /// Verifies the content hash of every artifact on every hit.
@@ -181,7 +245,13 @@ impl CasStore {
         let dir = self.object_dir(cache_key);
         // One read instead of `exists()` + read: a miss (the common case on a
         // cold build) costs a single failed `open`.
-        let content = fs::read_to_string(dir.join("manifest.json")).ok()?;
+        let content = match fs::read_to_string(dir.join("manifest.json")) {
+            Ok(c) => c,
+            Err(_) if self.pull(cache_key, crate::remote::Slot::Artifacts) => {
+                fs::read_to_string(dir.join("manifest.json")).ok()?
+            }
+            Err(_) => return None,
+        };
         let manifest = serde_json::from_str::<ArtifactManifest>(&content).ok()?;
         Some(CasEntry {
             manifest,
@@ -216,6 +286,7 @@ impl CasStore {
         // it is removed so it can be published again.
         if let Some(existing) = self.get(cache_key) {
             if Self::is_intact(&existing, cache_key) {
+                self.publish(cache_key, crate::remote::Slot::Artifacts);
                 return Ok(());
             }
             let _ = fs::remove_dir_all(&dir);
@@ -272,6 +343,7 @@ impl CasStore {
 
         self.pending.entries.fetch_add(1, Ordering::Relaxed);
         self.pending.bytes.fetch_add(total_size, Ordering::Relaxed);
+        self.publish(cache_key, crate::remote::Slot::Artifacts);
         Ok(())
     }
 
@@ -295,6 +367,7 @@ impl CasStore {
                     .iter()
                     .all(|r| object_dir.join("tree").join(r).is_file())
                 {
+                    self.publish(cache_key, crate::remote::Slot::Tree);
                     return Ok(());
                 }
             }
@@ -339,6 +412,7 @@ impl CasStore {
             object_dir.join("tree.json"),
             serde_json::to_string(&relative_paths)?,
         )?;
+        self.publish(cache_key, crate::remote::Slot::Tree);
         Ok(())
     }
 
@@ -350,7 +424,7 @@ impl CasStore {
     pub fn restore_dir_tree(&self, cache_key: &str, dest_dir: &Path) -> Result<bool> {
         let object_dir = self.object_dir(cache_key);
         let manifest_path = object_dir.join("tree.json");
-        if !manifest_path.exists() {
+        if !manifest_path.exists() && !self.pull(cache_key, crate::remote::Slot::Tree) {
             return Ok(false);
         }
         let tree_root = object_dir.join("tree");
@@ -372,12 +446,7 @@ impl CasStore {
             if already_linked(&src, &dest) {
                 continue;
             }
-            if dest.exists() {
-                fs::remove_file(&dest)?;
-            }
-            if fs::hard_link(&src, &dest).is_err() {
-                fs::copy(&src, &dest)?;
-            }
+            rune_common::fsutil::replace_with_link(&src, &dest)?;
         }
         Ok(true)
     }
@@ -419,24 +488,22 @@ impl CasStore {
                 continue;
             }
 
-            if dest.exists() {
-                fs::remove_file(&dest)?;
-            }
-
-            // Try hardlink, fallback to copy. A hardlink shares the source's
-            // inode, so its content is the source's content by construction
-            // and does not need re-verifying; only the copy fallback (e.g.
-            // across filesystems) can actually diverge and is worth the cost
-            // of hashing.
-            if fs::hard_link(&src, &dest).is_ok() {
+            // Replace atomically: another process may be reading `dest` right
+            // now. Try hardlink, fallback to copy. A hardlink shares the
+            // source's inode, so its content is the source's content by
+            // construction and does not need re-verifying; only the copy
+            // fallback (e.g. across filesystems) can actually diverge and is
+            // worth the cost of hashing.
+            rune_common::fsutil::replace_with_link(&src, &dest)?;
+            let hard_linked = matches!(
+                (fs::metadata(&src), fs::metadata(&dest)),
+                (Ok(a), Ok(b)) if same_file(&a, &b)
+            );
+            if hard_linked {
                 linked_files.push(dest);
                 continue;
             }
-            debug!(
-                "Hardlink failed for {}, falling back to copy.",
-                src.display()
-            );
-            fs::copy(&src, &dest)?;
+            debug!("Hardlink failed for {}, fell back to copy.", src.display());
 
             let dest_hash = hash_file(&dest)?;
 
@@ -492,7 +559,13 @@ impl CasStore {
     /// hardlink into a build directory.
     pub fn get_value<T: serde::de::DeserializeOwned>(&self, cache_key: &str) -> Option<T> {
         let path = self.object_dir(cache_key).join("value.json");
-        let content = fs::read_to_string(&path).ok()?;
+        let content = match fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(_) if self.pull(cache_key, crate::remote::Slot::Value) => {
+                fs::read_to_string(&path).ok()?
+            }
+            Err(_) => return None,
+        };
         serde_json::from_str(&content).ok()
     }
 
@@ -507,6 +580,7 @@ impl CasStore {
         let tmp = dir.join(format!(".value.{}.tmp", std::process::id()));
         fs::write(&tmp, json)?;
         fs::rename(&tmp, dir.join("value.json"))?;
+        self.publish(cache_key, crate::remote::Slot::Value);
         Ok(())
     }
 
@@ -523,6 +597,7 @@ impl CasStore {
     /// Merges the counters accumulated since the last flush into
     /// `stats.json` in one write. Call once at the end of a build.
     pub fn flush_stats(&self) {
+        self.flush_remote();
         let hits = self.pending.hits.swap(0, Ordering::Relaxed);
         let misses = self.pending.misses.swap(0, Ordering::Relaxed);
         let entries = self.pending.entries.swap(0, Ordering::Relaxed);

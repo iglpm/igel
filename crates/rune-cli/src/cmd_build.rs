@@ -64,7 +64,20 @@ pub fn build(args: BuildArgs, mode: Mode) -> Result<()> {
     let plan = plan_for(&sess, mode, &selection(&args.targets))?;
     sess.ws.config.ensure_dirs(sess.profile.output_dir_name())?;
 
-    let (result, _) = drive(&sess, &plan.graph, |_| {})?;
+    let (result, _) = if args.deps_only {
+        // Everything that is not a workspace member, and what those need.
+        let roots: Vec<_> = plan
+            .graph
+            .nodes()
+            .iter()
+            .filter(|n| !n.unit.ext.member)
+            .map(|n| n.id)
+            .collect();
+        let (deps, _) = plan.graph.subgraph(&roots);
+        drive(&sess, &deps, |_| {})?
+    } else {
+        drive(&sess, &plan.graph, |_| {})?
+    };
     ensure_success(&result)?;
     summarize(&sess, &result);
     Ok(())

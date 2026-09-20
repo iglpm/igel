@@ -1,10 +1,13 @@
-use crate::dag::{BuildGraph, NodeId};
+use crate::dag::{BuildGraph, BuildNode, NodeId};
 use std::collections::HashMap;
 
-/// Compute the critical path weight for each node.
-/// The critical path weight of a node is:
-///   its own cost + max(critical_path_weight of all its dependencies)
-/// This gives us a priority: nodes on the critical path should be scheduled first.
+/// Critical-path priority of every node: the length of the longest chain of
+/// work that still has to happen *from this node to the end of the build*
+/// (its "bottom level"), using each node's `estimated_cost`.
+///
+/// A ready node with a large value blocks a lot of downstream work, so the
+/// scheduler starts it first; a node with a small value (a leaf like the final
+/// binary) can wait without lengthening the build.
 pub fn compute_critical_paths(graph: &BuildGraph) -> HashMap<NodeId, f64> {
     compute_critical_paths_with(graph, |node| node.estimated_cost)
 }
@@ -15,28 +18,52 @@ pub fn compute_critical_paths(graph: &BuildGraph) -> HashMap<NodeId, f64> {
 /// schedule.
 pub fn compute_critical_paths_with(
     graph: &BuildGraph,
-    cost: impl Fn(&crate::dag::BuildNode) -> f64,
+    cost: impl Fn(&BuildNode) -> f64,
 ) -> HashMap<NodeId, f64> {
-    let mut weights = HashMap::new();
+    compute_critical_paths_pipelined(graph, cost, |dep, _dependent, dep_cost| {
+        let _ = dep;
+        dep_cost
+    })
+}
 
-    // Process in topological order so dependencies are computed before dependents
-    if let Ok(order) = graph.topological_sort() {
-        for &id in &order {
-            let node = graph.node(id);
-            let mut max_dep_weight = 0.0_f64;
-
-            for &dep_id in &node.dependencies {
-                if let Some(&dep_weight) = weights.get(&dep_id) {
-                    if dep_weight > max_dep_weight {
-                        max_dep_weight = dep_weight;
-                    }
-                }
+/// The bottom level with an explicit *edge delay*: how long after `dep` starts
+/// its `dependent` can start. A dependent that only needs a dependency's
+/// `.rmeta` (pipelining) waits for a fraction of the dependency's cost, one
+/// that links against it waits for all of it.
+///
+/// `delay(dep, dependent, dep_cost)` returns that wait in the same unit as the
+/// costs.
+pub fn compute_critical_paths_pipelined(
+    graph: &BuildGraph,
+    cost: impl Fn(&BuildNode) -> f64,
+    delay: impl Fn(&BuildNode, &BuildNode, f64) -> f64,
+) -> HashMap<NodeId, f64> {
+    let mut weights: HashMap<NodeId, f64> = HashMap::new();
+    let Ok(order) = graph.topological_sort() else {
+        return weights;
+    };
+    let costs: HashMap<NodeId, f64> = order
+        .iter()
+        .map(|&id| (id, cost(graph.node(id)).max(0.0)))
+        .collect();
+    for &id in &order {
+        weights.insert(id, costs[&id]);
+    }
+    // Reverse topological order: by the time a node is visited every one of its
+    // dependents has been, so its own weight is final and can be propagated to
+    // the nodes it depends on.
+    for &id in order.iter().rev() {
+        let node = graph.node(id);
+        let own = weights[&id];
+        for &dep_id in &node.dependencies {
+            let dep_cost = costs.get(&dep_id).copied().unwrap_or(0.0);
+            let through = delay(graph.node(dep_id), node, dep_cost) + own;
+            let entry = weights.entry(dep_id).or_insert(dep_cost);
+            if through > *entry {
+                *entry = through;
             }
-
-            weights.insert(id, cost(node) + max_dep_weight);
         }
     }
-
     weights
 }
 
@@ -93,9 +120,9 @@ mod tests {
     #[test]
     fn test_critical_path() {
         let mut graph = BuildGraph::new();
-        let a = graph.add_node(make_unit("a")); // default cost 1.0
-        let b = graph.add_node(make_unit("b")); // default cost 1.0
-        let c = graph.add_node(make_unit("c")); // default cost 1.0
+        let a = graph.add_node(make_unit("a"));
+        let b = graph.add_node(make_unit("b"));
+        let c = graph.add_node(make_unit("c"));
 
         graph.node_mut(a).estimated_cost = 2.0;
         graph.node_mut(b).estimated_cost = 3.0;
@@ -107,14 +134,59 @@ mod tests {
 
         let weights = compute_critical_paths(&graph);
 
-        // a: 2.0
-        // b: 3.0 + 2.0 = 5.0
-        // c: 1.0 + 5.0 = 6.0
-        assert_eq!(weights.get(&a).copied().unwrap(), 2.0);
-        assert_eq!(weights.get(&b).copied().unwrap(), 5.0);
-        assert_eq!(weights.get(&c).copied().unwrap(), 6.0);
+        // Work remaining from each node to the end of the build:
+        // c: 1.0, b: 3.0 + 1.0, a: 2.0 + 3.0 + 1.0
+        assert_eq!(weights[&c], 1.0);
+        assert_eq!(weights[&b], 4.0);
+        assert_eq!(weights[&a], 6.0);
+        assert_eq!(priority_order(&graph), vec![a, b, c]);
+    }
 
-        let order = priority_order(&graph);
-        assert_eq!(order, vec![c, b, a]);
+    #[test]
+    fn a_short_chain_does_not_outrank_the_long_one() {
+        // `slow` is expensive but nothing depends on it; `root` is cheap but
+        // gates a long chain. Starting `root` first is what shortens the build.
+        let mut graph = BuildGraph::new();
+        let slow = graph.add_node(make_unit("slow"));
+        let root = graph.add_node(make_unit("root"));
+        let mid = graph.add_node(make_unit("mid"));
+        let top = graph.add_node(make_unit("top"));
+        graph.node_mut(slow).estimated_cost = 5.0;
+        graph.node_mut(root).estimated_cost = 1.0;
+        graph.node_mut(mid).estimated_cost = 4.0;
+        graph.node_mut(top).estimated_cost = 4.0;
+        graph.add_edge(mid, root);
+        graph.add_edge(top, mid);
+
+        let w = compute_critical_paths(&graph);
+        assert_eq!(w[&slow], 5.0);
+        assert_eq!(w[&root], 9.0);
+        assert!(w[&root] > w[&slow]);
+    }
+
+    #[test]
+    fn pipelined_edges_only_wait_for_the_metadata() {
+        let mut graph = BuildGraph::new();
+        let lib = graph.add_node(make_unit("lib"));
+        let app = graph.add_node(make_unit("app"));
+        graph.node_mut(lib).estimated_cost = 10.0;
+        graph.node_mut(app).estimated_cost = 2.0;
+        graph.add_edge(app, lib);
+
+        let w = compute_critical_paths_pipelined(
+            &graph,
+            |n| n.estimated_cost,
+            |_, _, dep_cost| dep_cost * 0.4,
+        );
+        // app can start once 40 % of lib is done: 4 + 2, but lib itself takes 10.
+        assert_eq!(w[&lib], 10.0);
+        assert_eq!(w[&app], 2.0);
+
+        let w = compute_critical_paths_pipelined(
+            &graph,
+            |n| n.estimated_cost,
+            |_, _, dep_cost| dep_cost,
+        );
+        assert_eq!(w[&lib], 12.0);
     }
 }

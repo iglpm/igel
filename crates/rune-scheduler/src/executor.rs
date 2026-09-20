@@ -12,7 +12,7 @@ use rune_compiler::{
     BuildScriptRunner, CompilationResult, RustcCommandBuilder, RustcInvoker,
     build_script::BuildScriptEnv,
 };
-use rune_graph::{BuildGraph, NodeId, compute_critical_paths_with};
+use rune_graph::{BuildGraph, NodeId, compute_critical_paths_pipelined};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -56,6 +56,9 @@ enum WorkerMsg {
         node_id: NodeId,
         artifacts: Vec<PathBuf>,
         duration: Duration,
+        /// Taken from the store (another process built it while we waited)
+        /// rather than compiled by this one.
+        restored: bool,
     },
     Failed {
         node_id: NodeId,
@@ -170,7 +173,10 @@ impl BuildExecutor {
         let mut source_cache =
             rune_fingerprint::FingerprintCache::load(&source_cache_path).unwrap_or_default();
         let timings_path = self.config.fingerprint_dir.join("timings.json");
-        let mut timings = Timings::load(&timings_path);
+        let global_timings_path = self.config.cas_dir.join("timings.json");
+        let mut timings = Timings::load(&timings_path, &global_timings_path);
+        let mut spans: Vec<TraceSpan> = Vec::new();
+        let mut started: HashMap<NodeId, f64> = HashMap::new();
 
         // 1. Cache keys for every node, dependencies first. A unit's *base*
         // key covers its source, configuration and dependencies; the key it is
@@ -257,24 +263,55 @@ impl BuildExecutor {
                 } else {
                     String::new()
                 };
+                let diagnostics = if unit.crate_id.source == CrateSource::Local {
+                    cas.get_value::<Vec<String>>(&format!("{}-diagnostics", unit_cas_keys[&id]))
+                        .unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
                 let _ = self.event_tx.send(PipelineEvent::CacheHit {
                     node_id: id,
                     artifacts: linked.clone(),
                     warnings,
+                    diagnostics,
                 });
                 artifact_paths.insert(id, linked);
             }
         }
 
-        // 3. Critical-path weights over the *remaining* work only, using
-        // measured compile times where we have them.
-        let weights = compute_critical_paths_with(graph, |node| {
-            if completed.contains(&node.id) {
-                0.0
-            } else {
-                timings.estimate(&node.unit, &self.profile)
-            }
-        });
+        // 3. Critical-path priorities over the *remaining* work only: for each
+        // unit, the longest chain of work still to happen after it starts. Costs
+        // are measured compile times where we have them, size-based estimates
+        // where we do not. A dependent that only needs a library's `.rmeta`
+        // waits for part of the library's time, not all of it.
+        let weights = {
+            let _timer = rune_common::timing::phase("critical path");
+            timings.measure_sources(
+                topo.iter()
+                    .filter(|id| !completed.contains(id))
+                    .map(|&id| graph.node(id).unit.manifest_dir.clone()),
+            );
+            compute_critical_paths_pipelined(
+                graph,
+                |node| {
+                    if completed.contains(&node.id) {
+                        0.0
+                    } else {
+                        timings.estimate(&node.unit, &self.profile)
+                    }
+                },
+                |dep, dependent, dep_cost| {
+                    let pipelined = !dependent.unit.needs_real_link()
+                        && dep.unit.crate_type != CrateType::ProcMacro
+                        && !dep.unit.needs_real_link();
+                    if pipelined {
+                        dep_cost * METADATA_FRACTION
+                    } else {
+                        dep_cost
+                    }
+                },
+            )
+        };
 
         let (worker_tx, worker_rx) = unbounded::<WorkerMsg>();
         let total_nodes = graph.node_count();
@@ -349,6 +386,7 @@ impl BuildExecutor {
                     }
                     unscheduled.retain(|id| *id != node_id);
                     in_flight.insert(node_id);
+                    started.insert(node_id, start_time.elapsed().as_secs_f64());
                     let job = self.prepare_job(
                         graph,
                         node_id,
@@ -394,13 +432,29 @@ impl BuildExecutor {
                         // it can have, apart from pipelined dependents, which
                         // wait for the metadata that follows this message).
                         unit_cas_keys.insert(node_id, key);
+                        // Only what transitively depends on this unit can have
+                        // changed: one pass in dependency order, recomputing a
+                        // key only when one of its dependencies' just did.
+                        let mut changed: HashSet<NodeId> = HashSet::from([node_id]);
                         for &id in &topo {
-                            if id != node_id && !completed.contains(&id) && !in_flight.contains(&id)
+                            if id == node_id
+                                || completed.contains(&id)
+                                || in_flight.contains(&id)
+                                || !graph
+                                    .node(id)
+                                    .dependencies
+                                    .iter()
+                                    .any(|d| changed.contains(d))
                             {
-                                let (base, key) =
-                                    self.compute_keys(graph, id, &unit_cas_keys, &mut source_cache);
-                                unit_base_keys.insert(id, base);
-                                unit_cas_keys.insert(id, key);
+                                continue;
+                            }
+                            let (base, key) =
+                                self.compute_keys(graph, id, &unit_cas_keys, &mut source_cache);
+                            let moved = unit_cas_keys.get(&id) != Some(&key);
+                            unit_base_keys.insert(id, base);
+                            unit_cas_keys.insert(id, key);
+                            if moved {
+                                changed.insert(id);
                             }
                         }
                     }
@@ -408,14 +462,53 @@ impl BuildExecutor {
                         node_id,
                         artifacts,
                         duration,
+                        restored,
                     } => {
                         debug!("Finished compiling node {:?}", node_id);
                         in_flight.remove(&node_id);
                         completed.insert(node_id);
                         metadata_ready.insert(node_id);
                         artifact_paths.insert(node_id, artifacts);
-                        timings.record(&graph.node(node_id).unit, &self.profile, duration);
-                        compiled += 1;
+                        let unit = &graph.node(node_id).unit;
+                        if !restored {
+                            timings.record(unit, &self.profile, duration);
+                        }
+                        spans.push(TraceSpan {
+                            name: format!(
+                                "{} {} ({})",
+                                unit.crate_id.name,
+                                unit.crate_id.version,
+                                unit.kind.as_str()
+                            ),
+                            kind: if unit.crate_type == CrateType::ProcMacro {
+                                "proc-macro"
+                            } else if unit.build_script.is_some() {
+                                "build-script"
+                            } else {
+                                unit.kind.as_str()
+                            },
+                            start: started.get(&node_id).copied().unwrap_or(0.0),
+                            dur: duration.as_secs_f64(),
+                            after: graph
+                                .node(node_id)
+                                .dependencies
+                                .iter()
+                                .map(|d| {
+                                    let u = &graph.node(*d).unit;
+                                    format!(
+                                        "{} {} ({})",
+                                        u.crate_id.name,
+                                        u.crate_id.version,
+                                        u.kind.as_str()
+                                    )
+                                })
+                                .collect(),
+                        });
+                        if restored {
+                            cached += 1;
+                        } else {
+                            compiled += 1;
+                        }
                     }
                     WorkerMsg::Failed { node_id, error } => {
                         // The rendered diagnostic already went out on
@@ -430,7 +523,28 @@ impl BuildExecutor {
         }
 
         let _ = source_cache.save_if_changed(&source_cache_path);
-        timings.save(&timings_path);
+        timings.save(&timings_path, &global_timings_path);
+        if rune_common::timing::enabled() && !spans.is_empty() {
+            let trace_path = self.config.fingerprint_dir.join("trace.json");
+            write_trace(&trace_path, &spans);
+            let busy: f64 = spans.iter().map(|s| s.dur).sum();
+            let wall = start_time.elapsed().as_secs_f64().max(f64::EPSILON);
+            spans.sort_by(|a, b| (b.start + b.dur).total_cmp(&(a.start + a.dur)));
+            eprintln!(
+                "  [timing] schedule: {:.1}s of unit time in {:.1}s wall ({:.1} units running on average); \
+                 last to finish: {}; trace: {}",
+                busy,
+                wall,
+                busy / wall,
+                spans
+                    .iter()
+                    .take(3)
+                    .map(|s| format!("{} ({:.1}s)", s.name, s.dur))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                trace_path.display()
+            );
+        }
         if let Some(cas) = &self.cas {
             cas.flush_stats();
         }
@@ -662,14 +776,99 @@ struct UnitJob {
 
 impl UnitJob {
     fn fail(&self, error: String, event_error: String) {
+        self.fail_with(error, event_error, Vec::new());
+    }
+
+    fn fail_with(&self, error: String, event_error: String, diagnostics: Vec<String>) {
         let _ = self.event_tx.send(PipelineEvent::BuildFailed {
             node_id: self.node_id,
             error: event_error,
+            diagnostics,
         });
         let _ = self.worker_tx.send(WorkerMsg::Failed {
             node_id: self.node_id,
             error,
         });
+    }
+
+    /// After waiting for another process's lock: if that process stored this
+    /// unit, restore it exactly as the up-front cache pass would and report
+    /// the unit finished. Returns whether it did.
+    fn restore_finished_elsewhere(&self, start: Instant) -> bool {
+        let Some(cas) = &self.cas else { return false };
+        let unit = &self.unit;
+        let has_script = unit.build_script.is_some();
+        // The other process may have learned external inputs (which change the
+        // key the unit is stored under) that we did not know about.
+        let recorded: Option<DeclaredInputs> = cas.get_value(&format!("{}-inputs", self.base_key));
+        let key = effective_key(&self.base_key, recorded.as_ref(), has_script);
+        let out_dir = out_dir_for(&self.config, &self.profile, unit);
+        let Ok(linked) = cas.link_to(&key, &out_dir) else {
+            return false;
+        };
+        if linked.is_empty() {
+            return false;
+        }
+        if key != self.cas_key {
+            let _ = self.worker_tx.send(WorkerMsg::KeyUpdate {
+                node_id: self.node_id,
+                key: key.clone(),
+            });
+        }
+        if has_script {
+            let script_key_name = format!("{key}-buildscript");
+            if let Some(output) = cas.get_value(&script_key_name) {
+                let _ = self.worker_tx.send(WorkerMsg::BuildScriptDone {
+                    node_id: self.node_id,
+                    output,
+                });
+            }
+            let _ = cas.restore_dir_tree(
+                &script_key_name,
+                &self
+                    .config
+                    .build_script_out_dir_by_key(self.profile.output_dir_name(), &script_key(unit)),
+            );
+        }
+        if let Some(rmeta) = linked
+            .iter()
+            .find(|p| p.extension().and_then(|e| e.to_str()) == Some("rmeta"))
+        {
+            let _ = self.worker_tx.send(WorkerMsg::MetadataReady {
+                node_id: self.node_id,
+                rmeta_path: rmeta.clone(),
+            });
+        }
+        if unit.crate_type == CrateType::Bin && !unit.harness {
+            alias_binaries(&self.config, &self.profile, unit, &linked);
+        }
+        let warnings = if unit.crate_id.source == CrateSource::Local {
+            cas.get_value::<String>(&format!("{key}-warnings"))
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
+        let diagnostics = if unit.crate_id.source == CrateSource::Local {
+            cas.get_value::<Vec<String>>(&format!("{key}-diagnostics"))
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let duration = start.elapsed();
+        let _ = self.event_tx.send(PipelineEvent::BuildFinished {
+            node_id: self.node_id,
+            artifacts: linked.clone(),
+            duration,
+            warnings,
+            diagnostics,
+        });
+        let _ = self.worker_tx.send(WorkerMsg::Finished {
+            node_id: self.node_id,
+            artifacts: linked,
+            duration,
+            restored: true,
+        });
+        true
     }
 
     fn run(self) {
@@ -685,6 +884,23 @@ impl UnitJob {
             node_id,
             unit: unit.clone(),
         });
+
+        // Another `rune` process may be building this very unit into the same
+        // target directory (an editor's background check next to a terminal
+        // build). Whoever holds the unit's lock owns its output files; everyone
+        // else waits — and then usually finds the finished result in the store
+        // instead of compiling it again.
+        let lock_path = config
+            .profile_target_dir(profile.output_dir_name())
+            .join(".rune-locks")
+            .join(script_key(unit));
+        let (_unit_lock, acquired) = rune_common::fsutil::FileLock::exclusive(&lock_path);
+        if acquired == rune_common::fsutil::Acquired::AfterWaiting
+            && !self.force_rebuild
+            && self.restore_finished_elsewhere(start)
+        {
+            return;
+        }
 
         // A distinct CAS slot from the compiled-artifact entry, keyed off the
         // same (build-script-aware) fingerprint: whenever the crate needs
@@ -865,13 +1081,19 @@ impl UnitJob {
                             effective_build_output = Some(out);
                         }
                         Err(e) => {
-                            self.fail(e.to_string(), format!("build.rs execution failed: {e}"));
+                            self.fail(
+                                e.to_string(),
+                                with_hint(format!("build.rs execution failed: {e}")),
+                            );
                             return;
                         }
                     }
                 }
                 Err(e) => {
-                    self.fail(e.to_string(), format!("build.rs compilation failed: {e}"));
+                    self.fail(
+                        e.to_string(),
+                        with_hint(format!("build.rs compilation failed: {e}")),
+                    );
                     return;
                 }
             }
@@ -995,6 +1217,11 @@ impl UnitJob {
                 } else {
                     String::new()
                 };
+                let diagnostics: Vec<String> = if unit.crate_id.source == CrateSource::Local {
+                    rune_compiler::diagnostic_lines(&comp_res.stderr_raw)
+                } else {
+                    Vec::new()
+                };
                 let artifacts: Vec<PathBuf> =
                     comp_res.artifacts.into_iter().map(|a| a.artifact).collect();
 
@@ -1007,6 +1234,10 @@ impl UnitJob {
                     );
                     if !warnings.is_empty() {
                         let _ = cas_store.put_value(&format!("{store_key}-warnings"), &warnings);
+                    }
+                    if !diagnostics.is_empty() {
+                        let _ =
+                            cas_store.put_value(&format!("{store_key}-diagnostics"), &diagnostics);
                     }
                     // Remember what this unit depends on outside itself, so
                     // the next lookup keys on the current values of those.
@@ -1024,19 +1255,31 @@ impl UnitJob {
                     artifacts: artifacts.clone(),
                     duration,
                     warnings,
+                    diagnostics,
                 });
                 let _ = self.worker_tx.send(WorkerMsg::Finished {
                     node_id,
                     artifacts,
                     duration,
+                    restored: false,
                 });
             }
             Ok(comp_res) => {
                 let err_msg = render_compile_error(&comp_res);
-                self.fail(err_msg.clone(), err_msg);
+                let diagnostics = rune_compiler::diagnostic_lines(&comp_res.stderr_raw);
+                self.fail_with(err_msg.clone(), err_msg, diagnostics);
             }
             Err(e) => self.fail(e.to_string(), e.to_string()),
         }
+    }
+}
+
+/// Appends advice to a build-script failure when it is one of the usual
+/// "a system tool or library is missing" ones.
+fn with_hint(message: String) -> String {
+    match crate::hints::hint_for_failure(&message, crate::hints::Family::current()) {
+        Some(hint) => format!("{message}\n\n{hint}"),
+        None => message,
     }
 }
 
@@ -1239,16 +1482,25 @@ fn link_or_copy_replace(src: &Path, dest: &Path) {
             }
         }
     }
-    let _ = std::fs::remove_file(dest);
-    if std::fs::hard_link(src, dest).is_err() {
-        let _ = std::fs::copy(src, dest);
-    }
+    let _ = rune_common::fsutil::replace_with_link(src, dest);
 }
 
-/// Compile times from previous builds, used to weight the critical path.
+/// Fraction of a library's compile time after which its `.rmeta` exists, i.e.
+/// how long a pipelined dependent waits for it.
+const METADATA_FRACTION: f64 = 0.4;
+
+/// Compile times, used to weight the critical path.
+///
+/// Measured seconds from earlier builds win (this project's, then those of any
+/// project on the machine, kept next to the CAS so a fresh checkout does not
+/// start blind). For a unit nobody has timed yet the estimate comes from the
+/// size of its sources, which on a cold build is the difference between
+/// starting `syn` first and starting it last.
 #[derive(Default)]
 struct Timings {
     secs: HashMap<String, f64>,
+    /// Sizes of package sources in bytes, by manifest directory.
+    source_bytes: HashMap<PathBuf, u64>,
     dirty: bool,
 }
 
@@ -1264,20 +1516,70 @@ impl Timings {
         )
     }
 
-    fn load(path: &Path) -> Self {
-        let secs = std::fs::read_to_string(path)
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default();
-        Self { secs, dirty: false }
+    /// Loads the machine-wide timings, then this project's on top of them.
+    fn load(project: &Path, global: &Path) -> Self {
+        let read = |p: &Path| -> HashMap<String, f64> {
+            std::fs::read_to_string(p)
+                .ok()
+                .and_then(|s| serde_json::from_str(&s).ok())
+                .unwrap_or_default()
+        };
+        let mut secs = read(global);
+        secs.extend(read(project));
+        Self {
+            secs,
+            ..Self::default()
+        }
     }
 
-    /// Seconds this unit is expected to take; 1.0 when never seen.
+    /// Measures the source size of every distinct package directory in
+    /// `dirs`, in parallel.
+    fn measure_sources(&mut self, dirs: impl IntoIterator<Item = PathBuf>) {
+        let todo: Vec<PathBuf> = dirs
+            .into_iter()
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .filter(|d| !self.source_bytes.contains_key(d))
+            .collect();
+        let sizes: Vec<(PathBuf, u64)> = todo
+            .into_par_iter()
+            .map(|d| {
+                let bytes = rust_source_bytes(&d);
+                (d, bytes)
+            })
+            .collect();
+        self.source_bytes.extend(sizes);
+    }
+
+    /// Seconds this unit is expected to take: measured if we have seen it
+    /// before, otherwise guessed from the size of its package's sources.
     fn estimate(&self, unit: &CompilationUnit, profile: &Profile) -> f64 {
-        self.secs
-            .get(&Self::key(unit, profile))
+        if let Some(&secs) = self.secs.get(&Self::key(unit, profile)) {
+            return secs;
+        }
+        let bytes = self
+            .source_bytes
+            .get(&unit.manifest_dir)
             .copied()
-            .unwrap_or(1.0)
+            .unwrap_or(0) as f64;
+        // Roughly: 100 KB of Rust ≈ 1 s, 1 MB ≈ 4 s, 4 MB ≈ 8 s of debug
+        // compile time (fitted to a 182-crate build; only the *ordering*
+        // matters to the scheduler, not the absolute value).
+        let mb = bytes / (1024.0 * 1024.0);
+        let mut secs = 0.3 + 3.0 * mb.powf(0.6);
+        if unit.build_script.is_some() || unit.is_build_script {
+            secs += 1.0; // compile + run the script
+        }
+        if unit.harness {
+            secs *= 1.2;
+        }
+        if unit.crate_type == CrateType::ProcMacro {
+            secs *= 1.3;
+        }
+        if profile.output_dir_name() != "debug" {
+            secs *= 2.5; // optimised builds spend far longer in codegen
+        }
+        secs
     }
 
     fn record(&mut self, unit: &CompilationUnit, profile: &Profile, took: Duration) {
@@ -1286,14 +1588,114 @@ impl Timings {
         self.dirty = true;
     }
 
-    fn save(&self, path: &Path) {
+    /// Writes this project's timings, and merges them into the machine-wide
+    /// file (atomically; concurrent builds may lose each other's newest
+    /// numbers, which only costs some scheduling accuracy).
+    fn save(&self, project: &Path, global: &Path) {
         if !self.dirty {
             return;
         }
         if let Ok(json) = serde_json::to_string(&self.secs) {
-            let _ = std::fs::write(path, json);
+            let _ = std::fs::write(project, &json);
+        }
+        let mut merged: HashMap<String, f64> = std::fs::read_to_string(global)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default();
+        merged.extend(self.secs.iter().map(|(k, v)| (k.clone(), *v)));
+        // Bound the file: keep it a few thousand entries at most.
+        if merged.len() > 20_000 {
+            merged.retain(|k, _| self.secs.contains_key(k));
+        }
+        if let Ok(json) = serde_json::to_string(&merged) {
+            let tmp = global.with_extension(format!("json.{}.tmp", std::process::id()));
+            if std::fs::write(&tmp, json).is_ok() && std::fs::rename(&tmp, global).is_err() {
+                let _ = std::fs::remove_file(&tmp);
+            }
         }
     }
+}
+
+/// Total size of the `.rs` files below a package directory (build output,
+/// VCS metadata and vendored trees excluded); a cheap proxy for compile time.
+fn rust_source_bytes(dir: &Path) -> u64 {
+    const MAX_FILES: usize = 20_000;
+    let mut total = 0u64;
+    let mut seen = 0usize;
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&d) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(ft) = entry.file_type() else { continue };
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if ft.is_dir() {
+                if !matches!(
+                    name.as_ref(),
+                    "target" | ".git" | ".rune" | ".cargo" | "node_modules" | "tests" | "benches"
+                ) {
+                    stack.push(entry.path());
+                }
+            } else if name.ends_with(".rs") {
+                seen += 1;
+                if seen > MAX_FILES {
+                    return total;
+                }
+                total += entry.metadata().map(|m| m.len()).unwrap_or(0);
+            }
+        }
+    }
+    total
+}
+
+/// Writes the schedule of a finished build as a Chrome trace
+/// (`chrome://tracing`, Perfetto): one lane per concurrently running unit.
+fn write_trace(path: &Path, spans: &[TraceSpan]) {
+    let mut spans: Vec<&TraceSpan> = spans.iter().collect();
+    spans.sort_by(|a, b| {
+        a.start
+            .partial_cmp(&b.start)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let mut lane_free_at: Vec<f64> = Vec::new();
+    let mut events = Vec::with_capacity(spans.len());
+    for span in spans {
+        let lane = match lane_free_at.iter().position(|&t| t <= span.start) {
+            Some(l) => l,
+            None => {
+                lane_free_at.push(0.0);
+                lane_free_at.len() - 1
+            }
+        };
+        lane_free_at[lane] = span.start + span.dur;
+        events.push(serde_json::json!({
+            "name": span.name,
+            "cat": span.kind,
+            "ph": "X",
+            "ts": (span.start * 1e6) as u64,
+            "dur": (span.dur * 1e6) as u64,
+            "pid": 1,
+            "tid": lane,
+            "args": { "after": span.after },
+        }));
+    }
+    let doc = serde_json::json!({ "traceEvents": events });
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(path, doc.to_string());
+}
+
+/// One compiled unit's place in the schedule, in seconds since the build began.
+struct TraceSpan {
+    name: String,
+    kind: &'static str,
+    start: f64,
+    dur: f64,
+    /// Names of the units this one waited for.
+    after: Vec<String>,
 }
 
 /// `RUSTFLAGS` (or `CARGO_ENCODED_RUSTFLAGS`) as individual arguments.

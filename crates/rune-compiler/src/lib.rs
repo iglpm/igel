@@ -12,4 +12,4 @@ pub mod output;
 pub use build_script::BuildScriptRunner;
 pub use command::RustcCommandBuilder;
 pub use invoke::RustcInvoker;
-pub use output::CompilationResult;
+pub use output::{CompilationResult, diagnostic_lines};

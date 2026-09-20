@@ -23,6 +23,8 @@ pub enum PipelineEvent {
         duration: Duration,
         /// Rendered compiler warnings (empty if none), for local crates.
         warnings: String,
+        /// The compiler's diagnostics as raw JSON, for local crates.
+        diagnostics: Vec<String>,
     },
     /// A CAS cache hit — artifacts linked without compilation.
     CacheHit {
@@ -30,9 +32,16 @@ pub enum PipelineEvent {
         artifacts: Vec<PathBuf>,
         /// Warnings replayed from the build that populated the cache entry.
         warnings: String,
+        /// Diagnostics (raw JSON) replayed from that build.
+        diagnostics: Vec<String>,
     },
     /// A compilation unit failed.
-    BuildFailed { node_id: NodeId, error: String },
+    BuildFailed {
+        node_id: NodeId,
+        error: String,
+        /// The compiler's diagnostics as raw JSON (errors included).
+        diagnostics: Vec<String>,
+    },
     /// Build script started.
     BuildScriptStarted { node_id: NodeId, crate_name: String },
     /// Build script finished.

@@ -71,6 +71,14 @@ pub enum Commands {
     Install(InstallArgs),
     /// Remove generated target artifacts
     Clean(CleanArgs),
+    /// Check the toolchain, machine and project for what slows builds down
+    Doctor,
+    /// Re-run commands whenever the project's files change
+    Watch(WatchArgs),
+    /// List the workspace packages a change can influence (for selective CI)
+    Affected(AffectedArgs),
+    /// Run a single-file Rust script with `---cargo` frontmatter dependencies
+    Script(ScriptArgs),
     /// View and change settings (global or per project)
     #[command(subcommand)]
     Config(ConfigCommands),
@@ -157,9 +165,15 @@ pub struct CommonArgs {
     #[arg(long)]
     pub frozen: bool,
 
-    /// Print how long each phase of the build takes
+    /// Print how long each phase of the build takes (and write a Chrome
+    /// trace of the schedule to `.rune/fingerprints/trace.json`)
     #[arg(long)]
     pub timings: bool,
+
+    /// Output format of compiler messages: `human` (default) or `json` — one
+    /// JSON object per line on stdout, in Cargo's format
+    #[arg(long, value_name = "FMT", default_value = "human")]
+    pub message_format: String,
 
     /// Recompile everything even if cached (`--rebuild-all=false` to force
     /// using the cache when `build.release-rebuild-all` is set)
@@ -214,6 +228,12 @@ pub struct BuildArgs {
     pub common: CommonArgs,
     #[command(flatten)]
     pub targets: TargetArgs,
+
+    /// Build only the dependencies of the selected packages, not the packages
+    /// themselves: the step for a container image layer or CI cache that
+    /// should only change when `Cargo.lock` does
+    #[arg(long)]
+    pub deps_only: bool,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -246,6 +266,19 @@ pub struct TestArgs {
     /// Number of threads each test binary uses (forwarded as `--test-threads`)
     #[arg(long, value_name = "N")]
     pub test_threads: Option<usize>,
+
+    /// Skip test binaries that passed before and whose binary, package files,
+    /// arguments and RUST_/CARGO_/RUNE_ environment are unchanged. Only for
+    /// tests that depend on nothing else (no network, clock or files outside the
+    /// package). Failures are never remembered. `--cached=false` forces a run
+    #[arg(
+        long,
+        value_name = "BOOL",
+        num_args = 0..=1,
+        default_missing_value = "true",
+        require_equals = true
+    )]
+    pub cached: Option<bool>,
 
     /// Arguments passed to the test binaries (after `--`)
     #[arg(last = true, value_name = "ARGS")]
@@ -560,6 +593,15 @@ pub enum CasCommands {
     Stats,
     /// Garbage collect the CAS store by size or age
     Gc(CasGcArgs),
+    /// Show which packages take the space, and how much has gone unused
+    Du(CasDuArgs),
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct CasDuArgs {
+    /// How many of the biggest packages to list
+    #[arg(long, default_value_t = 15)]
+    pub top: usize,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -664,4 +706,67 @@ mod tests {
             assert!(Cli::try_parse_from(["rune", alias]).is_ok(), "{alias}");
         }
     }
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct WatchArgs {
+    /// A `rune` command to run on every change, e.g. `-x check -x "test --lib"`
+    /// (repeatable; they run in order and stop at the first failure).
+    /// Default: `check`
+    #[arg(short = 'x', long = "exec", value_name = "COMMAND")]
+    pub exec: Vec<String>,
+
+    /// Clear the screen before each run
+    #[arg(short, long)]
+    pub clear: bool,
+
+    /// A file or directory (relative to the project root) whose changes do not
+    /// trigger a run, e.g. output written by your tests (repeatable). The build
+    /// directory, `.git` and `Cargo.lock` are always ignored
+    #[arg(short = 'i', long, value_name = "PATH")]
+    pub ignore: Vec<PathBuf>,
+
+    /// How often to look for changes, in milliseconds
+    #[arg(long, value_name = "MS", default_value_t = 300)]
+    pub interval_ms: u64,
+
+    /// Stop after this many runs (used by tests)
+    #[arg(long, hide = true)]
+    pub max_runs: Option<u32>,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct AffectedArgs {
+    /// Compare against this git revision or range (`main`, `origin/main...HEAD`,
+    /// `HEAD~3`). Uncommitted and untracked changes count too
+    #[arg(long, value_name = "REV", default_value = "HEAD")]
+    pub since: String,
+
+    /// Output: `names` (one per line), `args` (`-p a -p b`, for
+    /// `rune test $(rune affected --format args)`) or `json`
+    #[arg(long, value_name = "FMT", default_value = "names", value_parser = ["names", "args", "json"])]
+    pub format: String,
+
+    /// Path to Cargo.toml
+    #[arg(long, value_name = "PATH")]
+    pub manifest_path: Option<PathBuf>,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct ScriptArgs {
+    /// Build the script with the release profile
+    #[arg(long)]
+    pub release: bool,
+
+    /// Use only locally cached registry data
+    #[arg(long)]
+    pub offline: bool,
+
+    /// The script (`hello.rs`)
+    #[arg(value_name = "FILE")]
+    pub file: PathBuf,
+
+    /// Arguments for the script
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true, value_name = "ARGS")]
+    pub args: Vec<String>,
 }

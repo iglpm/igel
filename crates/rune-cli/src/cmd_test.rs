@@ -41,6 +41,8 @@ struct Runnable {
 
 enum Outcome {
     Passed,
+    /// Passed in an earlier run with identical inputs; not run again.
+    Cached,
     Failed,
     CompileFailed,
     Skipped,
@@ -214,6 +216,17 @@ pub fn run(args: TestArgs, mode: Mode) -> Result<()> {
         )
         .collect();
 
+    // `--cached`: remembered passes, keyed by everything Rune can see.
+    let test_cas = (!bench && args.cached.unwrap_or_else(|| sess.ws.config.settings.test_cache()))
+        .then(|| sess.cas())
+        .flatten();
+    let package_files = std::sync::Mutex::new(
+        rune_fingerprint::FingerprintCache::load(
+            &sess.config().fingerprint_dir.join("source-cache.json"),
+        )
+        .unwrap_or_default(),
+    );
+
     let runner_count = sess.jobs.clamp(1, 16);
     let build_result = std::thread::scope(|scope| -> Result<_> {
         // Runner threads.
@@ -225,6 +238,8 @@ pub fn run(args: TestArgs, mode: Mode) -> Result<()> {
             let stop = &stop;
             let plan_ref = &plan;
             let args_ref = &args;
+            let test_cas = &test_cas;
+            let package_files = &package_files;
             scope.spawn(move || {
                 while let Ok(job) = job_rx.recv() {
                     let order = match &job {
@@ -240,6 +255,7 @@ pub fn run(args: TestArgs, mode: Mode) -> Result<()> {
                         });
                         continue;
                     }
+                    let mut remember_as: Option<String> = None;
                     let result = match job {
                         Job::Doc {
                             order,
@@ -256,6 +272,38 @@ pub fn run(args: TestArgs, mode: Mode) -> Result<()> {
                             harness,
                         } => {
                             let member = &sess.ws.members[member];
+                            if let (Some(cas), true) = (test_cas, harness) {
+                                let package_hash = {
+                                    let mut files = package_files.lock().unwrap();
+                                    rune_fingerprint::hasher::compute_package_hash(
+                                        &member.dir,
+                                        &mut files,
+                                    )
+                                    .ok()
+                                };
+                                remember_as = package_hash.and_then(|ph| {
+                                    crate::test_cache::key(&exe, &ph, libtest_args, std::env::vars())
+                                        .ok()
+                                });
+                                if let Some(rec) = remember_as
+                                    .as_ref()
+                                    .and_then(|k| cas.get_value::<crate::test_cache::Record>(k))
+                                {
+                                    let _ = res_tx.send(TestResult {
+                                        order,
+                                        outcome: Outcome::Cached,
+                                        counts: Counts {
+                                            passed: rec.passed,
+                                            failed: 0,
+                                            ignored: rec.ignored,
+                                            filtered: rec.filtered,
+                                        },
+                                        output: rec.output,
+                                        took: Duration::ZERO,
+                                    });
+                                    continue;
+                                }
+                            }
                             let mut cmd = sess.command_for(&exe);
                             if harness {
                                 cmd.args(libtest_args);
@@ -299,6 +347,20 @@ pub fn run(args: TestArgs, mode: Mode) -> Result<()> {
                     };
                     if matches!(result.outcome, Outcome::Failed) {
                         stop.store(true, Ordering::Relaxed);
+                    }
+                    if let (Outcome::Passed, Some(key), Some(cas)) =
+                        (&result.outcome, &remember_as, test_cas)
+                    {
+                        let c = result.counts;
+                        let _ = cas.put_value(
+                            key,
+                            &crate::test_cache::Record::new(
+                                c.passed,
+                                c.ignored,
+                                c.filtered,
+                                &result.output,
+                            ),
+                        );
                     }
                     let _ = res_tx.send(result);
                 }
@@ -614,9 +676,14 @@ fn find_executable(
 }
 
 fn print_result(label: &str, r: &TestResult, verbose: bool) {
-    let took = format!("{:.2}s", r.took.as_secs_f64());
+    let cached = matches!(r.outcome, Outcome::Cached);
+    let took = if cached {
+        "cached".to_string()
+    } else {
+        format!("{:.2}s", r.took.as_secs_f64())
+    };
     match r.outcome {
-        Outcome::Passed => {
+        Outcome::Passed | Outcome::Cached => {
             let c = r.counts;
             ui::action(
                 "ok",

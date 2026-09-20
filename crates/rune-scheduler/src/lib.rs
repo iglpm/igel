@@ -4,6 +4,7 @@
 //! critical-path-first scheduling, and rmeta pipelining.
 
 pub mod executor;
+pub mod hints;
 pub mod inputs;
 pub mod pipeline;
 pub mod progress;

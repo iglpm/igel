@@ -30,6 +30,8 @@ pub struct Session {
     pub selected: Vec<usize>,
     pub verbose: bool,
     pub quiet: bool,
+    /// `--message-format json`: events go to stdout as JSON lines.
+    pub json: bool,
     pub force_rebuild: bool,
     pub ignore_rust_version: bool,
 }
@@ -41,6 +43,10 @@ impl Session {
         if common.timings {
             rune_common::timing::enable();
         }
+        crate::messages::validate(&common.message_format).map_err(|e| anyhow::anyhow!(e))?;
+        let json = crate::messages::wants_json(&common.message_format);
+        crate::ui::set_machine_output(json);
+        crate::ui::set_quiet(common.quiet);
         let mut ws = Workspace::load(common.manifest_path.as_deref())?;
 
         if let Some(dir) = &common.target_dir {
@@ -110,6 +116,7 @@ impl Session {
             selected,
             verbose: common.verbose,
             quiet: common.quiet,
+            json,
             force_rebuild,
             ignore_rust_version: common.ignore_rust_version,
         })
@@ -124,9 +131,29 @@ impl Session {
         if !self.ws.config.settings.cas_enabled() {
             return None;
         }
-        CasStore::new(self.ws.config.cas_dir.clone())
-            .ok()
-            .map(|c| c.with_verify(self.ws.config.settings.cas_verify()))
+        let settings = &self.ws.config.settings;
+        CasStore::new(self.ws.config.cas_dir.clone()).ok().map(|c| {
+            let c = c.with_verify(settings.cas_verify());
+            let Some(spec) = settings.cas_remote() else {
+                return c;
+            };
+            let token = std::env::var("RUNE_CAS_REMOTE_TOKEN")
+                .ok()
+                .filter(|t| !t.is_empty())
+                .or_else(|| settings.cas_remote_token());
+            match rune_cas::remote::Remote::from_spec(
+                &spec,
+                settings.cas_remote_write(),
+                token,
+                settings.cas_remote_replicas(),
+            ) {
+                Ok(remote) => c.with_remote_store(remote),
+                Err(e) => {
+                    crate::ui::warn(format!("ignoring cas.remote: {e}"));
+                    c
+                }
+            }
+        })
     }
 
     pub fn executor(&self) -> BuildExecutor {
@@ -231,12 +258,29 @@ pub fn drive(
     let result = std::thread::scope(|scope| -> Result<BuildResult> {
         let handle = scope.spawn(|| executor.execute(graph));
 
-        let mut progress = (!sess.quiet)
+        let mut progress = (!sess.quiet && !sess.json)
             .then(|| BuildProgress::new(ui::multi_progress(), graph.node_count() as u64));
         while let Ok(event) = event_rx.recv() {
             let is_final = matches!(event, PipelineEvent::AllComplete { .. });
+            if sess.json {
+                let node = match &event {
+                    PipelineEvent::BuildFinished { node_id, .. }
+                    | PipelineEvent::CacheHit { node_id, .. }
+                    | PipelineEvent::BuildFailed { node_id, .. } => Some(*node_id),
+                    _ => None,
+                };
+                if let Some(node) = node {
+                    let unit = &graph.node(node).unit;
+                    for line in crate::messages::lines_for(unit, &sess.profile, &event) {
+                        println!("{line}");
+                    }
+                }
+                if let PipelineEvent::AllComplete { failed, .. } = &event {
+                    println!("{}", crate::messages::build_finished(*failed == 0));
+                }
+            }
             match &event {
-                PipelineEvent::BuildFailed { node_id, error } => {
+                PipelineEvent::BuildFailed { node_id, error, .. } => {
                     let unit = &graph.node(*node_id).unit;
                     failures.push((
                         format!("{} v{}", unit.crate_id.name, unit.crate_id.version),
@@ -245,7 +289,7 @@ pub fn drive(
                 }
                 PipelineEvent::BuildFinished { warnings, .. }
                 | PipelineEvent::CacheHit { warnings, .. }
-                    if !warnings.is_empty() && !sess.quiet =>
+                    if !warnings.is_empty() && !sess.quiet && !sess.json =>
                 {
                     ui::print_above_progress(warnings);
                 }
@@ -268,7 +312,9 @@ pub fn drive(
 
     for (crate_desc, error) in &failures {
         ui::error(format!("failed to compile {}", crate_desc.bold()));
-        eprintln!("{error}");
+        if !sess.json {
+            eprintln!("{error}");
+        }
     }
     sess.maybe_gc();
     Ok((result, failures))
@@ -284,4 +330,9 @@ pub fn ensure_success(result: &BuildResult) -> Result<()> {
             result.failed.len()
         )
     }
+}
+
+/// `RUSTFLAGS` (or `CARGO_ENCODED_RUSTFLAGS`) as individual arguments.
+pub fn rustflags_from_env_public() -> Vec<String> {
+    rune_scheduler::executor::rustflags_from_env()
 }

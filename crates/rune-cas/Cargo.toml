@@ -14,6 +14,9 @@ tracing.workspace = true
 serde = { workspace = true }
 serde_json.workspace = true
 blake3.workspace = true
+reqwest.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
 filetime.workspace = true
 walkdir.workspace = true
 

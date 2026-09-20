@@ -1543,6 +1543,8 @@ impl Planner<'_> {
             version: &self.uni.version[pkg],
             workspace_member: self.is_member(pkg),
             host,
+            lean_debuginfo: matches!(self.uni.origin[pkg], Origin::Registry)
+                && !self.ws.config.settings.dependency_debuginfo(),
         };
         let p = resolve_unit_profile(&self.req.profile.name, tables, role).ok()?;
         (p != *self.req.profile).then_some(p)
@@ -1561,6 +1563,7 @@ impl Planner<'_> {
                     version: &self.uni.version[pkg],
                     workspace_member: self.is_member(pkg),
                     host: true,
+                    lean_debuginfo: false,
                 },
             )
             .ok()
