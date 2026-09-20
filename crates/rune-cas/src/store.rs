@@ -39,6 +39,11 @@ pub struct CasStore {
     /// hundred crates do a few hundred read-modify-write round trips on one
     /// file for no benefit.
     pending: Arc<PendingStats>,
+    /// Re-hash every artifact on every hit (`cas.verify`). Off by default: an
+    /// entry is always verified against its key and the sizes in its manifest;
+    /// this additionally catches bit rot and tampering, at the cost of reading
+    /// every restored file.
+    verify: bool,
 }
 
 #[derive(Debug, Default)]
@@ -94,6 +99,17 @@ pub struct CasEntry {
 /// True if `dest` is already a hardlink to `src` (same inode on the same
 /// device), meaning there is nothing left to do to "link" it.
 #[cfg(unix)]
+/// Stored objects are never modified: taking away write permission makes a
+/// stray in-place write (through a hard link from a project directory) fail
+/// loudly instead of silently changing an object every project shares.
+fn make_read_only(path: &Path) {
+    if let Ok(meta) = fs::metadata(path) {
+        let mut perms = meta.permissions();
+        perms.set_readonly(true);
+        let _ = fs::set_permissions(path, perms);
+    }
+}
+
 fn already_linked(src: &Path, dest: &Path) -> bool {
     use std::os::unix::fs::MetadataExt;
     let (Ok(a), Ok(b)) = (fs::metadata(src), fs::metadata(dest)) else {
@@ -123,7 +139,26 @@ impl CasStore {
             root,
             stats_lock: Arc::new(Mutex::new(())),
             pending: Arc::new(PendingStats::default()),
+            verify: false,
         })
+    }
+
+    /// Verifies the content hash of every artifact on every hit.
+    pub fn with_verify(mut self, verify: bool) -> Self {
+        self.verify = verify;
+        self
+    }
+
+    /// An entry is usable only if it is the one asked for and everything its
+    /// manifest lists is present at the recorded size. Anything else — a
+    /// half-collected entry, damage on disk — is a miss, never a hit.
+    fn is_intact(entry: &CasEntry, cache_key: &str) -> bool {
+        entry.manifest.cache_key == cache_key
+            && entry.manifest.artifacts.iter().all(|a| {
+                fs::metadata(entry.object_dir.join(&a.filename))
+                    .map(|m| m.len() == a.size)
+                    .unwrap_or(false)
+            })
     }
 
     /// Return the root path.
@@ -175,6 +210,16 @@ impl CasStore {
         source_files: &[PathBuf],
     ) -> Result<()> {
         let dir = self.object_dir(cache_key);
+        // Objects are immutable: the first published result for a key stands,
+        // and a later build of the same key (a forced rebuild, a racing
+        // process) never changes it. A *damaged* entry is not an entry, though:
+        // it is removed so it can be published again.
+        if let Some(existing) = self.get(cache_key) {
+            if Self::is_intact(&existing, cache_key) {
+                return Ok(());
+            }
+            let _ = fs::remove_dir_all(&dir);
+        }
         fs::create_dir_all(&dir)?;
 
         let mut artifacts = Vec::new();
@@ -197,6 +242,7 @@ impl CasStore {
             let size = fs::metadata(&tmp)?.len();
             total_size += size;
             let hash = hash_file(&tmp)?;
+            make_read_only(&tmp);
             fs::rename(&tmp, &dest)?;
 
             artifacts.push(ArtifactEntry {
@@ -241,6 +287,18 @@ impl CasStore {
     /// machines.
     pub fn put_dir_tree(&self, cache_key: &str, source_dir: &Path) -> Result<()> {
         let object_dir = self.object_dir(cache_key);
+        // Immutable, like artifact entries: a complete tree already stored
+        // under this key stands.
+        if let Ok(text) = fs::read_to_string(object_dir.join("tree.json")) {
+            if let Ok(rels) = serde_json::from_str::<Vec<String>>(&text) {
+                if rels
+                    .iter()
+                    .all(|r| object_dir.join("tree").join(r).is_file())
+                {
+                    return Ok(());
+                }
+            }
+        }
         fs::create_dir_all(&object_dir)?;
         let tree_root = object_dir.join("tree");
         // Build the new tree beside the old one and swap by rename, so a
@@ -269,6 +327,7 @@ impl CasStore {
                 fs::create_dir_all(parent)?;
             }
             fs::copy(path, &dest)?;
+            make_read_only(&dest);
             relative_paths.push(rel.to_string_lossy().into_owned());
         }
 
@@ -339,10 +398,22 @@ impl CasStore {
         fs::create_dir_all(target_dir)?;
         let mut linked_files = Vec::new();
 
+        if !Self::is_intact(&entry, cache_key) {
+            return Err(CasError::Integrity(format!(
+                "entry {cache_key} is damaged or is not the requested one"
+            )));
+        }
+
         for artifact in entry.manifest.artifacts {
             let src = entry.object_dir.join(&artifact.filename);
             let dest = target_dir.join(&artifact.filename);
 
+            if self.verify && hash_file(&src)? != artifact.hash {
+                return Err(CasError::Integrity(format!(
+                    "artifact {} of {cache_key} does not match its recorded hash",
+                    artifact.filename
+                )));
+            }
             if already_linked(&src, &dest) {
                 linked_files.push(dest);
                 continue;
@@ -431,7 +502,11 @@ impl CasStore {
         let dir = self.object_dir(cache_key);
         fs::create_dir_all(&dir)?;
         let json = serde_json::to_string(value)?;
-        fs::write(dir.join("value.json"), json)?;
+        // Written beside and renamed: a crash mid-write must never leave a
+        // truncated value that a later build could mistake for a valid one.
+        let tmp = dir.join(format!(".value.{}.tmp", std::process::id()));
+        fs::write(&tmp, json)?;
+        fs::rename(&tmp, dir.join("value.json"))?;
         Ok(())
     }
 
@@ -521,28 +596,87 @@ mod tests {
     }
 
     #[test]
-    fn put_replaces_objects_without_writing_through_old_hardlinks() {
+    fn objects_are_immutable_and_never_written_through_old_hardlinks() {
         let dir = tempdir().unwrap();
         let store = CasStore::new(dir.path().to_path_buf()).unwrap();
         let src_dir = tempdir().unwrap();
         let file = src_dir.path().join("libfoo.rlib");
 
         fs::write(&file, "v1").unwrap();
-        store.put("keyv", "foo", "1.0.0", &[file.clone()]).unwrap();
+        store
+            .put("keyv", "foo", "1.0.0", std::slice::from_ref(&file))
+            .unwrap();
 
         // A build directory hardlinks the object...
         let build = tempdir().unwrap();
         let linked = store.link_to("keyv", build.path()).unwrap();
 
-        // ...then the same key is stored again with different content
-        // (a forced rebuild). The build dir's link must keep the old bytes.
+        // ...then the same key is published again with different content (a
+        // forced or racing rebuild). The first result stands.
         fs::write(&file, "v2").unwrap();
         store.put("keyv", "foo", "1.0.0", &[file]).unwrap();
 
         assert_eq!(fs::read_to_string(&linked[0]).unwrap(), "v1");
         let other_build = tempdir().unwrap();
         let relinked = store.link_to("keyv", other_build.path()).unwrap();
-        assert_eq!(fs::read_to_string(&relinked[0]).unwrap(), "v2");
+        assert_eq!(fs::read_to_string(&relinked[0]).unwrap(), "v1");
+
+        // And a stray in-place write through a link fails instead of
+        // corrupting the shared object.
+        assert!(
+            fs::OpenOptions::new().write(true).open(&linked[0]).is_err(),
+            "stored objects must be read-only"
+        );
+    }
+
+    #[test]
+    fn a_damaged_entry_is_a_miss_and_can_be_published_again() {
+        let dir = tempdir().unwrap();
+        let store = CasStore::new(dir.path().to_path_buf()).unwrap();
+        let src = tempdir().unwrap();
+        let file = src.path().join("libbar.rlib");
+        fs::write(&file, "intact").unwrap();
+        store
+            .put("k", "bar", "1.0.0", std::slice::from_ref(&file))
+            .unwrap();
+
+        // Damage: the artifact disappears (a half-collected entry).
+        let obj = store.object_dir("k").join("libbar.rlib");
+        fs::remove_file(&obj).unwrap();
+        assert!(store.link_to("k", tempdir().unwrap().path()).is_err());
+
+        // Publishing again repairs it instead of trusting the broken entry.
+        store.put("k", "bar", "1.0.0", &[file]).unwrap();
+        let target = tempdir().unwrap();
+        let ok = store.link_to("k", target.path()).unwrap();
+        assert_eq!(fs::read_to_string(&ok[0]).unwrap(), "intact");
+    }
+
+    #[test]
+    fn verification_catches_content_that_changed_without_changing_size() {
+        let dir = tempdir().unwrap();
+        let store = CasStore::new(dir.path().to_path_buf())
+            .unwrap()
+            .with_verify(true);
+        let src = tempdir().unwrap();
+        let file = src.path().join("libbaz.rlib");
+        fs::write(&file, "aaaa").unwrap();
+        store.put("kv", "baz", "1.0.0", &[file]).unwrap();
+        assert!(store.link_to("kv", tempdir().unwrap().path()).is_ok());
+
+        // Bit rot: same size, different bytes.
+        let obj = store.object_dir("kv").join("libbaz.rlib");
+        #[allow(clippy::permissions_set_readonly_false)]
+        {
+            let mut perms = fs::metadata(&obj).unwrap().permissions();
+            perms.set_readonly(false);
+            fs::set_permissions(&obj, perms).unwrap();
+        }
+        fs::write(&obj, "bbbb").unwrap();
+        assert!(store.link_to("kv", tempdir().unwrap().path()).is_err());
+        // Without verification only the size is checked.
+        let lax = CasStore::new(dir.path().to_path_buf()).unwrap();
+        assert!(lax.link_to("kv", tempdir().unwrap().path()).is_ok());
     }
 
     #[test]
