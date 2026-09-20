@@ -24,6 +24,8 @@ pub enum DownloadError {
     },
     #[error("Tar archive extraction error: {0}")]
     Archive(String),
+    #[error("{0}")]
+    Config(String),
 }
 
 pub type Result<T> = std::result::Result<T, DownloadError>;
@@ -34,6 +36,23 @@ pub struct CrateDownloader {
     src_dir: PathBuf,
     client: reqwest::blocking::Client,
     offline: bool,
+    backend: DlBackend,
+}
+
+/// Where the `.crate` archives of a registry come from.
+enum DlBackend {
+    CratesIo,
+    /// An alternative sparse registry: the download URL comes from its
+    /// `config.json`.
+    Sparse {
+        base: String,
+        token: Option<String>,
+        label: String,
+    },
+    /// `local-registry`: `.crate` files next to the index.
+    LocalRegistry(PathBuf),
+    /// `directory`: crates already unpacked; nothing to fetch or extract.
+    Directory(PathBuf),
 }
 
 /// Downloads are latency-bound, so run many at once regardless of core count.
@@ -58,6 +77,109 @@ impl CrateDownloader {
                 .build()
                 .unwrap_or_else(|_| reqwest::blocking::Client::new()),
             offline: false,
+            backend: DlBackend::CratesIo,
+        }
+    }
+
+    /// A downloader for the registry identified by `index`, honouring source
+    /// replacement and authentication from configuration.
+    pub fn for_registry(index: &str) -> std::result::Result<Self, crate::index::IndexError> {
+        use crate::source::{Backend, CRATES_IO, defs};
+        let backend = defs().backend_for(index)?;
+        let mut d = Self::default_downloader();
+        let key = crate::index::registry_dir_key(index);
+        let home = rune_common::settings::rune_home().join("registry");
+        match backend {
+            Backend::Sparse { url, token } => {
+                if index != CRATES_IO || url != CRATES_IO || token.is_some() {
+                    d.crates_dir = home.join("cache").join(&key);
+                    d.src_dir = home.join("src").join(&key);
+                    d.backend = DlBackend::Sparse {
+                        base: url
+                            .strip_prefix("sparse+")
+                            .unwrap_or(&url)
+                            .trim_end_matches('/')
+                            .to_string(),
+                        token,
+                        label: index.to_string(),
+                    };
+                }
+            }
+            Backend::LocalRegistry(dir) => {
+                d.crates_dir = home.join("cache").join(&key);
+                d.src_dir = home.join("src").join(&key);
+                d.backend = DlBackend::LocalRegistry(dir);
+            }
+            Backend::Directory(dir) => d.backend = DlBackend::Directory(dir),
+        }
+        Ok(d)
+    }
+
+    /// The download URL of a package of an alternative registry, from the
+    /// registry's `config.json` template: `{crate}`, `{version}`, `{prefix}`,
+    /// `{lowerprefix}` and `{sha256-checksum}` are substituted; a template
+    /// without markers gets `/{crate}/{version}/download` appended.
+    fn sparse_download_url(
+        &self,
+        base: &str,
+        token: Option<&str>,
+        name: &str,
+        version: &str,
+        cksum: Option<&str>,
+    ) -> Result<String> {
+        let config_path = self.crates_dir.join("config.json");
+        let cfg: serde_json::Value = match std::fs::read_to_string(&config_path)
+            .ok()
+            .and_then(|t| serde_json::from_str(&t).ok())
+        {
+            Some(v) => v,
+            None => {
+                if self.offline {
+                    return Err(DownloadError::Archive(format!(
+                        "the registry config of {base} is not cached and Rune is offline"
+                    )));
+                }
+                let mut req = self.client.get(format!("{base}/config.json"));
+                if let Some(t) = token {
+                    req = req.header(reqwest::header::AUTHORIZATION, t);
+                }
+                let text = req.send()?.error_for_status()?.text()?;
+                fs::create_dir_all(&self.crates_dir)?;
+                let _ = fs::write(&config_path, &text);
+                serde_json::from_str(&text).map_err(|e| {
+                    DownloadError::Archive(format!("invalid config.json from {base}: {e}"))
+                })?
+            }
+        };
+        let dl = cfg
+            .get("dl")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| DownloadError::Archive(format!("{base}/config.json has no `dl`")))?;
+        let prefix = match name.len() {
+            1 => "1".to_string(),
+            2 => "2".to_string(),
+            3 => format!("3/{}", &name[..1]),
+            _ => format!("{}/{}", &name[..2], &name[2..4]),
+        };
+        const MARKERS: [&str; 5] = [
+            "{crate}",
+            "{version}",
+            "{prefix}",
+            "{lowerprefix}",
+            "{sha256-checksum}",
+        ];
+        if MARKERS.iter().any(|m| dl.contains(m)) {
+            Ok(dl
+                .replace("{crate}", name)
+                .replace("{version}", version)
+                .replace("{prefix}", &prefix)
+                .replace("{lowerprefix}", &prefix.to_lowercase())
+                .replace("{sha256-checksum}", cksum.unwrap_or("")))
+        } else {
+            Ok(format!(
+                "{}/{name}/{version}/download",
+                dl.trim_end_matches('/')
+            ))
         }
     }
 
@@ -84,6 +206,20 @@ impl CrateDownloader {
         let crate_folder_name = format!("{name}-{version}");
         let extracted_path = self.src_dir.join(&crate_folder_name);
 
+        // Vendored crates are already unpacked (and `cargo vendor` may name
+        // the directory with or without the version).
+        if let DlBackend::Directory(dir) = &self.backend {
+            for candidate in [dir.join(&crate_folder_name), dir.join(name)] {
+                if candidate.join("Cargo.toml").is_file() {
+                    return Ok(candidate);
+                }
+            }
+            return Err(DownloadError::Archive(format!(
+                "{crate_folder_name} is not in the vendor directory {}",
+                dir.display()
+            )));
+        }
+
         // Fast path: if extracted directory already exists with a Cargo.toml, reuse immediately
         if extracted_path.exists() && extracted_path.join("Cargo.toml").exists() {
             debug!(
@@ -107,28 +243,66 @@ impl CrateDownloader {
                     "{crate_folder_name} is not in the local registry cache and Rune is offline"
                 )));
             }
-            let url = format!("https://static.crates.io/crates/{name}/{name}-{version}.crate");
-            debug!("Downloading crate {} from {}", crate_folder_name, url);
+            if let DlBackend::LocalRegistry(dir) = &self.backend {
+                let src = dir.join(format!("{crate_folder_name}.crate"));
+                if !src.is_file() {
+                    return Err(DownloadError::Archive(format!(
+                        "{} is not in the local registry {}",
+                        src.file_name().unwrap().to_string_lossy(),
+                        dir.display()
+                    )));
+                }
+                fs::copy(&src, &tarball_path)?;
+            } else {
+                let (url, token) = match &self.backend {
+                    DlBackend::Sparse { base, token, .. } => (
+                        self.sparse_download_url(
+                            base,
+                            token.as_deref(),
+                            name,
+                            version,
+                            expected_cksum,
+                        )?,
+                        token.clone(),
+                    ),
+                    _ => (
+                        format!("https://static.crates.io/crates/{name}/{name}-{version}.crate"),
+                        None,
+                    ),
+                };
+                debug!("Downloading crate {} from {}", crate_folder_name, url);
 
-            let mut resp = self.client.get(&url).send()?;
-            if !resp.status().is_success() {
-                return Err(DownloadError::Archive(format!(
-                    "Failed to download {}: HTTP {}",
-                    url,
-                    resp.status()
-                )));
-            }
+                let mut request = self.client.get(&url);
+                if let Some(token) = &token {
+                    request = request.header(reqwest::header::AUTHORIZATION, token.as_str());
+                }
+                let mut resp = request.send()?;
+                if !resp.status().is_success() {
+                    let hint = match (&self.backend, resp.status().as_u16()) {
+                        (DlBackend::Sparse { label, .. }, 401 | 403) => format!(
+                            " (the registry `{label}` requires authentication: set \
+                         `CARGO_REGISTRIES_<NAME>_TOKEN` or a token in .cargo/config.toml)"
+                        ),
+                        _ => String::new(),
+                    };
+                    return Err(DownloadError::Archive(format!(
+                        "Failed to download {}: HTTP {}{hint}",
+                        url,
+                        resp.status()
+                    )));
+                }
 
-            // Stream into a temp file and rename, so an interrupted download
-            // can never be mistaken for a complete tarball later.
-            let tmp_tarball = self
-                .crates_dir
-                .join(format!(".{crate_folder_name}.{}.part", std::process::id()));
-            {
-                let mut out_file = File::create(&tmp_tarball)?;
-                std::io::copy(&mut resp, &mut out_file)?;
+                // Stream into a temp file and rename, so an interrupted download
+                // can never be mistaken for a complete tarball later.
+                let tmp_tarball = self
+                    .crates_dir
+                    .join(format!(".{crate_folder_name}.{}.part", std::process::id()));
+                {
+                    let mut out_file = File::create(&tmp_tarball)?;
+                    std::io::copy(&mut resp, &mut out_file)?;
+                }
+                fs::rename(&tmp_tarball, &tarball_path)?;
             }
-            fs::rename(&tmp_tarball, &tarball_path)?;
         }
 
         // Verify checksum if provided
@@ -209,11 +383,12 @@ impl CrateDownloader {
             .iter()
             .enumerate()
             .filter(|(_, (name, version, _))| {
-                !self
-                    .src_dir
-                    .join(format!("{name}-{version}"))
-                    .join("Cargo.toml")
-                    .exists()
+                !matches!(self.backend, DlBackend::Directory(_))
+                    && !self
+                        .src_dir
+                        .join(format!("{name}-{version}"))
+                        .join("Cargo.toml")
+                        .exists()
             })
             .map(|(i, _)| i)
             .collect();
@@ -253,6 +428,46 @@ impl CrateDownloader {
             })
             .collect()
     }
+}
+
+/// Downloads and extracts packages from several registries at once.
+///
+/// Each item is `(name, version, checksum, registry index)`; the result is
+/// in the same order. Packages of one registry are fetched together (in
+/// parallel), each registry with its own source replacement, credentials and
+/// cache directory.
+pub fn download_and_extract_grouped(
+    packages: &[(String, String, Option<String>, String)],
+    offline: bool,
+) -> Result<Vec<PathBuf>> {
+    let mut by_registry: std::collections::BTreeMap<&str, Vec<usize>> = Default::default();
+    for (i, (_, _, _, index)) in packages.iter().enumerate() {
+        by_registry.entry(index.as_str()).or_default().push(i);
+    }
+    let mut out: Vec<Option<PathBuf>> = vec![None; packages.len()];
+    for (index, positions) in by_registry {
+        let downloader = CrateDownloader::for_registry(index)
+            .map_err(|e| DownloadError::Config(e.to_string()))?
+            .offline(offline);
+        let batch: Vec<(String, String, Option<String>)> = positions
+            .iter()
+            .map(|&i| {
+                let (n, v, c, _) = &packages[i];
+                (n.clone(), v.clone(), c.clone())
+            })
+            .collect();
+        for (dir, &i) in downloader
+            .download_and_extract_many(&batch)?
+            .into_iter()
+            .zip(&positions)
+        {
+            out[i] = Some(dir);
+        }
+    }
+    Ok(out
+        .into_iter()
+        .map(|d| d.expect("every package was downloaded"))
+        .collect())
 }
 
 /// Helper function to download and extract a crate using the default cache location.

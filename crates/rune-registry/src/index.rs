@@ -19,6 +19,8 @@ pub enum IndexError {
          (run without `--offline` once to populate it)"
     )]
     Offline(String),
+    #[error("{0}")]
+    Config(String),
 }
 
 pub type Result<T> = std::result::Result<T, IndexError>;
@@ -71,6 +73,10 @@ pub struct IndexDependency {
     pub kind: Option<String>, // "normal", "dev", "build"
     #[serde(default)]
     pub package: Option<String>,
+    /// The index of the registry this dependency comes from, when it is not
+    /// the registry of the depending package (`None` means the same one).
+    #[serde(default)]
+    pub registry: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -103,6 +109,10 @@ pub struct SparseIndexClient {
     client: reqwest::blocking::Client,
     /// Never touch the network: serve only what is already cached.
     offline: bool,
+    /// Sent as the `Authorization` header (private registries).
+    token: Option<String>,
+    /// For messages: the registry's identity.
+    label: String,
 }
 
 /// How many index requests to keep in flight at once. Index files are tiny
@@ -125,7 +135,32 @@ impl SparseIndexClient {
                 .build()
                 .unwrap_or_else(|_| reqwest::blocking::Client::new()),
             offline: false,
+            token: None,
+            label: "crates.io".to_string(),
         }
+    }
+
+    /// A client for an alternative sparse registry. Its cache lives in its own
+    /// directory, so registries never see each other's index files.
+    pub fn for_registry(index: &str, token: Option<String>) -> Self {
+        if index == crate::source::CRATES_IO && token.is_none() {
+            return Self::default_client();
+        }
+        let url = index
+            .strip_prefix("sparse+")
+            .unwrap_or(index)
+            .trim_end_matches('/')
+            .to_string();
+        let mut client = Self::new(
+            rune_common::settings::rune_home()
+                .join("registry")
+                .join("index")
+                .join(registry_dir_key(index)),
+        );
+        client.base_url = url;
+        client.token = token;
+        client.label = index.to_string();
+        client
     }
 
     /// Default client targeting `~/.rune/registry/index/crates.io-index`
@@ -244,6 +279,9 @@ impl SparseIndexClient {
 
         let url = format!("{}/{}", self.base_url, rel_path);
         let mut request = self.client.get(&url);
+        if let Some(token) = &self.token {
+            request = request.header(reqwest::header::AUTHORIZATION, token.as_str());
+        }
         let have_cache = cached_file.is_file();
         if have_cache {
             if let Ok(etag) = fs::read_to_string(&etag_file) {
@@ -287,6 +325,15 @@ impl SparseIndexClient {
                 || status == reqwest::StatusCode::GONE
             {
                 return Err(IndexError::CrateNotFound(name.to_string()));
+            } else if status == reqwest::StatusCode::UNAUTHORIZED
+                || status == reqwest::StatusCode::FORBIDDEN
+            {
+                return Err(IndexError::Config(format!(
+                    "the registry `{}` requires authentication (HTTP {status}); set a token with \
+                     `CARGO_REGISTRIES_<NAME>_TOKEN` or `[registries.<name>] token` / \
+                     `credential-provider` in .cargo/config.toml",
+                    self.label
+                )));
             }
         }
 
@@ -323,6 +370,26 @@ impl SparseIndexClient {
             versions,
         })
     }
+}
+
+/// A directory name for a registry's caches: readable host plus a hash of the
+/// full identity, so two registries never collide.
+pub fn registry_dir_key(index: &str) -> String {
+    if index == crate::source::CRATES_IO {
+        return "crates.io-index".to_string();
+    }
+    let host = index
+        .trim_start_matches("sparse+")
+        .trim_start_matches("registry+")
+        .split("://")
+        .nth(1)
+        .unwrap_or(index)
+        .split('/')
+        .next()
+        .unwrap_or("registry")
+        .replace(':', "_");
+    let hash = blake3::hash(index.as_bytes()).to_hex();
+    format!("{host}-{}", &hash[..16])
 }
 
 fn etag_path(cached_file: &std::path::Path) -> PathBuf {
