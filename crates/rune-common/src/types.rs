@@ -51,20 +51,70 @@ impl fmt::Display for CrateId {
 // CrateSource — where a crate comes from
 // ---------------------------------------------------------------------------
 
-/// The origin of a crate.
+/// The origin of a crate, with everything that makes its *content* immutable.
+///
+/// A cache key for a non-local crate never reads its files, so the source
+/// identity has to pin the content on its own: a registry package by index and
+/// archive checksum, a Git package by the exact commit (a branch name would
+/// change under it) plus the state of its submodules.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum CrateSource {
     /// A crate from crates.io or another registry.
-    Registry(String),
-    /// A local path dependency.
+    Registry {
+        /// Canonical index URL (`sparse+https://index.crates.io/`, ...).
+        index: String,
+        /// SHA-256 of the `.crate` archive, when known.
+        checksum: Option<String>,
+    },
+    /// A local path dependency or workspace member: mutable, hashed by content.
     Local,
-    /// A git dependency.
-    Git { url: String, rev: Option<String> },
+    /// A git dependency, resolved to an exact commit.
+    Git {
+        url: String,
+        /// The resolved commit (never a branch or tag name).
+        commit: String,
+        /// Where the package lives inside the repository.
+        subdir: Option<String>,
+        /// Commits of every checked-out submodule, `path=commit` joined by `,`.
+        submodules: String,
+    },
 }
+
+impl CrateSource {
+    /// A crates.io registry package.
+    pub fn crates_io(checksum: Option<String>) -> Self {
+        Self::Registry {
+            index: CRATES_IO_INDEX.to_string(),
+            checksum,
+        }
+    }
+
+    /// A stable string describing this source, for hashing.
+    pub fn identity(&self) -> String {
+        match self {
+            Self::Registry { index, checksum } => {
+                format!("registry|{index}|{}", checksum.as_deref().unwrap_or("-"))
+            }
+            Self::Local => "local".to_string(),
+            Self::Git {
+                url,
+                commit,
+                subdir,
+                submodules,
+            } => format!(
+                "git|{url}|{commit}|{}|{submodules}",
+                subdir.as_deref().unwrap_or("")
+            ),
+        }
+    }
+}
+
+/// The canonical index URL of crates.io.
+pub const CRATES_IO_INDEX: &str = "sparse+https://index.crates.io/";
 
 impl Default for CrateSource {
     fn default() -> Self {
-        Self::Registry("https://github.com/rust-lang/crates.io-index".into())
+        Self::crates_io(None)
     }
 }
 
@@ -181,7 +231,7 @@ impl fmt::Display for CrateType {
 // ---------------------------------------------------------------------------
 
 /// Build profile configuration, mirroring Cargo profiles.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Profile {
     /// Profile name (e.g., "dev", "release").
     pub name: String,
@@ -206,6 +256,9 @@ pub struct Profile {
     /// `-C strip=` value (`none`, `debuginfo`, `symbols`), if set.
     #[serde(default)]
     pub strip: Option<String>,
+    /// `-C split-debuginfo=` value (`off`, `packed`, `unpacked`), if set.
+    #[serde(default)]
+    pub split_debuginfo: Option<String>,
 }
 
 impl Profile {
@@ -225,6 +278,7 @@ impl Profile {
             incremental: true,
             rpath: false,
             strip: None,
+            split_debuginfo: None,
         }
     }
 
@@ -242,6 +296,7 @@ impl Profile {
             incremental: false,
             rpath: false,
             strip: None,
+            split_debuginfo: None,
         }
     }
 
@@ -270,7 +325,7 @@ impl Profile {
     /// artifacts and should share its cache entries.
     pub fn codegen_fingerprint(&self) -> String {
         format!(
-            "opt={}|debug={}|da={}|oc={}|lto={}|panic={}|cgu={:?}|rpath={}|strip={:?}",
+            "opt={}|debug={}|da={}|oc={}|lto={}|panic={}|cgu={:?}|rpath={}|strip={:?}|split={:?}",
             self.opt_level.as_str(),
             self.debuginfo.as_str(),
             self.debug_assertions,
@@ -280,6 +335,7 @@ impl Profile {
             self.codegen_units,
             self.rpath,
             self.strip,
+            self.split_debuginfo,
         )
     }
 
@@ -480,6 +536,59 @@ impl TargetKind {
 }
 
 // ---------------------------------------------------------------------------
+// UnitExtras — per-unit build configuration beyond the package identity
+// ---------------------------------------------------------------------------
+
+/// Everything about how one unit is compiled that is *not* implied by the
+/// request-wide profile and target. All of it is part of the unit's identity.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+pub struct UnitExtras {
+    /// Compiled for the host machine: a build script's dependencies, a
+    /// proc-macro and everything only it uses. Such a unit never gets
+    /// `--target`, whatever the request says.
+    pub for_host: bool,
+    /// The unit's effective profile when it differs from the request's:
+    /// `[profile.*.package.*]` and `[profile.*.build-override]` applied.
+    pub profile: Option<Profile>,
+    /// Further `--crate-type`s beyond [`CompilationUnit::crate_type`]
+    /// (`[lib] crate-type = ["cdylib", "rlib"]`).
+    pub extra_crate_types: Vec<CrateType>,
+    /// A workspace member (as opposed to a dependency): the
+    /// `RUSTC_WORKSPACE_WRAPPER` applies, and warnings are shown.
+    pub member: bool,
+    /// The effective `rustflags` for this unit's role (env, config, target).
+    pub rustflags: Vec<String>,
+    /// `target.<triple>.linker` for units that link.
+    pub linker: Option<String>,
+    /// Flags and linker for this unit's *build script*, which always runs on
+    /// the host (so, when cross-compiling, differ from `rustflags`/`linker`).
+    pub script_rustflags: Vec<String>,
+    pub script_linker: Option<String>,
+    /// The profile the package's build script is compiled with
+    /// (`build-override`).
+    pub script_profile: Option<Profile>,
+    /// `crate-name-hash` of the unit that runs this package's build script,
+    /// when it is not this unit. A package's script runs once and every unit
+    /// of the package — library, binaries, tests — shares its output (and its
+    /// `OUT_DIR`), as in Cargo.
+    pub script_owner: Option<String>,
+    /// The package's declared `[features]` (and optional dependencies), for
+    /// `--check-cfg cfg(feature, values(...))`.
+    pub declared_features: Vec<String>,
+    /// Hash of the normalized custom target specification, if the target is a
+    /// JSON file: the name alone can't identify it.
+    pub target_spec: Option<String>,
+    /// Environment from the `[env]` configuration table, `(name, value)`. It
+    /// reaches the compiler and can end up in the binary through `env!`, so
+    /// it is part of the unit's identity.
+    pub env: Vec<(String, String)>,
+    /// Whether the unit is part of `--target` builds' *cross* graph, i.e.
+    /// host units are distinct from target units even without differing
+    /// features.
+    pub cross: bool,
+}
+
+// ---------------------------------------------------------------------------
 // CompilationUnit — a single unit of compilation
 // ---------------------------------------------------------------------------
 
@@ -539,6 +648,8 @@ pub struct CompilationUnit {
     /// Compile as a test harness (`rustc --test`): the unit produces a
     /// runnable test executable for its target instead of the target itself.
     pub harness: bool,
+    /// Per-unit build configuration (host role, effective profile, flags).
+    pub ext: UnitExtras,
 }
 
 impl CompilationUnit {
@@ -553,6 +664,16 @@ impl CompilationUnit {
         }
     }
 
+    /// Every crate type this unit produces, primary first.
+    pub fn all_crate_types(&self) -> impl Iterator<Item = CrateType> + '_ {
+        std::iter::once(self.crate_type).chain(self.ext.extra_crate_types.iter().copied())
+    }
+
+    /// The profile this unit compiles with: its own override, else `base`.
+    pub fn effective_profile<'a>(&'a self, base: &'a Profile) -> &'a Profile {
+        self.ext.profile.as_ref().unwrap_or(base)
+    }
+
     /// Returns a unique disambiguation hash for this unit,
     /// used in `-C metadata=` and `-C extra-filename=`.
     pub fn metadata_hash(&self) -> String {
@@ -560,6 +681,9 @@ impl CompilationUnit {
         let mut hb = HashBuilder::new();
         hb.update(self.crate_id.name.as_bytes());
         hb.update(self.crate_id.version.to_string().as_bytes());
+        // The same name and version from two sources (a registry crate and
+        // the git checkout patched over it) are different crates.
+        hb.update(self.crate_id.source.identity().as_bytes());
         hb.update(self.crate_type.rustc_crate_type().as_bytes());
         hb.update(self.profile_name.as_bytes());
         hb.update(self.edition.as_str().as_bytes());
@@ -581,6 +705,22 @@ impl CompilationUnit {
         hb.update(self.meta.name.as_bytes());
         hb.update(self.kind.as_str().as_bytes());
         hb.update(if self.harness { b"harness" } else { b"plain" });
+        // Only mixed in when set, so ordinary units keep their identity.
+        if self.ext.for_host {
+            hb.update(b"\0host");
+        }
+        if let Some(p) = &self.ext.profile {
+            hb.update(b"\0profile=");
+            hb.update(p.codegen_fingerprint().as_bytes());
+        }
+        for ct in &self.ext.extra_crate_types {
+            hb.update(b"\0ct=");
+            hb.update(ct.rustc_crate_type().as_bytes());
+        }
+        if let Some(spec) = &self.ext.target_spec {
+            hb.update(b"\0spec=");
+            hb.update(spec.as_bytes());
+        }
         // Take the first 16 hex chars of the blake3 hash
         let hash = hb.finish_blake3();
         hash[..16].to_string()
@@ -607,10 +747,15 @@ impl CompilationUnit {
         self.crate_type == CrateType::ProcMacro
             || (self.harness && !self.check_only)
             || (!self.check_only
-                && matches!(
-                    self.crate_type,
-                    CrateType::Bin | CrateType::Cdylib | CrateType::Dylib
-                ))
+                && self.all_crate_types().any(|t| {
+                    matches!(
+                        t,
+                        CrateType::Bin
+                            | CrateType::Cdylib
+                            | CrateType::Dylib
+                            | CrateType::Staticlib
+                    )
+                }))
     }
 
     /// Whether scheduling must wait for every transitive dependency to be
@@ -647,6 +792,9 @@ pub struct BuildScriptOutput {
     pub link_libs: Vec<LinkLib>,
     /// Library search paths (`-L` flags).
     pub link_search: Vec<LinkSearch>,
+    /// Arguments passed straight to the linker (`cargo::rustc-link-arg*`),
+    /// each with the kinds of target it applies to.
+    pub link_args: Vec<LinkArg>,
     /// `--cfg` flags to pass to rustc.
     pub cfgs: Vec<String>,
     /// `--check-cfg` flags.
@@ -661,6 +809,34 @@ pub struct BuildScriptOutput {
     pub metadata: Vec<(String, String)>,
     /// Warnings emitted by the build script.
     pub warnings: Vec<String>,
+    /// Errors the script reported with `cargo::error=`; any of them fails the build.
+    pub errors: Vec<String>,
+}
+
+/// Which artifacts a `cargo::rustc-link-arg*` directive applies to.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LinkArgScope {
+    /// `rustc-link-arg`: every linked artifact of the package.
+    All,
+    /// `rustc-cdylib-link-arg` / `rustc-link-arg-cdylib`.
+    Cdylib,
+    /// `rustc-link-arg-bins`.
+    Bins,
+    /// `rustc-link-arg-bin=NAME`.
+    Bin(String),
+    /// `rustc-link-arg-tests`.
+    Tests,
+    /// `rustc-link-arg-examples`.
+    Examples,
+    /// `rustc-link-arg-benches`.
+    Benches,
+}
+
+/// A linker argument requested by a build script.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LinkArg {
+    pub scope: LinkArgScope,
+    pub arg: String,
 }
 
 /// A native library to link.
@@ -752,6 +928,7 @@ mod tests {
             target_name: String::new(),
             kind: TargetKind::Lib,
             harness: false,
+            ext: UnitExtras::default(),
         };
         let h1 = unit.metadata_hash();
         let h2 = unit.metadata_hash();
@@ -783,6 +960,7 @@ mod unit_tests {
             target_name: String::new(),
             kind: TargetKind::Bin,
             harness: false,
+            ext: UnitExtras::default(),
         }
     }
 

@@ -122,6 +122,14 @@ impl RuneConfig {
             .join("out")
     }
 
+    /// Like [`Self::build_script_out_dir`], for a `crate-name-hash` directory key.
+    pub fn build_script_out_dir_by_key(&self, profile_name: &str, key: &str) -> PathBuf {
+        self.profile_target_dir(profile_name)
+            .join("build")
+            .join(key)
+            .join("out")
+    }
+
     /// Ensure all necessary directories exist.
     pub fn ensure_dirs(&self, profile_name: &str) -> std::io::Result<()> {
         std::fs::create_dir_all(&self.fingerprint_dir)?;

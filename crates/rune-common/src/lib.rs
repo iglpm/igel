@@ -9,11 +9,14 @@
 //! - [`hash`] — fast content hashing utilities (xxhash3 + blake3)
 //! - [`RuneError`] — shared error types
 
+pub mod cargo_config;
+pub mod cfgexpr;
 pub mod config;
 pub mod error;
 pub mod hash;
 pub mod settings;
 pub mod timing;
+pub mod toolchain;
 pub mod types;
 
 pub use config::RuneConfig;

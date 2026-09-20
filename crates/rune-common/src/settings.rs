@@ -121,10 +121,26 @@ pub const KEYS: &[KeyDef] = &[
                       beyond this size.",
     },
     KeyDef {
+        name: "cas.verify",
+        kind: ValueKind::Bool,
+        default: "false",
+        description: "Re-hash every artifact restored from the content-addressable store \
+                      (catches bit rot and tampering; costs a read of every restored file). \
+                      Entries are always checked against their key and recorded sizes.",
+    },
+    KeyDef {
         name: "net.offline",
         kind: ValueKind::Bool,
         default: "false",
         description: "Never touch the network; resolve and build from local caches only.",
+    },
+    KeyDef {
+        name: "resolve.write-cargo-lock",
+        kind: ValueKind::Bool,
+        default: "true",
+        description: "Create and update `Cargo.lock` when the set of locked packages changes, as \
+                      Cargo does, so the project keeps working with plain `cargo`. A lockfile \
+                      that is already up to date is never touched.",
     },
     KeyDef {
         name: "test.doctests",
@@ -347,9 +363,19 @@ impl Settings {
         self.uint("cas.max-size")
     }
 
+    /// `cas.verify`.
+    pub fn cas_verify(&self) -> bool {
+        self.bool("cas.verify", false)
+    }
+
     /// `net.offline`.
     pub fn offline(&self) -> bool {
         self.bool("net.offline", false)
+    }
+
+    /// `resolve.write-cargo-lock`.
+    pub fn write_cargo_lock(&self) -> bool {
+        self.bool("resolve.write-cargo-lock", true)
     }
 
     /// `test.doctests`.
