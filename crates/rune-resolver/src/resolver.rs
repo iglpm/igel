@@ -1,6 +1,7 @@
 use cfg_expr::expr::TargetMatcher;
 use rune_manifest::dependency::{DependencyKind, DependencySpec};
-use rune_registry::{CrateIndex, IndexRecord, SparseIndexClient};
+use rune_registry::source::{CRATES_IO, IndexClient};
+use rune_registry::{CrateIndex, IndexRecord};
 use semver::{Version, VersionReq};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -8,19 +9,33 @@ use std::str::FromStr;
 use thiserror::Error;
 
 use crate::features::DynamicFeatureResolver;
-use crate::lockfile::{LockPackage, Lockfile};
+use crate::lockfile::{LockDecl, LockPackage, Lockfile};
 
 #[derive(Debug, Error)]
 pub enum ResolverError {
     #[error("Failed to find compatible version for `{name}` matching `{req}`")]
     NoMatchingVersion { name: String, req: String },
-    #[error("Registry error: {0}")]
+    #[error(transparent)]
     Registry(#[from] rune_registry::index::IndexError),
     #[error("Manifest parse error: {0}")]
     Manifest(String),
+    #[error("Git dependency error: {0}")]
+    Git(#[from] rune_registry::git::GitError),
 }
 
 pub type Result<T> = std::result::Result<T, ResolverError>;
+
+/// One dependency waiting to be resolved: package name, requirement,
+/// requested features, default-features, a local directory when it is not a
+/// registry package, and the identity (index URL) of the registry it comes from.
+type QueueItem = (
+    String,
+    VersionReq,
+    Vec<String>,
+    bool,
+    Option<PathBuf>,
+    String,
+);
 
 /// A fully resolved package in the dependency graph.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -31,13 +46,56 @@ pub struct ResolvedPackage {
     pub checksum: Option<String>,
     pub dependencies: Vec<ResolvedDependencyRef>,
     pub features: Vec<String>,
+    /// The package's `[features]` table (registry packages; local ones are
+    /// read from their manifests).
+    pub declared_features: HashMap<String, Vec<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PackageSource {
-    Registry,
+    /// A registry package; the string is the canonical index URL.
+    Registry(String),
     Path(PathBuf),
-    Git { url: String, rev: Option<String> },
+    /// A git package pinned to an exact commit.
+    Git {
+        url: String,
+        /// `branch=..`, `tag=..` or `rev=..`, as written in the manifest.
+        reference: Option<String>,
+        commit: String,
+    },
+}
+
+impl PackageSource {
+    /// crates.io.
+    pub fn crates_io() -> Self {
+        Self::Registry(rune_common::CRATES_IO_INDEX.to_string())
+    }
+
+    pub fn is_registry(&self) -> bool {
+        matches!(self, Self::Registry(_))
+    }
+
+    /// The `source` string of a lockfile entry (`None` for local packages).
+    pub fn lock_source(&self) -> Option<String> {
+        match self {
+            Self::Registry(index) => Some(if index == rune_common::CRATES_IO_INDEX {
+                // Cargo's canonical spelling of crates.io, whatever protocol
+                // is used to talk to it.
+                "registry+https://github.com/rust-lang/crates.io-index".to_string()
+            } else {
+                index.clone()
+            }),
+            Self::Path(_) => None,
+            Self::Git {
+                url,
+                reference,
+                commit,
+            } => Some(match reference {
+                Some(r) => format!("git+{url}?{r}#{commit}"),
+                None => format!("git+{url}#{commit}"),
+            }),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -49,6 +107,11 @@ pub struct ResolvedDependencyRef {
     pub features: Vec<String>,
     pub default_features: bool,
     pub package: Option<String>,
+    /// `cfg(unix)` / a triple, if the dependency is platform-gated.
+    pub target: Option<String>,
+    /// The registry it is declared to come from, when not the depending
+    /// package's own (`registry = "..."`, or the index's per-dependency field).
+    pub registry: Option<String>,
 }
 
 /// Result of complete workspace & registry dependency resolution.
@@ -64,30 +127,51 @@ impl ResolvedGraph {
         let mut lockfile = Lockfile::new();
 
         for pkg in self.packages.values() {
-            let source_str = match &pkg.source {
-                PackageSource::Registry => {
-                    Some("registry+https://github.com/rust-lang/crates.io-index".to_string())
-                }
-                PackageSource::Path(_) => None,
-                PackageSource::Git { url, .. } => Some(format!("git+{url}")),
-            };
+            let source_str = pkg.source.lock_source();
 
             let mut deps = Vec::new();
+            let mut decls = Vec::new();
             for dep in &pkg.dependencies {
                 // `dep.name` is the local extern alias (e.g. `webpki-roots`
                 // depends on `rustls-pki-types` under the name `pki-types`);
                 // matching against it directly only works for dependencies
                 // that aren't renamed. Search by the real package name when
                 // `package = "..."` is set, or the lockfile silently loses
-                // the edge for every renamed dependency — which is exactly
-                // what let a stale, edge-less lockfile through as "resolved
-                // successfully" despite compilation needing that edge.
+                // the edge for every renamed dependency.
                 let actual_name = dep.package.as_deref().unwrap_or(&dep.name);
-                if let Some(target) = self.find_matching(actual_name, &dep.req) {
+                let registry = dep.registry.clone().unwrap_or_else(|| match &pkg.source {
+                    PackageSource::Registry(r) => r.clone(),
+                    _ => CRATES_IO.to_string(),
+                });
+                let target = self.find_matching_in(actual_name, &dep.req, &registry);
+                if let Some(target) = target {
                     deps.push(format!("{} {}", target.name, target.version));
+                }
+                if pkg.source.is_registry() {
+                    decls.push(LockDecl {
+                        alias: dep.name.clone(),
+                        package: dep.package.clone(),
+                        kind: match dep.kind {
+                            DependencyKind::Normal => 0,
+                            DependencyKind::Dev => 1,
+                            DependencyKind::Build => 2,
+                        },
+                        target: dep.target.clone(),
+                        optional: dep.optional,
+                        features: dep.features.clone(),
+                        default_features: dep.default_features,
+                        resolved: target.map(|t| format!("{} {}", t.name, t.version)),
+                    });
                 }
             }
             deps.sort();
+            deps.dedup();
+            let mut feature_table: Vec<(String, Vec<String>)> = pkg
+                .declared_features
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            feature_table.sort();
 
             lockfile.add_or_replace(LockPackage {
                 name: pkg.name.clone(),
@@ -96,10 +180,33 @@ impl ResolvedGraph {
                 checksum: pkg.checksum.clone(),
                 dependencies: deps,
                 features: pkg.features.clone(),
+                decls,
+                feature_table,
             });
         }
 
         lockfile
+    }
+
+    /// Like [`Self::find_matching`], but a registry package must come from
+    /// `registry` (patched local and git packages match regardless: they stand
+    /// in for whatever registry the patch replaces).
+    pub fn find_matching_in(
+        &self,
+        name: &str,
+        req_str: &str,
+        registry: &str,
+    ) -> Option<&ResolvedPackage> {
+        let req =
+            VersionReq::from_str(req_str).unwrap_or_else(|_| VersionReq::from_str("*").unwrap());
+        self.packages
+            .values()
+            .filter(|p| p.name == name && req.matches(&p.version))
+            .filter(|p| match &p.source {
+                PackageSource::Registry(r) => r == registry,
+                _ => true,
+            })
+            .max_by(|a, b| a.version.cmp(&b.version))
     }
 
     /// Finds a resolved package matching name and version requirement.
@@ -119,8 +226,12 @@ impl ResolvedGraph {
 
 /// The core dependency resolver.
 pub struct DependencyResolver {
-    index_client: SparseIndexClient,
-    cached_indices: HashMap<String, CrateIndex>,
+    /// One index client per registry (by identity), created on first use.
+    clients: HashMap<String, IndexClient>,
+    /// `(registry, crate name)` → its published versions.
+    cached_indices: HashMap<(String, String), CrateIndex>,
+    /// Prefer versions whose `rust-version` this compiler satisfies.
+    msrv: Option<Version>,
     /// When true, always re-query the registry index over the network
     /// instead of trusting the local cache. Used by `rune update`/`rune add`,
     /// which need to discover newly published versions; left off for
@@ -129,62 +240,107 @@ pub struct DependencyResolver {
     refresh: bool,
     /// Never touch the network.
     offline: bool,
+    /// `[patch]` / `[replace]` substitutions.
+    patches: crate::patch::Patches,
+}
+
+impl Default for DependencyResolver {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl DependencyResolver {
-    /// Creates a new `DependencyResolver` that trusts the local index cache.
-    pub fn new(index_client: SparseIndexClient) -> Self {
+    /// Creates a resolver that trusts the local index cache.
+    pub fn new() -> Self {
         Self {
-            index_client,
+            clients: HashMap::new(),
             cached_indices: HashMap::new(),
+            msrv: None,
             refresh: false,
             offline: false,
+            patches: Default::default(),
         }
+    }
+
+    /// Applies `[patch]` and `[replace]` substitutions.
+    pub fn with_patches(mut self, patches: crate::patch::Patches) -> Self {
+        self.patches = patches;
+        self
+    }
+
+    /// Chooses, among the versions a requirement allows, the newest whose
+    /// `rust-version` fits `msrv` — falling back to the newest overall when
+    /// none does (resolver 3's `incompatible-rust-versions = "fallback"`).
+    pub fn with_msrv(mut self, msrv: Option<Version>) -> Self {
+        self.msrv = msrv;
+        self
     }
 
     /// Creates a default resolver that trusts the local index cache
     /// (no network access unless a package has never been seen before).
     pub fn default_resolver() -> Self {
-        Self::new(SparseIndexClient::default_client())
+        Self::new()
     }
 
     /// Creates a resolver that always re-queries the registry index over
     /// the network, used for `rune update`/`rune add` where discovering
     /// newly published versions is the point of the operation.
     pub fn refreshing_resolver() -> Self {
-        let mut resolver = Self::new(SparseIndexClient::default_client());
+        let mut resolver = Self::new();
         resolver.refresh = true;
         resolver
     }
 
     /// Makes the resolver use only the local index cache.
     pub fn offline(mut self, offline: bool) -> Self {
-        self.index_client =
-            std::mem::replace(&mut self.index_client, SparseIndexClient::default_client())
-                .offline(offline);
         self.offline = offline;
+        self.clients.clear();
         self
     }
 
-    /// Fetches the index of every not-yet-loaded registry crate in `names`
-    /// concurrently, so the sequential resolution walk below hits memory.
-    fn prefetch<'a>(&mut self, names: impl Iterator<Item = &'a str>) {
-        let mut wanted: Vec<String> = names
-            .filter(|n| !self.cached_indices.contains_key(*n))
-            .map(str::to_string)
-            .collect();
-        wanted.sort();
-        wanted.dedup();
-        if wanted.is_empty() {
+    fn client(&mut self, registry: &str) -> Result<&IndexClient> {
+        if !self.clients.contains_key(registry) {
+            let client = IndexClient::for_registry(registry, self.offline)?;
+            self.clients.insert(registry.to_string(), client);
+        }
+        Ok(&self.clients[registry])
+    }
+
+    /// Fetches the index of every not-yet-loaded registry crate in `wanted`
+    /// (`(registry, name)`) concurrently, so the sequential resolution walk
+    /// below hits memory.
+    fn prefetch<'a>(&mut self, wanted: impl Iterator<Item = (&'a str, &'a str)>) {
+        let mut by_registry: HashMap<String, Vec<String>> = HashMap::new();
+        for (registry, name) in wanted {
+            if !self
+                .cached_indices
+                .contains_key(&(registry.to_string(), name.to_string()))
+            {
+                by_registry
+                    .entry(registry.to_string())
+                    .or_default()
+                    .push(name.to_string());
+            }
+        }
+        if by_registry.is_empty() {
             return;
         }
         let _timer = rune_common::timing::phase("index prefetch");
-        let results = self.index_client.fetch_many_with(&wanted, self.refresh);
-        for (name, result) in wanted.into_iter().zip(results) {
-            // Errors are deliberately not recorded: the item that actually
-            // needs this crate re-fetches it and reports the real error.
-            if let Ok(index) = result {
-                self.cached_indices.insert(name, index);
+        let refresh = self.refresh;
+        for (registry, mut names) in by_registry {
+            names.sort();
+            names.dedup();
+            let Ok(client) = self.client(&registry) else {
+                continue; // reported when an item actually needs this registry
+            };
+            let results = client.fetch_many_with(&names, refresh);
+            for (name, result) in names.into_iter().zip(results) {
+                // Errors are deliberately not recorded: the item that actually
+                // needs this crate re-fetches it and reports the real error.
+                if let Ok(index) = result {
+                    self.cached_indices.insert((registry.clone(), name), index);
+                }
             }
         }
     }
@@ -223,14 +379,13 @@ impl DependencyResolver {
         // still pull host-only dependency edges; same-target (the common
         // case, including this project's own self-hosted build) resolves
         // correctly.
-        let host_triple = rune_common::TargetTriple::host()
-            .map(|t| t.0)
-            .unwrap_or_else(|| "x86_64-unknown-linux-gnu".to_string());
+        // Like `Cargo.lock`, the resolution covers *every* platform: which
+        // target-gated dependencies a build actually compiles is decided when
+        // the build is planned, against the platform it is built for.
 
         let mut resolved_packages: HashMap<String, ResolvedPackage> = HashMap::new();
         let mut feature_resolver = DynamicFeatureResolver::new();
-        let mut queue: VecDeque<(String, VersionReq, Vec<String>, bool, Option<PathBuf>)> =
-            VecDeque::new();
+        let mut queue: VecDeque<QueueItem> = VecDeque::new();
         let mut visited: HashSet<(String, String)> = HashSet::new();
 
         let mut root_names = Vec::new();
@@ -243,12 +398,16 @@ impl DependencyResolver {
                 .clone()
                 .unwrap_or_else(|| VersionReq::from_str("*").unwrap());
             let local_dir = spec.path.as_ref().map(|p| project_root.join(p));
+            let registry = rune_registry::source::defs()
+                .index_for_name(spec.registry.as_deref())
+                .map_err(ResolverError::Registry)?;
             queue.push_back((
                 name.clone(),
                 req,
                 spec.features.clone(),
                 spec.default_features,
                 local_dir,
+                registry,
             ));
         }
 
@@ -276,21 +435,22 @@ impl DependencyResolver {
                 self.prefetch(
                     generation
                         .iter()
-                        .filter(|(_, _, _, _, local_dir)| local_dir.is_none())
-                        .map(|(name, ..)| name.as_str()),
+                        .filter(|(_, _, _, _, local_dir, _)| local_dir.is_none())
+                        .map(|(name, _, _, _, _, registry)| (registry.as_str(), name.as_str())),
                 );
-                for (name, req, features, default_features, local_dir) in generation {
+                for (name, req, features, default_features, local_dir, registry) in generation {
                     resolve_one_queue_item(
                         name,
                         req,
                         features,
                         default_features,
                         local_dir,
+                        registry,
                         &mut resolved_packages,
                         &mut feature_resolver,
                         &mut queue,
                         &mut visited,
-                        &host_triple,
+                        project_root,
                         workspace,
                         existing_lock,
                         self,
@@ -325,16 +485,19 @@ impl DependencyResolver {
         })
     }
 
-    fn get_or_fetch_index(&mut self, name: &str) -> Result<&CrateIndex> {
-        if !self.cached_indices.contains_key(name) {
-            let index = if self.refresh {
-                self.index_client.refresh_crate(name)?
+    fn get_or_fetch_index(&mut self, registry: &str, name: &str) -> Result<&CrateIndex> {
+        let key = (registry.to_string(), name.to_string());
+        if !self.cached_indices.contains_key(&key) {
+            let refresh = self.refresh;
+            let client = self.client(registry)?;
+            let index = if refresh {
+                client.refresh_crate(name)?
             } else {
-                self.index_client.fetch_crate(name)?
+                client.fetch_crate(name)?
             };
-            self.cached_indices.insert(name.to_string(), index);
+            self.cached_indices.insert(key.clone(), index);
         }
-        Ok(self.cached_indices.get(name).unwrap())
+        Ok(&self.cached_indices[&key])
     }
 }
 
@@ -345,11 +508,12 @@ fn resolve_one_queue_item(
     features: Vec<String>,
     default_features: bool,
     local_dir: Option<PathBuf>,
+    registry: String,
     resolved_packages: &mut HashMap<String, ResolvedPackage>,
     feature_resolver: &mut DynamicFeatureResolver,
-    queue: &mut VecDeque<(String, VersionReq, Vec<String>, bool, Option<PathBuf>)>,
+    queue: &mut VecDeque<QueueItem>,
     visited: &mut HashSet<(String, String)>,
-    host_triple: &str,
+    project_root: &Path,
     workspace: Option<&rune_manifest::workspace::WorkspaceManifest>,
     existing_lock: Option<&Lockfile>,
     resolver: &mut DependencyResolver,
@@ -358,9 +522,19 @@ fn resolve_one_queue_item(
     if let Some(dir) = local_dir {
         let manifest_path = dir.join("Cargo.toml");
         if let Ok(manifest) = rune_manifest::Manifest::from_path(&manifest_path) {
+            // A package inherits from *its own* workspace — the one it is a
+            // member of — which for a path dependency next door or a git
+            // repository is not the project being built.
+            let canon = dir.canonicalize().unwrap_or_else(|_| dir.clone());
+            let enclosing = rune_manifest::find_enclosing_workspace(&canon, &manifest);
+            let ws_ref = enclosing.as_ref().map(|(_, w)| w).or(workspace);
+            let ws_root: PathBuf = enclosing
+                .as_ref()
+                .map(|(r, _)| r.clone())
+                .unwrap_or_else(|| project_root.to_path_buf());
             if let Some(pkg) = manifest.package {
                 let version: Version = pkg
-                    .version_in(workspace)
+                    .version_in(ws_ref)
                     .unwrap_or_else(|| Version::new(0, 0, 0));
 
                 let pkg_id = format!("{} {}", name, version);
@@ -391,25 +565,27 @@ fn resolve_one_queue_item(
                 let mut member_deps: Vec<_> = manifest.dependencies.values().collect();
                 member_deps.sort_by(|a, b| (&a.name, a.kind as u8).cmp(&(&b.name, b.kind as u8)));
                 for dep_spec in member_deps {
-                    if dep_spec.kind == DependencyKind::Dev {
-                        continue;
-                    }
-                    let mut spec = dep_spec.spec.clone();
-                    if let Some(ws_dep) =
-                        workspace.and_then(|ws| ws.dependencies.get(&dep_spec.name))
-                    {
-                        spec.merge_workspace(ws_dep);
-                    }
+                    let spec = rune_manifest::effective_spec(dep_spec, &canon, &ws_root, ws_ref);
                     let dep_req = spec
                         .version
                         .clone()
                         .unwrap_or_else(|| VersionReq::from_str("*").unwrap());
-                    let child_local_dir = spec.path.as_ref().map(|p| dir.join(p));
 
                     let actual_pkg_name = spec
                         .package
                         .clone()
                         .unwrap_or_else(|| dep_spec.name.clone());
+                    // Where the dependency lives on disk, if not in a registry.
+                    let child_registry = rune_registry::source::defs()
+                        .index_for_name(spec.registry.as_deref())
+                        .map_err(ResolverError::Registry)?;
+                    let child_local_dir = if let Some(p) = &spec.path {
+                        Some(p.clone())
+                    } else if let (Some(url), false) = (&spec.git, spec.optional) {
+                        Some(git_package_dir(&spec, url, &actual_pkg_name)?)
+                    } else {
+                        None
+                    };
                     dep_refs.push(ResolvedDependencyRef {
                         name: dep_spec.name.clone(),
                         req: dep_req.to_string(),
@@ -418,28 +594,45 @@ fn resolve_one_queue_item(
                         features: spec.features.clone(),
                         default_features: spec.default_features,
                         package: spec.package.clone(),
+                        target: dep_spec.target.clone(),
+                        registry: spec.registry.as_ref().map(|_| child_registry.clone()),
                     });
 
-                    if !spec.optional {
+                    // Development dependencies appear in the lockfile but
+                    // are resolved as roots by the caller, never followed
+                    // transitively.
+                    if !spec.optional && dep_spec.kind != DependencyKind::Dev {
                         queue.push_back((
                             actual_pkg_name,
                             dep_req,
                             spec.features.clone(),
                             spec.default_features,
                             child_local_dir,
+                            child_registry,
                         ));
                     }
                 }
 
+                let source = match rune_registry::git::locate_dir(&canon)
+                    .or_else(|| rune_registry::git::locate_dir(&dir))
+                {
+                    Some(co) => PackageSource::Git {
+                        url: co.url.clone(),
+                        reference: co.reference.lock_query(),
+                        commit: co.commit.clone(),
+                    },
+                    None => PackageSource::Path(dir),
+                };
                 resolved_packages.insert(
                     pkg_id,
                     ResolvedPackage {
                         name,
                         version,
-                        source: PackageSource::Path(dir),
+                        source,
                         checksum: None,
                         dependencies: dep_refs,
                         features: Vec::new(),
+                        declared_features: HashMap::new(),
                     },
                 );
                 return Ok(());
@@ -447,11 +640,47 @@ fn resolve_one_queue_item(
         }
     }
 
+    // A patch replaces the registry package outright: resolve the patch's
+    // own package (and its dependencies) instead.
+    let patch_source = if registry == CRATES_IO {
+        crate::patch::PatchSource::CratesIo
+    } else {
+        crate::patch::PatchSource::Registry(registry.clone())
+    };
+    for entry in resolver.patches.find(&name, &patch_source) {
+        match entry.locate(&req) {
+            Ok(Some((dir, _))) => {
+                return resolve_one_queue_item(
+                    name,
+                    req,
+                    features,
+                    default_features,
+                    Some(dir),
+                    registry.clone(),
+                    resolved_packages,
+                    feature_resolver,
+                    queue,
+                    visited,
+                    project_root,
+                    workspace,
+                    existing_lock,
+                    resolver,
+                );
+            }
+            Ok(None) => {}
+            Err(e) => return Err(ResolverError::Manifest(e)),
+        }
+    }
+
     // If already resolved with a version that matches req, reuse and request features
-    if let Some((pkg_id, _existing)) = resolved_packages
-        .iter()
-        .find(|(_, p)| p.name == name && req.matches(&p.version))
-    {
+    if let Some((pkg_id, _existing)) = resolved_packages.iter().find(|(_, p)| {
+        p.name == name
+            && req.matches(&p.version)
+            && match &p.source {
+                PackageSource::Registry(r) => *r == registry,
+                _ => true,
+            }
+    }) {
         feature_resolver.request_features(pkg_id, &features, default_features);
         return Ok(());
     }
@@ -463,15 +692,16 @@ fn resolve_one_queue_item(
     // entry with the right name.
     let mut chosen_record = None;
     if let Some(lock) = existing_lock {
+        let wanted_source = PackageSource::Registry(registry.clone()).lock_source();
         let pinned = lock
             .packages
             .iter()
-            .filter(|p| p.name == name && p.source.is_some())
+            .filter(|p| p.name == name && p.source == wanted_source)
             .filter_map(|p| Version::parse(&p.version).ok())
             .filter(|v| req.matches(v))
             .max();
         if let Some(ver) = pinned {
-            if let Ok(index) = resolver.get_or_fetch_index(&name) {
+            if let Ok(index) = resolver.get_or_fetch_index(&registry, &name) {
                 if let Some(rec) = index.get_version(&ver.to_string()) {
                     chosen_record = Some(rec.clone());
                 }
@@ -481,7 +711,8 @@ fn resolve_one_queue_item(
 
     // If not found in lockfile, query index for latest matching version
     if chosen_record.is_none() {
-        let index = resolver.get_or_fetch_index(&name)?;
+        let msrv = resolver.msrv.clone();
+        let index = resolver.get_or_fetch_index(&registry, &name)?;
         let mut matches: Vec<&IndexRecord> = index
             .available_versions()
             .into_iter()
@@ -501,15 +732,26 @@ fn resolve_one_queue_item(
             vb.cmp(&va)
         });
 
-        if let Some(&best) = matches.first() {
+        // Prefer the newest release this compiler can build, when asked to.
+        let compatible = msrv.as_ref().and_then(|m| {
+            matches.iter().copied().find(|rec| {
+                rec.rust_version
+                    .as_deref()
+                    .and_then(rune_common::toolchain::parse_rust_version)
+                    .is_none_or(|need| need <= *m)
+            })
+        });
+        if let Some(best) = compatible.or_else(|| matches.first().copied()) {
             chosen_record = Some(best.clone());
         } else if !resolver.refresh && !resolver.offline {
             // The cached index may simply predate the release this manifest
             // asks for (e.g. `serde = "1.0.999"` typed by hand). Cargo would
             // have queried the registry; do the same once before giving up.
-            resolver.cached_indices.remove(&name);
+            resolver
+                .cached_indices
+                .remove(&(registry.clone(), name.clone()));
             resolver.refresh = true;
-            let retry = resolver.get_or_fetch_index(&name).map(|i| {
+            let retry = resolver.get_or_fetch_index(&registry, &name).map(|i| {
                 i.available_versions()
                     .into_iter()
                     .filter(|rec| Version::parse(&rec.vers).is_ok_and(|v| req.matches(&v)))
@@ -566,10 +808,6 @@ fn resolve_one_queue_item(
             continue;
         }
 
-        if !matches_target(dep.target.as_deref(), host_triple) {
-            continue;
-        }
-
         let dep_req =
             VersionReq::from_str(&dep.req).unwrap_or_else(|_| VersionReq::from_str("*").unwrap());
 
@@ -585,7 +823,12 @@ fn resolve_one_queue_item(
             features: dep.features.clone(),
             default_features: dep.default_features,
             package: dep.package.clone(),
+            target: dep.target.clone(),
+            registry: dep.registry.as_deref().map(normalize_registry),
         };
+        // A dependency comes from the depending package's own registry unless
+        // the index says otherwise (`registry` names the other one's index).
+        let dep_registry = dep_ref.registry.clone().unwrap_or_else(|| registry.clone());
         dep_refs.push(dep_ref);
 
         if !dep.optional {
@@ -595,6 +838,7 @@ fn resolve_one_queue_item(
                 dep.features.clone(),
                 dep.default_features,
                 None,
+                dep_registry,
             ));
         }
     }
@@ -604,14 +848,41 @@ fn resolve_one_queue_item(
         ResolvedPackage {
             name,
             version: parsed_version,
-            source: PackageSource::Registry,
-            checksum: Some(record.cksum),
+            source: PackageSource::Registry(registry.clone()),
+            checksum: Some(record.cksum.clone()),
             dependencies: dep_refs,
             features: Vec::new(),
+            declared_features: record.all_features(),
         },
     );
 
     Ok(())
+}
+
+/// An index URL from a registry index's `registry` field, in the identity
+/// form used everywhere else: crates.io's git index maps to crates.io.
+fn normalize_registry(url: &str) -> String {
+    if url.trim_end_matches('/') == "https://github.com/rust-lang/crates.io-index"
+        || url.trim_end_matches('/') == "https://index.crates.io"
+    {
+        CRATES_IO.to_string()
+    } else if url.starts_with("sparse+") || url.starts_with("registry+") {
+        url.to_string()
+    } else {
+        format!("sparse+{}", url.trim_end_matches('/').to_string() + "/")
+    }
+}
+
+/// Checks a git dependency out (at the commit the lockfile pinned, or the one
+/// its branch/tag/revision points to now) and finds the named package in it.
+fn git_package_dir(spec: &DependencySpec, url: &str, package: &str) -> Result<PathBuf> {
+    let reference = rune_registry::git::GitRef::from_spec(
+        spec.branch.as_deref(),
+        spec.tag.as_deref(),
+        spec.rev.as_deref(),
+    );
+    let checkout = rune_registry::git::checkout(url, &reference)?;
+    Ok(rune_registry::git::find_package(&checkout, package)?)
 }
 
 /// Scans every currently resolved package for an optional dependency whose
@@ -631,7 +902,7 @@ fn resolve_one_queue_item(
 fn activate_newly_enabled_optional_deps(
     resolved_packages: &HashMap<String, ResolvedPackage>,
     feature_resolver: &mut DynamicFeatureResolver,
-    queue: &mut VecDeque<(String, VersionReq, Vec<String>, bool, Option<PathBuf>)>,
+    queue: &mut VecDeque<QueueItem>,
 ) -> bool {
     let current_feature_results = feature_resolver.resolve();
     let mut queued_anything = false;
@@ -673,12 +944,20 @@ fn activate_newly_enabled_optional_deps(
                 .values()
                 .any(|p| p.name == actual_pkg_name && dep_req.matches(&p.version));
             if !already_resolved {
+                let registry = dep_ref
+                    .registry
+                    .clone()
+                    .unwrap_or_else(|| match &pkg.source {
+                        PackageSource::Registry(r) => r.clone(),
+                        _ => CRATES_IO.to_string(),
+                    });
                 queue.push_back((
                     actual_pkg_name,
                     dep_req,
                     dep_ref.features.clone(),
                     dep_ref.default_features,
                     None,
+                    registry,
                 ));
                 queued_anything = true;
             }

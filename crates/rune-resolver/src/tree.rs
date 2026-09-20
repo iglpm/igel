@@ -288,7 +288,7 @@ mod tests {
             ResolvedPackage {
                 name: name.into(),
                 version: v,
-                source: PackageSource::Registry,
+                source: PackageSource::crates_io(),
                 checksum: None,
                 dependencies: deps
                     .iter()
@@ -300,9 +300,12 @@ mod tests {
                         features: vec![],
                         default_features: true,
                         package: None,
+                        target: None,
+                        registry: None,
                     })
                     .collect(),
                 features: vec![],
+                declared_features: Default::default(),
             },
         )
     }
