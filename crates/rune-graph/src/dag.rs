@@ -15,6 +15,15 @@ pub struct BuildNode {
     pub dependents: Vec<NodeId>,
     /// Explicit extern aliases for dependencies (e.g., renamed crates: dep_id -> "serde").
     pub extern_aliases: HashMap<NodeId, String>,
+    /// The subset of `dependencies` linked into the crate itself (`--extern`,
+    /// or a build-order dependency such as a binary an integration test runs).
+    pub normal_dependencies: HashSet<NodeId>,
+    /// The subset of `dependencies` that this unit's *build script* links
+    /// against (`[build-dependencies]`, compiled for the host). An edge can be
+    /// in both sets when the same unit serves both purposes.
+    pub build_dependencies: HashSet<NodeId>,
+    /// Extern aliases for `build_dependencies`.
+    pub build_aliases: HashMap<NodeId, String>,
     /// Estimated compile time (for critical path scheduling).
     pub estimated_cost: f64,
 }
@@ -45,6 +54,9 @@ impl BuildGraph {
             dependencies: Vec::new(),
             dependents: Vec::new(),
             extern_aliases: HashMap::new(),
+            normal_dependencies: HashSet::new(),
+            build_dependencies: HashSet::new(),
+            build_aliases: HashMap::new(),
             estimated_cost: 1.0, // Default cost, can be updated later
         };
 
@@ -59,6 +71,7 @@ impl BuildGraph {
         if !self.nodes[from.0].dependencies.contains(&to) {
             self.nodes[from.0].dependencies.push(to);
         }
+        self.nodes[from.0].normal_dependencies.insert(to);
         if let Some(ext) = extern_name {
             self.nodes[from.0]
                 .extern_aliases
@@ -72,6 +85,28 @@ impl BuildGraph {
     /// Adds a dependency edge: `from` depends on `to`.
     pub fn add_edge(&mut self, from: NodeId, to: NodeId) {
         self.add_edge_with_extern(from, to, None);
+    }
+
+    /// Adds an edge for `from`'s build script: `to` is built (for the host)
+    /// before the script is compiled, and linked into it — but not into the
+    /// crate. If `from` also depends on `to` normally, that edge stays.
+    pub fn add_build_edge(&mut self, from: NodeId, to: NodeId, extern_name: Option<&str>) {
+        if !self.nodes[from.0].dependencies.contains(&to) {
+            self.nodes[from.0].dependencies.push(to);
+        }
+        self.nodes[from.0].build_dependencies.insert(to);
+        if let Some(ext) = extern_name {
+            self.nodes[from.0].build_aliases.insert(to, ext.to_string());
+        }
+        if !self.nodes[to.0].dependents.contains(&from) {
+            self.nodes[to.0].dependents.push(from);
+        }
+    }
+
+    /// Whether `from` links `to` into the crate itself (as opposed to only
+    /// into its build script).
+    pub fn is_normal_edge(&self, from: NodeId, to: NodeId) -> bool {
+        self.nodes[from.0].normal_dependencies.contains(&to)
     }
 
     /// Returns a reference to a node.
@@ -162,11 +197,21 @@ impl BuildGraph {
                 continue;
             };
             for &dep in &node.dependencies {
-                if let Some(&new_to) = map.get(&dep) {
+                let Some(&new_to) = map.get(&dep) else {
+                    continue;
+                };
+                if node.normal_dependencies.contains(&dep) {
                     out.add_edge_with_extern(
                         new_from,
                         new_to,
                         node.extern_aliases.get(&dep).map(String::as_str),
+                    );
+                }
+                if node.build_dependencies.contains(&dep) {
+                    out.add_build_edge(
+                        new_from,
+                        new_to,
+                        node.build_aliases.get(&dep).map(String::as_str),
                     );
                 }
             }
@@ -239,6 +284,7 @@ mod tests {
             target_name: String::new(),
             kind: Default::default(),
             harness: false,
+            ext: Default::default(),
         }
     }
 

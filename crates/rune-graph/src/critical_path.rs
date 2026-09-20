@@ -86,6 +86,7 @@ mod tests {
             target_name: String::new(),
             kind: Default::default(),
             harness: false,
+            ext: Default::default(),
         }
     }
 
