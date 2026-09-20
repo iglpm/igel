@@ -64,8 +64,28 @@ impl RustcInvoker {
     /// waiting for the full codegen/linking phase.
     pub fn invoke_pipelined(
         &self,
-        mut cmd: Command,
+        cmd: Command,
         on_metadata: impl FnOnce(PathBuf),
+    ) -> Result<CompilationResult> {
+        let mut on_metadata = Some(on_metadata);
+        self.invoke_streaming(cmd, &mut |artifact| {
+            if artifact.emit == "metadata" {
+                if let Some(cb) = on_metadata.take() {
+                    cb(artifact.artifact.clone());
+                }
+            }
+        })
+    }
+
+    /// Invoke `rustc`, calling `on_artifact` for every artifact it announces
+    /// (`dep-info`, `metadata`, `link`) the moment it does. rustc announces
+    /// dep-info — which lists the environment variables read by `env!` — before
+    /// it announces metadata, so a caller can react to it before dependents
+    /// start.
+    pub fn invoke_streaming(
+        &self,
+        mut cmd: Command,
+        on_artifact: &mut dyn FnMut(&ArtifactEvent),
     ) -> Result<CompilationResult> {
         cmd.stderr(Stdio::piped());
         cmd.stdout(Stdio::null());
@@ -78,7 +98,6 @@ impl RustcInvoker {
         let mut diagnostics = Vec::new();
         let mut reader = BufReader::new(stderr);
         let mut line = String::new();
-        let mut metadata_cb = Some(on_metadata);
 
         while reader.read_line(&mut line)? > 0 {
             stderr_raw.push_str(&line);
@@ -88,11 +107,7 @@ impl RustcInvoker {
                     if value.get("$message_type").and_then(|v| v.as_str()) == Some("artifact") {
                         if let Ok(artifact) = serde_json::from_value::<ArtifactEvent>(value.clone())
                         {
-                            if artifact.emit == "metadata" {
-                                if let Some(cb) = metadata_cb.take() {
-                                    cb(artifact.artifact.clone());
-                                }
-                            }
+                            on_artifact(&artifact);
                             artifacts.push(artifact);
                         }
                     } else if value.get("message").is_some() && value.get("level").is_some() {

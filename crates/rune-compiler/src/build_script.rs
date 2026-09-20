@@ -1,5 +1,15 @@
-use rune_common::{BuildScriptOutput, LinkLib, LinkSearch};
-use std::io::{BufRead, BufReader};
+//! Compiling and running `build.rs`, and understanding what it reports.
+//!
+//! A build script is a separate program that runs *on the host* before its
+//! package compiles. Cargo defines its contract precisely: the environment it
+//! sees (`TARGET`, `HOST`, `OUT_DIR`, `CARGO_CFG_*`, `CARGO_FEATURE_*`,
+//! `CARGO_PKG_*`, `DEP_*`, ...) and the `cargo::` lines it may print. Crates
+//! from `cc`, `bindgen` and `pkg-config` users to `ring` and `openssl-sys`
+//! depend on every detail, so this module follows the contract rather than an
+//! approximation of it.
+
+use rune_common::{BuildScriptOutput, LinkArg, LinkArgScope, LinkLib, LinkSearch, PackageMeta};
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use tracing::{debug, warn};
@@ -10,8 +20,18 @@ pub enum BuildScriptError {
     Io(#[from] std::io::Error),
     #[error("Build script compilation failed with exit code: {0}")]
     CompilationFailed(i32),
-    #[error("Build script execution failed with exit code: {0}")]
-    ExecutionFailed(i32),
+    #[error("Build script execution failed with exit code: {code}{}", fmt_stderr(.stderr))]
+    ExecutionFailed { code: i32, stderr: String },
+    #[error("Build script reported an error:\n{}", .0.join("\n"))]
+    ReportedErrors(Vec<String>),
+}
+
+fn fmt_stderr(stderr: &str) -> String {
+    if stderr.trim().is_empty() {
+        String::new()
+    } else {
+        format!("\n--- stderr\n{}", stderr.trim_end())
+    }
 }
 
 pub type Result<T> = std::result::Result<T, BuildScriptError>;
@@ -23,22 +43,83 @@ pub struct BuildScriptRunner;
 pub struct BuildScriptEnv {
     pub manifest_dir: PathBuf,
     pub out_dir: PathBuf,
+    /// `TARGET`: the triple the *package* is built for.
     pub target: String,
+    /// `HOST`: the machine running the build.
     pub host: String,
     pub opt_level: String,
-    pub debug: String,
+    /// `DEBUG`.
+    pub debug: bool,
+    pub debug_assertions: bool,
+    /// `PROFILE`: `release` or `debug`.
     pub profile: String,
     pub num_jobs: u32,
     pub rustc: PathBuf,
+    pub rustdoc: PathBuf,
+    pub rustc_wrapper: Option<PathBuf>,
+    pub rustc_workspace_wrapper: Option<PathBuf>,
+    /// `RUSTC_LINKER`.
+    pub linker: Option<PathBuf>,
     pub pkg_name: String,
     pub pkg_version: String,
+    /// `CARGO_PKG_AUTHORS`, `_DESCRIPTION`, ...
+    pub meta: PackageMeta,
     pub features: Vec<String>,
-    pub cfgs: Vec<(String, Option<String>)>, // CARGO_CFG_* vars
-    pub dep_metadata: Vec<(String, String, String)>, // DEP_<LINKS>_<KEY>=<VALUE>
+    /// `CARGO_CFG_*`, computed from the compiler's cfg set for `target`.
+    pub target_cfg_env: Vec<(String, String)>,
+    /// `(links, key, value)` → `DEP_<LINKS>_<KEY>=<value>`.
+    pub dep_metadata: Vec<(String, String, String)>,
     /// The crate's own `links` manifest field, if set. Cargo exposes this to
     /// the build script as `CARGO_MANIFEST_LINKS`; crates like `ring` assert
     /// it matches an expected value and unconditionally `.unwrap()` it.
     pub links: Option<String>,
+    /// The effective rustflags (`CARGO_ENCODED_RUSTFLAGS`).
+    pub rustflags: Vec<String>,
+    /// `[env]` entries from configuration: `(name, value, force)`.
+    pub config_env: Vec<(String, String, bool)>,
+}
+
+impl BuildScriptEnv {
+    /// The variables both compiling and running a script see, mirroring what
+    /// Cargo sets on the package's own `rustc` invocation.
+    fn apply_package_env(&self, cmd: &mut Command) {
+        cmd.env("CARGO_PKG_NAME", &self.pkg_name);
+        cmd.env("CARGO_PKG_VERSION", &self.pkg_version);
+        cmd.env("CARGO_MANIFEST_DIR", &self.manifest_dir);
+        cmd.env("CARGO_MANIFEST_PATH", self.manifest_dir.join("Cargo.toml"));
+        let core = self
+            .pkg_version
+            .split(['-', '+'])
+            .next()
+            .unwrap_or(&self.pkg_version);
+        let mut parts = core.split('.');
+        cmd.env("CARGO_PKG_VERSION_MAJOR", parts.next().unwrap_or("0"));
+        cmd.env("CARGO_PKG_VERSION_MINOR", parts.next().unwrap_or("0"));
+        cmd.env("CARGO_PKG_VERSION_PATCH", parts.next().unwrap_or("0"));
+        cmd.env(
+            "CARGO_PKG_VERSION_PRE",
+            self.pkg_version
+                .split_once('-')
+                .map(|(_, pre)| pre.split('+').next().unwrap_or(pre))
+                .unwrap_or(""),
+        );
+        cmd.env("CARGO_PKG_AUTHORS", &self.meta.authors);
+        cmd.env("CARGO_PKG_DESCRIPTION", &self.meta.description);
+        cmd.env("CARGO_PKG_HOMEPAGE", &self.meta.homepage);
+        cmd.env("CARGO_PKG_REPOSITORY", &self.meta.repository);
+        cmd.env("CARGO_PKG_LICENSE", &self.meta.license);
+        cmd.env("CARGO_PKG_LICENSE_FILE", &self.meta.license_file);
+        cmd.env("CARGO_PKG_RUST_VERSION", &self.meta.rust_version);
+        cmd.env("CARGO_PKG_README", &self.meta.readme);
+        if let Some(links) = &self.links {
+            cmd.env("CARGO_MANIFEST_LINKS", links);
+        }
+        for (k, v, force) in &self.config_env {
+            if *force || std::env::var_os(k).is_none() {
+                cmd.env(k, v);
+            }
+        }
+    }
 }
 
 impl BuildScriptRunner {
@@ -53,7 +134,7 @@ impl BuildScriptRunner {
         env: Option<&BuildScriptEnv>,
     ) -> Result<PathBuf> {
         Self::compile_with(
-            rustc_path,
+            Command::new(rustc_path),
             build_rs_path,
             out_dir,
             deps_dir,
@@ -64,11 +145,12 @@ impl BuildScriptRunner {
         )
     }
 
-    /// Like [`Self::compile`], but lets the caller adjust the `rustc` command
-    /// before it runs (e.g. to hand it a jobserver).
+    /// Like [`Self::compile`], but takes the compiler command (so wrappers
+    /// configured for the build apply) and lets the caller adjust it before it
+    /// runs (e.g. to hand it a jobserver).
     #[allow(clippy::too_many_arguments)]
     pub fn compile_with(
-        rustc_path: &Path,
+        mut cmd: Command,
         build_rs_path: &Path,
         out_dir: &Path,
         deps_dir: &Path,
@@ -77,7 +159,6 @@ impl BuildScriptRunner {
         env: Option<&BuildScriptEnv>,
         configure: &dyn Fn(&mut Command),
     ) -> Result<PathBuf> {
-        let mut cmd = Command::new(rustc_path);
         cmd.arg(build_rs_path);
         cmd.arg("--crate-name").arg("build_script_build");
         cmd.arg("--crate-type").arg("bin");
@@ -94,49 +175,24 @@ impl BuildScriptRunner {
                 .arg(format!("{crate_name}={}", path.display()));
         }
 
-        // `build.rs` is part of the same package as the crate it builds, and
-        // is compiled with that package's own active feature set — plenty of
-        // real-world build scripts branch on `cfg!(feature = "...")`
-        // directly (e.g. `aws-lc-rs`'s picks its backend crate this way)
-        // rather than only reading the `CARGO_FEATURE_*` env vars set at
-        // *run* time. Only setting those env vars and never passing the
-        // matching `--cfg feature="..."` at *compile* time left every such
-        // check permanently false regardless of which features were
-        // actually active, since `cfg!()` is resolved when `build.rs` itself
-        // is compiled, not when it runs.
         if let Some(e) = env {
+            // `build.rs` is part of the same package as the crate it builds,
+            // and is compiled with that package's own active feature set —
+            // plenty of real-world build scripts branch on
+            // `cfg!(feature = "...")` directly (e.g. `aws-lc-rs`'s picks its
+            // backend crate this way) rather than only reading the
+            // `CARGO_FEATURE_*` env vars set at *run* time.
             for feature in &e.features {
                 cmd.arg("--cfg").arg(format!("feature=\"{feature}\""));
             }
+            // A build script is a host program: it gets the host's flags
+            // and linker, not the device's.
+            cmd.args(&e.rustflags);
+            if let Some(linker) = &e.linker {
+                cmd.arg("-C").arg(format!("linker={}", linker.display()));
+            }
+            e.apply_package_env(&mut cmd);
         }
-
-        if let Some(e) = env {
-            cmd.env("CARGO_PKG_NAME", &e.pkg_name);
-            cmd.env("CARGO_PKG_VERSION", &e.pkg_version);
-            cmd.env("CARGO_MANIFEST_DIR", &e.manifest_dir);
-            let parts: Vec<&str> = e.pkg_version.split('.').collect();
-            let major = parts.first().copied().unwrap_or("0");
-            let minor = parts.get(1).copied().unwrap_or("0");
-            let patch_full = parts.get(2).copied().unwrap_or("0");
-            let patch = patch_full.split('-').next().unwrap_or(patch_full);
-            let pre = if let Some((_, pre_str)) = patch_full.split_once('-') {
-                pre_str
-            } else {
-                ""
-            };
-            cmd.env("CARGO_PKG_VERSION_MAJOR", major);
-            cmd.env("CARGO_PKG_VERSION_MINOR", minor);
-            cmd.env("CARGO_PKG_VERSION_PATCH", patch);
-            cmd.env("CARGO_PKG_VERSION_PRE", pre);
-        }
-        cmd.env("CARGO_PKG_AUTHORS", "");
-        cmd.env("CARGO_PKG_DESCRIPTION", "");
-        cmd.env("CARGO_PKG_HOMEPAGE", "");
-        cmd.env("CARGO_PKG_REPOSITORY", "");
-        cmd.env("CARGO_PKG_LICENSE", "");
-        cmd.env("CARGO_PKG_LICENSE_FILE", "");
-        cmd.env("CARGO_PKG_RUST_VERSION", "");
-        cmd.env("CARGO_PKG_README", "");
 
         configure(&mut cmd);
         debug!("Compiling build script: {:?}", cmd);
@@ -176,162 +232,44 @@ impl BuildScriptRunner {
         // Cargo always runs a build script with its crate's manifest
         // directory as the current directory, and build scripts routinely
         // rely on that to resolve relative paths (e.g. openssl-sys's
-        // `build/expando.c`). Without this, such scripts fail with
-        // "No such file or directory" against whatever directory `rune`
-        // itself happened to be invoked from.
+        // `build/expando.c`).
         cmd.current_dir(&env.manifest_dir);
 
-        // Standard cargo environment variables
-        cmd.env("CARGO_MANIFEST_DIR", &env.manifest_dir);
+        env.apply_package_env(&mut cmd);
         cmd.env("OUT_DIR", &env.out_dir);
         cmd.env("TARGET", &env.target);
         cmd.env("HOST", &env.host);
         cmd.env("OPT_LEVEL", &env.opt_level);
-        cmd.env("DEBUG", &env.debug);
+        cmd.env("DEBUG", if env.debug { "true" } else { "false" });
         cmd.env("PROFILE", &env.profile);
         cmd.env("NUM_JOBS", env.num_jobs.to_string());
         cmd.env("RUSTC", &env.rustc);
-        cmd.env("CARGO_PKG_NAME", &env.pkg_name);
-        cmd.env("CARGO_PKG_VERSION", &env.pkg_version);
-        if let Some(links) = &env.links {
-            cmd.env("CARGO_MANIFEST_LINKS", links);
+        cmd.env("RUSTDOC", &env.rustdoc);
+        match &env.rustc_wrapper {
+            Some(w) => cmd.env("RUSTC_WRAPPER", w),
+            None => cmd.env_remove("RUSTC_WRAPPER"),
+        };
+        match &env.rustc_workspace_wrapper {
+            Some(w) => cmd.env("RUSTC_WORKSPACE_WRAPPER", w),
+            None => cmd.env_remove("RUSTC_WORKSPACE_WRAPPER"),
+        };
+        if let Some(linker) = &env.linker {
+            cmd.env("RUSTC_LINKER", linker);
         }
+        // Flags meant for the compiler are handed over encoded so that
+        // arguments containing spaces survive; the plain variable would apply
+        // them to any nested cargo/rustc invocation the script makes.
+        cmd.env("CARGO_ENCODED_RUSTFLAGS", env.rustflags.join("\x1f"));
+        cmd.env_remove("RUSTFLAGS");
 
-        let parts: Vec<&str> = env.pkg_version.split('.').collect();
-        let major = parts.first().copied().unwrap_or("0");
-        let minor = parts.get(1).copied().unwrap_or("0");
-        let patch_full = parts.get(2).copied().unwrap_or("0");
-        let patch = patch_full.split('-').next().unwrap_or(patch_full);
-        let pre = if let Some((_, pre_str)) = patch_full.split_once('-') {
-            pre_str
-        } else {
-            ""
-        };
-        cmd.env("CARGO_PKG_VERSION_MAJOR", major);
-        cmd.env("CARGO_PKG_VERSION_MINOR", minor);
-        cmd.env("CARGO_PKG_VERSION_PATCH", patch);
-        cmd.env("CARGO_PKG_VERSION_PRE", pre);
-        cmd.env("CARGO_PKG_AUTHORS", "");
-        cmd.env("CARGO_PKG_DESCRIPTION", "");
-        cmd.env("CARGO_PKG_HOMEPAGE", "");
-        cmd.env("CARGO_PKG_REPOSITORY", "");
-        cmd.env("CARGO_PKG_LICENSE", "");
-        cmd.env("CARGO_PKG_LICENSE_FILE", "");
-        cmd.env("CARGO_PKG_RUST_VERSION", "");
-        cmd.env("CARGO_PKG_README", "");
-
-        // Set standard target configuration environment variables
-        let arch = if cfg!(target_arch = "x86_64") {
-            "x86_64"
-        } else if cfg!(target_arch = "aarch64") {
-            "aarch64"
-        } else if cfg!(target_arch = "arm") {
-            "arm"
-        } else if cfg!(target_arch = "x86") {
-            "x86"
-        } else if cfg!(target_arch = "riscv64") {
-            "riscv64"
-        } else if cfg!(target_arch = "wasm32") {
-            "wasm32"
-        } else {
-            "x86_64"
-        };
-        cmd.env("CARGO_CFG_TARGET_ARCH", arch);
-
-        let os = if cfg!(target_os = "linux") {
-            "linux"
-        } else if cfg!(target_os = "macos") {
-            "macos"
-        } else if cfg!(target_os = "windows") {
-            "windows"
-        } else if cfg!(target_os = "freebsd") {
-            "freebsd"
-        } else {
-            std::env::consts::OS
-        };
-        cmd.env("CARGO_CFG_TARGET_OS", os);
-
-        let family = if cfg!(target_family = "unix") {
-            "unix"
-        } else if cfg!(target_family = "windows") {
-            "windows"
-        } else if cfg!(target_family = "wasm") {
-            "wasm"
-        } else {
-            ""
-        };
-        if !family.is_empty() {
-            cmd.env("CARGO_CFG_TARGET_FAMILY", family);
-            if family == "unix" {
-                cmd.env("CARGO_CFG_UNIX", "");
-            } else if family == "windows" {
-                cmd.env("CARGO_CFG_WINDOWS", "");
-            }
+        // `CARGO_CFG_*` describes the *target*, not the machine Rune runs on.
+        for (k, v) in &env.target_cfg_env {
+            cmd.env(k, v);
         }
-
-        let env_target = if cfg!(target_env = "gnu") {
-            "gnu"
-        } else if cfg!(target_env = "msvc") {
-            "msvc"
-        } else if cfg!(target_env = "musl") {
-            "musl"
-        } else {
-            ""
-        };
-        cmd.env("CARGO_CFG_TARGET_ENV", env_target);
-
-        // Cargo always sets this too (e.g. "unknown" for
-        // x86_64-unknown-linux-gnu, "apple" for macOS, "pc" for Windows).
-        // Missing entirely — rather than merely being wrong for an
-        // unanticipated target — made any build script that reads it
-        // unconditionally (as `libm`'s does) panic outright on `NotPresent`
-        // instead of just risking a wrong cfg decision.
-        let vendor = if cfg!(target_vendor = "apple") {
-            "apple"
-        } else if cfg!(target_vendor = "pc") {
-            "pc"
-        } else {
-            "unknown"
-        };
-        cmd.env("CARGO_CFG_TARGET_VENDOR", vendor);
-
-        let ptr_width = if cfg!(target_pointer_width = "64") {
-            "64"
-        } else if cfg!(target_pointer_width = "32") {
-            "32"
-        } else {
-            "64"
-        };
-        cmd.env("CARGO_CFG_TARGET_POINTER_WIDTH", ptr_width);
-
-        let endian = if cfg!(target_endian = "little") {
-            "little"
-        } else {
-            "big"
-        };
-        cmd.env("CARGO_CFG_TARGET_ENDIAN", endian);
-
-        // Cargo always sets this (to a possibly-empty comma list); crates
-        // that check it defensively still warn on it being entirely absent.
-        cmd.env(
-            "CARGO_CFG_TARGET_FEATURE",
-            target_features(&env.target).join(","),
-        );
-
         for feature in &env.features {
             let feature_env = format!("CARGO_FEATURE_{}", feature.to_uppercase().replace('-', "_"));
             cmd.env(feature_env, "1");
         }
-
-        for (key, val_opt) in &env.cfgs {
-            let env_key = format!("CARGO_CFG_{}", key.to_uppercase().replace('-', "_"));
-            if let Some(val) = val_opt {
-                cmd.env(env_key, val);
-            } else {
-                cmd.env(env_key, "");
-            }
-        }
-
         for (links, key, val) in &env.dep_metadata {
             let env_key = format!(
                 "DEP_{}_{}",
@@ -341,137 +279,302 @@ impl BuildScriptRunner {
             cmd.env(env_key, val);
         }
 
-        cmd.stdout(Stdio::piped());
+        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
         debug!("Executing build script: {:?}", cmd);
         let mut child = cmd.spawn()?;
         let stdout = child.stdout.take().unwrap();
-        let reader = BufReader::new(stdout);
+        let mut stderr = child.stderr.take().unwrap();
+        // Drain stderr concurrently: a chatty script would otherwise fill the
+        // pipe and stall while we're still reading stdout.
+        let stderr_reader = std::thread::spawn(move || {
+            let mut text = String::new();
+            let _ = stderr.read_to_string(&mut text);
+            text
+        });
 
         let mut output = BuildScriptOutput::default();
-
-        for line_res in reader.lines() {
+        let mut raw_stdout = String::new();
+        for line_res in BufReader::new(stdout).lines() {
             let line = line_res?;
+            raw_stdout.push_str(&line);
+            raw_stdout.push('\n');
             if let Some(stripped) = line.strip_prefix("cargo::") {
-                Self::parse_instruction(stripped, &mut output);
+                Self::parse_instruction(stripped, true, &mut output);
             } else if let Some(stripped) = line.strip_prefix("cargo:") {
-                Self::parse_instruction(stripped, &mut output);
+                Self::parse_instruction(stripped, false, &mut output);
             }
         }
 
         let status = child.wait()?;
+        let stderr_text = stderr_reader.join().unwrap_or_default();
+
+        // Keep what the script said next to its output directory, like Cargo,
+        // so a failed build can be inspected afterwards.
+        if let Some(dir) = env.out_dir.parent() {
+            let _ = std::fs::write(dir.join("output"), &raw_stdout);
+            let _ = std::fs::write(dir.join("stderr"), &stderr_text);
+        }
+
         if !status.success() {
-            return Err(BuildScriptError::ExecutionFailed(
-                status.code().unwrap_or(1),
-            ));
+            return Err(BuildScriptError::ExecutionFailed {
+                code: status.code().unwrap_or(1),
+                stderr: stderr_text,
+            });
+        }
+        if !output.errors.is_empty() {
+            return Err(BuildScriptError::ReportedErrors(output.errors));
         }
 
         Ok(output)
     }
-}
 
-/// Enabled target features for `triple`, as `rustc --print=cfg` reports
-/// them, cached per triple since this only depends on the (fixed, per-build)
-/// target and never changes within a single `rune` invocation.
-fn target_features(triple: &str) -> Vec<String> {
-    use std::collections::HashMap;
-    use std::sync::{Mutex, OnceLock};
-
-    static CACHE: OnceLock<Mutex<HashMap<String, Vec<String>>>> = OnceLock::new();
-    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-
-    if let Some(cached) = cache.lock().unwrap().get(triple) {
-        return cached.clone();
+    /// Parses one directive. `modern` is the `cargo::key=value` spelling, in
+    /// which unknown keys are errors and metadata must be spelled
+    /// `cargo::metadata=key=value`; the legacy `cargo:key=value` treats every
+    /// unknown key as metadata.
+    pub fn parse_instruction(instruction: &str, modern: bool, output: &mut BuildScriptOutput) {
+        let Some((key, value)) = instruction.split_once('=') else {
+            return;
+        };
+        let key = key.trim();
+        let value = value.trim();
+        match key {
+            "rustc-link-lib" => {
+                if let Some((kind, name)) = value.split_once('=') {
+                    output.link_libs.push(LinkLib {
+                        kind: Some(kind.trim().to_string()),
+                        name: name.trim().to_string(),
+                    });
+                } else {
+                    output.link_libs.push(LinkLib {
+                        kind: None,
+                        name: value.to_string(),
+                    });
+                }
+            }
+            "rustc-link-search" => {
+                if let Some((kind, path)) = value.split_once('=') {
+                    output.link_search.push(LinkSearch {
+                        kind: Some(kind.trim().to_string()),
+                        path: PathBuf::from(path.trim()),
+                    });
+                } else {
+                    output.link_search.push(LinkSearch {
+                        kind: None,
+                        path: PathBuf::from(value),
+                    });
+                }
+            }
+            "rustc-flags" => Self::parse_rustc_flags(value, output),
+            "rustc-cfg" => output.cfgs.push(value.to_string()),
+            "rustc-check-cfg" => output.check_cfgs.push(value.to_string()),
+            "rustc-env" => {
+                if let Some((env_key, env_val)) = value.split_once('=') {
+                    output
+                        .env_vars
+                        .push((env_key.trim().to_string(), env_val.to_string()));
+                }
+            }
+            "rustc-link-arg" => output.link_args.push(LinkArg {
+                scope: LinkArgScope::All,
+                arg: value.to_string(),
+            }),
+            "rustc-cdylib-link-arg" | "rustc-link-arg-cdylib" => output.link_args.push(LinkArg {
+                scope: LinkArgScope::Cdylib,
+                arg: value.to_string(),
+            }),
+            "rustc-link-arg-bins" => output.link_args.push(LinkArg {
+                scope: LinkArgScope::Bins,
+                arg: value.to_string(),
+            }),
+            "rustc-link-arg-bin" => {
+                if let Some((name, arg)) = value.split_once('=') {
+                    output.link_args.push(LinkArg {
+                        scope: LinkArgScope::Bin(name.trim().to_string()),
+                        arg: arg.to_string(),
+                    });
+                }
+            }
+            "rustc-link-arg-tests" => output.link_args.push(LinkArg {
+                scope: LinkArgScope::Tests,
+                arg: value.to_string(),
+            }),
+            "rustc-link-arg-examples" => output.link_args.push(LinkArg {
+                scope: LinkArgScope::Examples,
+                arg: value.to_string(),
+            }),
+            "rustc-link-arg-benches" => output.link_args.push(LinkArg {
+                scope: LinkArgScope::Benches,
+                arg: value.to_string(),
+            }),
+            "rerun-if-changed" => output.rerun_if_changed.push(PathBuf::from(value)),
+            "rerun-if-env-changed" => output.rerun_if_env_changed.push(value.to_string()),
+            "warning" => {
+                output.warnings.push(value.to_string());
+                warn!("Build script warning: {}", value);
+            }
+            "error" if modern => output.errors.push(value.to_string()),
+            "metadata" if modern => {
+                if let Some((k, v)) = value.split_once('=') {
+                    output
+                        .metadata
+                        .push((k.trim().to_string(), v.trim().to_string()));
+                }
+            }
+            // Legacy spelling: everything else is `cargo:KEY=VALUE` metadata.
+            _ if !modern => output.metadata.push((key.to_string(), value.to_string())),
+            _ => warn!("Unknown build script directive `cargo::{key}`"),
+        }
     }
 
-    let features = Command::new("rustc")
-        .arg("--print=cfg")
-        .arg("--target")
-        .arg(triple)
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| {
-            String::from_utf8_lossy(&o.stdout)
-                .lines()
-                .filter_map(|line| line.strip_prefix("target_feature=\""))
-                .filter_map(|rest| rest.strip_suffix('"'))
-                .map(str::to_string)
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-
-    cache
-        .lock()
-        .unwrap()
-        .insert(triple.to_string(), features.clone());
-    features
-}
-
-impl BuildScriptRunner {
-    fn parse_instruction(instruction: &str, output: &mut BuildScriptOutput) {
-        if let Some((key, value)) = instruction.split_once('=') {
-            let key = key.trim();
-            let value = value.trim();
-            match key {
-                "rustc-link-lib" => {
-                    if let Some((kind, name)) = value.split_once('=') {
-                        output.link_libs.push(LinkLib {
-                            kind: Some(kind.trim().to_string()),
-                            name: name.trim().to_string(),
-                        });
-                    } else {
-                        output.link_libs.push(LinkLib {
-                            kind: None,
-                            name: value.to_string(),
-                        });
-                    }
-                }
-                "rustc-link-search" => {
-                    if let Some((kind, path)) = value.split_once('=') {
-                        output.link_search.push(LinkSearch {
-                            kind: Some(kind.trim().to_string()),
-                            path: PathBuf::from(path.trim()),
-                        });
-                    } else {
-                        output.link_search.push(LinkSearch {
-                            kind: None,
-                            path: PathBuf::from(value),
-                        });
-                    }
-                }
-                "rustc-cfg" => {
-                    output.cfgs.push(value.to_string());
-                }
-                "rustc-check-cfg" => {
-                    output.check_cfgs.push(value.to_string());
-                }
-                "rustc-env" => {
-                    if let Some((env_key, env_val)) = value.split_once('=') {
-                        output
-                            .env_vars
-                            .push((env_key.trim().to_string(), env_val.trim().to_string()));
-                    }
-                }
-                "rerun-if-changed" => {
-                    output.rerun_if_changed.push(PathBuf::from(value));
-                }
-                "rerun-if-env-changed" => {
-                    output.rerun_if_env_changed.push(value.to_string());
-                }
-                "warning" => {
-                    output.warnings.push(value.to_string());
-                    warn!("Build script warning: {}", value);
-                }
-                _ => {
-                    // Custom metadata
-                    output.metadata.push((key.to_string(), value.to_string()));
-                }
+    /// `cargo::rustc-flags=-l foo -L /path`: only `-l` and `-L` are allowed.
+    fn parse_rustc_flags(value: &str, output: &mut BuildScriptOutput) {
+        let mut tokens = value.split_whitespace();
+        while let Some(tok) = tokens.next() {
+            let (flag, rest) = if tok == "-l" || tok == "-L" {
+                (tok, tokens.next().unwrap_or(""))
+            } else if let Some(r) = tok.strip_prefix("-l") {
+                ("-l", r)
+            } else if let Some(r) = tok.strip_prefix("-L") {
+                ("-L", r)
+            } else {
+                warn!("Ignoring unsupported `rustc-flags` argument `{tok}`");
+                continue;
+            };
+            if rest.is_empty() {
+                continue;
             }
-        } else {
-            if instruction.trim() == "warning" {
-                // handled by empty warning logic if needed
+            if flag == "-l" {
+                match rest.split_once('=') {
+                    Some((kind, name)) => output.link_libs.push(LinkLib {
+                        kind: Some(kind.to_string()),
+                        name: name.to_string(),
+                    }),
+                    None => output.link_libs.push(LinkLib {
+                        kind: None,
+                        name: rest.to_string(),
+                    }),
+                }
+            } else {
+                match rest.split_once('=') {
+                    Some((kind, path)) => output.link_search.push(LinkSearch {
+                        kind: Some(kind.to_string()),
+                        path: PathBuf::from(path),
+                    }),
+                    None => output.link_search.push(LinkSearch {
+                        kind: None,
+                        path: PathBuf::from(rest),
+                    }),
+                }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(lines: &[&str]) -> BuildScriptOutput {
+        let mut out = BuildScriptOutput::default();
+        for line in lines {
+            if let Some(rest) = line.strip_prefix("cargo::") {
+                BuildScriptRunner::parse_instruction(rest, true, &mut out);
+            } else if let Some(rest) = line.strip_prefix("cargo:") {
+                BuildScriptRunner::parse_instruction(rest, false, &mut out);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn link_libraries_search_paths_and_flags() {
+        let out = parse(&[
+            "cargo::rustc-link-lib=static=foo",
+            "cargo::rustc-link-lib=bar",
+            "cargo::rustc-link-search=native=/opt/lib",
+            "cargo:rustc-link-search=/plain",
+            "cargo::rustc-flags=-l baz -L /flags/dir -Lnative=/x -lstatic:+whole-archive=q",
+        ]);
+        assert_eq!(out.link_libs.len(), 4);
+        assert_eq!(out.link_libs[0].kind.as_deref(), Some("static"));
+        assert_eq!(out.link_libs[1].kind, None);
+        assert_eq!(out.link_libs[2].name, "baz");
+        assert_eq!(
+            out.link_libs[3].kind.as_deref(),
+            Some("static:+whole-archive")
+        );
+        assert_eq!(out.link_search.len(), 4);
+        assert_eq!(out.link_search[3].kind.as_deref(), Some("native"));
+        assert_eq!(out.link_search[2].path, PathBuf::from("/flags/dir"));
+    }
+
+    #[test]
+    fn link_args_are_scoped() {
+        let out = parse(&[
+            "cargo::rustc-link-arg=-all",
+            "cargo::rustc-cdylib-link-arg=-cd",
+            "cargo::rustc-link-arg-bins=-bins",
+            "cargo::rustc-link-arg-bin=tool=-only-tool",
+            "cargo::rustc-link-arg-tests=-t",
+            "cargo::rustc-link-arg-examples=-e",
+            "cargo::rustc-link-arg-benches=-b",
+        ]);
+        let scopes: Vec<_> = out.link_args.iter().map(|a| a.scope.clone()).collect();
+        assert_eq!(
+            scopes,
+            [
+                LinkArgScope::All,
+                LinkArgScope::Cdylib,
+                LinkArgScope::Bins,
+                LinkArgScope::Bin("tool".into()),
+                LinkArgScope::Tests,
+                LinkArgScope::Examples,
+                LinkArgScope::Benches,
+            ]
+        );
+        assert_eq!(out.link_args[3].arg, "-only-tool");
+    }
+
+    #[test]
+    fn metadata_spellings() {
+        let out = parse(&[
+            "cargo:include=/legacy",
+            "cargo::metadata=root=/modern",
+            "cargo::not-a-thing=1",
+        ]);
+        assert_eq!(
+            out.metadata,
+            [
+                ("include".to_string(), "/legacy".to_string()),
+                ("root".to_string(), "/modern".to_string())
+            ]
+        );
+    }
+
+    #[test]
+    fn cfg_env_warning_error_and_rerun() {
+        let out = parse(&[
+            "cargo::rustc-cfg=has_foo",
+            "cargo::rustc-cfg=feature=\"bar\"",
+            "cargo::rustc-check-cfg=cfg(has_foo)",
+            "cargo::rustc-env=GREETING=hello world",
+            "cargo::warning=careful",
+            "cargo::error=broken",
+            "cargo::rerun-if-changed=build/x.c",
+            "cargo::rerun-if-env-changed=CC",
+            "not a directive",
+        ]);
+        assert_eq!(out.cfgs, ["has_foo", "feature=\"bar\""]);
+        assert_eq!(out.check_cfgs, ["cfg(has_foo)"]);
+        assert_eq!(
+            out.env_vars,
+            [("GREETING".to_string(), "hello world".to_string())]
+        );
+        assert_eq!(out.warnings, ["careful"]);
+        assert_eq!(out.errors, ["broken"]);
+        assert_eq!(out.rerun_if_changed, [PathBuf::from("build/x.c")]);
+        assert_eq!(out.rerun_if_env_changed, ["CC"]);
     }
 }

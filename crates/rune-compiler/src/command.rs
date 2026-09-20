@@ -180,6 +180,20 @@ impl RustcCommandBuilder {
         self
     }
 
+    /// Pass an argument straight to the linker (`-C link-arg=`).
+    pub fn link_arg(mut self, arg: &str) -> Self {
+        self.flags.push("-C".into());
+        self.flags.push(format!("link-arg={arg}").into());
+        self
+    }
+
+    /// Use a specific linker (`-C linker=`).
+    pub fn linker(mut self, linker: &str) -> Self {
+        self.flags.push("-C".into());
+        self.flags.push(format!("linker={linker}").into());
+        self
+    }
+
     /// Set an environment variable for compilation.
     pub fn env(mut self, key: &str, val: &str) -> Self {
         self.envs.push((key.to_string(), val.to_string()));
@@ -242,9 +256,20 @@ impl RustcCommandBuilder {
         self
     }
 
+    /// The accumulated compiler arguments (without the source file).
+    pub fn into_args(self) -> Vec<OsString> {
+        self.flags
+    }
+
     /// Construct a `std::process::Command` from this builder using a specific rustc path.
     pub fn build_with_rustc(self, rustc_path: &Path) -> Command {
-        let mut cmd = Command::new(rustc_path);
+        self.build_with_command(Command::new(rustc_path))
+    }
+
+    /// Appends this builder's arguments and environment to `cmd`, which
+    /// already names the compiler (and any wrappers in front of it), e.g. from
+    /// `Toolchain::rustc_command`.
+    pub fn build_with_command(self, mut cmd: Command) -> Command {
         cmd.arg(&self.source_root);
         cmd.args(&self.flags);
         for (k, v) in self.envs {
