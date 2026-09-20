@@ -61,7 +61,7 @@ fn scaffold(dir: &Path, name: &str, lib: bool, edition: &str, gitignore: bool) -
     fs::create_dir_all(dir.join("src"))?;
 
     fs::write(
-        dir.join("Rune.toml"),
+        dir.join("Cargo.toml"),
         format!(
             "[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"{edition}\"\n\n[dependencies]\n"
         ),
