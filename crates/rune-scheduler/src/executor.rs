@@ -1285,6 +1285,15 @@ fn with_hint(message: String) -> String {
 
 /// A cheap fingerprint of every file below `dir` (path, size, modification
 /// time), to notice that something wrote there.
+///
+/// Directories only contribute their path, not their own size/mtime: tools
+/// invoked by a build script (e.g. `rustc --emit=metadata -o -`, which stages
+/// the `.rmeta` in a temp dir under the process's CWD before streaming it to
+/// stdout) routinely create-then-remove a scratch directory inside the
+/// package root. That leaves no file behind, but it does bump the mtime of
+/// whichever directory held it — which would otherwise register as a false
+/// "modified its own source" violation even though the tree's actual
+/// contents are unchanged.
 fn tree_stamp(dir: &Path) -> u64 {
     let mut hb = rune_common::hash::HashBuilder::new();
     for entry in walkdir::WalkDir::new(dir)
@@ -1294,6 +1303,9 @@ fn tree_stamp(dir: &Path) -> u64 {
     {
         let Ok(meta) = entry.metadata() else { continue };
         hb.update(entry.path().to_string_lossy().as_bytes());
+        if meta.is_dir() {
+            continue;
+        }
         hb.update(&meta.len().to_le_bytes());
         let mtime = meta
             .modified()
