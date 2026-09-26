@@ -551,11 +551,15 @@ mod tests {
 
     #[test]
     fn tokens_come_from_config_env_or_a_credential_command() {
-        let d = defs(
+        #[cfg(windows)]
+        let b_prov = r#"credential-provider = ["cargo:token-from-stdout", "cmd", "/c", "echo", "from-command"]"#;
+        #[cfg(not(windows))]
+        let b_prov = r#"credential-provider = ["cargo:token-from-stdout", "echo", "from-command"]"#;
+        let d = defs(&format!(
             "[registries.a]\nindex = \"sparse+https://a/\"\ntoken = \"cfg-token\"\n\
-             [registries.b]\nindex = \"sparse+https://b/\"\ncredential-provider = [\"cargo:token-from-stdout\", \"echo\", \"from-command\"]\n\
+             [registries.b]\nindex = \"sparse+https://b/\"\n{b_prov}\n\
              [registries.c]\nindex = \"sparse+https://c/\"\n",
-        );
+        ));
         let token = |index: &str| match d.backend_for(index).unwrap() {
             Backend::Sparse { token, .. } => token,
             other => panic!("{other:?}"),

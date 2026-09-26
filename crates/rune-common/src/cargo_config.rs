@@ -252,12 +252,24 @@ fn merge(higher: &mut Table, lower: Table) {
 }
 
 fn is_relative_path(p: &str) -> bool {
-    !Path::new(p).is_absolute() && p.contains('/')
+    !Path::new(p).is_absolute() && (p.contains('/') || p.contains('\\'))
+}
+
+fn join_path(base: &Path, p: &str) -> String {
+    let joined = base.join(p).to_string_lossy().into_owned();
+    #[cfg(windows)]
+    {
+        joined.replace('\\', "/")
+    }
+    #[cfg(not(windows))]
+    {
+        joined
+    }
 }
 
 fn abs(p: &str, base: &Path) -> String {
     if is_relative_path(p) {
-        base.join(p).to_string_lossy().into_owned()
+        join_path(base, p)
     } else {
         p.to_string()
     }
@@ -312,7 +324,7 @@ fn absolutize(root: &mut Table, base: &Path) {
                 if let Some(Value::String(s)) = t.get_mut(key) {
                     // Always config-relative, slash or not.
                     if !Path::new(s.as_str()).is_absolute() {
-                        *s = base.join(&*s).to_string_lossy().into_owned();
+                        *s = join_path(base, s);
                     }
                 }
             }
@@ -326,7 +338,7 @@ fn absolutize(root: &mut Table, base: &Path) {
                 if let Value::Table(dep) = dep {
                     if let Some(Value::String(s)) = dep.get_mut("path") {
                         if !Path::new(s.as_str()).is_absolute() {
-                            *s = base.join(&*s).to_string_lossy().into_owned();
+                            *s = join_path(base, s);
                         }
                     }
                 }
@@ -338,7 +350,7 @@ fn absolutize(root: &mut Table, base: &Path) {
         for p in paths.iter_mut() {
             if let Value::String(s) = p {
                 if !Path::new(s.as_str()).is_absolute() {
-                    *s = base.join(&*s).to_string_lossy().into_owned();
+                    *s = join_path(base, s);
                 }
             }
         }
@@ -349,7 +361,7 @@ fn absolutize(root: &mut Table, base: &Path) {
             if let Value::Table(t) = v {
                 if t.get("relative").and_then(Value::as_bool) == Some(true) {
                     if let Some(Value::String(s)) = t.get_mut("value") {
-                        *s = base.join(&*s).to_string_lossy().into_owned();
+                        *s = join_path(base, s);
                     }
                 }
             }

@@ -19,6 +19,7 @@ tokio.workspace = true
 tokio-util.workspace = true
 filetime.workspace = true
 walkdir.workspace = true
+same-file.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

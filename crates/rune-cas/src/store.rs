@@ -101,9 +101,6 @@ pub struct CasEntry {
     pub object_dir: PathBuf,
 }
 
-/// True if `dest` is already a hardlink to `src` (same inode on the same
-/// device), meaning there is nothing left to do to "link" it.
-#[cfg(unix)]
 /// Stored objects are never modified: taking away write permission makes a
 /// stray in-place write (through a hard link from a project directory) fail
 /// loudly instead of silently changing an object every project shares.
@@ -115,29 +112,14 @@ fn make_read_only(path: &Path) {
     }
 }
 
+/// True if `dest` is already a hardlink to `src` (same inode on the same
+/// device), meaning there is nothing left to do to "link" it.
 fn already_linked(src: &Path, dest: &Path) -> bool {
-    use std::os::unix::fs::MetadataExt;
-    let (Ok(a), Ok(b)) = (fs::metadata(src), fs::metadata(dest)) else {
-        return false;
-    };
-    a.ino() == b.ino() && a.dev() == b.dev()
+    same_file::is_same_file(src, dest).unwrap_or(false)
 }
 
-#[cfg(not(unix))]
-fn already_linked(_src: &Path, _dest: &Path) -> bool {
-    false
-}
 
-#[cfg(unix)]
-fn same_file(a: &fs::Metadata, b: &fs::Metadata) -> bool {
-    use std::os::unix::fs::MetadataExt;
-    a.ino() == b.ino() && a.dev() == b.dev()
-}
 
-#[cfg(not(unix))]
-fn same_file(_a: &fs::Metadata, _b: &fs::Metadata) -> bool {
-    false
-}
 
 impl CasStore {
     /// Create a new CAS store, initializing directories if needed.
@@ -495,10 +477,8 @@ impl CasStore {
             // fallback (e.g. across filesystems) can actually diverge and is
             // worth the cost of hashing.
             rune_common::fsutil::replace_with_link(&src, &dest)?;
-            let hard_linked = matches!(
-                (fs::metadata(&src), fs::metadata(&dest)),
-                (Ok(a), Ok(b)) if same_file(&a, &b)
-            );
+            let hard_linked = already_linked(&src, &dest);
+
             if hard_linked {
                 linked_files.push(dest);
                 continue;

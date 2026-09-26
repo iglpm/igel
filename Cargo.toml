@@ -67,6 +67,7 @@ tokio-util = { version = "0.7", default-features = false, features = ["io"] }
 rustix = { version = "1", default-features = false, features = ["fs", "std"] }
 memmap2 = "0.9"
 walkdir = "2"
+same-file = "1.0"
 
 # Internal crates
 rune-common = { path = "crates/rune-common" }
