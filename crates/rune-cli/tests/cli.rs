@@ -5530,3 +5530,20 @@ fn a_declared_target_without_its_file_is_reported_like_cargo() {
         text(&out)
     );
 }
+
+#[test]
+fn a_links_package_with_integration_tests_is_not_its_own_conflict() {
+    let p = Project::new();
+    p.write(
+        "Cargo.toml",
+        "[package]\nname = \"natlib\"\nversion = \"0.1.0\"\nedition = \"2021\"\nlinks = \"natlib_0_1\"\n",
+    );
+    p.write("build.rs", "fn main() {}\n");
+    p.write("src/lib.rs", "pub fn one() -> u32 { 1 }\n");
+    p.write(
+        "tests/aead_tests.rs",
+        "#[test]\nfn works() { assert_eq!(natlib::one(), 1); }\n",
+    );
+    let out = p.ok(&["test"]);
+    assert!(out.contains("(test aead_tests) · 1 passed"), "{out}");
+}

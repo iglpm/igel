@@ -1938,28 +1938,34 @@ impl Planner<'_> {
 /// The set of `links` values in a graph must be unique per package: two
 /// packages linking the same native library would collide at link time.
 fn check_links_conflicts(graph: &BuildGraph) -> Result<()> {
-    let mut seen: HashMap<String, (String, semver::Version)> = HashMap::new();
+    // A package is its directory: its test, example and binary units carry
+    // their target's name, not the package's (`ring`'s `aead_tests`).
+    let mut seen: HashMap<String, (PathBuf, String, semver::Version)> = HashMap::new();
     for node in graph.nodes() {
         let Some(links) = &node.unit.links else {
             continue;
         };
-        let pkg = (
-            node.unit.crate_id.name.clone(),
-            node.unit.crate_id.version.clone(),
-        );
-        if let Some(prev) = seen.get(links) {
-            if *prev != pkg {
+        let unit = &node.unit;
+        match seen.get(links) {
+            Some((dir, name, version)) if *dir != unit.manifest_dir => {
                 bail!(
                     "multiple packages link to the native library `{links}`, but a native library can be linked only once\n  \
-                     package `{} v{}` links to `{links}`\n  package `{} v{}` also links to `{links}`",
-                    prev.0,
-                    prev.1,
-                    pkg.0,
-                    pkg.1
+                     package `{name} v{version}` links to `{links}`\n  package `{} v{}` also links to `{links}`",
+                    unit.crate_id.name,
+                    unit.crate_id.version
                 );
             }
-        } else {
-            seen.insert(links.clone(), pkg);
+            Some(_) => {}
+            None => {
+                seen.insert(
+                    links.clone(),
+                    (
+                        unit.manifest_dir.clone(),
+                        unit.crate_id.name.clone(),
+                        unit.crate_id.version.clone(),
+                    ),
+                );
+            }
         }
     }
     Ok(())

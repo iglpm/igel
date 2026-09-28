@@ -2815,13 +2815,18 @@ pub fn build_rustc_command(
         unit.all_crate_types()
             .fold(builder, |b, t| b.crate_type(t.rustc_crate_type()))
     };
-    let links_final_artifact = !unit.harness
-        && unit.all_crate_types().any(|t| {
+    // A test harness is a program too: `[profile.test] lto = "fat"` applies
+    // to it (some crates' tests depend on it, e.g. `no-panic` checks).
+    let links_final_artifact = if unit.harness {
+        !unit.check_only && unit.crate_type != CrateType::ProcMacro
+    } else {
+        unit.all_crate_types().any(|t| {
             matches!(
                 t,
                 CrateType::Bin | CrateType::Cdylib | CrateType::Dylib | CrateType::Staticlib
             )
-        });
+        })
+    };
     // The test harness needs unwinding, and a panicking proc-macro must not
     // take the compiler down: both ignore `panic = "abort"`, as in Cargo.
     let unwinding;
