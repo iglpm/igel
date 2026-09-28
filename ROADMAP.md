@@ -1044,8 +1044,8 @@ bindgen, ratatui, …):
   (`winnow` — Cargo ignores `panic` for tests, proc-macros and build scripts);
   `#[cfg(test)]` was an unexpected cfg under `deny(warnings)` because Rune did
   not declare Cargo's `cfg(docsrs,test)` (`http`, `httparse`). Now every crate
-  ends as under Cargo, test for test: 37 pass identically; `anyhow`, `glob`
-  fail the same test under both, `mime`, `nom` fail to build under both; and
+  ends as under Cargo, test for test: 36 pass identically; `unicode-ident`,
+  `anyhow` and `glob` fail the same test under both, `mime`, `nom` fail to build under both; and
   `same-file` passes only under Rune (Cargo cannot read the v1 lockfile it ships).
 - Found on the way: a registry crate's `cargo:warning` lines leaked into every
   build as log lines (Cargo hides dependencies' script warnings).
