@@ -251,6 +251,9 @@ pub struct DependencyResolver {
     /// `(registry, name, version)` never to choose: backtracking away from a
     /// release whose requirements conflict with the rest of the graph.
     exclude: HashSet<(String, String, Version)>,
+    /// Newly chosen releases must have been published at least this long
+    /// ago (`resolve.min-release-age`); locked ones are kept regardless.
+    min_release_age: Option<std::time::Duration>,
 }
 
 impl Default for DependencyResolver {
@@ -272,7 +275,17 @@ impl DependencyResolver {
             hints: Vec::new(),
             prefer: HashMap::new(),
             exclude: HashSet::new(),
+            min_release_age: None,
         }
+    }
+
+    /// Only choose releases published at least `age` ago when nothing locks
+    /// a version: a malicious release is usually noticed and yanked within
+    /// days, before it would be picked up. When no release that old fits a
+    /// requirement, the newest that does is taken, with a warning.
+    pub fn with_min_release_age(mut self, age: Option<std::time::Duration>) -> Self {
+        self.min_release_age = age.filter(|a| !a.is_zero());
+        self
     }
 
     /// Versions to take whenever a requirement allows them (`(registry index,
@@ -1079,6 +1092,7 @@ fn resolve_one_queue_item(
     // If not found in lockfile, query index for latest matching version
     if chosen_record.is_none() {
         let msrv = resolver.msrv.clone();
+        let min_release_age = resolver.min_release_age;
         let index = resolver.get_or_fetch_index(&registry, &name)?;
         let mut matches: Vec<&IndexRecord> = index
             .available_versions()
@@ -1098,6 +1112,30 @@ fn resolve_one_queue_item(
             let vb = Version::parse(&b.vers).unwrap_or_else(|_| Version::new(0, 0, 0));
             vb.cmp(&va)
         });
+
+        // Releases too young for `resolve.min-release-age` only when nothing
+        // older fits.
+        if let Some(age) = min_release_age {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs());
+            let cutoff = now.saturating_sub(age.as_secs());
+            let mature = |rec: &&IndexRecord| {
+                rec.pubtime
+                    .as_deref()
+                    .and_then(rune_common::time::parse_rfc3339)
+                    .is_none_or(|t| t <= cutoff)
+            };
+            if matches.iter().any(mature) {
+                matches.retain(mature);
+            } else if let Some(newest) = matches.first() {
+                tracing::warn!(
+                    "{name} {}: every release matching `{req}` is younger than \
+                     resolve.min-release-age; using it anyway",
+                    newest.vers
+                );
+            }
+        }
 
         // Prefer the newest release this compiler can build, when asked to.
         let compatible = msrv.as_ref().and_then(|m| {

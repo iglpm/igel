@@ -839,6 +839,7 @@ pub fn resolve_fresh_with(
     .offline(offline)
     .with_patches(ws.patches.clone())
     .with_msrv(msrv_for_resolution(ws))
+    .with_min_release_age(ws.config.settings.min_release_age())
     .with_prefetch_hint(on_disk.as_ref())
     .with_preferred(preferred);
     let resolved = resolver
@@ -950,7 +951,8 @@ fn resolve(ws: &Workspace, locals: &Locals, req: &Request) -> Result<(ResolvedGr
     let mut resolver = DependencyResolver::default_resolver()
         .offline(req.offline)
         .with_patches(ws.patches.clone())
-        .with_msrv(msrv_for_resolution(ws));
+        .with_msrv(msrv_for_resolution(ws))
+        .with_min_release_age(ws.config.settings.min_release_age());
     let resolved = resolver
         .resolve_with_workspace(
             root,
@@ -2431,4 +2433,142 @@ fn exempt_real_link_requirements_from_check(graph: &mut BuildGraph) {
     for id in must_be_real {
         graph.node_mut(id).unit.check_only = false;
     }
+}
+
+// ---------------------------------------------------------------------------
+// Inventory: every package of the resolved graph, for reports (`rune sbom`)
+// ---------------------------------------------------------------------------
+
+/// How a package depends on another.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum EdgeKind {
+    Normal,
+    Build,
+    Dev,
+}
+
+/// A package of the resolved graph, with what its manifest says about it.
+#[derive(Debug, Clone)]
+pub struct InventoryPackage {
+    pub name: String,
+    pub version: semver::Version,
+    /// As `Cargo.lock` spells it; `None` for a path package.
+    pub source: Option<String>,
+    pub checksum: Option<String>,
+    pub meta: rune_common::PackageMeta,
+    /// A member of this workspace.
+    pub member: bool,
+    /// `(repository URL, commit)` of a git package.
+    pub git: Option<(String, String)>,
+    /// The registry's index URL, for a registry package.
+    pub registry: Option<String>,
+    /// Packages this one depends on as locked (only what is used, with
+    /// optional dependencies nothing enables left out), and how.
+    pub deps: Vec<(usize, EdgeKind)>,
+}
+
+/// Every package the lockfile holds, with metadata from its manifest and the
+/// locked dependency edges. Resolves (and downloads) first, like `build`.
+pub fn inventory(ws: &Workspace, offline: bool) -> Result<Vec<InventoryPackage>> {
+    let existing = LockfileManager::load_fast(ws.root());
+    let (resolved, lock) = resolve_fresh(ws, offline, existing.as_ref(), false)?;
+    store_resolution(ws, &lock)?;
+    download_all(&resolved, offline)?;
+    let mut locals = Locals::load(ws)?;
+    locals.extend_from_lock(ws, &lock)?;
+
+    let mut pkgs: Vec<&ResolvedPackage> = resolved.packages.values().collect();
+    pkgs.sort_by(|a, b| (&a.name, &a.version).cmp(&(&b.name, &b.version)));
+    let manifests: Vec<Option<rune_common::PackageMeta>> = pkgs
+        .par_iter()
+        .map(|p| match &p.source {
+            PackageSource::Registry(index) => {
+                let dl = rune_registry::CrateDownloader::for_registry(index)
+                    .ok()?
+                    .offline(true);
+                let dir = dl
+                    .download_and_extract(&p.name, &p.version.to_string(), p.checksum.as_deref())
+                    .ok()?;
+                let m = Manifest::from_path(&rune_common::manifest_file::manifest_in(&dir)).ok()?;
+                Some(m.package.as_ref()?.meta_in(None))
+            }
+            _ => None,
+        })
+        .collect();
+
+    let mut out: Vec<InventoryPackage> = Vec::with_capacity(pkgs.len());
+    for (p, registry_meta) in pkgs.iter().zip(manifests) {
+        let local = locals
+            .list
+            .iter()
+            .position(|m| m.name == p.name && m.version == p.version);
+        let meta = registry_meta
+            .or_else(|| local.map(|li| locals.list[li].meta.clone()))
+            .unwrap_or_default();
+        out.push(InventoryPackage {
+            name: p.name.clone(),
+            version: p.version.clone(),
+            source: p.source.lock_source(),
+            checksum: p.checksum.clone(),
+            meta,
+            member: local.is_some_and(|li| locals.member_of[li].is_some()),
+            git: match &p.source {
+                PackageSource::Git { url, commit, .. } => Some((url.clone(), commit.clone())),
+                _ => None,
+            },
+            registry: match &p.source {
+                PackageSource::Registry(index) => Some(index.clone()),
+                _ => None,
+            },
+            deps: Vec::new(),
+        });
+    }
+
+    // Edges as locked: `name`, `name version` or `name version (source)`.
+    let find = |spec: &str| -> Option<usize> {
+        let mut parts = spec.split_whitespace();
+        let name = parts.next()?;
+        let version = parts.next();
+        let source = spec.split_once(" (").map(|(_, s)| s.trim_end_matches(')'));
+        out.iter().position(|q| {
+            q.name == name
+                && version.is_none_or(|v| q.version.to_string() == v)
+                && source.is_none_or(|s| q.source.as_deref() == Some(s))
+        })
+    };
+    let mut edges: Vec<Vec<(usize, EdgeKind)>> = vec![Vec::new(); out.len()];
+    for (i, p) in pkgs.iter().enumerate() {
+        let Some(locked) = lock.packages.iter().find(|l| {
+            l.name == p.name
+                && l.version == p.version.to_string()
+                && l.source == p.source.lock_source()
+        }) else {
+            continue;
+        };
+        for spec in &locked.dependencies {
+            let Some(j) = find(spec) else { continue };
+            // The strongest way the manifest declares it: a dependency that
+            // is also a build- or dev-dependency is an ordinary one.
+            let kinds: Vec<DependencyKind> = p
+                .dependencies
+                .iter()
+                .filter(|d| d.package.as_deref().unwrap_or(&d.name) == out[j].name)
+                .map(|d| d.kind)
+                .collect();
+            let kind = if kinds.is_empty() || kinds.contains(&DependencyKind::Normal) {
+                EdgeKind::Normal
+            } else if kinds.contains(&DependencyKind::Build) {
+                EdgeKind::Build
+            } else {
+                EdgeKind::Dev
+            };
+            if !edges[i].iter().any(|(k, _)| *k == j) {
+                edges[i].push((j, kind));
+            }
+        }
+    }
+    for (p, e) in out.iter_mut().zip(edges) {
+        p.deps = e;
+    }
+    Ok(out)
 }

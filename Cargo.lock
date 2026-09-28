@@ -1190,6 +1190,7 @@ name = "rune-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "blake3",
  "clap",
  "colored",
  "crossbeam-channel",

@@ -39,6 +39,8 @@ pub enum ValueKind {
     Text,
     /// `off`, `auto`, or a positive number (of threads).
     Threads,
+    /// A length of time: `14d`, `72h`, `2w`, `0`.
+    Duration,
 }
 
 impl ValueKind {
@@ -50,6 +52,7 @@ impl ValueKind {
             ValueKind::Text => "text",
             ValueKind::Size => "a size such as `20GB` or `512MiB`",
             ValueKind::Threads => "`off`, `auto` or a number of threads",
+            ValueKind::Duration => "a duration such as `14d`, `72h` or `2w`",
         }
     }
 }
@@ -201,6 +204,15 @@ pub const KEYS: &[KeyDef] = &[
         description: "Re-hash every artifact restored from the content-addressable store \
                       (catches bit rot and tampering; costs a read of every restored file). \
                       Entries are always checked against their key and recorded sizes.",
+    },
+    KeyDef {
+        name: "resolve.min-release-age",
+        kind: ValueKind::Duration,
+        default: "0",
+        description: "Only choose releases published at least this long ago (`14d`, `72h`, `2w`) \
+                      when resolving new versions; locked versions are kept. A malicious release \
+                      is usually noticed and yanked within days. When nothing that old fits a \
+                      requirement, the newest release that does is used, with a warning.",
     },
     KeyDef {
         name: "net.offline",
@@ -456,6 +468,16 @@ impl Settings {
         self.bool("build.release-rebuild-all", false)
     }
 
+    /// `resolve.min-release-age`.
+    pub fn min_release_age(&self) -> Option<std::time::Duration> {
+        match self.values.get("resolve.min-release-age") {
+            Some((Value::Text(t), _)) => crate::time::parse_duration(t)
+                .filter(|s| *s > 0)
+                .map(std::time::Duration::from_secs),
+            _ => None,
+        }
+    }
+
     /// `build.frontend-threads`.
     pub fn frontend_threads(&self) -> FrontendThreads {
         match self.values.get("build.frontend-threads") {
@@ -704,6 +726,15 @@ fn from_toml(def: &KeyDef, item: &Item) -> Result<Value, &'static str> {
             TomlValue::String(s) => parse_threads(s.value()).ok_or(expected),
             _ => Err(expected),
         },
+        ValueKind::Duration => match value {
+            TomlValue::Integer(n) => u64::try_from(*n.value())
+                .map(|n| Value::Text(n.to_string()))
+                .map_err(|_| expected),
+            TomlValue::String(s) => crate::time::parse_duration(s.value())
+                .map(|_| Value::Text(s.value().trim().to_string()))
+                .ok_or(expected),
+            _ => Err(expected),
+        },
     }
 }
 
@@ -753,6 +784,9 @@ pub fn parse_value(def: &KeyDef, raw: &str) -> Result<Value, SettingsError> {
         ValueKind::Text => Err(bad()),
         ValueKind::Size => parse_size(raw).map(Value::Size).ok_or_else(bad),
         ValueKind::Threads => parse_threads(raw).ok_or_else(bad),
+        ValueKind::Duration => crate::time::parse_duration(raw)
+            .map(|_| Value::Text(raw.to_string()))
+            .ok_or_else(bad),
     }
 }
 
@@ -1033,6 +1067,17 @@ mod tests {
         assert_eq!(parse_value(def, "1").unwrap(), Value::Text("off".into()));
         assert_eq!(parse_value(def, "8").unwrap(), Value::Text("8".into()));
         assert!(parse_value(def, "lots").is_err());
+    }
+
+    #[test]
+    fn release_ages_must_be_durations() {
+        let def = KEYS
+            .iter()
+            .find(|k| k.name == "resolve.min-release-age")
+            .unwrap();
+        assert!(parse_value(def, "14d").is_ok());
+        assert!(parse_value(def, "0").is_ok());
+        assert!(parse_value(def, "14 days please").is_err());
     }
 
     #[test]

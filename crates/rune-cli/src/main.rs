@@ -8,6 +8,8 @@ mod cmd_explain;
 mod cmd_install;
 mod cmd_misc;
 mod cmd_publish;
+mod cmd_sbom;
+mod cmd_surface;
 mod cmd_test;
 mod cmd_unused;
 mod cmd_upgrade;
@@ -68,6 +70,7 @@ fn main() {
         Commands::Outdated(a) => cmd_upgrade::outdated(a),
         Commands::Upgrade(a) => cmd_upgrade::upgrade(a),
         Commands::Unused(a) => cmd_unused::unused(a),
+        Commands::Sbom(a) => cmd_sbom::sbom(a),
         Commands::Tree(a) => cmd_deps::tree(a),
         Commands::Why(a) => cmd_deps::why(a),
         Commands::Fetch(a) => cmd_deps::fetch(a),

@@ -615,6 +615,7 @@ fn directory_index(dir: &Path, name: &str) -> Result<CrateIndex, IndexError> {
                 .get("rust-version")
                 .and_then(|v| v.as_str())
                 .map(str::to_string),
+            pubtime: None,
         });
     }
     if versions.is_empty() {

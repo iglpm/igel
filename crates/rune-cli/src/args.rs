@@ -75,6 +75,8 @@ pub enum Commands {
     Upgrade(UpgradeArgs),
     /// Find dependencies the workspace's packages declare but never use
     Unused(UnusedArgs),
+    /// Write a software bill of materials (CycloneDX or SPDX JSON)
+    Sbom(SbomArgs),
     /// Display the resolved dependency tree
     Tree(TreeArgs),
     /// Explain why a package is in the dependency graph
@@ -618,6 +620,24 @@ pub struct OutdatedArgs {
 }
 
 #[derive(Args, Debug, Clone)]
+pub struct SbomArgs {
+    #[command(flatten)]
+    pub manifest: ManifestArgs,
+    /// Only these workspace members (all of them when none are given)
+    #[arg(short = 'p', long = "package", value_name = "SPEC")]
+    pub package: Vec<String>,
+    /// `cyclonedx` (1.5) or `spdx` (2.3), both JSON
+    #[arg(long, default_value = "cyclonedx", value_parser = ["cyclonedx", "spdx"])]
+    pub format: String,
+    /// Write to this file instead of stdout
+    #[arg(short = 'o', long, value_name = "FILE")]
+    pub output: Option<PathBuf>,
+    /// Include the members' development dependencies (not shipped)
+    #[arg(long)]
+    pub dev: bool,
+}
+
+#[derive(Args, Debug, Clone)]
 pub struct UnusedArgs {
     #[command(flatten)]
     pub common: CommonArgs,
@@ -683,6 +703,39 @@ pub struct TreeArgs {
     /// Also show dev-dependencies
     #[arg(long)]
     pub dev: bool,
+
+    /// Instead of the tree, list every crate that runs code on this machine
+    /// while building (build scripts, proc-macros) or links native code
+    #[arg(long)]
+    pub exec_surface: bool,
+
+    /// With --exec-surface: `human` or `json`
+    #[arg(long, default_value = "human", value_parser = ["human", "json"])]
+    pub format: String,
+}
+
+impl CommonArgs {
+    /// Every option at its default, with the manifest and offline flags of
+    /// `m` — for commands that build a plan without taking build options.
+    pub fn defaults_for(m: &ManifestArgs) -> CommonArgs {
+        use clap::{FromArgMatches, Parser};
+        #[derive(Parser)]
+        struct Wrapper {
+            #[command(flatten)]
+            common: CommonArgs,
+        }
+        let mut argv = vec!["rune".to_string()];
+        if let Some(p) = &m.manifest_path {
+            argv.push("--manifest-path".into());
+            argv.push(p.display().to_string());
+        }
+        let matches = <Wrapper as clap::CommandFactory>::command().get_matches_from(argv);
+        let mut common = Wrapper::from_arg_matches(&matches)
+            .expect("the defaults parse")
+            .common;
+        common.offline = m.offline;
+        common
+    }
 }
 
 #[derive(Args, Debug, Clone)]

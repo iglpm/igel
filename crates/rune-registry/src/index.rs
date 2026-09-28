@@ -42,6 +42,10 @@ pub struct IndexRecord {
     pub yanked: bool,
     #[serde(default)]
     pub rust_version: Option<String>,
+    /// When the release was published (`2026-03-11T00:20:04Z`), where the
+    /// registry says.
+    #[serde(default)]
+    pub pubtime: Option<String>,
 }
 
 impl IndexRecord {

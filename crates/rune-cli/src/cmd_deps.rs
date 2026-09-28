@@ -150,13 +150,38 @@ pub fn add(args: AddArgs) -> Result<()> {
             let requirement = match ver_req {
                 Some(v) => v,
                 None => {
-                    // Latest non-yanked, non-prerelease release.
-                    let latest = index
+                    // Latest non-yanked, non-prerelease release — old enough
+                    // for `resolve.min-release-age`, when one is.
+                    let cutoff = ws.config.settings.min_release_age().map(|age| {
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map_or(0, |d| d.as_secs())
+                            .saturating_sub(age.as_secs())
+                    });
+                    let mature = |r: &&rune_registry::IndexRecord| {
+                        cutoff.is_none_or(|c| {
+                            r.pubtime
+                                .as_deref()
+                                .and_then(rune_common::time::parse_rfc3339)
+                                .is_none_or(|t| t <= c)
+                        })
+                    };
+                    let stable_mature = index
                         .available_versions()
                         .into_iter()
+                        .filter(mature)
                         .filter_map(|r| semver::Version::parse(&r.vers).ok())
                         .filter(|v| v.pre.is_empty())
-                        .max()
+                        .max();
+                    let latest = stable_mature
+                        .or_else(|| {
+                            index
+                                .available_versions()
+                                .into_iter()
+                                .filter_map(|r| semver::Version::parse(&r.vers).ok())
+                                .filter(|v| v.pre.is_empty())
+                                .max()
+                        })
                         .or_else(|| {
                             index
                                 .available_versions()
@@ -500,6 +525,9 @@ fn resolved_for_inspection(ws: &Workspace, offline: bool) -> Result<rune_resolve
 }
 
 pub fn tree(args: TreeArgs) -> Result<()> {
+    if args.exec_surface {
+        return crate::cmd_surface::exec_surface(&args);
+    }
     let (ws, offline) = load(&args.manifest)?;
     let resolved = resolved_for_inspection(&ws, offline)?;
     let selected = ws.select(&args.package, args.workspace, &[])?;

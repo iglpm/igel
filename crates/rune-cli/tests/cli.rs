@@ -4592,3 +4592,180 @@ fn a_dependency_used_only_under_another_cfg_is_reported_but_never_removed() {
         "must be kept"
     );
 }
+
+// ---------------------------------------------------------------------------
+// sbom
+// ---------------------------------------------------------------------------
+
+#[cfg(unix)]
+#[test]
+fn sbom_lists_what_ships_with_checksums_purls_and_edges() {
+    let reg = local_registry(&[
+        ("a", "1.0.0", &[("b", "1")]),
+        ("b", "1.1.0", &[]),
+        ("t", "0.5.0", &[]),
+    ]);
+    let p = app_with(
+        &reg,
+        "a = \"1\"\nhelper = { path = \"helper\" }\n[dev-dependencies]\nt = \"0.5\"\n",
+    );
+    p.write(
+        "helper/Cargo.toml",
+        "[package]\nname = \"helper\"\nversion = \"0.2.0\"\nedition = \"2021\"\nlicense = \"MIT\"\n",
+    );
+    p.write("helper/src/lib.rs", "");
+    let manifest = p.read("Cargo.toml").replace(
+        "edition = \"2021\"",
+        "edition = \"2021\"\nlicense = \"Apache-2.0\"\ndescription = \"demo\"",
+    );
+    p.write("Cargo.toml", &manifest);
+
+    let out = p.rune(&["sbom"]);
+    assert!(out.status.success(), "{}", text(&out));
+    let bom: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(bom["bomFormat"], "CycloneDX");
+    assert_eq!(bom["metadata"]["component"]["purl"], "pkg:cargo/app@0.1.0");
+    assert_eq!(
+        bom["metadata"]["component"]["licenses"][0]["expression"],
+        "Apache-2.0"
+    );
+    let names: Vec<&str> = bom["components"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names.len(), 3, "{names:?}");
+    for n in ["a", "b", "helper"] {
+        assert!(names.contains(&n), "{names:?}");
+    }
+    let a = bom["components"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["name"] == "a")
+        .unwrap();
+    assert_eq!(a["purl"], "pkg:cargo/a@1.0.0");
+    assert_eq!(a["hashes"][0]["alg"], "SHA-256");
+    let lock = p.read("Cargo.lock");
+    assert!(lock.contains(a["hashes"][0]["content"].as_str().unwrap()));
+    let edges_of_a = bom["dependencies"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["ref"] == "pkg:cargo/a@1.0.0")
+        .unwrap();
+    assert_eq!(edges_of_a["dependsOn"][0], "pkg:cargo/b@1.1.0");
+
+    // Development dependencies on request.
+    let with_dev: serde_json::Value =
+        serde_json::from_slice(&p.rune(&["sbom", "--dev"]).stdout).unwrap();
+    assert_eq!(with_dev["components"].as_array().unwrap().len(), 4);
+
+    // SPDX, to a file.
+    p.ok(&["sbom", "--format", "spdx", "-o", "bom.spdx.json"]);
+    let spdx: serde_json::Value = serde_json::from_str(&p.read("bom.spdx.json")).unwrap();
+    assert_eq!(spdx["spdxVersion"], "SPDX-2.3");
+    let rel = spdx["relationships"].as_array().unwrap();
+    assert!(rel.iter().any(|r| r["relationshipType"] == "DESCRIBES"
+        && r["relatedSpdxElement"] == "SPDXRef-Package-app-0.1.0"));
+    assert!(
+        rel.iter()
+            .any(|r| r["spdxElementId"] == "SPDXRef-Package-a-1.0.0"
+                && r["relatedSpdxElement"] == "SPDXRef-Package-b-1.1.0")
+    );
+}
+
+#[test]
+fn exec_surface_lists_build_scripts_and_proc_macros_with_their_chain() {
+    let p = Project::new();
+    p.write(
+        "Cargo.toml",
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\
+         [dependencies]\nmid = { path = \"mid\" }\n",
+    );
+    p.write("src/lib.rs", "pub use mid::*;\n");
+    p.write(
+        "mid/Cargo.toml",
+        "[package]\nname = \"mid\"\nversion = \"0.1.0\"\nedition = \"2021\"\nlinks = \"midnative\"\n\
+         [dependencies]\nmacros = { path = \"../macros\" }\n",
+    );
+    p.write("mid/build.rs", "fn main() {}\n");
+    p.write("mid/src/lib.rs", "pub use macros::*;\n");
+    p.write(
+        "macros/Cargo.toml",
+        "[package]\nname = \"macros\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[lib]\nproc-macro = true\n",
+    );
+    p.write("macros/src/lib.rs", "");
+    let human = p.ok(&["tree", "--exec-surface"]);
+    assert!(human.contains("2 of 3 packages run code"), "{human}");
+    let json = p.rune(&["tree", "--exec-surface", "--format", "json"]);
+    let items: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    let by_name = |n: &str| {
+        items
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["name"] == n)
+            .cloned()
+            .unwrap_or_else(|| panic!("{n} missing: {items}"))
+    };
+    let mid = by_name("mid");
+    assert_eq!(mid["runs"], serde_json::json!(["build-script", "links"]));
+    assert_eq!(mid["links"], "midnative");
+    assert_eq!(mid["via"], serde_json::json!(["app", "mid"]));
+    let macros = by_name("macros");
+    assert_eq!(macros["runs"], serde_json::json!(["proc-macro"]));
+    assert_eq!(macros["via"], serde_json::json!(["app", "mid", "macros"]));
+}
+
+/// Sets `pubtime` of one release in a local registry's index.
+#[cfg(unix)]
+fn published(reg: &tempfile::TempDir, name: &str, version: &str, when: &str) {
+    let path = reg.path().join("index/1").join(name);
+    let text = std::fs::read_to_string(&path).unwrap().replace(
+        &format!("\"vers\":\"{version}\""),
+        &format!("\"vers\":\"{version}\",\"pubtime\":\"{when}\""),
+    );
+    std::fs::write(path, text).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn a_minimum_release_age_keeps_brand_new_releases_out_until_they_mature() {
+    let reg = local_registry(&[
+        ("a", "1.0.0", &[]),
+        ("a", "1.1.0", &[]),
+        ("b", "2.0.0", &[]),
+    ]);
+    published(&reg, "a", "1.0.0", "2020-01-01T00:00:00Z");
+    published(&reg, "a", "1.1.0", "2099-01-01T00:00:00Z");
+    published(&reg, "b", "2.0.0", "2099-01-01T00:00:00Z");
+    let p = app_with(&reg, "a = \"1\"\nb = \"2\"\n");
+    let with_age = |args: &[&str]| {
+        let out = Command::new(env!("CARGO_BIN_EXE_rune"))
+            .args(args)
+            .current_dir(p.path())
+            .env("RUNE_HOME", p.home())
+            .env("RUNE_RESOLVE_MIN_RELEASE_AGE", "7d")
+            .env("NO_COLOR", "1")
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{}", text(&out));
+        text(&out)
+    };
+    let out = with_age(&["generate-lockfile"]);
+    // `a` has a mature release; `b` has none, so the young one is taken with
+    // a warning rather than failing the resolution.
+    assert_eq!(locked(&p), ["a 1.0.0", "app 0.1.0", "b 2.0.0"]);
+    assert!(
+        out.contains("younger than resolve.min-release-age"),
+        "{out}"
+    );
+    // Without the setting, the newest wins.
+    p.ok(&["update"]);
+    assert_eq!(locked(&p), ["a 1.1.0", "app 0.1.0", "b 2.0.0"]);
+    // A locked young version stays locked when the setting comes back.
+    with_age(&["build"]);
+    assert_eq!(locked(&p), ["a 1.1.0", "app 0.1.0", "b 2.0.0"]);
+}
