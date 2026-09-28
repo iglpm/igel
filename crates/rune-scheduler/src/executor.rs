@@ -3064,6 +3064,14 @@ fn identity_with(
         hb.update("environment", b"=");
         hb.update("environment", v.as_bytes());
     }
+    for (k, v) in inputs::apple_environment(compiled_for(unit)) {
+        if unit.ext.env.iter().all(|(set, _)| set != k) {
+            hb.update("environment", b"\0apple-env=");
+            hb.update("environment", k.as_bytes());
+            hb.update("environment", b"=");
+            hb.update("environment", v.as_bytes());
+        }
+    }
     // How the build script is compiled and what it links against is part of
     // what the package produces.
     if let Some(p) = &unit.ext.script_profile

@@ -370,6 +370,34 @@ pub fn reads_manifest(dep_info: &Path, manifest: &Path) -> bool {
         })
 }
 
+/// Variables that change what rustc emits for an Apple target without rustc
+/// listing them in its dep-info: the minimum OS version written into every
+/// object file, and the SDK binaries are linked against.
+const APPLE_ENVIRONMENT: [&str; 6] = [
+    "MACOSX_DEPLOYMENT_TARGET",
+    "IPHONEOS_DEPLOYMENT_TARGET",
+    "TVOS_DEPLOYMENT_TARGET",
+    "WATCHOS_DEPLOYMENT_TARGET",
+    "XROS_DEPLOYMENT_TARGET",
+    "SDKROOT",
+];
+
+/// The [`APPLE_ENVIRONMENT`] variables that are set, for a unit compiled for
+/// `triple`; nothing for other targets, or when none is set (so keys do not
+/// change where they don't matter).
+pub fn apple_environment(triple: &str) -> &'static [(&'static str, String)] {
+    static SET: OnceLock<Vec<(&'static str, String)>> = OnceLock::new();
+    if !triple.contains("-apple-") {
+        return &[];
+    }
+    SET.get_or_init(|| {
+        APPLE_ENVIRONMENT
+            .iter()
+            .filter_map(|k| Some((*k, std::env::var(k).ok()?)))
+            .collect()
+    })
+}
+
 /// The C toolchain a build script may drive, as one string: the compiler
 /// (`$CC`, else `cc`) and archiver, by path, size, mtime and `--version`.
 /// Cached for the process. It only enters keys of units *with* build scripts;
@@ -396,8 +424,58 @@ pub fn native_tools_identity() -> &'static str {
             out.push_str(&version);
             out.push('\n');
         }
+        if cfg!(target_os = "macos") {
+            let developer_dir = std::env::var_os("DEVELOPER_DIR")
+                .map(PathBuf::from)
+                .or_else(|| std::fs::read_link("/var/db/xcode_select_link").ok())
+                .unwrap_or_else(|| PathBuf::from("/Library/Developer/CommandLineTools"));
+            let sdkroot = std::env::var_os("SDKROOT").map(PathBuf::from);
+            out.push_str(&apple_developer_identity(
+                &developer_dir,
+                sdkroot.as_deref(),
+            ));
+        }
         out
     })
+}
+
+/// On macOS, `/usr/bin/cc` is a shim into the active developer directory
+/// (Command Line Tools or Xcode, `xcode-select`): updating those changes the
+/// compiler and the SDK without changing the shim. So the real `clang` and
+/// the SDK are fingerprinted too — by path, size and mtime, without starting
+/// `xcrun` (which would cost every build tens of milliseconds).
+fn apple_developer_identity(developer_dir: &Path, sdkroot: Option<&Path>) -> String {
+    let canonical = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let mut out = format!("DEVELOPER_DIR={}\n", canonical(developer_dir).display());
+    for clang in [
+        "usr/bin/clang",
+        "Toolchains/XcodeDefault.xctoolchain/usr/bin/clang",
+    ] {
+        let path = developer_dir.join(clang);
+        if path.is_file() {
+            out.push_str(&format!(
+                "clang={}\n",
+                rune_common::toolchain::program_fingerprint(&path)
+            ));
+        }
+    }
+    let sdks = match sdkroot {
+        Some(sdk) => vec![sdk.to_path_buf()],
+        None => vec![
+            developer_dir.join("SDKs/MacOSX.sdk"),
+            developer_dir.join("Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk"),
+        ],
+    };
+    for sdk in sdks.iter().filter(|s| s.exists()) {
+        // `MacOSX.sdk` is a link to the versioned SDK (`MacOSX26.1.sdk`).
+        let settings = sdk.join("SDKSettings.json");
+        out.push_str(&format!(
+            "sdk={}|{}\n",
+            canonical(sdk).display(),
+            rune_common::toolchain::program_fingerprint(&settings)
+        ));
+    }
+    out
 }
 
 #[cfg(test)]
@@ -440,6 +518,43 @@ mod tests {
             script_result_key("base", None, || "package v1".into()),
             script_result_key("base", None, || "package v2".into())
         );
+    }
+
+    #[test]
+    fn apple_developer_tools_are_identified_by_the_real_compiler_and_sdk() {
+        let dev = tempfile::tempdir().unwrap();
+        let clang = dev.path().join("usr/bin/clang");
+        let sdk = dev.path().join("SDKs/MacOSX26.0.sdk");
+        std::fs::create_dir_all(clang.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&sdk).unwrap();
+        std::fs::write(&clang, "clang 17").unwrap();
+        std::fs::write(sdk.join("SDKSettings.json"), "{}").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&sdk, dev.path().join("SDKs/MacOSX.sdk")).unwrap();
+        #[cfg(not(unix))]
+        std::fs::create_dir_all(dev.path().join("SDKs/MacOSX.sdk")).unwrap();
+
+        let before = apple_developer_identity(dev.path(), None);
+        assert!(before.contains("clang="), "{before}");
+        assert!(before.contains("sdk="), "{before}");
+        // An update to the command line tools: a new compiler binary.
+        std::fs::write(&clang, "clang 18, a longer binary").unwrap();
+        let after = apple_developer_identity(dev.path(), None);
+        assert_ne!(before, after);
+        // An explicit SDKROOT replaces the default SDK.
+        let other = dev.path().join("Other.sdk");
+        std::fs::create_dir_all(&other).unwrap();
+        let chosen = apple_developer_identity(dev.path(), Some(&other));
+        assert!(
+            chosen.contains("Other.sdk") && !chosen.contains("MacOSX"),
+            "{chosen}"
+        );
+    }
+
+    #[test]
+    fn apple_environment_only_applies_to_apple_targets() {
+        assert!(apple_environment("x86_64-unknown-linux-gnu").is_empty());
+        assert!(apple_environment("wasm32-unknown-unknown").is_empty());
     }
 
     #[test]
