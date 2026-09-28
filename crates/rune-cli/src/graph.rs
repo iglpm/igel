@@ -147,6 +147,9 @@ pub struct DocTest {
     pub externs: Vec<(String, NodeId)>,
     pub features: Vec<String>,
     pub edition: Edition,
+    /// The library is a proc-macro crate (its examples use it through its
+    /// compiled plugin, as Cargo's doc tests do).
+    pub proc_macro: bool,
 }
 
 /// The planned build.
@@ -2360,7 +2363,6 @@ pub fn plan(ws: &Workspace, req: &Request) -> Result<Plan> {
             && let (Some(lib), Some(&lib_node)) =
                 (&member.manifest.lib, planner.lib_node.get(&(li, false)))
             && lib.doctest
-            && !lib.proc_macro
         {
             let mut externs = match harness_lib_externs.take() {
                 Some(e) => e,
@@ -2385,6 +2387,7 @@ pub fn plan(ws: &Workspace, req: &Request) -> Result<Plan> {
                 externs,
                 features: active.clone(),
                 edition: member.edition,
+                proc_macro: lib.proc_macro,
             });
         }
     }

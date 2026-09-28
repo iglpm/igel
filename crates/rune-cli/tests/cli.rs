@@ -5574,3 +5574,28 @@ fn a_workspace_crate_does_not_stand_in_for_its_published_release() {
     assert!(lock.contains("\"core_lib 1.0.0\""), "{lock}");
     p.ok(&["test"]);
 }
+
+#[test]
+fn a_proc_macro_crates_doc_tests_run_like_cargo() {
+    let p = Project::new();
+    p.write(
+        "Cargo.toml",
+        "[package]\nname = \"pm\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[lib]\nproc-macro = true\n",
+    );
+    p.write(
+        "src/lib.rs",
+        r#"//! ```
+//! pm::make_answer!();
+//! assert_eq!(answer(), 42);
+//! ```
+use proc_macro::TokenStream;
+
+#[proc_macro]
+pub fn make_answer(_: TokenStream) -> TokenStream {
+    "fn answer() -> u32 { 42 }".parse().unwrap()
+}
+"#,
+    );
+    let out = p.ok(&["test"]);
+    assert!(out.contains("(doc-tests) · 1 passed"), "{out}");
+}

@@ -1133,6 +1133,11 @@ fn run_doctest(
         .arg(&doc.crate_name)
         .arg("--edition")
         .arg(doc.edition.as_str())
+        .args(if doc.proc_macro {
+            &["--crate-type", "proc-macro", "--extern", "proc_macro"][..]
+        } else {
+            &[][..]
+        })
         .arg("-L")
         .arg(format!("dependency={}", deps_dir.display()));
     if let Some(target) = &sess.target {
