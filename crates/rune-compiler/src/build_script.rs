@@ -461,7 +461,7 @@ impl BuildScriptRunner {
             "rerun-if-env-changed" => output.rerun_if_env_changed.push(value.to_string()),
             "warning" => {
                 output.warnings.push(value.to_string());
-                warn!("Build script warning: {}", value);
+                debug!("build script warning: {}", value);
             }
             "error" if modern => output.errors.push(value.to_string()),
             "metadata" if modern => {
