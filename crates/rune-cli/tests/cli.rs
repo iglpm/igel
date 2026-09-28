@@ -4769,3 +4769,84 @@ fn a_minimum_release_age_keeps_brand_new_releases_out_until_they_mature() {
     with_age(&["build"]);
     assert_eq!(locked(&p), ["a 1.1.0", "app 0.1.0", "b 2.0.0"]);
 }
+
+// ---------------------------------------------------------------------------
+// test runner: retries, flaky tests, JUnit
+// ---------------------------------------------------------------------------
+
+#[test]
+fn retries_mark_flaky_tests_and_junit_reports_every_test() {
+    let p = Project::new();
+    p.write("Cargo.toml", LIB_MANIFEST);
+    let lib = r#"pub fn one() -> u32 { 1 }
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn flaky() {
+        let marker = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("first-run-done");
+        if !marker.exists() {
+            std::fs::write(&marker, "").unwrap();
+            panic!("fails the first time only");
+        }
+    }
+    #[test]
+    fn solid() { assert_eq!(super::one(), 1); }
+    #[test]
+    fn broken() { assert_eq!(super::one(), 2, "never passes"); }
+    #[test]
+    #[ignore]
+    fn skipped() {}
+}
+"#;
+    p.write("src/lib.rs", lib);
+    let out = p.rune(&["test", "--retries", "2", "--junit", "report.xml"]);
+    let msg = text(&out);
+    assert_eq!(out.status.code(), Some(101), "`broken` still fails:\n{msg}");
+    assert!(
+        msg.contains("flaky test(s)") && msg.contains("tests::flaky"),
+        "{msg}"
+    );
+
+    let xml = p.read("report.xml");
+    assert!(xml.contains("tests=\"4\" failures=\"1\""), "{xml}");
+    assert!(
+        xml.contains("name=\"flaky\">\n      <system-out>flaky:"),
+        "{xml}"
+    );
+    assert!(xml.contains("name=\"broken\">\n      <failure"), "{xml}");
+    assert!(xml.contains("never passes"), "{xml}");
+    assert!(xml.contains("name=\"skipped\">\n      <skipped/>"), "{xml}");
+    assert!(xml.contains("name=\"solid\"/>"), "{xml}");
+
+    // With the real failure gone, a flaky failure alone does not fail the run.
+    std::fs::remove_file(p.path().join("first-run-done")).unwrap();
+    p.write(
+        "src/lib.rs",
+        &lib.replace("super::one(), 2", "super::one(), 1"),
+    );
+    let out = p.rune(&["test", "--retries", "1"]);
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(text(&out).contains("flaky test(s)"), "{}", text(&out));
+    // Without retries, it fails as before.
+    std::fs::remove_file(p.path().join("first-run-done")).unwrap();
+    assert_eq!(p.rune(&["test"]).status.code(), Some(101));
+}
+
+#[test]
+fn test_results_are_json_lines_with_message_format_json() {
+    let p = lib_project();
+    let out = p.rune(&["test", "--message-format", "json"]);
+    assert!(out.status.success(), "{}", text(&out));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let lines: Vec<serde_json::Value> = stdout
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap_or_else(|e| panic!("not JSON ({e}): {l}")))
+        .collect();
+    let suite = lines
+        .iter()
+        .find(|l| l["reason"] == "test-suite-finished")
+        .expect("a test-suite-finished line");
+    assert_eq!(suite["outcome"], "passed");
+    assert_eq!(suite["tests"][0]["name"], "tests::adds");
+    assert_eq!(suite["tests"][0]["status"], "passed");
+}

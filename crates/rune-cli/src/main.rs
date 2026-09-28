@@ -23,6 +23,7 @@ mod messages;
 mod script;
 mod session;
 mod test_cache;
+mod test_report;
 mod ui;
 mod workspace;
 

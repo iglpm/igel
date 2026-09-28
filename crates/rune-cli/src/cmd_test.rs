@@ -54,6 +54,8 @@ struct TestResult {
     counts: Counts,
     output: String,
     took: Duration,
+    /// Tests that failed and then passed when run again (`--retries`).
+    flaky: Vec<String>,
 }
 
 #[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
@@ -203,6 +205,8 @@ pub fn run(args: TestArgs, mode: Mode) -> Result<()> {
     let (res_tx, res_rx) = unbounded::<TestResult>();
 
     let mut counts_total = Counts::default();
+    let mut report_suites: Vec<crate::test_report::Suite> = Vec::new();
+    let mut flaky_tests: Vec<String> = Vec::new();
     let mut failed_labels: Vec<String> = Vec::new();
     let mut built_ok = true;
     let mut binaries_run = 0usize;
@@ -256,6 +260,7 @@ pub fn run(args: TestArgs, mode: Mode) -> Result<()> {
                             counts: Counts::default(),
                             output: String::new(),
                             took: Duration::ZERO,
+                            flaky: Vec::new(),
                         });
                         continue;
                     }
@@ -316,6 +321,7 @@ pub fn run(args: TestArgs, mode: Mode) -> Result<()> {
                                         },
                                         output: rec.output,
                                         took: Duration::ZERO,
+                                        flaky: Vec::new(),
                                     });
                                     continue;
                                 }
@@ -339,7 +345,7 @@ pub fn run(args: TestArgs, mode: Mode) -> Result<()> {
                                         String::from_utf8_lossy(&out.stdout).into_owned();
                                     text.push_str(&String::from_utf8_lossy(&out.stderr));
                                     let counts = parse_counts(&text);
-                                    TestResult {
+                                    let mut result = TestResult {
                                         order,
                                         outcome: if out.status.success() {
                                             Outcome::Passed
@@ -349,7 +355,30 @@ pub fn run(args: TestArgs, mode: Mode) -> Result<()> {
                                         counts,
                                         output: text,
                                         took: t.elapsed(),
+                                        flaky: Vec::new(),
+                                    };
+                                    if harness && args_ref.retries > 0 {
+                                        retry_failed(&mut result, args_ref.retries, |names| {
+                                            let mut again = sess.command_for(&exe);
+                                            again.arg("--exact").args(names);
+                                            if let Some(n) = args_ref.test_threads {
+                                                again.arg("--test-threads").arg(n.to_string());
+                                            }
+                                            again
+                                                .args(&args_ref.test_args)
+                                                .current_dir(&member.dir)
+                                                .env("CARGO_TARGET_TMPDIR", &tmp)
+                                                .stdin(Stdio::null());
+                                            apply_run_env(&mut again, member, sess);
+                                            let out = again.output().ok()?;
+                                            let mut text =
+                                                String::from_utf8_lossy(&out.stdout).into_owned();
+                                            text.push_str(&String::from_utf8_lossy(&out.stderr));
+                                            Some(text)
+                                        });
+                                        result.took = t.elapsed();
                                     }
+                                    result
                                 }
                                 Err(e) => TestResult {
                                     order,
@@ -357,6 +386,7 @@ pub fn run(args: TestArgs, mode: Mode) -> Result<()> {
                                     counts: Counts::default(),
                                     output: format!("failed to execute test binary: {e}"),
                                     took: t.elapsed(),
+                                    flaky: Vec::new(),
                                 },
                             }
                         }
@@ -387,28 +417,60 @@ pub fn run(args: TestArgs, mode: Mode) -> Result<()> {
         let printer = {
             let res_rx = res_rx.clone();
             let labels = &labels;
+            let json = sess.json;
             scope.spawn(move || {
                 let mut pending: BTreeMap<usize, TestResult> = BTreeMap::new();
                 let mut next = 0usize;
                 let mut counts = Counts::default();
                 let mut failed: Vec<String> = Vec::new();
                 let mut ran = 0usize;
+                let mut suites: Vec<crate::test_report::Suite> = Vec::new();
+                let mut flaky: Vec<String> = Vec::new();
                 while next < total_slots {
                     let Ok(r) = res_rx.recv() else { break };
                     pending.insert(r.order, r);
                     while let Some(r) = pending.remove(&next) {
-                        print_result(&labels[next], &r, verbose);
+                        if !json {
+                            print_result(&labels[next], &r, verbose);
+                        }
                         if !matches!(r.outcome, Outcome::Skipped) {
                             ran += 1;
+                            let suite = suite_of(&labels[next], &r);
+                            if json {
+                                // One line per binary, after the build's
+                                // compiler messages, for tools.
+                                println!(
+                                    "{}",
+                                    serde_json::json!({
+                                        "reason": "test-suite-finished",
+                                        "suite": suite.name,
+                                        "outcome": match r.outcome {
+                                            Outcome::Passed => "passed",
+                                            Outcome::Cached => "cached",
+                                            Outcome::Failed => "failed",
+                                            Outcome::CompileFailed => "not-built",
+                                            Outcome::Skipped => "skipped",
+                                        },
+                                        "seconds": suite.seconds,
+                                        "passed": r.counts.passed,
+                                        "failed": r.counts.failed,
+                                        "ignored": r.counts.ignored,
+                                        "tests": suite.cases,
+                                        "error": suite.error,
+                                    })
+                                );
+                            }
+                            suites.push(suite);
                         }
                         counts.add(r.counts);
                         if matches!(r.outcome, Outcome::Failed | Outcome::CompileFailed) {
                             failed.push(labels[next].clone());
                         }
+                        flaky.extend(r.flaky.iter().map(|t| format!("{t} ({})", labels[next])));
                         next += 1;
                     }
                 }
-                (counts, failed, ran)
+                (counts, failed, ran, suites, flaky)
             })
         };
 
@@ -437,6 +499,7 @@ pub fn run(args: TestArgs, mode: Mode) -> Result<()> {
                         counts: Counts::default(),
                         output: String::new(),
                         took: Duration::ZERO,
+                        flaky: Vec::new(),
                     });
                 }
                 None => {
@@ -446,6 +509,7 @@ pub fn run(args: TestArgs, mode: Mode) -> Result<()> {
                         counts: Counts::default(),
                         output: "the build produced no executable".into(),
                         took: Duration::ZERO,
+                        flaky: Vec::new(),
                     });
                 }
             }
@@ -470,6 +534,7 @@ pub fn run(args: TestArgs, mode: Mode) -> Result<()> {
                     counts: Counts::default(),
                     output: String::new(),
                     took: Duration::ZERO,
+                    flaky: Vec::new(),
                 });
             }
         }
@@ -540,6 +605,7 @@ pub fn run(args: TestArgs, mode: Mode) -> Result<()> {
                         counts: Counts::default(),
                         output: "failed to compile (see the errors above)".into(),
                         took: Duration::ZERO,
+                        flaky: Vec::new(),
                     });
                 }
             }
@@ -555,6 +621,7 @@ pub fn run(args: TestArgs, mode: Mode) -> Result<()> {
                     counts: Counts::default(),
                     output: "not built because a dependency failed to compile".into(),
                     took: Duration::ZERO,
+                    flaky: Vec::new(),
                 });
             }
         }
@@ -569,18 +636,21 @@ pub fn run(args: TestArgs, mode: Mode) -> Result<()> {
                     counts: Counts::default(),
                     output: String::new(),
                     took: Duration::ZERO,
+                    flaky: Vec::new(),
                 });
             }
         }
         drop(job_tx);
         drop(res_tx);
 
-        let (counts, failed, ran) = printer
+        let (counts, failed, ran, suites, flaky) = printer
             .join()
             .map_err(|_| anyhow::anyhow!("printer panicked"))?;
         counts_total = counts;
         failed_labels = failed;
         binaries_run = ran;
+        report_suites = suites;
+        flaky_tests = flaky;
         built_ok = build.success;
         Ok(build)
     })?;
@@ -591,6 +661,32 @@ pub fn run(args: TestArgs, mode: Mode) -> Result<()> {
     }
 
     let elapsed = start.elapsed().as_secs_f64();
+    if let Some(path) = &args.junit {
+        std::fs::write(path, crate::test_report::junit(&report_suites))
+            .map_err(|e| anyhow::anyhow!("cannot write {}: {e}", path.display()))?;
+    }
+    if !flaky_tests.is_empty() {
+        ui::warn(format!(
+            "{} flaky test(s) failed, then passed when run again: {}",
+            flaky_tests.len(),
+            flaky_tests.join(", ")
+        ));
+    }
+    // Where the time went, when there was time to spend.
+    let mut slowest: Vec<&crate::test_report::Suite> =
+        report_suites.iter().filter(|s| s.seconds > 0.0).collect();
+    slowest.sort_by(|a, b| b.seconds.total_cmp(&a.seconds));
+    if elapsed >= 5.0 && slowest.len() > 1 && !args.common.quiet {
+        ui::hint(format!(
+            "slowest: {}",
+            slowest
+                .iter()
+                .take(3)
+                .map(|s| format!("{} ({:.1}s)", s.name, s.seconds))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
     if !failed_labels.is_empty() {
         eprintln!();
         ui::error(format!(
@@ -701,6 +797,98 @@ fn find_executable(
         unit.metadata_hash()
     )));
     guess.exists().then_some(guess)
+}
+
+/// Runs the failed tests of a failed binary again, by exact name, up to
+/// `retries` times (`rerun` returns what a run printed). A test that passes
+/// on a later attempt is flaky; when every failure turns out flaky, the
+/// binary passed. A binary that failed without a failing test (a crash) is
+/// not retried.
+fn retry_failed(
+    result: &mut TestResult,
+    retries: u32,
+    rerun: impl Fn(&[String]) -> Option<String>,
+) {
+    use crate::test_report::{Status, parse_cases};
+    if !matches!(result.outcome, Outcome::Failed) {
+        return;
+    }
+    let mut failing: Vec<String> = parse_cases(&result.output)
+        .into_iter()
+        .filter(|c| c.status == Status::Failed)
+        .map(|c| c.name)
+        .collect();
+    if failing.is_empty() {
+        return;
+    }
+    let first_failures = failing.len() as u64;
+    for attempt in 1..=retries {
+        let Some(text) = rerun(&failing) else { break };
+        let cases = parse_cases(&text);
+        let still: Vec<String> = failing
+            .iter()
+            .filter(|n| {
+                !cases
+                    .iter()
+                    .any(|c| &c.name == *n && c.status == Status::Passed)
+            })
+            .cloned()
+            .collect();
+        result
+            .flaky
+            .extend(failing.iter().filter(|n| !still.contains(n)).cloned());
+        result.output.push_str(&format!(
+            "\n--- retry {attempt}: {} failed test(s) run again ---\n{text}",
+            failing.len()
+        ));
+        failing = still;
+        if failing.is_empty() {
+            break;
+        }
+    }
+    let recovered = first_failures - failing.len() as u64;
+    result.counts.failed = failing.len() as u64;
+    result.counts.passed += recovered;
+    if failing.is_empty() {
+        result.outcome = Outcome::Passed;
+    }
+}
+
+/// A binary's result for reports: its tests (the last run of each counts,
+/// so a flaky test shows as passed) or, when it could not run, an error.
+fn suite_of(label: &str, r: &TestResult) -> crate::test_report::Suite {
+    let mut cases: Vec<crate::test_report::Case> = Vec::new();
+    for c in crate::test_report::parse_cases(&r.output) {
+        match cases.iter_mut().find(|k| k.name == c.name) {
+            Some(k) => {
+                k.status = c.status;
+                if !c.output.is_empty() {
+                    k.output = c.output;
+                }
+            }
+            None => cases.push(c),
+        }
+    }
+    for c in cases.iter_mut() {
+        c.flaky = r.flaky.contains(&c.name);
+    }
+    let error = match r.outcome {
+        Outcome::CompileFailed => Some(r.output.clone()),
+        Outcome::Failed
+            if !cases
+                .iter()
+                .any(|c| c.status == crate::test_report::Status::Failed) =>
+        {
+            Some(r.output.clone())
+        }
+        _ => None,
+    };
+    crate::test_report::Suite {
+        name: label.to_string(),
+        seconds: r.took.as_secs_f64(),
+        error,
+        cases,
+    }
 }
 
 fn print_result(label: &str, r: &TestResult, verbose: bool) {
@@ -914,6 +1102,7 @@ fn run_doctest(
                 counts,
                 output: text,
                 took: start.elapsed(),
+                flaky: Vec::new(),
             }
         }
         Err(e) => TestResult {
@@ -922,6 +1111,7 @@ fn run_doctest(
             counts: Counts::default(),
             output: format!("failed to run `{}`: {e}", rustdoc.display()),
             took: start.elapsed(),
+            flaky: Vec::new(),
         },
     }
 }

@@ -331,6 +331,15 @@ pub struct TestArgs {
     /// Arguments passed to the test binaries (after `--`)
     #[arg(last = true, value_name = "ARGS")]
     pub test_args: Vec<String>,
+
+    /// Run a failed test binary's failed tests again, up to N times; a test
+    /// that then passes is reported as flaky instead of failing the run
+    #[arg(long, value_name = "N", default_value_t = 0)]
+    pub retries: u32,
+
+    /// Also write the results as JUnit XML (for CI test reports)
+    #[arg(long, value_name = "PATH")]
+    pub junit: Option<PathBuf>,
 }
 
 #[derive(Args, Debug, Clone)]
