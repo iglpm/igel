@@ -1160,6 +1160,7 @@ dependencies = [
  "reqwest",
  "rune-common",
  "rune-fingerprint",
+ "same-file",
  "serde",
  "serde_json",
  "tempfile",

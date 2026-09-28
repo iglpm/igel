@@ -342,12 +342,24 @@ fn merge(higher: &mut Table, lower: Table) {
 }
 
 fn is_relative_path(p: &str) -> bool {
-    !Path::new(p).is_absolute() && p.contains('/')
+    !Path::new(p).is_absolute() && (p.contains('/') || p.contains('\\'))
+}
+
+fn join_path(base: &Path, p: &str) -> String {
+    let joined = base.join(p).to_string_lossy().into_owned();
+    #[cfg(windows)]
+    {
+        joined.replace('\\', "/")
+    }
+    #[cfg(not(windows))]
+    {
+        joined
+    }
 }
 
 fn abs(p: &str, base: &Path) -> String {
     if is_relative_path(p) {
-        base.join(p).to_string_lossy().into_owned()
+        join_path(base, p)
     } else {
         p.to_string()
     }
@@ -402,7 +414,7 @@ fn absolutize(root: &mut Table, base: &Path) {
                 if let Some(Value::String(s)) = t.get_mut(key) {
                     // Always config-relative, slash or not.
                     if !Path::new(s.as_str()).is_absolute() {
-                        *s = base.join(&*s).to_string_lossy().into_owned();
+                        *s = join_path(base, s);
                     }
                 }
             }
@@ -419,6 +431,7 @@ fn absolutize(root: &mut Table, base: &Path) {
                 {
                     *s = base.join(&*s).to_string_lossy().into_owned();
                 }
+                }
             }
         }
     }
@@ -430,6 +443,7 @@ fn absolutize(root: &mut Table, base: &Path) {
             {
                 *s = base.join(&*s).to_string_lossy().into_owned();
             }
+            }
         }
     }
     // [env] entries with `relative = true`
@@ -440,6 +454,7 @@ fn absolutize(root: &mut Table, base: &Path) {
                 && let Some(Value::String(s)) = t.get_mut("value")
             {
                 *s = base.join(&*s).to_string_lossy().into_owned();
+            }
             }
         }
     }

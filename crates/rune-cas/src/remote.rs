@@ -905,9 +905,10 @@ mod tests {
     #[test]
     fn a_missing_or_unreachable_remote_is_just_a_miss() {
         let l = tempdir().unwrap();
+        let dead = tempfile::NamedTempFile::new().unwrap();
         let store = CasStore::new(l.path().to_path_buf())
             .unwrap()
-            .with_remote(PathBuf::from("/definitely/not/mounted"), true);
+            .with_remote(dead.path().join("not/mounted"), true);
         assert!(store.get("nokey").is_none());
         let (_d, lib) = artifact("libfoo-abc.rlib", "x");
         store.put("nokey", "foo", "1.0.0", &[lib]).unwrap(); // still stores locally
@@ -934,10 +935,12 @@ mod tests {
         p.a.flush_remote();
         let dir = p.remote.join("objects").join("ke").join("keybad");
         let file = dir.join("libfoo-abc.rlib");
-        let mut perms = fs::metadata(&file).unwrap().permissions();
-        #[allow(clippy::permissions_set_readonly_false)]
-        perms.set_readonly(false);
-        fs::set_permissions(&file, perms).unwrap();
+        {
+            let mut perms = fs::metadata(&file).unwrap().permissions();
+            #[allow(clippy::permissions_set_readonly_false)]
+            perms.set_readonly(false);
+            fs::set_permissions(&file, perms).unwrap();
+        }
         fs::write(&file, "truncated").unwrap();
         assert!(
             p.b.get("keybad").is_none(),
