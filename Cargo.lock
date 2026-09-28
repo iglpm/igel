@@ -885,15 +885,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
-name = "memmap2"
-version = "0.9.11"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d1219ed1b7f229ee7104d281dd01d6802fe28bb6e95d292942c4daacdeb798c0"
-dependencies = [
- "libc",
-]
-
-[[package]]
 name = "miniz_oxide"
 version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1183,7 +1174,6 @@ dependencies = [
  "filetime",
  "reqwest",
  "rune-common",
- "rune-fingerprint",
  "same-file",
  "serde",
  "serde_json",
@@ -1202,7 +1192,6 @@ dependencies = [
  "anyhow",
  "clap",
  "colored",
- "console",
  "crossbeam-channel",
  "flate2",
  "glob",
@@ -1212,7 +1201,6 @@ dependencies = [
  "rayon",
  "rune-cas",
  "rune-common",
- "rune-compiler",
  "rune-fingerprint",
  "rune-graph",
  "rune-manifest",
@@ -1228,6 +1216,7 @@ dependencies = [
  "toml_edit",
  "tracing",
  "tracing-subscriber",
+ "walkdir",
 ]
 
 [[package]]
@@ -1235,8 +1224,8 @@ name = "rune-common"
 version = "0.1.0"
 dependencies = [
  "blake3",
- "filetime",
  "home",
+ "libc",
  "rustix",
  "semver",
  "serde",
@@ -1245,7 +1234,6 @@ dependencies = [
  "thiserror",
  "toml",
  "toml_edit",
- "tracing",
  "xxhash-rust",
 ]
 
@@ -1253,12 +1241,9 @@ dependencies = [
 name = "rune-compiler"
 version = "0.1.0"
 dependencies = [
- "jobserver",
  "rune-common",
- "rune-manifest",
  "serde",
  "serde_json",
- "tempfile",
  "thiserror",
  "tracing",
 ]
@@ -1267,18 +1252,13 @@ dependencies = [
 name = "rune-fingerprint"
 version = "0.1.0"
 dependencies = [
- "blake3",
- "filetime",
- "memmap2",
  "rayon",
  "rune-common",
  "serde",
  "serde_json",
  "tempfile",
  "thiserror",
- "tracing",
  "walkdir",
- "xxhash-rust",
 ]
 
 [[package]]
@@ -1286,10 +1266,7 @@ name = "rune-graph"
 version = "0.1.0"
 dependencies = [
  "rune-common",
- "rune-manifest",
  "semver",
- "thiserror",
- "tracing",
 ]
 
 [[package]]
@@ -1300,12 +1277,9 @@ dependencies = [
  "rune-common",
  "semver",
  "serde",
- "serde_json",
  "tempfile",
  "thiserror",
  "toml",
- "toml_edit",
- "tracing",
 ]
 
 [[package]]
@@ -1318,7 +1292,6 @@ dependencies = [
  "rayon",
  "reqwest",
  "rune-common",
- "semver",
  "serde",
  "serde_json",
  "tar",
@@ -1340,7 +1313,6 @@ dependencies = [
  "rune-registry",
  "semver",
  "serde",
- "serde_json",
  "tempfile",
  "thiserror",
  "toml",
@@ -1360,12 +1332,10 @@ dependencies = [
  "rune-compiler",
  "rune-fingerprint",
  "rune-graph",
- "rune-manifest",
  "semver",
  "serde",
  "serde_json",
  "tempfile",
- "thiserror",
  "tracing",
  "walkdir",
 ]

@@ -8,19 +8,18 @@ rust-version.workspace = true
 
 [dependencies]
 thiserror.workspace = true
-tracing.workspace = true
 serde = { workspace = true }
 serde_json.workspace = true
 xxhash-rust.workspace = true
 blake3.workspace = true
 semver.workspace = true
 home.workspace = true
-filetime.workspace = true
 toml_edit.workspace = true
 toml.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 rustix.workspace = true
+libc.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

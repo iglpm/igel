@@ -44,7 +44,6 @@ crossbeam-channel = "0.5"
 # CLI & UI
 clap = { version = "4", features = ["derive"] }
 colored = "2"
-console = "0.15"
 
 # Logging & Diagnostics
 tracing = "0.1"
@@ -65,7 +64,6 @@ tempfile = "3"
 tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "fs", "io-util", "time"] }
 tokio-util = { version = "0.7", default-features = false, features = ["io"] }
 rustix = { version = "1", default-features = false, features = ["fs", "std"] }
-memmap2 = "0.9"
 walkdir = "2"
 libc = "0.2"
 same-file = "1.0"
