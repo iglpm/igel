@@ -94,6 +94,12 @@ pub fn summarize(sess: &Session, result: &rune_scheduler::executor::BuildResult)
     }
     parts.push(format!("{:.2}s", result.total_duration.as_secs_f64()));
     ui::summary(parts.join(" · "));
+    if !sess.json && result.memory_held.as_secs_f64() >= 1.0 {
+        ui::hint(format!(
+            "memory ran short, so fewer compilers ran at once for {:.0} s",
+            result.memory_held.as_secs_f64()
+        ));
+    }
     // A slow build that left most cores idle says why.
     if !sess.json
         && let Some(hint) = result.schedule.as_ref().and_then(|s| s.hint())

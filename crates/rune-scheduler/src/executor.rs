@@ -40,6 +40,8 @@ pub struct BuildResult {
     pub build_script_outputs: HashMap<NodeId, BuildScriptOutput>,
     /// How the build was scheduled, when anything was built.
     pub schedule: Option<ScheduleReport>,
+    /// How long starting more compilers was held back for lack of memory.
+    pub memory_held: Duration,
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -218,6 +220,8 @@ pub struct BuildExecutor {
     frontend_threads: rune_common::settings::FrontendThreads,
     /// Cores on this machine.
     cpus: usize,
+    /// Reads the machine's memory (replaceable in tests).
+    memory: fn() -> Option<rune_common::sysinfo::Memory>,
 }
 
 impl BuildExecutor {
@@ -237,7 +241,17 @@ impl BuildExecutor {
             jobserver: jobserver::Client::new(max_jobs.max(1)).ok(),
             frontend_threads: Default::default(),
             cpus: std::thread::available_parallelism().map_or(1, |n| n.get()),
+            memory: rune_common::sysinfo::memory,
         }
+    }
+
+    /// Replaces how the machine's memory is read (tests).
+    pub fn with_memory_probe(
+        mut self,
+        probe: fn() -> Option<rune_common::sysinfo::Memory>,
+    ) -> Self {
+        self.memory = probe;
+        self
     }
 
     /// Threads for rustc's parallel front end (nightly compilers only; see
@@ -560,6 +574,9 @@ impl BuildExecutor {
         // slot) blocks on it and hands it over.
         let mut lock_waiting: HashSet<NodeId> = HashSet::new();
         let mut job_threads: Vec<std::thread::JoinHandle<()>> = Vec::new();
+        // How long new work was held back because memory was short.
+        let mut memory_held = Duration::ZERO;
+        let mut memory_held_since: Option<Instant> = None;
 
         // Nodes still to schedule, in stable graph order.
         let mut unscheduled: Vec<NodeId> = graph
@@ -623,6 +640,19 @@ impl BuildExecutor {
                 for (index, (node_id, script_only)) in ready.into_iter().enumerate() {
                     if in_flight.len() >= self.max_jobs {
                         break;
+                    }
+                    // Short of memory: let what runs finish (it frees memory)
+                    // before starting more — a slower build instead of a
+                    // swapping machine or a compiler killed for lack of it.
+                    if !in_flight.is_empty() && (self.memory)().is_some_and(|m| m.is_short()) {
+                        if memory_held_since.is_none() {
+                            memory_held_since = Some(Instant::now());
+                            debug!("memory is short: holding back new compilations");
+                        }
+                        break;
+                    }
+                    if let Some(since) = memory_held_since.take() {
+                        memory_held += since.elapsed();
                     }
                     // Another `rune` process may be building this very unit into
                     // the same target directory (an editor's background check
@@ -849,6 +879,9 @@ impl BuildExecutor {
                 }
             }
         }
+        if let Some(since) = memory_held_since.take() {
+            memory_held += since.elapsed();
+        }
         // Units report `Finished` before they are stored (so their dependents
         // start sooner); the build is over once every store has landed.
         drop(held_locks);
@@ -908,6 +941,7 @@ impl BuildExecutor {
             cache_keys: unit_cas_keys,
             build_script_outputs,
             schedule,
+            memory_held,
         })
     }
 
@@ -2968,6 +3002,45 @@ mod tests {
         let before = key(&u, &Profile::dev());
         std::fs::write(dir.path().join("src/lib.rs"), "fn b() {}").unwrap();
         assert_ne!(before, key(&u, &Profile::dev()));
+    }
+
+    #[test]
+    fn a_machine_short_of_memory_builds_one_unit_at_a_time_and_finishes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut graph = BuildGraph::new();
+        for name in ["one", "two", "three", "four"] {
+            let pkg = dir.path().join(name);
+            std::fs::create_dir_all(pkg.join("src")).unwrap();
+            std::fs::write(pkg.join("Cargo.toml"), "").unwrap();
+            std::fs::write(
+                pkg.join("src/lib.rs"),
+                format!("pub fn {name}() -> u32 {{ 1 }}\n"),
+            )
+            .unwrap();
+            let mut u = unit(name, CrateSource::Local, &pkg);
+            u.target_name = name.into();
+            graph.add_node(u);
+        }
+        fn short() -> Option<rune_common::sysinfo::Memory> {
+            Some(rune_common::sysinfo::Memory {
+                total: 8 << 30,
+                available: 100 << 20,
+            })
+        }
+        let config = RuneConfig::new(dir.path().join("project"));
+        let result = BuildExecutor::new(config, Profile::dev(), 4)
+            .with_memory_probe(short)
+            .execute(&graph)
+            .unwrap();
+        assert!(result.success, "{:?}", result.failed);
+        assert_eq!(result.compiled, 4);
+        let schedule = result.schedule.unwrap();
+        assert!(
+            schedule.parallelism() <= 1.05,
+            "ran {:.2} units at once while memory was short",
+            schedule.parallelism()
+        );
+        assert!(result.memory_held > Duration::ZERO);
     }
 
     #[test]

@@ -18,6 +18,7 @@ pub mod hash;
 pub mod manifest_file;
 pub mod net;
 pub mod settings;
+pub mod sysinfo;
 pub mod timing;
 pub mod toolchain;
 pub mod types;
