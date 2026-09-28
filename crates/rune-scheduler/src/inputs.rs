@@ -85,6 +85,90 @@ impl DeclaredInputs {
     }
 }
 
+/// What a build script's result was found to depend on, recorded after it
+/// runs (`<script base>-script-record`) and used to key its next lookup.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ScriptRecord {
+    /// Declared files (inside the package too), environment variables, native
+    /// libraries, and the script's own source files.
+    pub inputs: DeclaredInputs,
+    /// It declared `rerun-if-changed`: then only those files matter, not every
+    /// file of the package.
+    pub watches_files: bool,
+}
+
+/// The record of a script run: what it declared (`rerun-if-*`), the native
+/// libraries it points the linker at, and `sources`, the files its own
+/// compilation read.
+pub fn script_record(
+    out: &BuildScriptOutput,
+    manifest_dir: &Path,
+    out_dir: &Path,
+    sources: &[PathBuf],
+) -> ScriptRecord {
+    let mut inputs = DeclaredInputs {
+        env: out.rerun_if_env_changed.clone(),
+        native: from_script_output(out, manifest_dir, out_dir).native,
+        ..Default::default()
+    };
+    for p in &out.rerun_if_changed {
+        let abs = if p.is_absolute() {
+            p.clone()
+        } else {
+            manifest_dir.join(p)
+        };
+        // What it writes itself is an output, not an input.
+        if !abs.starts_with(out_dir) {
+            inputs.files.push(abs);
+        }
+    }
+    inputs.files.extend(sources.iter().cloned());
+    inputs.merge(DeclaredInputs::default());
+    ScriptRecord {
+        inputs,
+        watches_files: !out.rerun_if_changed.is_empty(),
+    }
+}
+
+/// The key a build script's result is stored under. `base` covers everything
+/// the script can observe apart from files: the unit's configuration, its
+/// build-dependencies and the `DEP_*` values it receives. A script that
+/// declared `rerun-if-changed` is then keyed by the contents of exactly
+/// those files (and its own sources), so editing the rest of the package
+/// does not run it again; one that declared nothing is keyed by every file
+/// of the package, as Cargo reruns it on any change (`package_hash`).
+pub fn script_result_key(
+    base: &str,
+    record: Option<&ScriptRecord>,
+    package_hash: impl FnOnce() -> String,
+) -> String {
+    match record {
+        Some(r) if r.watches_files => {
+            effective_key(&format!("{base}\0watched"), Some(&r.inputs), true)
+        }
+        _ => {
+            let mut hb = HashBuilder::new();
+            hb.update(base.as_bytes());
+            hb.update(b"\0package=");
+            hb.update(package_hash().as_bytes());
+            effective_key(&hb.finish_blake3(), record.map(|r| &r.inputs), true)
+        }
+    }
+}
+
+/// The source files a rustc dep-info file lists (`path:` lines).
+pub fn dep_info_sources(dep_info: &Path) -> Vec<PathBuf> {
+    let Ok(text) = std::fs::read_to_string(dep_info) else {
+        return Vec::new();
+    };
+    text.lines()
+        .filter(|l| !l.starts_with('#'))
+        .filter_map(|l| l.strip_suffix(':'))
+        .filter(|l| !l.contains(": "))
+        .map(|l| PathBuf::from(l.replace("\\ ", " ")))
+        .collect()
+}
+
 /// The key a unit is stored and looked up under: its base key plus the
 /// current values of what it declared, plus — for a unit with a build script —
 /// the identity of the native toolchain the script may drive.
@@ -319,6 +403,62 @@ pub fn native_tools_identity() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_script_that_watches_files_is_keyed_by_them_not_the_package() {
+        let dir = tempfile::tempdir().unwrap();
+        let build_rs = dir.path().join("build.rs");
+        std::fs::write(&build_rs, "fn main() {}").unwrap();
+        let out = BuildScriptOutput {
+            rerun_if_changed: vec![PathBuf::from("build.rs")],
+            ..Default::default()
+        };
+        let record = script_record(&out, dir.path(), &dir.path().join("out"), &[]);
+        assert!(record.watches_files);
+        let a = script_result_key("base", Some(&record), || "package v1".into());
+        let b = script_result_key("base", Some(&record), || "package v2".into());
+        assert_eq!(a, b, "other files of the package do not matter");
+        std::fs::write(&build_rs, "fn main() { println!(); }").unwrap();
+        assert_ne!(
+            a,
+            script_result_key("base", Some(&record), || "package v2".into())
+        );
+
+        // Without `rerun-if-changed`, every file of the package counts.
+        let quiet = script_record(
+            &BuildScriptOutput::default(),
+            dir.path(),
+            &dir.path().join("out"),
+            &[],
+        );
+        assert!(!quiet.watches_files);
+        assert_ne!(
+            script_result_key("base", Some(&quiet), || "package v1".into()),
+            script_result_key("base", Some(&quiet), || "package v2".into())
+        );
+        assert_ne!(
+            script_result_key("base", None, || "package v1".into()),
+            script_result_key("base", None, || "package v2".into())
+        );
+    }
+
+    #[test]
+    fn dep_info_lists_the_sources() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path().join("x.d");
+        std::fs::write(
+            &d,
+            "/o/build_script_build: /p/build.rs /p/build/gen.rs\n\n/p/build.rs:\n/p/build/gen.rs:\n\n# env-dep:X=1\n",
+        )
+        .unwrap();
+        assert_eq!(
+            dep_info_sources(&d),
+            [
+                PathBuf::from("/p/build.rs"),
+                PathBuf::from("/p/build/gen.rs")
+            ]
+        );
+    }
 
     #[test]
     fn empty_inputs_leave_a_plain_key_alone() {

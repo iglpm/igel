@@ -4924,3 +4924,117 @@ fn affected_partitions_split_the_packages_between_machines() {
     assert!(!bad.status.success());
     assert!(text(&bad).contains("N/M"), "{}", text(&bad));
 }
+
+// ---------------------------------------------------------------------------
+// build scripts rerun only when what they watch changes
+// ---------------------------------------------------------------------------
+
+/// A package whose build script counts its runs in `runs.log` (outside the
+/// package) and reads `schema.txt` into a generated constant.
+fn watching_script_project(watch: bool) -> Project {
+    let p = Project::new();
+    p.write("Cargo.toml", LIB_MANIFEST);
+    let rerun = if watch {
+        "println!(\"cargo::rerun-if-changed=build.rs\");\n    println!(\"cargo::rerun-if-changed=schema.txt\");\n    println!(\"cargo::rerun-if-changed=build\");"
+    } else {
+        ""
+    };
+    p.write(
+        "build.rs",
+        &format!(
+            r#"#[path = "build/helper.rs"] mod helper;
+use std::io::Write;
+fn main() {{
+    let log = std::env::var("RUNE_T_RUNS").unwrap();
+    std::fs::OpenOptions::new().create(true).append(true).open(log).unwrap().write_all(b"run\n").unwrap();
+    let schema = std::fs::read_to_string("schema.txt").unwrap();
+    let out = std::path::PathBuf::from(std::env::var("OUT_DIR").unwrap());
+    std::fs::write(out.join("gen.rs"), format!("pub const SCHEMA: &str = {{:?}};", helper::decorate(schema.trim()))).unwrap();
+    {rerun}
+}}
+"#
+        ),
+    );
+    p.write(
+        "build/helper.rs",
+        "pub fn decorate(s: &str) -> String { format!(\"<{s}>\") }\n",
+    );
+    p.write("schema.txt", "v1\n");
+    p.write(
+        "src/lib.rs",
+        "include!(concat!(env!(\"OUT_DIR\"), \"/gen.rs\"));\npub fn schema() -> &'static str { SCHEMA }\n#[test] fn t() { assert!(SCHEMA.starts_with('<')); }\n",
+    );
+    p
+}
+
+fn build_counting_runs(p: &Project) -> usize {
+    let log = p.home().join("runs.log");
+    let out = Command::new(env!("CARGO_BIN_EXE_rune"))
+        .args(["build"])
+        .current_dir(p.path())
+        .env("RUNE_HOME", p.home())
+        .env("RUNE_T_RUNS", &log)
+        .env("NO_COLOR", "1")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", text(&out));
+    std::fs::read_to_string(&log).map_or(0, |t| t.lines().count())
+}
+
+#[test]
+fn a_build_script_reruns_only_when_a_file_it_watches_changes() {
+    let p = watching_script_project(true);
+    assert_eq!(build_counting_runs(&p), 1);
+    let bin = std::fs::read_dir(p.path().join(".rune/target/debug/build"))
+        .unwrap()
+        .flatten()
+        .next()
+        .unwrap()
+        .path()
+        .join("script/build_script_build");
+    let compiled_at = std::fs::metadata(&bin).unwrap().modified().unwrap();
+
+    // The crate's own sources are not something the script reads.
+    p.write("src/lib.rs", &(p.read("src/lib.rs") + "pub fn more() {}\n"));
+    assert_eq!(
+        build_counting_runs(&p),
+        1,
+        "an unwatched edit must not run the script"
+    );
+
+    // A watched input: the script runs again, but is not compiled again.
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    p.write("schema.txt", "v2\n");
+    assert_eq!(build_counting_runs(&p), 2);
+    assert_eq!(
+        std::fs::metadata(&bin).unwrap().modified().unwrap(),
+        compiled_at
+    );
+
+    // A module of the script: compiled and run again.
+    p.write(
+        "build/helper.rs",
+        "pub fn decorate(s: &str) -> String { format!(\"<<{s}>>\") }\n",
+    );
+    assert_eq!(build_counting_runs(&p), 3);
+    assert_ne!(
+        std::fs::metadata(&bin).unwrap().modified().unwrap(),
+        compiled_at
+    );
+
+    // Going back to an earlier state finds its result in the store.
+    p.write("schema.txt", "v1\n");
+    p.write(
+        "build/helper.rs",
+        "pub fn decorate(s: &str) -> String { format!(\"<{s}>\") }\n",
+    );
+    assert_eq!(build_counting_runs(&p), 3);
+}
+
+#[test]
+fn a_build_script_that_watches_nothing_reruns_on_any_change_like_cargo() {
+    let p = watching_script_project(false);
+    assert_eq!(build_counting_runs(&p), 1);
+    p.write("src/lib.rs", &(p.read("src/lib.rs") + "pub fn more() {}\n"));
+    assert_eq!(build_counting_runs(&p), 2);
+}

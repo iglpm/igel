@@ -103,6 +103,37 @@ fn frontend_threads(
     (n > 1).then_some(n)
 }
 
+/// What a compiled build script was compiled from, kept beside it.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ScriptStamp {
+    /// The script's base key (configuration and build-dependencies).
+    base: String,
+    /// Its source files and their content hashes, from rustc's dep-info.
+    sources: Vec<(PathBuf, String)>,
+    /// What the compiler printed.
+    warnings: String,
+}
+
+impl ScriptStamp {
+    fn hash(p: &Path) -> String {
+        rune_common::hash::xxhash3_file(p)
+            .map(|h| format!("{h:016x}"))
+            .unwrap_or_default()
+    }
+
+    fn new(base: &str, sources: &[PathBuf], warnings: &str) -> Self {
+        Self {
+            base: base.to_string(),
+            sources: sources.iter().map(|p| (p.clone(), Self::hash(p))).collect(),
+            warnings: warnings.to_string(),
+        }
+    }
+
+    fn sources_unchanged(&self) -> bool {
+        !self.sources.is_empty() && self.sources.iter().all(|(p, h)| Self::hash(p) == *h)
+    }
+}
+
 /// Shows again what compiling a restored build script printed.
 fn replay_script_warnings(
     events: &Sender<PipelineEvent>,
@@ -714,6 +745,51 @@ impl BuildExecutor {
                     job.script_only = script_only;
                     job.lock = Some(lock);
                     job.lock_waited = lock_waited;
+                    if script_only {
+                        let node = graph.node(node_id);
+                        let build_dep_keys: Vec<(String, String)> = node
+                            .build_dependencies
+                            .iter()
+                            .filter_map(|d| {
+                                let dep = &graph.node(*d).unit;
+                                let alias = node
+                                    .build_aliases
+                                    .get(d)
+                                    .cloned()
+                                    .unwrap_or_else(|| dep.rustc_crate_name());
+                                Some((
+                                    format!("build-dep:{alias}:{}", dep.crate_id.name),
+                                    unit_cas_keys.get(d)?.clone(),
+                                ))
+                            })
+                            .collect();
+                        let base = compute_script_base(
+                            &node.unit,
+                            &self.profile,
+                            &build_dep_keys,
+                            &job.dep_metadata,
+                            &mut source_cache,
+                        );
+                        job.package_hash = if node.unit.crate_id.source == CrateSource::Local {
+                            rune_fingerprint::hasher::compute_package_hash(
+                                &node.unit.manifest_dir,
+                                &mut source_cache,
+                            )
+                            .unwrap_or_default()
+                        } else {
+                            String::new()
+                        };
+                        let record: Option<inputs::ScriptRecord> = self
+                            .cas
+                            .as_ref()
+                            .and_then(|c| c.get_value(&format!("{base}-script-record")));
+                        let package_hash = job.package_hash.clone();
+                        job.script_cache_key =
+                            Some(inputs::script_result_key(&base, record.as_ref(), || {
+                                package_hash
+                            }));
+                        job.script_base = Some(base);
+                    }
                     if !script_only {
                         job.frontend_threads =
                             self.frontend_threads_for(in_flight.len(), ready_count - index - 1);
@@ -1311,6 +1387,9 @@ impl BuildExecutor {
             lock: None,
             lock_waited: false,
             frontend_threads: None,
+            script_base: None,
+            script_cache_key: None,
+            package_hash: String::new(),
         }
     }
 }
@@ -1354,6 +1433,12 @@ struct UnitJob {
     lock_waited: bool,
     /// `-Z threads` for this unit's compilation.
     frontend_threads: Option<usize>,
+    /// For a script step: the script result's base key (see
+    /// [`compute_script_base`]) and the key it is looked up under now.
+    script_base: Option<String>,
+    script_cache_key: Option<String>,
+    /// The package's source hash (for a script that watches no files).
+    package_hash: String,
 }
 
 impl UnitJob {
@@ -1486,7 +1571,15 @@ impl UnitJob {
         // recompiling for any reason, a build script whose own inputs didn't
         // change can skip being recompiled and re-executed — the most
         // expensive part of crates like `openssl-sys` or `ring`.
-        let build_script_cache_key = format!("{}-buildscript", self.cas_key);
+        // A script step looks its result up by the script's own key (see
+        // `compute_script_base`): editing the package's other files does not
+        // run a script that declared which files it reads.
+        let build_script_cache_key = match &self.script_cache_key {
+            Some(k) => format!("{k}-buildscript"),
+            None => format!("{}-buildscript", self.cas_key),
+        };
+        // The files the script's own compilation read (for its record).
+        let mut script_sources: Vec<PathBuf> = Vec::new();
 
         // 1. Compile & execute the build script, unless a cached run already
         //    told us its output. Its output is two things that must be
@@ -1635,16 +1728,52 @@ impl UnitJob {
             };
             let script_bin_dir =
                 config.build_script_bin_dir_by_key(profile.output_dir_name(), &script_key(unit));
-            let compiled = BuildScriptRunner::compile_reporting(
-                tc.rustc_command(unit.ext.member),
-                &build_rs,
-                &script_bin_dir,
-                &deps_dir,
-                unit.edition.as_str(),
-                &self.build_script_extern_deps,
-                Some(&compile_env),
-                &configure,
-            );
+            // The compiled script is kept beside `OUT_DIR` with a stamp of
+            // what it was compiled from; a script that must run again because
+            // a file it watches changed is not compiled again for that.
+            let stamp_path = script_bin_dir.join(".rune-stamp");
+            let reusable = self
+                .script_base
+                .as_ref()
+                .filter(|_| !self.force_rebuild)
+                .and_then(|base| {
+                    let stamp: ScriptStamp =
+                        serde_json::from_str(&std::fs::read_to_string(&stamp_path).ok()?).ok()?;
+                    let bin = script_bin_dir.join(if cfg!(windows) {
+                        "build_script_build.exe"
+                    } else {
+                        "build_script_build"
+                    });
+                    (stamp.base == *base && bin.is_file() && stamp.sources_unchanged())
+                        .then_some((bin, stamp))
+                });
+            let compiled = match reusable {
+                Some((bin, stamp)) => {
+                    script_sources = stamp.sources.iter().map(|(p, _)| p.clone()).collect();
+                    Ok((bin, stamp.warnings))
+                }
+                None => {
+                    let compiled = BuildScriptRunner::compile_reporting(
+                        tc.rustc_command(unit.ext.member),
+                        &build_rs,
+                        &script_bin_dir,
+                        &deps_dir,
+                        unit.edition.as_str(),
+                        &self.build_script_extern_deps,
+                        Some(&compile_env),
+                        &configure,
+                    );
+                    if let (Ok((_, printed)), Some(base)) = (&compiled, &self.script_base) {
+                        script_sources =
+                            inputs::dep_info_sources(&script_bin_dir.join("build_script_build.d"));
+                        let stamp = ScriptStamp::new(base, &script_sources, printed);
+                        if let Ok(text) = serde_json::to_string(&stamp) {
+                            let _ = rune_common::fsutil::write_atomic(&stamp_path, text.as_bytes());
+                        }
+                    }
+                    compiled
+                }
+            };
             match compiled {
                 Ok((bin_path, printed)) => {
                     // Warnings about a dependency's `build.rs` are capped, as
@@ -1741,7 +1870,22 @@ impl UnitJob {
             bump(&declared, &mut store_key);
         }
         if let (Some(out), Some(cas_store)) = (&script_ran, &self.cas) {
-            let key = format!("{store_key}-buildscript");
+            let key = match &self.script_base {
+                // What the run showed it depends on keys its next lookup.
+                Some(base) => {
+                    let record = inputs::script_record(
+                        out,
+                        &unit.manifest_dir,
+                        &script_out_dir,
+                        &script_sources,
+                    );
+                    let _ = cas_store.put_value(&format!("{base}-script-record"), &record);
+                    let package_hash = self.package_hash.clone();
+                    let key = inputs::script_result_key(base, Some(&record), || package_hash);
+                    format!("{key}-buildscript")
+                }
+                None => format!("{store_key}-buildscript"),
+            };
             let _ = cas_store.put_dir_tree(&key, &script_out_dir);
             let _ = cas_store.put_value(&key, out);
         }
@@ -2849,6 +2993,42 @@ pub fn compute_unit_identity(
     dep_keys: &[(String, String)],
     source_cache: &mut rune_fingerprint::FingerprintCache,
 ) -> UnitIdentity {
+    identity_with(unit, profile, dep_keys, source_cache, true)
+}
+
+/// The base key of a unit's *build script result*: the unit's configuration
+/// without its package's sources (which [`inputs::script_result_key`] adds
+/// back as the script declared them), with the script's build-dependencies
+/// and the `DEP_*` values it receives in place of the unit's dependencies.
+pub fn compute_script_base(
+    unit: &CompilationUnit,
+    profile: &Profile,
+    build_dep_keys: &[(String, String)],
+    dep_metadata: &[(String, String, String)],
+    source_cache: &mut rune_fingerprint::FingerprintCache,
+) -> String {
+    let mut deps: Vec<(String, String)> = build_dep_keys.to_vec();
+    for (links, k, v) in dep_metadata {
+        deps.push((format!("dep-metadata:{links}:{k}"), v.clone()));
+    }
+    let identity = identity_with(unit, profile, &deps, source_cache, false);
+    let mut hb = rune_common::hash::HashBuilder::new();
+    hb.update(b"build-script-result\0");
+    hb.update(identity.key.as_bytes());
+    if let Some(script) = &unit.build_script {
+        let rel = script.strip_prefix(&unit.manifest_dir).unwrap_or(script);
+        hb.update(rel.to_string_lossy().as_bytes());
+    }
+    hb.finish_blake3()
+}
+
+fn identity_with(
+    unit: &CompilationUnit,
+    profile: &Profile,
+    dep_keys: &[(String, String)],
+    source_cache: &mut rune_fingerprint::FingerprintCache,
+    include_sources: bool,
+) -> UnitIdentity {
     let mut hb = KeyRecorder {
         key: rune_common::hash::HashBuilder::new(),
         parts: Default::default(),
@@ -2928,7 +3108,7 @@ pub fn compute_unit_identity(
     }
 
     let mut files = std::collections::BTreeMap::new();
-    if unit.crate_id.source == CrateSource::Local {
+    if unit.crate_id.source == CrateSource::Local && include_sources {
         // Where the crate root lives is an input too (`[lib] path = ...`).
         let rel_root = unit
             .source_root

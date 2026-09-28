@@ -204,6 +204,9 @@ impl BuildScriptRunner {
         cmd.arg("--crate-type").arg("bin");
         cmd.arg("--edition").arg(edition);
         cmd.arg("--out-dir").arg(out_dir);
+        // The dep-info lists the files the script is compiled from, which is
+        // what decides whether the compiled script can be reused.
+        cmd.arg("--emit=dep-info,link");
 
         // Add dependency search path
         cmd.arg("-L")
