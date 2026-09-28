@@ -305,6 +305,7 @@ pub fn drive(
                 }
                 PipelineEvent::BuildFinished { warnings, .. }
                 | PipelineEvent::CacheHit { warnings, .. }
+                | PipelineEvent::ScriptWarnings { warnings, .. }
                     if !warnings.is_empty() && !sess.quiet && !sess.json =>
                 {
                     ui::print_above_progress(warnings);

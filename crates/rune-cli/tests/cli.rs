@@ -4461,3 +4461,31 @@ fn upgrade_edits_workspace_dependencies_where_members_inherit_them() {
     // `-p app` only looks at the member's own manifest, which inherits.
     assert!(p.ok(&["upgrade", "-p", "app"]).contains("already allows"));
 }
+
+#[test]
+fn out_dir_holds_only_what_the_script_generated_and_script_errors_are_shown() {
+    let p = build_script_project();
+    p.ok(&["build"]);
+    let build = p.path().join(".rune/target/debug/build");
+    let dirs: Vec<_> = std::fs::read_dir(&build).unwrap().flatten().collect();
+    assert_eq!(dirs.len(), 1, "{dirs:?}");
+    let out: Vec<String> = std::fs::read_dir(dirs[0].path().join("out"))
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(
+        out,
+        ["generated.rs"],
+        "the script binary does not belong in OUT_DIR"
+    );
+
+    p.write("build.rs", "fn main() { let x: u32 = \"not a number\"; }\n");
+    let failed = p.rune(&["build"]);
+    assert!(!failed.status.success());
+    let msg = text(&failed);
+    assert!(
+        msg.contains("mismatched types"),
+        "the compiler's error is shown:\n{msg}"
+    );
+}

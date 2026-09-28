@@ -1575,8 +1575,12 @@ impl UnitJob {
                     .into_args()
                 })
                 .unwrap_or_default();
+            let color = self.color;
             let configure = |cmd: &mut std::process::Command| {
                 cmd.args(&script_flags);
+                if color {
+                    cmd.arg("--color=always");
+                }
                 // A dependency's build script is not the user's code: its
                 // warnings are noise, exactly as for the crate itself.
                 if unit.crate_id.source != CrateSource::Local {
@@ -1586,10 +1590,12 @@ impl UnitJob {
                     js.configure(cmd);
                 }
             };
-            let compiled = BuildScriptRunner::compile_with(
+            let script_bin_dir =
+                config.build_script_bin_dir_by_key(profile.output_dir_name(), &script_key(unit));
+            let compiled = BuildScriptRunner::compile_reporting(
                 tc.rustc_command(unit.ext.member),
                 &build_rs,
-                &script_out_dir,
+                &script_bin_dir,
                 &deps_dir,
                 unit.edition.as_str(),
                 &self.build_script_extern_deps,
@@ -1597,7 +1603,13 @@ impl UnitJob {
                 &configure,
             );
             match compiled {
-                Ok(bin_path) => {
+                Ok((bin_path, printed)) => {
+                    if unit.crate_id.source == CrateSource::Local && !printed.trim().is_empty() {
+                        let _ = self.event_tx.send(PipelineEvent::ScriptWarnings {
+                            node_id,
+                            warnings: printed,
+                        });
+                    }
                     let run_configure = |cmd: &mut std::process::Command| {
                         if let Some(js) = &self.jobserver {
                             js.configure(cmd);

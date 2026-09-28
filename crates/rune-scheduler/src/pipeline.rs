@@ -51,6 +51,8 @@ pub enum PipelineEvent {
         node_id: NodeId,
         output: BuildScriptOutput,
     },
+    /// What compiling a workspace package's build script printed (warnings).
+    ScriptWarnings { node_id: NodeId, warnings: String },
     /// Build script started.
     BuildScriptStarted { node_id: NodeId, crate_name: String },
     /// Build script finished.
