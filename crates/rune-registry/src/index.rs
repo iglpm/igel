@@ -3,12 +3,13 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 use thiserror::Error;
+use tracing::debug;
 
 #[derive(Debug, Error)]
 pub enum IndexError {
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
-    #[error("Network error: {0}")]
+    #[error("network error: {}", crate::http::describe(.0))]
     Network(#[from] reqwest::Error),
     #[error("JSON parse error: {0}")]
     Json(#[from] serde_json::Error),
@@ -106,7 +107,7 @@ impl CrateIndex {
 pub struct SparseIndexClient {
     base_url: String,
     cache_dir: PathBuf,
-    client: reqwest::blocking::Client,
+    client: crate::http::LazyClient,
     /// Never touch the network: serve only what is already cached.
     offline: bool,
     /// Sent as the `Authorization` header (private registries).
@@ -126,14 +127,12 @@ impl SparseIndexClient {
         Self {
             base_url: "https://index.crates.io".to_string(),
             cache_dir,
-            client: reqwest::blocking::Client::builder()
-                .user_agent("rune (github.com/jonas/rune)")
-                .pool_max_idle_per_host(PREFETCH_CONCURRENCY)
-                .tcp_nodelay(true)
-                .connect_timeout(std::time::Duration::from_secs(15))
-                .timeout(std::time::Duration::from_secs(60))
-                .build()
-                .unwrap_or_else(|_| reqwest::blocking::Client::new()),
+            client: crate::http::LazyClient::new(|b| {
+                b.pool_max_idle_per_host(PREFETCH_CONCURRENCY)
+                    .tcp_nodelay(true)
+                    .connect_timeout(std::time::Duration::from_secs(15))
+                    .timeout(std::time::Duration::from_secs(60))
+            }),
             offline: false,
             token: None,
             label: "crates.io".to_string(),
@@ -278,69 +277,91 @@ impl SparseIndexClient {
         }
 
         let url = format!("{}/{}", self.base_url, rel_path);
-        let mut request = self.client.get(&url);
-        if let Some(token) = &self.token {
-            request = request.header(reqwest::header::AUTHORIZATION, token.as_str());
-        }
         let have_cache = cached_file.is_file();
-        if have_cache && let Ok(etag) = fs::read_to_string(&etag_file) {
-            request = request.header(reqwest::header::IF_NONE_MATCH, etag.trim());
-        }
-
-        if let Ok(resp) = request.send() {
-            let status = resp.status();
-            if status == reqwest::StatusCode::NOT_MODIFIED && have_cache {
-                if let Ok(content) = fs::read_to_string(&cached_file) {
-                    return Self::parse_index_text(name, &content);
-                }
-            } else if status.is_success() {
-                let etag = resp
-                    .headers()
-                    .get(reqwest::header::ETAG)
-                    .and_then(|v| v.to_str().ok())
-                    .map(str::to_string);
-                if let Ok(text) = resp.text() {
-                    if let Some(parent) = cached_file.parent() {
-                        let _ = fs::create_dir_all(parent);
-                    }
-                    // Write to a temp name and rename: parallel fetches and
-                    // concurrent `rune` processes share this cache.
-                    let tmp = cached_file.with_extension(format!("{}.tmp", std::process::id()));
-                    if fs::write(&tmp, &text).is_ok() {
-                        let _ = fs::rename(&tmp, &cached_file);
-                    }
-                    match etag {
-                        Some(etag) => {
-                            let _ = fs::write(&etag_file, etag);
-                        }
-                        None => {
-                            let _ = fs::remove_file(&etag_file);
-                        }
-                    }
-                    return Self::parse_index_text(name, &text);
-                }
-            } else if status == reqwest::StatusCode::NOT_FOUND
-                || status == reqwest::StatusCode::GONE
-            {
-                return Err(IndexError::CrateNotFound(name.to_string()));
-            } else if status == reqwest::StatusCode::UNAUTHORIZED
-                || status == reqwest::StatusCode::FORBIDDEN
-            {
-                return Err(IndexError::Config(format!(
-                    "the registry `{}` requires authentication (HTTP {status}); set a token with \
-                     `CARGO_REGISTRIES_<NAME>_TOKEN` or `[registries.<name>] token` / \
-                     `credential-provider` in .cargo/config.toml",
-                    self.label
-                )));
+        let etag = have_cache
+            .then(|| fs::read_to_string(&etag_file).ok())
+            .flatten();
+        let sent = crate::http::send_with_retry(|| {
+            let mut request = self.client.get(&url);
+            if let Some(token) = &self.token {
+                request = request.header(reqwest::header::AUTHORIZATION, token.as_str());
             }
-        }
+            if let Some(etag) = &etag {
+                request = request.header(reqwest::header::IF_NONE_MATCH, etag.trim());
+            }
+            request
+        });
 
-        // Fallback to local cache if offline or network failed
+        // What went wrong, if the answer is not usable; the cached copy (if
+        // any) is used instead, so a flaky network never breaks a build that
+        // has what it needs.
+        let failure = match sent {
+            Ok(resp) => {
+                let status = resp.status();
+                if status == reqwest::StatusCode::NOT_MODIFIED && have_cache {
+                    if let Ok(content) = fs::read_to_string(&cached_file) {
+                        return Self::parse_index_text(name, &content);
+                    }
+                    IndexError::Config(format!("the cached index entry of `{name}` vanished"))
+                } else if status.is_success() {
+                    let etag = resp
+                        .headers()
+                        .get(reqwest::header::ETAG)
+                        .and_then(|v| v.to_str().ok())
+                        .map(str::to_string);
+                    match resp.text() {
+                        Ok(text) => {
+                            if let Some(parent) = cached_file.parent() {
+                                let _ = fs::create_dir_all(parent);
+                            }
+                            // Write to a temp name and rename: parallel fetches and
+                            // concurrent `rune` processes share this cache.
+                            let tmp =
+                                cached_file.with_extension(format!("{}.tmp", std::process::id()));
+                            if fs::write(&tmp, &text).is_ok() {
+                                let _ = fs::rename(&tmp, &cached_file);
+                            }
+                            match etag {
+                                Some(etag) => {
+                                    let _ = fs::write(&etag_file, etag);
+                                }
+                                None => {
+                                    let _ = fs::remove_file(&etag_file);
+                                }
+                            }
+                            return Self::parse_index_text(name, &text);
+                        }
+                        Err(e) => IndexError::Network(e),
+                    }
+                } else if status == reqwest::StatusCode::NOT_FOUND
+                    || status == reqwest::StatusCode::GONE
+                {
+                    return Err(IndexError::CrateNotFound(name.to_string()));
+                } else if status == reqwest::StatusCode::UNAUTHORIZED
+                    || status == reqwest::StatusCode::FORBIDDEN
+                {
+                    return Err(IndexError::Config(format!(
+                        "the registry `{}` requires authentication (HTTP {status}); set a token with \
+                         `CARGO_REGISTRIES_<NAME>_TOKEN` or `[registries.<name>] token` / \
+                         `credential-provider` in .cargo/config.toml",
+                        self.label
+                    )));
+                } else {
+                    IndexError::Config(format!(
+                        "the registry `{}` answered HTTP {status} for `{name}` ({url})",
+                        self.label
+                    ))
+                }
+            }
+            Err(e) => IndexError::Network(e),
+        };
+
+        // Fall back to the local cache if the network failed.
         if let Ok(content) = fs::read_to_string(&cached_file) {
+            debug!("using the cached index entry of `{name}`: {failure}");
             return Self::parse_index_text(name, &content);
         }
-
-        Err(IndexError::CrateNotFound(name.to_string()))
+        Err(failure)
     }
 
     /// Parses a line-delimited JSON sparse index file.

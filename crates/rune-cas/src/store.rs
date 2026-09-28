@@ -115,13 +115,9 @@ fn make_read_only(path: &Path) {
 /// True if `dest` is already a hardlink to `src` (same inode on the same
 /// device), meaning there is nothing left to do to "link" it. (Elsewhere the
 /// link is simply made again, which is correct, only slower.)
-#[cfg(unix)]
 fn already_linked(src: &Path, dest: &Path) -> bool {
     same_file::is_same_file(src, dest).unwrap_or(false)
 }
-
-
-
 
 impl CasStore {
     /// Create a new CAS store, initializing directories if needed.
@@ -478,7 +474,6 @@ impl CasStore {
             // worth the cost of hashing.
             rune_common::fsutil::replace_with_link(&src, &dest)?;
             let hard_linked = already_linked(&src, &dest);
-
             if hard_linked {
                 linked_files.push(dest);
                 continue;
@@ -677,11 +672,21 @@ mod tests {
         assert_eq!(fs::read_to_string(&relinked[0]).unwrap(), "v1");
 
         // And a stray in-place write through a link fails instead of
-        // corrupting the shared object.
+        // corrupting the shared object. (A superuser may write read-only
+        // files anyway; then only the permission bits can be checked.)
         assert!(
-            fs::OpenOptions::new().write(true).open(&linked[0]).is_err(),
+            fs::metadata(&linked[0]).unwrap().permissions().readonly(),
             "stored objects must be read-only"
         );
+        let probe = src_dir.path().join("probe");
+        fs::write(&probe, "x").unwrap();
+        make_read_only(&probe);
+        if fs::OpenOptions::new().write(true).open(&probe).is_err() {
+            assert!(
+                fs::OpenOptions::new().write(true).open(&linked[0]).is_err(),
+                "stored objects must be read-only"
+            );
+        }
     }
 
     #[test]

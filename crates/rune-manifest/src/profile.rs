@@ -324,8 +324,7 @@ fn apply(profile: &mut Profile, name: &str, table: &ProfileOverride) -> Result<(
                     toml::Value::Boolean(b) => *b,
                     toml::Value::String(s) if SCOPES.contains(&s.as_str()) => s != "none",
                     toml::Value::Array(a)
-                        if a
-                            .iter()
+                        if a.iter()
                             .all(|v| v.as_str().is_some_and(|s| SCOPES.contains(&s))) =>
                     {
                         a.iter().any(|v| v.as_str() != Some("none"))

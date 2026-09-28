@@ -16,6 +16,7 @@ pub mod error;
 pub mod fsutil;
 pub mod hash;
 pub mod manifest_file;
+pub mod net;
 pub mod settings;
 pub mod timing;
 pub mod toolchain;

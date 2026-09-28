@@ -673,7 +673,11 @@ impl BuildExecutor {
             .cas
             .as_ref()
             .and_then(|c| c.get_value(&format!("{}-inputs", identity.key)));
-        let key = effective_key(&identity.key, recorded.as_ref(), unit.build_script.is_some());
+        let key = effective_key(
+            &identity.key,
+            recorded.as_ref(),
+            unit.build_script.is_some(),
+        );
         if key != identity.key {
             identity.parts.insert(
                 "outside inputs (environment variables and files it read)".into(),
@@ -699,7 +703,11 @@ impl BuildExecutor {
         for id in topo {
             let identity = self.unit_identity(graph, id, &keys, &mut source_cache);
             keys.insert(id, identity.key.clone());
-            out.push((id, unit_label(&graph.node(id).unit, &self.profile), identity));
+            out.push((
+                id,
+                unit_label(&graph.node(id).unit, &self.profile),
+                identity,
+            ));
         }
         Ok(out)
     }
@@ -776,7 +784,6 @@ fn dep_keys_of(
 }
 
 impl BuildExecutor {
-
     /// Gathers everything a worker thread needs, by value.
     #[allow(clippy::too_many_arguments)]
     fn prepare_job(

@@ -282,13 +282,33 @@ impl HttpTransport {
             .enable_all()
             .build()
             .map_err(|e| e.to_string())?;
-        let client = reqwest::Client::builder()
+        let mut builder = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(2))
             .timeout(Duration::from_secs(300))
             .tcp_nodelay(true)
-            .pool_max_idle_per_host(32)
-            .build()
-            .map_err(|e| e.to_string())?;
+            .pool_max_idle_per_host(32);
+        // The same CA bundles and proxy as registry traffic (`http.cainfo`,
+        // `http.proxy`), so a Cairn server behind a private CA just works.
+        let http = rune_common::net::global();
+        for (path, pem) in http.ca_bundles() {
+            if let Ok(certs) = pem.map_err(|e| e.to_string()).and_then(|pem| {
+                reqwest::Certificate::from_pem_bundle(&pem).map_err(|e| e.to_string())
+            }) {
+                for cert in certs {
+                    builder = builder.add_root_certificate(cert);
+                }
+            } else {
+                tracing::warn!("ignoring unreadable CA bundle {}", path.display());
+            }
+        }
+        if let Some(proxy) = http
+            .proxy
+            .as_deref()
+            .and_then(|p| reqwest::Proxy::all(p).ok())
+        {
+            builder = builder.proxy(proxy);
+        }
+        let client = builder.build().map_err(|e| e.to_string())?;
         Ok(Self {
             endpoints,
             replicas: replicas.clamp(1, urls.len()),

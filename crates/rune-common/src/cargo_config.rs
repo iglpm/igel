@@ -429,8 +429,7 @@ fn absolutize(root: &mut Table, base: &Path) {
                     && let Some(Value::String(s)) = dep.get_mut("path")
                     && !Path::new(s.as_str()).is_absolute()
                 {
-                    *s = base.join(&*s).to_string_lossy().into_owned();
-                }
+                    *s = join_path(base, s);
                 }
             }
         }
@@ -441,8 +440,7 @@ fn absolutize(root: &mut Table, base: &Path) {
             if let Value::String(s) = p
                 && !Path::new(s.as_str()).is_absolute()
             {
-                *s = base.join(&*s).to_string_lossy().into_owned();
-            }
+                *s = join_path(base, s);
             }
         }
     }
@@ -453,8 +451,7 @@ fn absolutize(root: &mut Table, base: &Path) {
                 && t.get("relative").and_then(Value::as_bool) == Some(true)
                 && let Some(Value::String(s)) = t.get_mut("value")
             {
-                *s = base.join(&*s).to_string_lossy().into_owned();
-            }
+                *s = join_path(base, s);
             }
         }
     }

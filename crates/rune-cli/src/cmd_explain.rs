@@ -30,9 +30,11 @@ pub fn explain(args: BuildArgs) -> Result<()> {
         let (reasons, only_dependencies) = match previous.get(label) {
             None => (vec!["not built in this project before".to_string()], false),
             Some(prev) if prev.key == cur.key => (
-                vec!["built before, but its result is no longer in the store \
+                vec![
+                    "built before, but its result is no longer in the store \
                       (removed by `rune cas gc`?)"
-                    .to_string()],
+                        .to_string(),
+                ],
                 false,
             ),
             Some(prev) => describe(prev, cur),
@@ -50,9 +52,7 @@ pub fn explain(args: BuildArgs) -> Result<()> {
         println!("nothing would be compiled: all {total} units are in the store");
         return Ok(());
     }
-    println!(
-        "{compiled} of {total} units would be compiled ({restored} come from the store):\n"
-    );
+    println!("{compiled} of {total} units would be compiled ({restored} come from the store):\n");
     for (label, reasons) in roots.iter().chain(&downstream) {
         println!("{}", label.bold());
         for r in reasons {
