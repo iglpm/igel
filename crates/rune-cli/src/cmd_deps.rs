@@ -46,6 +46,92 @@ fn target_member(ws: &Workspace, package: Option<&str>) -> Result<usize> {
     }
 }
 
+/// The features of a release — `+` for those that `requested` (and the
+/// defaults, when `defaults`) turn on — as `cargo add` lists them, then the
+/// release's `rust-version` and publication date when the index has them.
+fn release_notes(
+    record: &rune_registry::IndexRecord,
+    requested: &[String],
+    defaults: bool,
+) -> Vec<String> {
+    let features = record.all_features();
+    // Optional dependencies are features too, unless a `dep:` hides them.
+    let hidden: std::collections::HashSet<&str> = features
+        .values()
+        .flatten()
+        .filter_map(|v| v.strip_prefix("dep:"))
+        .collect();
+    let mut all: std::collections::BTreeSet<String> = features
+        .keys()
+        .filter(|f| *f != "default")
+        .cloned()
+        .collect();
+    for d in &record.deps {
+        if d.optional && d.kind.as_deref() != Some("dev") && !hidden.contains(d.name.as_str()) {
+            all.insert(d.name.clone());
+        }
+    }
+    let mut on: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut stack: Vec<String> = requested
+        .iter()
+        .flat_map(|f| f.split([',', ' ']))
+        .filter(|f| !f.is_empty() && !f.contains('/'))
+        .map(String::from)
+        .collect();
+    if defaults {
+        stack.push("default".into());
+    }
+    while let Some(f) = stack.pop() {
+        if !on.insert(f.clone()) {
+            continue;
+        }
+        for v in features.get(&f).into_iter().flatten() {
+            if v.starts_with("dep:") {
+                continue;
+            }
+            // `dep/feature` turns on the optional dependency `dep` (and its
+            // implicit feature); `dep?/feature` does not.
+            let name = match v.split_once('/') {
+                Some((d, _)) if d.ends_with('?') => continue,
+                Some((d, _)) => d,
+                None => v.as_str(),
+            };
+            if all.contains(name) {
+                stack.push(name.to_string());
+            }
+        }
+    }
+    let mut notes = Vec::new();
+    // Enabled first, as `cargo add` lists them.
+    let (enabled, rest): (Vec<&String>, Vec<&String>) = all.iter().partition(|f| on.contains(*f));
+    if all.len() > 40 {
+        // `windows-sys` has hundreds: the enabled ones and a count.
+        notes.push(format!(
+            "{} features in v{}, {} enabled (`rune info {}` lists them)",
+            all.len(),
+            record.vers,
+            enabled.len(),
+            record.name
+        ));
+        notes.extend(enabled.iter().map(|f| format!("  + {f}")));
+    } else if !all.is_empty() {
+        notes.push(format!("features of v{}:", record.vers));
+        notes.extend(enabled.iter().map(|f| format!("  + {f}")));
+        notes.extend(rest.iter().map(|f| format!("  - {f}")));
+    }
+    let mut facts = Vec::new();
+    if let Some(rv) = &record.rust_version {
+        facts.push(format!("needs Rust {rv}"));
+    }
+    if let Some(date) = record.pubtime.as_deref().and_then(|t| t.get(..10)) {
+        facts.push(format!("published {date}"));
+    }
+    if !facts.is_empty() {
+        notes.push(format!("v{}: {}", record.vers, facts.join(", ")));
+    }
+    notes
+}
+
 pub fn add(args: AddArgs) -> Result<()> {
     let (ws, offline) = load(&args.manifest)?;
     let mi = target_member(&ws, args.package.as_deref())?;
@@ -112,7 +198,10 @@ pub fn add(args: AddArgs) -> Result<()> {
         .unwrap_or_default();
 
     let mut added = Vec::new();
+    // What to say under each added crate: its features and release facts.
+    let mut notes: Vec<Vec<String>> = Vec::new();
     for spec in &args.crate_specs {
+        let mut chosen: Option<rune_registry::IndexRecord> = None;
         let (name, ver_req) = match spec.split_once('@') {
             Some((n, v)) => (n.to_string(), Some(v.to_string())),
             None => (spec.clone(), args.version.clone()),
@@ -194,6 +283,16 @@ pub fn add(args: AddArgs) -> Result<()> {
                 }
             };
             version_shown = requirement.clone();
+            chosen = semver::VersionReq::parse(&requirement)
+                .ok()
+                .and_then(|req| {
+                    index
+                        .available_versions()
+                        .into_iter()
+                        .filter(|r| semver::Version::parse(&r.vers).is_ok_and(|v| req.matches(&v)))
+                        .max_by_key(|r| semver::Version::parse(&r.vers).ok())
+                        .cloned()
+                });
             inline.insert("version", Value::from(requirement));
             if let Some(r) = &args.registry {
                 inline.insert("registry", Value::from(r.as_str()));
@@ -233,9 +332,17 @@ pub fn add(args: AddArgs) -> Result<()> {
             None => table_name.to_string(),
         };
         added.push(format!("{} {} to [{}]", key.bold(), version_shown, section));
+        notes.push(
+            chosen
+                .map(|r| release_notes(&r, &args.features, !args.no_default_features))
+                .unwrap_or_default(),
+        );
     }
-    for line in &added {
+    for (line, notes) in added.iter().zip(&notes) {
         ui::action(if args.dry_run { "would add" } else { "added" }, line);
+        for n in notes {
+            ui::hint_line(n);
+        }
     }
     if args.dry_run {
         ui::warn("aborting add (--dry-run)");

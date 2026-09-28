@@ -2012,6 +2012,45 @@ fn update_precise_and_dry_run_move_one_package_like_cargo() {
 
 #[cfg(unix)]
 #[test]
+fn add_lists_the_features_it_turns_on_like_cargo() {
+    let reg = local_registry(&[("foo", "1.0.0", &[])]);
+    // Features, two optional dependencies (one hidden behind `dep:`), and
+    // what the index says about the release.
+    let optional = |name: &str| {
+        format!(
+            "{{\"name\":\"{name}\",\"req\":\"1\",\"features\":[],\"optional\":true,\"default_features\":true,\"target\":null,\"kind\":\"normal\"}}"
+        )
+    };
+    let file = reg.path().join("index/3/f/foo");
+    let record = std::fs::read_to_string(&file)
+        .unwrap()
+        .replace(
+            "\"deps\":[]",
+            &format!("\"deps\":[{},{}]", optional("foo_derive"), optional("bar")),
+        )
+        .replace(
+            "\"features\":{}",
+            "\"features\":{\"default\":[\"std\"],\"std\":[],\"derive\":[\"dep:foo_derive\"],\"extra\":[\"bar\"]},\"rust_version\":\"1.70\",\"pubtime\":\"2026-01-02T03:04:05Z\"",
+        );
+    std::fs::write(&file, record).unwrap();
+    let p = app_with(&reg, "");
+    let out = p.ok(&["add", "foo", "-F", "extra", "--dry-run"]);
+    let listed: Vec<&str> = out
+        .lines()
+        .map(str::trim)
+        .filter(|l| l.starts_with("+ ") || l.starts_with("- "))
+        .collect();
+    assert_eq!(listed, ["+ bar", "+ extra", "+ std", "- derive"], "{out}");
+    assert!(
+        out.contains("needs Rust 1.70, published 2026-01-02"),
+        "{out}"
+    );
+    let quiet = p.ok(&["add", "foo", "--no-default-features", "--dry-run"]);
+    assert!(quiet.contains("- std"), "{quiet}");
+}
+
+#[cfg(unix)]
+#[test]
 fn add_supports_renames_platforms_workspace_deps_and_replaced_sources() {
     let reg = local_registry(&[("foo", "1.0.0", &[]), ("foo", "1.4.2", &[])]);
     let p = app_with(&reg, "");
