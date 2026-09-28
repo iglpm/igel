@@ -104,6 +104,11 @@ pub struct CasEntry {
 /// Stored objects are never modified: taking away write permission makes a
 /// stray in-place write (through a hard link from a project directory) fail
 /// loudly instead of silently changing an object every project shares.
+#[cfg_attr(unix, allow(dead_code))]
+pub(crate) fn make_read_only_pub(path: &Path) {
+    make_read_only(path);
+}
+
 fn make_read_only(path: &Path) {
     if let Ok(meta) = fs::metadata(path) {
         let mut perms = meta.permissions();
@@ -645,7 +650,7 @@ fn touch_if_stale(manifest: &Path) {
 }
 
 /// Blake3 of a file's contents, hex encoded.
-fn hash_file(path: &Path) -> Result<String> {
+pub(crate) fn hash_file(path: &Path) -> Result<String> {
     let mut hasher = blake3::Hasher::new();
     hasher.update_reader(File::open(path)?)?;
     Ok(hasher.finalize().to_hex().to_string())

@@ -515,6 +515,22 @@ pub fn cas(cmd: CasCommands) -> Result<()> {
     let cas = CasStore::new(config.cas_dir.clone())?;
 
     match cmd {
+        CasCommands::Import { path } => {
+            let stats = cas
+                .import_bundle(&path)
+                .with_context(|| format!("cannot import {}", path.display()))?;
+            ui::summary(format!(
+                "imported {} entries ({}){}",
+                stats.entries,
+                format_size_human(stats.bytes),
+                if stats.skipped > 0 {
+                    format!(" · {} already present or damaged", stats.skipped)
+                } else {
+                    String::new()
+                }
+            ));
+        }
+        CasCommands::Export(_) => unreachable!("handled by cmd_build::cas_export"),
         CasCommands::Stats => {
             let stats = cas.stats().unwrap_or_default();
             let total = stats.hits + stats.misses;
@@ -622,7 +638,7 @@ pub fn cas(cmd: CasCommands) -> Result<()> {
     Ok(())
 }
 
-fn format_size_human(bytes: u64) -> String {
+pub(crate) fn format_size_human(bytes: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
     let mut v = bytes as f64;
     let mut i = 0;
@@ -927,7 +943,12 @@ pub fn affected(args: crate::args::AffectedArgs) -> Result<()> {
                 .collect(),
         })
         .collect();
-    let names = crate::affected::affected(&pkgs, &root, &changed);
+    let mut names = crate::affected::affected(&pkgs, &root, &changed);
+    if let Some(spec) = &args.partition {
+        let (n, m) = crate::affected::parse_partition(spec)
+            .with_context(|| format!("`--partition {spec}`: expected N/M with 1 ≤ N ≤ M"))?;
+        names = crate::affected::partition(&names, n, m);
+    }
 
     match args.format.as_str() {
         "json" => println!("{}", serde_json::to_string(&names)?),

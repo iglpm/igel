@@ -635,3 +635,35 @@ fn doc_with(args: DocArgs, extra: &[String]) -> Result<()> {
     }
     Ok(())
 }
+
+/// `rune cas export`: the store entries the requested builds need, in one
+/// file. Nothing is compiled: keys are computed from the sources, and only
+/// entries the store has go in (run the build first to fill it).
+pub fn cas_export(args: crate::args::CasExportArgs) -> Result<()> {
+    let sess = Session::new(&args.build.common, "dev")?;
+    let Some(cas) = sess.cas() else {
+        bail!("the store is disabled (cas.enabled = false)");
+    };
+    let mut keys: Vec<String> = Vec::new();
+    for command in &args.for_commands {
+        let (mode, profile) = match command.as_str() {
+            "check" => (Mode::Check, "dev"),
+            "test" => (Mode::Test, "test"),
+            _ => (Mode::Build, "dev"),
+        };
+        let s = Session::new(&args.build.common, profile)?;
+        let plan = plan_for(&s, mode, &selection(&args.build.targets))?;
+        keys.extend(s.executor().store_keys(&plan.graph)?);
+    }
+    let stats = cas.export_bundle(&keys, &args.output)?;
+    ui::summary(format!(
+        "wrote {} entries ({}) to {}",
+        stats.entries,
+        crate::cmd_misc::format_size_human(stats.bytes),
+        args.output.display()
+    ));
+    if stats.entries == 0 {
+        ui::hint("the store has none of them yet: build first, then export");
+    }
+    Ok(())
+}

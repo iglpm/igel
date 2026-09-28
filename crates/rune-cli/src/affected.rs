@@ -87,9 +87,45 @@ pub fn affected(pkgs: &[Pkg], root: &Path, changed: &[PathBuf]) -> Vec<String> {
         .collect()
 }
 
+/// `N/M`: shard `N` (1-based) of `M`.
+pub fn parse_partition(s: &str) -> Option<(usize, usize)> {
+    let (n, m) = s.split_once('/')?;
+    let (n, m): (usize, usize) = (n.trim().parse().ok()?, m.trim().parse().ok()?);
+    (m > 0 && (1..=m).contains(&n)).then_some((n, m))
+}
+
+/// The packages of shard `n` of `m`: every `m`-th of the sorted list, starting
+/// at the `n`-th, so shards differ in size by at most one and the same input
+/// always splits the same way on every CI machine.
+pub fn partition(names: &[String], n: usize, m: usize) -> Vec<String> {
+    let mut sorted: Vec<&String> = names.iter().collect();
+    sorted.sort();
+    sorted
+        .into_iter()
+        .enumerate()
+        .filter(|(i, _)| i % m == n - 1)
+        .map(|(_, s)| s.clone())
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn partitions_cover_everything_once_and_are_balanced() {
+        let names: Vec<String> = ["e", "a", "d", "b", "c"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let shards: Vec<Vec<String>> = (1..=2).map(|n| partition(&names, n, 2)).collect();
+        assert_eq!(shards[0], ["a", "c", "e"]);
+        assert_eq!(shards[1], ["b", "d"]);
+        assert_eq!(parse_partition("2/3"), Some((2, 3)));
+        assert_eq!(parse_partition("0/3"), None);
+        assert_eq!(parse_partition("4/3"), None);
+        assert_eq!(parse_partition("x"), None);
+    }
 
     fn pkg(name: &str, dir: &str, deps: &[&str]) -> Pkg {
         Pkg {

@@ -1046,6 +1046,33 @@ impl BuildExecutor {
         Ok(out)
     }
 
+    /// Every store slot a build of `graph` reads, as it stands now: each
+    /// unit's artifacts, its build script's result, replayed warnings and
+    /// diagnostics, and the outside inputs recorded for it — what
+    /// `rune cas export` puts in a bundle.
+    pub fn store_keys(&self, graph: &BuildGraph) -> RuneResult<Vec<String>> {
+        let topo = graph.topological_sort()?;
+        let cache_path = self.config.fingerprint_dir.join("source-cache.json");
+        let mut source_cache =
+            rune_fingerprint::FingerprintCache::load(&cache_path).unwrap_or_default();
+        let mut keys: HashMap<NodeId, String> = HashMap::new();
+        let mut out = Vec::new();
+        for id in topo {
+            let (base, key) = self.compute_keys(graph, id, &keys, &mut source_cache, false);
+            for slot in [
+                key.clone(),
+                format!("{key}-buildscript"),
+                format!("{key}-warnings"),
+                format!("{key}-diagnostics"),
+                format!("{base}-inputs"),
+            ] {
+                out.push(slot);
+            }
+            keys.insert(id, key);
+        }
+        Ok(out)
+    }
+
     /// Whether the store has a result for `key`.
     pub fn is_cached(&self, key: &str) -> bool {
         self.cas.as_ref().is_some_and(|c| c.contains(key))

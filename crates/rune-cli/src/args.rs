@@ -893,6 +893,27 @@ pub enum CasCommands {
     Gc(CasGcArgs),
     /// Show which packages take the space, and how much has gone unused
     Du(CasDuArgs),
+    /// Write the store entries a build of the workspace needs into one file
+    /// (a CI cache step saves it; `rune cas import` restores it)
+    Export(Box<CasExportArgs>),
+    /// Add the entries of a file written by `rune cas export` to the store
+    Import {
+        /// The file (`.tar` or `.tar.gz`)
+        path: PathBuf,
+    },
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct CasExportArgs {
+    #[command(flatten)]
+    pub build: BuildArgs,
+    /// The file to write: `.tar`, or `.tar.gz` to compress it
+    #[arg(short = 'o', long, value_name = "FILE")]
+    pub output: PathBuf,
+    /// Which commands' entries to include (repeatable): `build`, `check`,
+    /// `test`
+    #[arg(long = "for", value_name = "COMMAND", default_value = "build", value_parser = ["build", "check", "test"])]
+    pub for_commands: Vec<String>,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -1048,6 +1069,11 @@ pub struct AffectedArgs {
     /// Path to the manifest (Cargo.toml or Rune.toml), or a directory holding one
     #[arg(long, value_name = "PATH")]
     pub manifest_path: Option<PathBuf>,
+
+    /// Only shard N of M (`2/4`): split the affected packages between CI
+    /// machines, the same way on every one
+    #[arg(long, value_name = "N/M")]
+    pub partition: Option<String>,
 }
 
 #[derive(Args, Debug, Clone)]

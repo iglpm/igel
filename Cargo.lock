@@ -1172,11 +1172,13 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "filetime",
+ "flate2",
  "reqwest",
  "rune-common",
  "same-file",
  "serde",
  "serde_json",
+ "tar",
  "tempfile",
  "thiserror",
  "tokio",

@@ -4850,3 +4850,77 @@ fn test_results_are_json_lines_with_message_format_json() {
     assert_eq!(suite["tests"][0]["name"], "tests::adds");
     assert_eq!(suite["tests"][0]["status"], "passed");
 }
+
+// ---------------------------------------------------------------------------
+// cas export / import, affected --partition
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_store_bundle_carries_a_build_to_a_fresh_machine() {
+    let p = build_script_project();
+    p.ok(&["build"]);
+    p.ok(&["test", "--no-run"]);
+    let bundle = p.home().join("ci-cache.tar.gz");
+    let out = p.ok(&[
+        "cas",
+        "export",
+        "-o",
+        bundle.to_str().unwrap(),
+        "--for",
+        "build",
+        "--for",
+        "test",
+    ]);
+    assert!(out.contains("wrote"), "{out}");
+
+    // A fresh store and a clean checkout: everything comes from the bundle.
+    let fresh = tempfile::tempdir().unwrap();
+    std::fs::remove_dir_all(p.path().join(".rune")).unwrap();
+    let rune = |args: &[&str]| {
+        let out = Command::new(env!("CARGO_BIN_EXE_rune"))
+            .args(args)
+            .current_dir(p.path())
+            .env("RUNE_HOME", fresh.path())
+            .env("NO_COLOR", "1")
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{}", text(&out));
+        text(&out)
+    };
+    assert!(rune(&["cas", "import", bundle.to_str().unwrap()]).contains("imported"));
+    let build = rune(&["build"]);
+    assert!(build.contains(" 0 compiled"), "{build}");
+    let run = rune(&["run"]);
+    assert!(
+        run.contains("cfg=true env=ok"),
+        "the restored program runs:\n{run}"
+    );
+    let test = rune(&["test", "--no-run"]);
+    assert!(
+        test.contains(" 0 compiled") || !test.contains("compiled"),
+        "{test}"
+    );
+}
+
+#[test]
+fn affected_partitions_split_the_packages_between_machines() {
+    // app -> c2 -> c1 -> c0; an edit to c0 affects all four.
+    let p = chain_project(3);
+    git_in(p.path(), &["init", "-q", "-b", "main"]);
+    git_in(p.path(), &["add", "-A"]);
+    git_in(p.path(), &["commit", "-q", "-m", "base"]);
+    p.write("c0/src/extra.rs", "");
+    let shard = |n: &str| -> Vec<String> {
+        p.ok(&["affected", "--partition", n])
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(String::from)
+            .collect()
+    };
+    assert_eq!(shard("1/2"), ["app", "c1"]);
+    assert_eq!(shard("2/2"), ["c0", "c2"]);
+    let bad = p.rune(&["affected", "--partition", "3/2"]);
+    assert!(!bad.status.success());
+    assert!(text(&bad).contains("N/M"), "{}", text(&bad));
+}
