@@ -29,7 +29,6 @@ pub fn selection(t: &TargetArgs) -> TargetSelection {
 
 /// Plans a build for a session.
 pub fn plan_for(sess: &Session, mode: Mode, targets: &TargetSelection) -> Result<Plan> {
-    warn_on_cross_compile(sess);
     graph::plan(
         &sess.ws,
         &Request {
@@ -45,18 +44,6 @@ pub fn plan_for(sess: &Session, mode: Mode, targets: &TargetSelection) -> Result
             doctests: false,
         },
     )
-}
-
-fn warn_on_cross_compile(sess: &Session) {
-    let host = rune_common::TargetTriple::host().map(|t| t.0);
-    if let (Some(target), Some(host)) = (&sess.target, host)
-        && *target != host
-    {
-        ui::warn(format!(
-            "cross-compiling for `{target}`: build scripts and proc-macros are still built \
-                 for the host, and their dependencies are not yet built separately for the host"
-        ));
-    }
 }
 
 pub fn build(args: BuildArgs, mode: Mode) -> Result<()> {

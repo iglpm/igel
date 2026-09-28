@@ -1369,7 +1369,7 @@ impl UnitJob {
                 }
                 .to_string(),
                 num_jobs: self.max_jobs as u32,
-                rustc: tc.rustc.clone(),
+                rustc: tc.exec.clone(),
                 rustdoc: tc.rustdoc.clone(),
                 rustc_wrapper: tc.wrapper.clone(),
                 rustc_workspace_wrapper: tc.workspace_wrapper.clone(),

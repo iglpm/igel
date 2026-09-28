@@ -308,19 +308,7 @@ pub fn native_tools_identity() -> &'static str {
                 program,
                 rune_common::toolchain::program_fingerprint(&path)
             ));
-            let version = std::process::Command::new(&program)
-                .arg("--version")
-                .output()
-                .ok()
-                .filter(|o| o.status.success())
-                .map(|o| {
-                    String::from_utf8_lossy(&o.stdout)
-                        .lines()
-                        .next()
-                        .unwrap_or("")
-                        .to_string()
-                })
-                .unwrap_or_default();
+            let version = rune_common::toolchain::tool_version(&path);
             out.push_str(&version);
             out.push('\n');
         }

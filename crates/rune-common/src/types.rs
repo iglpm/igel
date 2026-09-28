@@ -470,25 +470,10 @@ impl PanicStrategy {
 pub struct TargetTriple(pub String);
 
 impl TargetTriple {
-    /// Returns the host target triple by querying `rustc -vV`.
+    /// The host triple, as the build's compiler reports it.
     pub fn host() -> Option<Self> {
-        // Cached in a static once we compute it
-        use std::sync::OnceLock;
-        static HOST: OnceLock<Option<TargetTriple>> = OnceLock::new();
-        HOST.get_or_init(|| {
-            let output = std::process::Command::new("rustc")
-                .arg("-vV")
-                .output()
-                .ok()?;
-            let stdout = String::from_utf8(output.stdout).ok()?;
-            for line in stdout.lines() {
-                if let Some(triple) = line.strip_prefix("host: ") {
-                    return Some(TargetTriple(triple.trim().to_string()));
-                }
-            }
-            None
-        })
-        .clone()
+        let host = &crate::toolchain::global().host;
+        (!host.is_empty()).then(|| TargetTriple(host.clone()))
     }
 }
 
