@@ -116,15 +116,15 @@ impl Patches {
         for (key, spec) in replaces {
             // `name:version`, or `url#name:version` for other sources.
             let tail = key.rsplit('#').next().unwrap_or(key);
-            if let Some((name, version)) = tail.rsplit_once(':') {
-                if let Ok(v) = version.parse::<Version>() {
-                    entries.push(PatchEntry {
-                        source: PatchSource::CratesIo,
-                        name: name.to_string(),
-                        spec: absolutize(spec.clone(), root),
-                        exact: Some(v),
-                    });
-                }
+            if let Some((name, version)) = tail.rsplit_once(':')
+                && let Ok(v) = version.parse::<Version>()
+            {
+                entries.push(PatchEntry {
+                    source: PatchSource::CratesIo,
+                    name: name.to_string(),
+                    spec: absolutize(spec.clone(), root),
+                    exact: Some(v),
+                });
             }
         }
         Patches { entries }
@@ -175,10 +175,10 @@ impl PatchEntry {
             .as_ref()
             .and_then(|p| p.version_in(ws))
             .unwrap_or_else(|| Version::new(0, 0, 0));
-        if let Some(exact) = &self.exact {
-            if *exact != version {
-                return Ok(None);
-            }
+        if let Some(exact) = &self.exact
+            && *exact != version
+        {
+            return Ok(None);
         }
         Ok(req.matches(&version).then_some((dir, version)))
     }

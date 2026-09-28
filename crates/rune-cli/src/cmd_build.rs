@@ -3,10 +3,10 @@
 use anyhow::{Context, Result, bail};
 use colored::Colorize;
 use rune_common::TargetKind;
-use rune_scheduler::executor::out_dir_for;
-use std::path::{Path, PathBuf};
+use rune_scheduler::executor::bin_dir_for;
+use std::path::PathBuf;
 
-use crate::args::{BuildArgs, DocArgs, InstallArgs, RunArgs, TargetArgs};
+use crate::args::{BuildArgs, DocArgs, RunArgs, TargetArgs};
 use crate::graph::{self, Mode, Plan, Request, TargetSelection};
 use crate::session::{Session, drive, ensure_success};
 use crate::ui;
@@ -49,19 +49,29 @@ pub fn plan_for(sess: &Session, mode: Mode, targets: &TargetSelection) -> Result
 
 fn warn_on_cross_compile(sess: &Session) {
     let host = rune_common::TargetTriple::host().map(|t| t.0);
-    if let (Some(target), Some(host)) = (&sess.target, host) {
-        if *target != host {
-            ui::warn(format!(
-                "cross-compiling for `{target}`: build scripts and proc-macros are still built \
+    if let (Some(target), Some(host)) = (&sess.target, host)
+        && *target != host
+    {
+        ui::warn(format!(
+            "cross-compiling for `{target}`: build scripts and proc-macros are still built \
                  for the host, and their dependencies are not yet built separately for the host"
-            ));
-        }
+        ));
     }
 }
 
 pub fn build(args: BuildArgs, mode: Mode) -> Result<()> {
+    build_with(args, mode, |_| Ok(()))
+}
+
+/// [`build`], with a chance to adjust the plan before it runs.
+fn build_with(
+    args: BuildArgs,
+    mode: Mode,
+    adjust: impl FnOnce(&mut Plan) -> Result<()>,
+) -> Result<()> {
     let sess = Session::new(&args.common, "dev")?;
-    let plan = plan_for(&sess, mode, &selection(&args.targets))?;
+    let mut plan = plan_for(&sess, mode, &selection(&args.targets))?;
+    adjust(&mut plan)?;
     sess.ws.config.ensure_dirs(sess.profile.output_dir_name())?;
 
     let (result, _) = if args.deps_only {
@@ -99,14 +109,19 @@ pub fn summarize(sess: &Session, result: &rune_scheduler::executor::BuildResult)
     ui::summary(parts.join(" · "));
 }
 
-/// `rune clippy`: lints every local crate with `clippy-driver`.
+/// `rune clippy`: lints the workspace's crates with `clippy-driver`.
 ///
-/// Reuses the exact same resolve/graph/executor pipeline as `rune check`
-/// (`clippy-driver` accepts every flag `rustc` does, plus its own lint
-/// passes) by pointing the `RUSTC` environment variable at it before building.
-/// Dependencies are compiled with `--cap-lints allow`, so only local crates
-/// actually get linted, as with `cargo clippy`.
-pub fn clippy(args: BuildArgs) -> Result<()> {
+/// Reuses the exact same resolve/graph/executor pipeline as `rune check`,
+/// with `clippy-driver` as `RUSTC_WORKSPACE_WRAPPER` — exactly what `cargo
+/// clippy` does. Only workspace members go through it; dependencies are
+/// compiled by rustc as for `rune check` (and share its cached results), and
+/// build scripts see the real compiler as `RUSTC`: one that runs `$RUSTC
+/// --version` (libc, serde, proc-macro2, …) would otherwise read clippy's
+/// version and fail. Lint flags after `--`
+/// (`-D warnings`, `-W clippy::pedantic`) go to the workspace's own crates,
+/// and are part of their keys: a result cached without `-D warnings` is never
+/// replayed as a pass with it.
+pub fn clippy(args: crate::args::ClippyArgs) -> Result<()> {
     let clippy_driver = std::env::var_os("CLIPPY_DRIVER")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("clippy-driver"));
@@ -123,9 +138,126 @@ pub fn clippy(args: BuildArgs) -> Result<()> {
     }
     // SAFETY: called on the main thread before any worker threads exist.
     unsafe {
-        std::env::set_var("RUSTC", &clippy_driver);
+        std::env::set_var("RUSTC_WORKSPACE_WRAPPER", &clippy_driver);
     }
-    build(args, Mode::Check)
+    if args.fix {
+        return fix_loop(&args.build, &args.args, &FixVcs::default(), "clippy");
+    }
+    build_with(args.build, Mode::Check, |plan| {
+        add_flags(plan, &args.args, |n| n.unit.ext.member);
+        Ok(())
+    })
+}
+
+/// `rune rustc -- <ARGS>`: builds, with extra rustc arguments for the
+/// selected targets only (their keys include them).
+pub fn rustc(args: crate::args::RustcArgs) -> Result<()> {
+    let extra = args.args.clone();
+    build_with(args.build, Mode::Build, move |plan| {
+        let targets: std::collections::HashSet<_> = plan.requested.iter().map(|r| r.node).collect();
+        if targets.len() > 1 && !extra.is_empty() {
+            let names: Vec<String> = plan
+                .requested
+                .iter()
+                .map(|r| format!("{} `{}`", r.kind.as_str(), r.target))
+                .collect();
+            bail!(
+                "extra arguments to `rustc` can only be passed to one target; this selects {}.\n\
+                 Pick one with `--lib`, `--bin NAME`, `--example NAME`, `--test NAME` or `--bench NAME`",
+                names.join(", ")
+            );
+        }
+        add_flags(plan, &extra, |n| targets.contains(&n.id));
+        Ok(())
+    })
+}
+
+/// Settings of `rune fix` about uncommitted changes.
+#[derive(Default)]
+pub struct FixVcs {
+    pub allow_dirty: bool,
+    pub allow_staged: bool,
+    pub allow_no_vcs: bool,
+}
+
+/// `rune fix`: applies the compiler's machine-applicable suggestions.
+pub fn fix(args: crate::args::FixArgs) -> Result<()> {
+    let vcs = FixVcs {
+        allow_dirty: args.allow_dirty,
+        allow_staged: args.allow_staged,
+        allow_no_vcs: args.allow_no_vcs,
+    };
+    fix_loop(&args.build, &[], &vcs, "rustc")
+}
+
+/// Checks, applies suggestions, and checks again until none are left (at
+/// most four rounds, as rustfix does).
+fn fix_loop(args: &BuildArgs, flags: &[String], vcs: &FixVcs, what: &str) -> Result<()> {
+    let sess = Session::new(&args.common, "dev")?;
+    crate::fix::check_vcs(
+        sess.ws.root(),
+        vcs.allow_dirty,
+        vcs.allow_staged,
+        vcs.allow_no_vcs,
+    )?;
+    sess.ws.config.ensure_dirs(sess.profile.output_dir_name())?;
+    let roots: Vec<PathBuf> = sess.ws.members.iter().map(|m| m.dir.clone()).collect();
+    let mut total = 0;
+    for _ in 0..4 {
+        let mut plan = plan_for(&sess, Mode::Check, &selection(&args.targets))?;
+        add_flags(&mut plan, flags, |n| n.unit.ext.member);
+        let diagnostics = std::cell::RefCell::new(Vec::<String>::new());
+        let (result, _) = drive(&sess, &plan.graph, |event| match event {
+            rune_scheduler::PipelineEvent::BuildFinished {
+                node_id,
+                diagnostics: d,
+                ..
+            }
+            | rune_scheduler::PipelineEvent::CacheHit {
+                node_id,
+                diagnostics: d,
+                ..
+            }
+            | rune_scheduler::PipelineEvent::BuildFailed {
+                node_id,
+                diagnostics: d,
+                ..
+            } if plan.graph.node(*node_id).unit.ext.member => {
+                diagnostics.borrow_mut().extend(d.iter().cloned());
+            }
+            _ => {}
+        })?;
+        let applied = crate::fix::apply(&diagnostics.borrow(), &roots)?;
+        total += applied;
+        if applied == 0 {
+            ensure_success(&result)?;
+            break;
+        }
+    }
+    ui::summary(format!("applied {total} {what} suggestion(s)"));
+    Ok(())
+}
+
+/// Adds `flags` to the rustc invocation of every node `pick` selects.
+fn add_flags(plan: &mut Plan, flags: &[String], pick: impl Fn(&rune_graph::BuildNode) -> bool) {
+    if flags.is_empty() {
+        return;
+    }
+    let ids: Vec<_> = plan
+        .graph
+        .nodes()
+        .iter()
+        .filter(|n| pick(n))
+        .map(|n| n.id)
+        .collect();
+    for id in ids {
+        plan.graph
+            .node_mut(id)
+            .unit
+            .ext
+            .rustflags
+            .extend(flags.iter().cloned());
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -161,7 +293,7 @@ pub fn run(args: RunArgs) -> Result<()> {
         .find(|r| r.kind == kind && r.target == name && !r.harness)
         .with_context(|| format!("no {} target named `{name}`", kind.as_str()))?;
     let unit = &plan.graph.node(node.node).unit;
-    let exe = out_dir_for(sess.config(), &sess.profile, unit).join(&name);
+    let exe = bin_dir_for(sess.config(), &sess.profile, unit).join(unit.executable_name(&name));
     let member = &sess.ws.members[node.member];
 
     ui::action("running", exe.display());
@@ -223,14 +355,39 @@ pub fn apply_run_env(
         .env("CARGO_PKG_VERSION_PRE", member.version.pre.as_str())
         .env("CARGO_PKG_AUTHORS", &member.meta.authors)
         .env("CARGO_PKG_DESCRIPTION", &member.meta.description);
-    // Dynamic libraries (proc-macro hosts, dylib dependencies) live in `deps`.
-    let deps = sess.config().deps_dir(sess.profile.output_dir_name());
-    let mut paths = vec![deps];
-    if let Some(existing) = std::env::var_os("LD_LIBRARY_PATH") {
-        paths.extend(std::env::split_paths(&existing));
+    // Where the program's dynamic libraries are, as Cargo sets it up: the
+    // native libraries build scripts produced, `deps/` (dylib dependencies)
+    // and the profile directory (the workspace's own cdylibs).
+    let dir = sess.profile.output_dir_name();
+    let mut paths: Vec<PathBuf> = sess.native_dirs.lock().unwrap().clone();
+    paths.push(sess.config().deps_dir(dir));
+    paths.push(sess.config().profile_target_dir(dir));
+    let var = dylib_path_var();
+    match std::env::var_os(var) {
+        Some(existing) => paths.extend(std::env::split_paths(&existing)),
+        // Setting the fallback path replaces macOS's default one.
+        None if var == "DYLD_FALLBACK_LIBRARY_PATH" => {
+            if let Some(home) = home::home_dir() {
+                paths.push(home.join("lib"));
+            }
+            paths.push(PathBuf::from("/usr/local/lib"));
+            paths.push(PathBuf::from("/usr/lib"));
+        }
+        None => {}
     }
     if let Ok(joined) = std::env::join_paths(paths) {
-        cmd.env("LD_LIBRARY_PATH", joined);
+        cmd.env(var, joined);
+    }
+}
+
+/// The variable the platform's dynamic loader searches.
+fn dylib_path_var() -> &'static str {
+    if cfg!(windows) {
+        "PATH"
+    } else if cfg!(target_os = "macos") {
+        "DYLD_FALLBACK_LIBRARY_PATH"
+    } else {
+        "LD_LIBRARY_PATH"
     }
 }
 
@@ -254,77 +411,22 @@ fn exec(mut cmd: std::process::Command) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// install
-// ---------------------------------------------------------------------------
-
-pub fn install(args: InstallArgs) -> Result<()> {
-    let mut common = args.common.clone();
-    // Installed binaries are release builds unless a profile is named.
-    common.release = args.common.profile.is_none();
-    common.manifest_path = Some(rune_common::manifest_file::manifest_in(&args.path));
-    let sess = Session::new(&common, "release")?;
-
-    let targets = TargetSelection {
-        bins: args.bin.is_empty(),
-        bin: args.bin.clone(),
-        ..Default::default()
-    };
-    let plan = plan_for(&sess, Mode::Build, &targets)?;
-    let bins: Vec<_> = plan
-        .requested
-        .iter()
-        .filter(|r| r.kind == TargetKind::Bin && !r.harness)
-        .collect();
-    if bins.is_empty() {
-        bail!("there is nothing to install: the package has no binary targets");
-    }
-    sess.ws.config.ensure_dirs(sess.profile.output_dir_name())?;
-    let (result, _) = drive(&sess, &plan.graph, |_| {})?;
-    ensure_success(&result)?;
-
-    let bin_dir = install_dir(args.root.as_deref())?;
-    std::fs::create_dir_all(&bin_dir)?;
-    for r in bins {
-        let unit = &plan.graph.node(r.node).unit;
-        let src = out_dir_for(sess.config(), &sess.profile, unit).join(&r.target);
-        let dest = bin_dir.join(&r.target);
-        if dest.exists() && !args.force {
-            bail!(
-                "binary `{}` already exists in destination `{}` (use --force to overwrite)",
-                r.target,
-                bin_dir.display()
-            );
-        }
-        // Copy, don't link: the installed file must survive `rune clean`.
-        let _ = std::fs::remove_file(&dest);
-        std::fs::copy(&src, &dest)
-            .with_context(|| format!("failed to install {}", dest.display()))?;
-        ui::action("installed", dest.display());
-    }
-    Ok(())
-}
-
-fn install_dir(root: Option<&Path>) -> Result<PathBuf> {
-    if let Some(root) = root {
-        return Ok(root.join("bin"));
-    }
-    if let Some(root) = std::env::var_os("CARGO_INSTALL_ROOT") {
-        return Ok(PathBuf::from(root).join("bin"));
-    }
-    let cargo_home = std::env::var_os("CARGO_HOME")
-        .map(PathBuf::from)
-        .or_else(|| home::home_dir().map(|h| h.join(".cargo")))
-        .context("could not determine the install directory; pass --root")?;
-    Ok(cargo_home.join("bin"))
-}
-
-// ---------------------------------------------------------------------------
 // doc
 // ---------------------------------------------------------------------------
 
 /// `rune doc`: builds documentation with `rustdoc` for the selected packages'
 /// libraries (and, unless `--no-deps`, everything they depend on).
 pub fn doc(args: DocArgs) -> Result<()> {
+    doc_with(args, &[])
+}
+
+/// `rune rustdoc -- <ARGS>`: `rune doc` with extra rustdoc arguments for the
+/// selected packages' own documentation.
+pub fn rustdoc(args: crate::args::RustdocArgs) -> Result<()> {
+    doc_with(args.doc, &args.args)
+}
+
+fn doc_with(args: DocArgs, extra: &[String]) -> Result<()> {
     let sess = Session::new(&args.common, "dev")?;
     let plan = plan_for(
         &sess,
@@ -397,6 +499,9 @@ pub fn doc(args: DocArgs) -> Result<()> {
                 .as_bytes(),
         );
         hb.update(rustdoc_id.as_bytes());
+        if requested.contains(&id) {
+            hb.update(format!("{}|{extra:?}", args.document_private_items).as_bytes());
+        }
         let stamp_name = format!("{}-{}", unit.rustc_crate_name(), &hb.finish_blake3()[..16]);
         let stamp = stamp_dir.join(&stamp_name);
         if stamp.is_file() && doc_dir.join(unit.rustc_crate_name()).is_dir() {
@@ -448,6 +553,34 @@ pub fn doc(args: DocArgs) -> Result<()> {
         cmd.env("CARGO_MANIFEST_DIR", &unit.manifest_dir)
             .env("CARGO_PKG_NAME", &unit.crate_id.name)
             .env("CARGO_PKG_VERSION", unit.crate_id.version.to_string());
+        // What the crate's build script gave its compilation: generated code
+        // in `OUT_DIR` (bindgen output), `cfg`s, environment.
+        if unit.build_script.is_some() {
+            let key = unit
+                .ext
+                .script_owner
+                .clone()
+                .unwrap_or_else(|| rune_scheduler::executor::script_key(unit));
+            cmd.env(
+                "OUT_DIR",
+                sess.config()
+                    .build_script_out_dir_by_key(sess.profile.output_dir_name(), &key),
+            );
+        }
+        if let Some(out) = result.build_script_outputs.get(&id) {
+            for cfg in &out.cfgs {
+                cmd.arg("--cfg").arg(cfg);
+            }
+            for (k, v) in &out.env_vars {
+                cmd.env(k, v);
+            }
+        }
+        if requested.contains(&id) {
+            if args.document_private_items {
+                cmd.arg("--document-private-items");
+            }
+            cmd.args(extra);
+        }
         let out = cmd.output().with_context(|| {
             format!(
                 "failed to run `{}` — is rustdoc installed?",
@@ -486,12 +619,20 @@ pub fn doc(args: DocArgs) -> Result<()> {
         doc_dir.display()
     ));
 
-    if args.open {
-        if let Some(r) = plan.requested.first() {
-            let unit = &plan.graph.node(r.node).unit;
-            let index = doc_dir.join(unit.rustc_crate_name()).join("index.html");
-            let _ = std::process::Command::new("xdg-open").arg(index).spawn();
-        }
+    if args.open
+        && let Some(r) = plan.requested.first()
+    {
+        let unit = &plan.graph.node(r.node).unit;
+        let index = doc_dir.join(unit.rustc_crate_name()).join("index.html");
+        let opener = if cfg!(target_os = "macos") {
+            "open"
+        } else if cfg!(windows) {
+            "explorer"
+        } else {
+            "xdg-open"
+        };
+        ui::action("opening", index.display());
+        let _ = std::process::Command::new(opener).arg(index).spawn();
     }
     Ok(())
 }

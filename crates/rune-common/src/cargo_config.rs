@@ -23,6 +23,10 @@ pub struct CargoConfig {
     table: Table,
     /// The files that contributed, closest first.
     pub files: Vec<PathBuf>,
+    /// Files that exist but could not be read or parsed, with why. A command
+    /// that builds refuses to go on (a mirror, rustflags or linker silently
+    /// not applying is worse than an error), as Cargo does.
+    pub errors: Vec<(PathBuf, String)>,
 }
 
 /// One `[env]` entry.
@@ -39,9 +43,19 @@ impl CargoConfig {
         Self::default()
     }
 
-    /// Loads every config file that applies to a build started in `start`.
+    /// Loads every config file that applies to a build started in `start`,
+    /// under whatever `--config` gave on the command line.
     pub fn load(start: &Path) -> Self {
         let mut cfg = Self::default();
+        for entry in cli_overrides() {
+            let path = start.join(&entry);
+            if entry.ends_with(".toml") && path.is_file() {
+                cfg.add_file(&path, start);
+            } else if let Err(e) = cfg.add_str(&entry, start) {
+                cfg.errors
+                    .push((PathBuf::from("--config"), format!("`{entry}`: {e}")));
+            }
+        }
         let mut dir = Some(start);
         while let Some(d) = dir {
             for name in ["config.toml", "config"] {
@@ -79,13 +93,89 @@ impl CargoConfig {
     }
 
     fn add_file(&mut self, path: &Path, base: &Path) {
-        // An unreadable or malformed config file must not break builds that
-        // don't need it; Cargo would error, but Rune only warns via `files`.
-        if let Ok(text) = std::fs::read_to_string(path) {
-            if self.add_str(&text, base).is_ok() {
-                self.files.push(path.to_path_buf());
+        self.add_file_depth(path, base, 0);
+    }
+
+    /// Adds a file and then what its `include` names (`"a.toml"`, a list of
+    /// paths, or `{ path, optional }` tables, relative to the including
+    /// file): the including file wins over what it includes.
+    fn add_file_depth(&mut self, path: &Path, base: &Path, depth: usize) {
+        if depth > 8 || (depth > 0 && self.files.iter().any(|f| f == path)) {
+            return;
+        }
+        let parsed = std::fs::read_to_string(path)
+            .map_err(|e| e.to_string())
+            .and_then(|text| toml::from_str::<Table>(&text).map_err(|e| e.to_string()));
+        let mut table = match parsed {
+            Ok(t) => t,
+            Err(e) => {
+                self.errors.push((path.to_path_buf(), e));
+                return;
+            }
+        };
+        let include = table.remove("include");
+        absolutize(&mut table, base);
+        merge(&mut self.table, table);
+        self.files.push(path.to_path_buf());
+
+        let dir = path.parent().unwrap_or(Path::new("."));
+        let entries: Vec<(String, bool)> = match include {
+            None => Vec::new(),
+            Some(Value::String(s)) => vec![(s, false)],
+            Some(Value::Array(items)) => items
+                .into_iter()
+                .filter_map(|i| match i {
+                    Value::String(s) => Some((s, false)),
+                    Value::Table(t) => Some((
+                        t.get("path")?.as_str()?.to_string(),
+                        t.get("optional").and_then(|o| o.as_bool()).unwrap_or(false),
+                    )),
+                    _ => None,
+                })
+                .collect(),
+            Some(Value::Table(t)) => t
+                .get("path")
+                .and_then(|p| p.as_str())
+                .map(|p| {
+                    vec![(
+                        p.to_string(),
+                        t.get("optional").and_then(|o| o.as_bool()).unwrap_or(false),
+                    )]
+                })
+                .unwrap_or_default(),
+            Some(_) => {
+                self.errors.push((
+                    path.to_path_buf(),
+                    "`include` must be a path or a list".into(),
+                ));
+                Vec::new()
+            }
+        };
+        for (rel, optional) in entries {
+            let included = dir.join(&rel);
+            if included.is_file() {
+                self.add_file_depth(&included, base, depth + 1);
+            } else if !optional {
+                self.errors.push((
+                    path.to_path_buf(),
+                    format!("included file `{}` does not exist", included.display()),
+                ));
             }
         }
+    }
+
+    /// The first problem with a configuration file, as an error message.
+    pub fn error(&self) -> Option<String> {
+        self.errors.first().map(|(path, e)| {
+            if path.as_os_str() == "--config" {
+                format!("invalid `--config` value {e}")
+            } else {
+                format!(
+                    "could not load configuration file `{}`: {e}",
+                    path.display()
+                )
+            }
+        })
     }
 
     /// Looks up a value by path, e.g. `["build", "rustc"]`, ignoring the environment.
@@ -323,12 +413,11 @@ fn absolutize(root: &mut Table, base: &Path) {
         for (_, srcs) in patches.iter_mut() {
             let Value::Table(srcs) = srcs else { continue };
             for (_, dep) in srcs.iter_mut() {
-                if let Value::Table(dep) = dep {
-                    if let Some(Value::String(s)) = dep.get_mut("path") {
-                        if !Path::new(s.as_str()).is_absolute() {
-                            *s = base.join(&*s).to_string_lossy().into_owned();
-                        }
-                    }
+                if let Value::Table(dep) = dep
+                    && let Some(Value::String(s)) = dep.get_mut("path")
+                    && !Path::new(s.as_str()).is_absolute()
+                {
+                    *s = base.join(&*s).to_string_lossy().into_owned();
                 }
             }
         }
@@ -336,30 +425,74 @@ fn absolutize(root: &mut Table, base: &Path) {
     // paths = [..]
     if let Some(Value::Array(paths)) = root.get_mut("paths") {
         for p in paths.iter_mut() {
-            if let Value::String(s) = p {
-                if !Path::new(s.as_str()).is_absolute() {
-                    *s = base.join(&*s).to_string_lossy().into_owned();
-                }
+            if let Value::String(s) = p
+                && !Path::new(s.as_str()).is_absolute()
+            {
+                *s = base.join(&*s).to_string_lossy().into_owned();
             }
         }
     }
     // [env] entries with `relative = true`
     if let Some(Value::Table(env)) = root.get_mut("env") {
         for (_, v) in env.iter_mut() {
-            if let Value::Table(t) = v {
-                if t.get("relative").and_then(Value::as_bool) == Some(true) {
-                    if let Some(Value::String(s)) = t.get_mut("value") {
-                        *s = base.join(&*s).to_string_lossy().into_owned();
-                    }
-                }
+            if let Value::Table(t) = v
+                && t.get("relative").and_then(Value::as_bool) == Some(true)
+                && let Some(Value::String(s)) = t.get_mut("value")
+            {
+                *s = base.join(&*s).to_string_lossy().into_owned();
             }
         }
     }
 }
 
+static CLI_OVERRIDES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+
+/// `--config KEY=VALUE` (TOML) or `--config path/to/file.toml` from the
+/// command line: the highest-precedence configuration, as with Cargo.
+pub fn set_cli_overrides(entries: Vec<String>) {
+    let _ = CLI_OVERRIDES.set(entries);
+}
+
+fn cli_overrides() -> Vec<String> {
+    CLI_OVERRIDES.get().cloned().unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn included_files_apply_below_the_file_that_includes_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let cargo = dir.path().join(".cargo");
+        std::fs::create_dir_all(&cargo).unwrap();
+        std::fs::write(
+            cargo.join("config.toml"),
+            "include = [\"shared.toml\", { path = \"missing.toml\", optional = true }]\n[build]\njobs = 3\n",
+        )
+        .unwrap();
+        std::fs::write(
+            cargo.join("shared.toml"),
+            "[build]\njobs = 9\ntarget-dir = \"out\"\n",
+        )
+        .unwrap();
+        let cfg = CargoConfig::load(dir.path());
+        assert!(cfg.errors.is_empty(), "{:?}", cfg.errors);
+        assert_eq!(
+            cfg.file_value(&["build", "jobs"])
+                .and_then(|v| v.as_integer()),
+            Some(3)
+        );
+        assert!(cfg.file_value(&["build", "target-dir"]).is_some());
+
+        std::fs::write(cargo.join("config.toml"), "include = \"nope.toml\"\n").unwrap();
+        assert!(
+            CargoConfig::load(dir.path())
+                .error()
+                .unwrap()
+                .contains("nope.toml")
+        );
+    }
 
     fn cfg(files: &[(&str, &str)]) -> CargoConfig {
         // Closest first, like `load`.

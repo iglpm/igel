@@ -13,15 +13,6 @@ use std::io::{self, Write};
 use std::sync::OnceLock;
 use tracing_subscriber::{EnvFilter, fmt};
 
-/// When set, stdout carries machine-readable output only (`--message-format
-/// json`), so the human-readable action and summary lines go to stderr.
-static MACHINE_OUTPUT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-/// Reserves stdout for machine-readable output.
-pub fn set_machine_output(on: bool) {
-    MACHINE_OUTPUT.store(on, std::sync::atomic::Ordering::Relaxed);
-}
-
 /// `--quiet`: no action or summary lines at all.
 static QUIET: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -31,10 +22,6 @@ pub fn set_quiet(on: bool) {
 
 fn quiet() -> bool {
     QUIET.load(std::sync::atomic::Ordering::Relaxed)
-}
-
-fn machine_output() -> bool {
-    MACHINE_OUTPUT.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// The `MultiProgress` shared between the active build's progress bars and
@@ -99,28 +86,22 @@ fn marker() -> ColoredString {
 
 /// A notable action, in progress or completed (e.g. `resolving`, `finished`,
 /// `added`). Lowercase by convention — set the verb lowercase at the call
-/// site.
+/// site. Status goes to stderr, as Cargo's does: stdout is for what a command
+/// produces (`metadata`, `vendor`'s configuration, the program `run` runs),
+/// so that it can be piped and redirected.
 pub fn action(verb: &str, message: impl Display) {
     if quiet() {
         return;
     }
-    if machine_output() {
-        eprintln!("{} {} {}", marker(), brand(verb), message);
-    } else {
-        println!("{} {} {}", marker(), brand(verb), message);
-    }
+    eprintln!("{} {} {}", marker(), brand(verb), message);
 }
 
-/// The final summary line for a completed build.
+/// The final summary line for a completed build (on stderr, see [`action`]).
 pub fn summary(message: impl Display) {
     if quiet() {
         return;
     }
-    if machine_output() {
-        eprintln!("{} {}", "✓".green().bold(), message);
-    } else {
-        println!("{} {}", "✓".green().bold(), message);
-    }
+    eprintln!("{} {}", "✓".green().bold(), message);
 }
 
 /// A non-fatal warning.

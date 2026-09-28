@@ -254,7 +254,13 @@ pub fn clean(args: CleanArgs) -> Result<()> {
 /// root, so handing it just the entry points formats every file the module
 /// tree reaches, as `cargo fmt` does. Crates are grouped by edition since
 /// `rustfmt` takes a single `--edition` per invocation.
-pub fn fmt(args: FmtArgs) -> Result<()> {
+pub fn fmt(mut args: FmtArgs) -> Result<()> {
+    // `rune fmt -- --check`, as CI writes it for `cargo fmt`: the check flag
+    // after `--` means the same as before it; the rest goes to rustfmt.
+    if let Some(i) = args.rustfmt_args.iter().position(|a| a == "--check") {
+        args.rustfmt_args.remove(i);
+        args.check = true;
+    }
     let ws = Workspace::load(args.manifest.manifest_path.as_deref())?;
     let selected = ws.select(&args.package, args.workspace, &[])?;
 
@@ -315,6 +321,7 @@ pub fn fmt(args: FmtArgs) -> Result<()> {
         if args.check {
             cmd.arg("--check");
         }
+        cmd.args(&args.rustfmt_args);
         cmd.args(&entries);
         let status = cmd.status().with_context(|| {
             format!(
@@ -452,24 +459,23 @@ pub fn config(cmd: ConfigCommands) -> Result<()> {
             );
             // Say so if something with higher precedence still wins.
             let effective = Settings::load(root.as_deref())?;
-            if let Some((v, origin)) = effective.get(&key) {
-                if *v != stored {
-                    ui::warn(format!("the effective value is still {v}, from {origin}"));
-                }
+            if let Some((v, origin)) = effective.get(&key)
+                && *v != stored
+            {
+                ui::warn(format!("the effective value is still {v}, from {origin}"));
             }
-            if scope == Scope::Global && root.is_some() {
-                if let Some(proj) = root.as_ref().map(|r| r.join(settings::PROJECT_FILE)) {
-                    if settings::read_from_file(&proj, &key)
-                        .ok()
-                        .flatten()
-                        .is_some()
-                    {
-                        ui::warn(format!(
-                            "this project's {} overrides the global value",
-                            settings::PROJECT_FILE
-                        ));
-                    }
-                }
+            if scope == Scope::Global
+                && root.is_some()
+                && let Some(proj) = root.as_ref().map(|r| r.join(settings::PROJECT_FILE))
+                && settings::read_from_file(&proj, &key)
+                    .ok()
+                    .flatten()
+                    .is_some()
+            {
+                ui::warn(format!(
+                    "this project's {} overrides the global value",
+                    settings::PROJECT_FILE
+                ));
             }
         }
         ConfigCommands::Unset {
@@ -848,10 +854,10 @@ pub fn doctor() -> Result<()> {
             Level::Note => println!("  {} {}", "·".dimmed(), f.title),
             Level::Warn => println!("  {} {}", "!".yellow().bold(), f.title.bold()),
         }
-        if f.level != Level::Ok {
-            if let Some(d) = &f.detail {
-                println!("      {d}");
-            }
+        if f.level != Level::Ok
+            && let Some(d) = &f.detail
+        {
+            println!("      {d}");
         }
         if let Some(fix) = &f.fix {
             for (i, line) in fix.lines().enumerate() {

@@ -218,6 +218,27 @@ pub fn checkout(url: &str, reference: &GitRef) -> Result<GitCheckout> {
         })
         .flatten();
 
+    // Vendored: the packages are in a directory; the lockfile's pin stays
+    // the identity.
+    if let Some(dir) = crate::source::defs().git_replacement(url, reference.lock_query().as_deref())
+    {
+        let commit = pinned.clone().ok_or_else(|| GitError::Command {
+            args: format!("(vendored {url})"),
+            stderr: "a vendored git dependency needs its commit in Cargo.lock; run \
+                     `rune vendor` again"
+                .into(),
+        })?;
+        let checkout = GitCheckout {
+            url: url.to_string(),
+            reference: reference.clone(),
+            commit,
+            dir,
+            submodules: String::new(),
+        };
+        memo().lock().unwrap().insert(key, checkout.clone());
+        return Ok(checkout);
+    }
+
     if !db.join("HEAD").is_file() {
         if opts.offline {
             return Err(GitError::Offline { url: url.into() });

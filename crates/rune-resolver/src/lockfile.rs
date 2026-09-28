@@ -235,21 +235,18 @@ pub struct LockfileManager;
 impl LockfileManager {
     /// Loads a lockfile, preferring `Rune.lock.bin` for maximum speed, falling back to `Cargo.lock`.
     pub fn load_fast(project_root: &Path) -> Option<Lockfile> {
-        let bin_path = project_root.join("Rune.lock.bin");
-        if bin_path.exists() {
-            if let Ok(lock) = Self::read_binary(&bin_path) {
-                return Some(lock);
-            }
+        let binary = Self::read_binary(&project_root.join("Rune.lock.bin")).ok();
+        let cargo = Self::read_cargo(&project_root.join("Cargo.lock")).ok();
+        match (binary, cargo) {
+            // `Cargo.lock` is the source of truth; the binary lockfile is a
+            // cache of it that also carries feature sets. It is only used
+            // while it describes the same packages: after a `git pull`, a
+            // checkout or a `cargo update`, trusting it would silently put
+            // the old versions back.
+            (Some(bin), Some(cargo)) if bin.graph_view() == cargo.graph_view() => Some(bin),
+            (_, Some(cargo)) => Some(cargo),
+            (bin, None) => bin,
         }
-
-        let cargo_path = project_root.join("Cargo.lock");
-        if cargo_path.exists() {
-            if let Ok(lock) = Self::read_cargo(&cargo_path) {
-                return Some(lock);
-            }
-        }
-
-        None
     }
 
     /// Loads only `Rune.lock.bin` (never falling back to `Cargo.lock`).

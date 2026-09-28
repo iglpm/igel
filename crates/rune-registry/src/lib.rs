@@ -3,8 +3,11 @@
 //! Fast crates.io Sparse Index client, parallel `.crate` package downloader,
 //! tarball decompression & extraction, and registry cache management for Rune.
 
+pub mod api;
+pub mod credential;
 pub mod download;
 pub mod git;
+pub mod git_index;
 pub mod index;
 pub mod source;
 

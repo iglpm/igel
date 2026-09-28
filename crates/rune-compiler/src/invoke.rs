@@ -69,10 +69,10 @@ impl RustcInvoker {
     ) -> Result<CompilationResult> {
         let mut on_metadata = Some(on_metadata);
         self.invoke_streaming(cmd, &mut |artifact| {
-            if artifact.emit == "metadata" {
-                if let Some(cb) = on_metadata.take() {
-                    cb(artifact.artifact.clone());
-                }
+            if artifact.emit == "metadata"
+                && let Some(cb) = on_metadata.take()
+            {
+                cb(artifact.artifact.clone());
             }
         })
     }
@@ -102,25 +102,23 @@ impl RustcInvoker {
         while reader.read_line(&mut line)? > 0 {
             stderr_raw.push_str(&line);
 
-            if line.starts_with('{') {
-                if let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) {
-                    if value.get("$message_type").and_then(|v| v.as_str()) == Some("artifact") {
-                        if let Ok(artifact) = serde_json::from_value::<ArtifactEvent>(value.clone())
-                        {
-                            on_artifact(&artifact);
-                            artifacts.push(artifact);
-                        }
-                    } else if value.get("message").is_some() && value.get("level").is_some() {
-                        if let Ok(diag) =
-                            serde_json::from_value::<crate::output::RawDiagnostic>(value)
-                        {
-                            diagnostics.push(crate::output::Diagnostic {
-                                level: diag.level,
-                                message: diag.message,
-                                rendered: diag.rendered,
-                            });
-                        }
+            if line.starts_with('{')
+                && let Ok(value) = serde_json::from_str::<serde_json::Value>(&line)
+            {
+                if value.get("$message_type").and_then(|v| v.as_str()) == Some("artifact") {
+                    if let Ok(artifact) = serde_json::from_value::<ArtifactEvent>(value.clone()) {
+                        on_artifact(&artifact);
+                        artifacts.push(artifact);
                     }
+                } else if value.get("message").is_some()
+                    && value.get("level").is_some()
+                    && let Ok(diag) = serde_json::from_value::<crate::output::RawDiagnostic>(value)
+                {
+                    diagnostics.push(crate::output::Diagnostic {
+                        level: diag.level,
+                        message: diag.message,
+                        rendered: diag.rendered,
+                    });
                 }
             }
             line.clear();

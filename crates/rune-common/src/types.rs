@@ -123,7 +123,7 @@ impl Default for CrateSource {
 // ---------------------------------------------------------------------------
 
 /// Rust edition for a crate.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 pub enum Edition {
     /// Rust 2015 edition.
     #[serde(rename = "2015")]
@@ -133,6 +133,7 @@ pub enum Edition {
     E2018,
     /// Rust 2021 edition.
     #[serde(rename = "2021")]
+    #[default]
     E2021,
     /// Rust 2024 edition.
     #[serde(rename = "2024")]
@@ -148,12 +149,6 @@ impl Edition {
             Self::E2021 => "2021",
             Self::E2024 => "2024",
         }
-    }
-}
-
-impl Default for Edition {
-    fn default() -> Self {
-        Self::E2021
     }
 }
 
@@ -259,6 +254,11 @@ pub struct Profile {
     /// `-C split-debuginfo=` value (`off`, `packed`, `unpacked`), if set.
     #[serde(default)]
     pub split_debuginfo: Option<String>,
+    /// `trim-paths`: sources are named relative to their package or
+    /// workspace in the output (debuginfo, panic messages), not by where
+    /// they happen to be on this machine.
+    #[serde(default)]
+    pub trim_paths: bool,
 }
 
 impl Profile {
@@ -279,6 +279,7 @@ impl Profile {
             rpath: false,
             strip: None,
             split_debuginfo: None,
+            trim_paths: false,
         }
     }
 
@@ -297,6 +298,7 @@ impl Profile {
             rpath: false,
             strip: None,
             split_debuginfo: None,
+            trim_paths: false,
         }
     }
 
@@ -324,8 +326,10 @@ impl Profile {
     /// included — a custom profile identical to `release` produces identical
     /// artifacts and should share its cache entries.
     pub fn codegen_fingerprint(&self) -> String {
+        // Only mentioned when on, so that other profiles keep their keys.
+        let trim = if self.trim_paths { "|trim" } else { "" };
         format!(
-            "opt={}|debug={}|da={}|oc={}|lto={}|panic={}|cgu={:?}|rpath={}|strip={:?}|split={:?}",
+            "opt={}|debug={}|da={}|oc={}|lto={}|panic={}|cgu={:?}|rpath={}|strip={:?}|split={:?}{trim}",
             self.opt_level.as_str(),
             self.debuginfo.as_str(),
             self.debug_assertions,
@@ -337,6 +341,21 @@ impl Profile {
             self.strip,
             self.split_debuginfo,
         )
+    }
+
+    /// The `-C split-debuginfo` a unit built for `target` gets: the profile's
+    /// own setting, or else Cargo's platform default — `unpacked` on Apple
+    /// targets whenever there is debuginfo. rustc's own default there is
+    /// `packed`, which runs `dsymutil` over every binary it links (about 10 %
+    /// of a cold debug build on macOS).
+    pub fn split_debuginfo_for(&self, target: &str) -> Option<&str> {
+        match &self.split_debuginfo {
+            Some(split) => Some(split),
+            None if self.debuginfo != DebugInfo::None && target.contains("-apple-") => {
+                Some("unpacked")
+            }
+            None => None,
+        }
     }
 
     /// Whether this is a "release-like" profile (optimized).
@@ -669,6 +688,21 @@ impl CompilationUnit {
         std::iter::once(self.crate_type).chain(self.ext.extra_crate_types.iter().copied())
     }
 
+    /// The triple the unit is compiled for: its `--target`, or the host for
+    /// host units (build-script dependencies, proc-macros) and native builds.
+    pub fn compiled_for(&self) -> &str {
+        match &self.target {
+            Some(t) if !self.ext.for_host && self.crate_type != CrateType::ProcMacro => &t.0,
+            _ => &crate::toolchain::global().host,
+        }
+    }
+
+    /// The file name of the executable this (binary or test) unit links,
+    /// given its hash-free stem: `.exe` on Windows, `.wasm` for bare wasm.
+    pub fn executable_name(&self, stem: &str) -> String {
+        format!("{stem}{}", exe_suffix(self.compiled_for()))
+    }
+
     /// The profile this unit compiles with: its own override, else `base`.
     pub fn effective_profile<'a>(&'a self, base: &'a Profile) -> &'a Profile {
         self.ext.profile.as_ref().unwrap_or(base)
@@ -874,9 +908,46 @@ pub struct RustcArtifact {
 // Tests
 // ---------------------------------------------------------------------------
 
+/// The file-name suffix of an executable for a target triple.
+pub fn exe_suffix(triple: &str) -> &'static str {
+    if triple.contains("-windows") {
+        ".exe"
+    } else if triple.contains("emscripten") {
+        ".js"
+    } else if triple.starts_with("wasm32") || triple.starts_with("wasm64") {
+        ".wasm"
+    } else {
+        ""
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn apple_targets_default_to_unpacked_debuginfo_like_cargo() {
+        let dev = Profile::dev();
+        assert_eq!(
+            dev.split_debuginfo_for("aarch64-apple-darwin"),
+            Some("unpacked")
+        );
+        assert_eq!(dev.split_debuginfo_for("x86_64-unknown-linux-gnu"), None);
+        // No debuginfo, nothing to split.
+        assert_eq!(
+            Profile::release().split_debuginfo_for("aarch64-apple-darwin"),
+            None
+        );
+        // An explicit setting always wins.
+        let packed = Profile {
+            split_debuginfo: Some("packed".into()),
+            ..Profile::dev()
+        };
+        assert_eq!(
+            packed.split_debuginfo_for("aarch64-apple-darwin"),
+            Some("packed")
+        );
+    }
 
     #[test]
     fn test_edition_round_trip() {

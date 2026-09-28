@@ -245,10 +245,10 @@ impl SparseIndexClient {
     pub fn fetch_crate(&self, name: &str) -> Result<CrateIndex> {
         let cached_file = self.cache_dir.join(Self::crate_index_path(name));
 
-        if let Ok(content) = fs::read_to_string(&cached_file) {
-            if let Ok(index) = Self::parse_index_text(name, &content) {
-                return Ok(index);
-            }
+        if let Ok(content) = fs::read_to_string(&cached_file)
+            && let Ok(index) = Self::parse_index_text(name, &content)
+        {
+            return Ok(index);
         }
 
         if self.offline {
@@ -283,10 +283,8 @@ impl SparseIndexClient {
             request = request.header(reqwest::header::AUTHORIZATION, token.as_str());
         }
         let have_cache = cached_file.is_file();
-        if have_cache {
-            if let Ok(etag) = fs::read_to_string(&etag_file) {
-                request = request.header(reqwest::header::IF_NONE_MATCH, etag.trim());
-            }
+        if have_cache && let Ok(etag) = fs::read_to_string(&etag_file) {
+            request = request.header(reqwest::header::IF_NONE_MATCH, etag.trim());
         }
 
         if let Ok(resp) = request.send() {

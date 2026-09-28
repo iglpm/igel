@@ -45,21 +45,20 @@ pub fn run_gc(store: &CasStore, config: &GcConfig) -> crate::store::Result<GcRep
 
         if entry.file_type().is_dir() {
             let manifest_path = entry.path().join("manifest.json");
-            if manifest_path.exists() {
-                if let Ok(content) = fs::read_to_string(&manifest_path) {
-                    if let Ok(mut manifest) = serde_json::from_str::<ArtifactManifest>(&content) {
-                        // Last *use*, not last store: a cache hit bumps the
-                        // manifest's mtime (see `CasStore::link_to`).
-                        let used = fs::metadata(&manifest_path)
-                            .and_then(|m| m.modified())
-                            .ok()
-                            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                            .map(|d| d.as_secs())
-                            .unwrap_or(0);
-                        manifest.stored_at = manifest.stored_at.max(used);
-                        entries.push((entry.path().to_path_buf(), manifest));
-                    }
-                }
+            if manifest_path.exists()
+                && let Ok(content) = fs::read_to_string(&manifest_path)
+                && let Ok(mut manifest) = serde_json::from_str::<ArtifactManifest>(&content)
+            {
+                // Last *use*, not last store: a cache hit bumps the
+                // manifest's mtime (see `CasStore::link_to`).
+                let used = fs::metadata(&manifest_path)
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                manifest.stored_at = manifest.stored_at.max(used);
+                entries.push((entry.path().to_path_buf(), manifest));
             }
         }
     }
@@ -75,14 +74,14 @@ pub fn run_gc(store: &CasStore, config: &GcConfig) -> crate::store::Result<GcRep
         let age = now.saturating_sub(manifest.stored_at);
         let mut remove = false;
 
-        if let Some(max_age) = config.max_age_secs {
-            if age > max_age {
-                remove = true;
-                debug!(
-                    "Evicting {} due to age ({}s > {}s)",
-                    manifest.cache_key, age, max_age
-                );
-            }
+        if let Some(max_age) = config.max_age_secs
+            && age > max_age
+        {
+            remove = true;
+            debug!(
+                "Evicting {} due to age ({}s > {}s)",
+                manifest.cache_key, age, max_age
+            );
         }
 
         if remove {
@@ -146,7 +145,9 @@ mod tests {
         let file = src_dir.path().join("lib.rlib");
         fs::write(&file, "test data").unwrap();
 
-        store.put("key1", "foo", "1.0", &[file.clone()]).unwrap();
+        store
+            .put("key1", "foo", "1.0", std::slice::from_ref(&file))
+            .unwrap();
         store.put("key2", "bar", "1.0", &[file]).unwrap();
 
         // Age key1 by ten seconds instead of sleeping: rewrite its manifest

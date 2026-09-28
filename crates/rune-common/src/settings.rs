@@ -733,7 +733,7 @@ pub fn format_size(bytes: u64) -> String {
         ("KiB", 1 << 10),
     ];
     for (name, size) in UNITS {
-        if bytes >= size && bytes % size == 0 {
+        if bytes >= size && bytes.is_multiple_of(size) {
             return format!("{}{name}", bytes / size);
         }
     }
@@ -761,10 +761,10 @@ pub fn is_url_list(s: &str) -> bool {
 }
 
 fn expand_home(p: &str) -> PathBuf {
-    if let Some(rest) = p.strip_prefix("~/") {
-        if let Some(home) = home::home_dir() {
-            return home.join(rest);
-        }
+    if let Some(rest) = p.strip_prefix("~/")
+        && let Some(home) = home::home_dir()
+    {
+        return home.join(rest);
     }
     PathBuf::from(p)
 }

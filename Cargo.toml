@@ -17,7 +17,7 @@ members = [
 version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
-rust-version = "1.85"
+rust-version = "1.89"
 
 [workspace.dependencies]
 # Serialization
@@ -67,6 +67,7 @@ tokio-util = { version = "0.7", default-features = false, features = ["io"] }
 rustix = { version = "1", default-features = false, features = ["fs", "std"] }
 memmap2 = "0.9"
 walkdir = "2"
+libc = "0.2"
 
 # Internal crates
 rune-common = { path = "crates/rune-common" }

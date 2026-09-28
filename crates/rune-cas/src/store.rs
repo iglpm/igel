@@ -101,9 +101,6 @@ pub struct CasEntry {
     pub object_dir: PathBuf,
 }
 
-/// True if `dest` is already a hardlink to `src` (same inode on the same
-/// device), meaning there is nothing left to do to "link" it.
-#[cfg(unix)]
 /// Stored objects are never modified: taking away write permission makes a
 /// stray in-place write (through a hard link from a project directory) fail
 /// loudly instead of silently changing an object every project shares.
@@ -115,6 +112,10 @@ fn make_read_only(path: &Path) {
     }
 }
 
+/// True if `dest` is already a hardlink to `src` (same inode on the same
+/// device), meaning there is nothing left to do to "link" it. (Elsewhere the
+/// link is simply made again, which is correct, only slower.)
+#[cfg(unix)]
 fn already_linked(src: &Path, dest: &Path) -> bool {
     use std::os::unix::fs::MetadataExt;
     let (Ok(a), Ok(b)) = (fs::metadata(src), fs::metadata(dest)) else {
@@ -361,16 +362,14 @@ impl CasStore {
         let object_dir = self.object_dir(cache_key);
         // Immutable, like artifact entries: a complete tree already stored
         // under this key stands.
-        if let Ok(text) = fs::read_to_string(object_dir.join("tree.json")) {
-            if let Ok(rels) = serde_json::from_str::<Vec<String>>(&text) {
-                if rels
-                    .iter()
-                    .all(|r| object_dir.join("tree").join(r).is_file())
-                {
-                    self.publish(cache_key, crate::remote::Slot::Tree);
-                    return Ok(());
-                }
-            }
+        if let Ok(text) = fs::read_to_string(object_dir.join("tree.json"))
+            && let Ok(rels) = serde_json::from_str::<Vec<String>>(&text)
+            && rels
+                .iter()
+                .all(|r| object_dir.join("tree").join(r).is_file())
+        {
+            self.publish(cache_key, crate::remote::Slot::Tree);
+            return Ok(());
         }
         fs::create_dir_all(&object_dir)?;
         let tree_root = object_dir.join("tree");

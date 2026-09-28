@@ -111,6 +111,27 @@ impl CrateDownloader {
                 d.backend = DlBackend::LocalRegistry(dir);
             }
             Backend::Directory(dir) => d.backend = DlBackend::Directory(dir),
+            Backend::GitIndex { url, token } => {
+                // Downloads work as for a sparse registry, from the `dl`
+                // template in the clone's `config.json`.
+                d.crates_dir = home.join("cache").join(&key);
+                d.src_dir = home.join("src").join(&key);
+                if let Ok(clone) = crate::git_index::GitIndex::open(&url, false) {
+                    let _ = std::fs::create_dir_all(&d.crates_dir);
+                    let _ = std::fs::copy(
+                        clone.dir().join("config.json"),
+                        d.crates_dir.join("config.json"),
+                    );
+                }
+                d.backend = DlBackend::Sparse {
+                    base: url
+                        .trim_start_matches("registry+")
+                        .trim_end_matches('/')
+                        .to_string(),
+                    token,
+                    label: index.to_string(),
+                };
+            }
         }
         Ok(d)
     }
@@ -479,6 +500,11 @@ pub fn download_and_extract_crate(
     CrateDownloader::default_downloader().download_and_extract(name, version, expected_cksum)
 }
 
+/// The SHA-256 of a file, hex encoded (what `.cargo-checksum.json` records).
+pub fn sha256_file(path: &Path) -> std::io::Result<String> {
+    compute_sha256(path).map_err(|e| std::io::Error::other(e.to_string()))
+}
+
 /// Computes the SHA-256 hash of a file as a hex string.
 fn compute_sha256(path: &Path) -> Result<String> {
     use std::io::Read;
@@ -548,13 +574,8 @@ impl Sha256Hasher {
 
     fn process_block(&mut self) {
         let mut w = [0u32; 64];
-        for i in 0..16 {
-            w[i] = u32::from_be_bytes([
-                self.buffer[i * 4],
-                self.buffer[i * 4 + 1],
-                self.buffer[i * 4 + 2],
-                self.buffer[i * 4 + 3],
-            ]);
+        for (word, bytes) in w.iter_mut().zip(self.buffer.as_chunks::<4>().0) {
+            *word = u32::from_be_bytes(*bytes);
         }
         for i in 16..64 {
             let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
@@ -567,14 +588,14 @@ impl Sha256Hasher {
 
         let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h] = self.state;
 
-        for i in 0..64 {
+        for (k, wi) in Self::K.iter().zip(w.iter()) {
             let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
             let ch = (e & f) ^ ((!e) & g);
             let temp1 = h
                 .wrapping_add(s1)
                 .wrapping_add(ch)
-                .wrapping_add(Self::K[i])
-                .wrapping_add(w[i]);
+                .wrapping_add(*k)
+                .wrapping_add(*wi);
             let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
             let maj = (a & b) ^ (a & c) ^ (b & c);
             let temp2 = s0.wrapping_add(maj);

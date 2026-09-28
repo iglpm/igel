@@ -49,9 +49,34 @@ pub struct FingerprintCache {
     /// several targets (a library plus binaries) is walked and hashed once.
     #[serde(skip)]
     pub(crate) package_hashes: HashMap<PathBuf, String>,
+    /// The files each package hashed this run consists of (what `rune
+    /// explain` compares file by file).
+    #[serde(skip)]
+    pub(crate) package_files: HashMap<PathBuf, Vec<PathBuf>>,
 }
 
 impl FingerprintCache {
+    /// Every file of a package hashed this run, relative to the package, with
+    /// its content hash (hex), sorted. Empty if the package was not hashed.
+    pub fn package_file_hashes(&self, package_dir: &std::path::Path) -> Vec<(String, String)> {
+        let Some(files) = self.package_files.get(package_dir) else {
+            return Vec::new();
+        };
+        let mut out: Vec<(String, String)> = files
+            .iter()
+            .filter_map(|f| {
+                let rel = f.strip_prefix(package_dir).ok()?;
+                let entry = self.files.get(f)?;
+                Some((
+                    rel.to_string_lossy().replace('\\', "/"),
+                    format!("{:016x}", entry.hash),
+                ))
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
     /// Creates a new, empty cache.
     pub fn new() -> Self {
         Self::default()

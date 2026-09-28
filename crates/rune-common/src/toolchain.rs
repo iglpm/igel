@@ -295,18 +295,18 @@ fn driver_fingerprint(rustc: &Path) -> String {
     if let Ok(entries) = std::fs::read_dir(sysroot.join("lib")) {
         for e in entries.flatten() {
             let name = e.file_name().to_string_lossy().into_owned();
-            if name.starts_with("librustc_driver") {
-                if let Ok(m) = e.metadata() {
-                    parts.push(format!(
-                        "{name}:{}:{}",
-                        m.len(),
-                        m.modified()
-                            .ok()
-                            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                            .map(|d| d.as_secs())
-                            .unwrap_or(0)
-                    ));
-                }
+            if name.starts_with("librustc_driver")
+                && let Ok(m) = e.metadata()
+            {
+                parts.push(format!(
+                    "{name}:{}:{}",
+                    m.len(),
+                    m.modified()
+                        .ok()
+                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0)
+                ));
             }
         }
     }
@@ -516,10 +516,10 @@ pub fn rustflags(cfg: &CargoConfig, target: &TargetInfo, role: Role, cross: bool
 
 fn target_string(cfg: &CargoConfig, target: &TargetInfo, key: &str) -> Option<String> {
     for (table_key, table) in cfg.target_tables(&target.name, &|k| target.matches(k)) {
-        if !table_key.starts_with("cfg(") {
-            if let Ok(v) = std::env::var(CargoConfig::env_name(&["target", table_key, key])) {
-                return Some(v);
-            }
+        if !table_key.starts_with("cfg(")
+            && let Ok(v) = std::env::var(CargoConfig::env_name(&["target", table_key, key]))
+        {
+            return Some(v);
         }
         match table.get(key) {
             Some(toml::Value::String(s)) => return Some(s.clone()),

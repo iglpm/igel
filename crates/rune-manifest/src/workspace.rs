@@ -90,16 +90,16 @@ pub fn find_enclosing_workspace(
     }
     let mut cur = dir.parent()?.to_path_buf();
     loop {
-        if rune_common::manifest_file::has_manifest(&cur) {
-            if let Some(ws) = load(&cur) {
-                let is_member = ws
-                    .resolve_members(&cur)
-                    .unwrap_or_default()
-                    .iter()
-                    .any(|d| d.canonicalize().unwrap_or_else(|_| d.clone()) == dir);
-                if is_member {
-                    return Some((cur, ws));
-                }
+        if rune_common::manifest_file::has_manifest(&cur)
+            && let Some(ws) = load(&cur)
+        {
+            let is_member = ws
+                .resolve_members(&cur)
+                .unwrap_or_default()
+                .iter()
+                .any(|d| d.canonicalize().unwrap_or_else(|_| d.clone()) == dir);
+            if is_member {
+                return Some((cur, ws));
             }
         }
         if !cur.pop() {

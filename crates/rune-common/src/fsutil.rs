@@ -27,6 +27,14 @@ fn temp_sibling(dest: &Path) -> PathBuf {
     ))
 }
 
+/// Writes `path` whole or not at all: a temporary file renamed over it, so a
+/// concurrent reader never sees half of it.
+pub fn write_atomic(path: &Path, contents: &[u8]) -> io::Result<()> {
+    let tmp = temp_sibling(path);
+    fs::write(&tmp, contents)?;
+    fs::rename(&tmp, path)
+}
+
 /// Makes `dest` a hard link to `src` (or a copy, where linking is impossible),
 /// replacing whatever was there **atomically**: a reader that opens `dest` at
 /// any moment sees either the old file or the new one, never a missing file.
@@ -97,7 +105,15 @@ impl FileLock {
         }
         #[cfg(not(unix))]
         {
-            (Self { _file: Some(file) }, Acquired::Immediately)
+            // The standard library's locks (`LockFileEx` on Windows).
+            match file.try_lock() {
+                Ok(()) => (Self { _file: Some(file) }, Acquired::Immediately),
+                Err(std::fs::TryLockError::WouldBlock) => match file.lock() {
+                    Ok(()) => (Self { _file: Some(file) }, Acquired::AfterWaiting),
+                    Err(_) => (Self { _file: None }, Acquired::Immediately),
+                },
+                Err(_) => (Self { _file: None }, Acquired::Immediately),
+            }
         }
     }
 }

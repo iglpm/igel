@@ -269,10 +269,7 @@ impl Locals {
                     // A registry-style dependency that a `[patch]` replaces:
                     // load the patch's package (only if its version fits).
                     let real = spec.package.clone().unwrap_or(name);
-                    let req = spec
-                        .version
-                        .clone()
-                        .unwrap_or_else(|| semver::VersionReq::STAR);
+                    let req = spec.version.clone().unwrap_or(semver::VersionReq::STAR);
                     let source = match spec.registry.as_deref() {
                         None | Some("crates-io") => rune_resolver::PatchSource::CratesIo,
                         Some(name) => rune_resolver::PatchSource::Registry(name.to_string()),
@@ -733,15 +730,14 @@ fn is_registry_source(source: Option<&str>) -> bool {
 }
 
 /// The canonical index URL for a lockfile `source`.
-fn index_of_lock_source(source: Option<&str>) -> String {
+pub fn index_of_lock_source(source: Option<&str>) -> String {
     match source {
         Some("registry+https://github.com/rust-lang/crates.io-index") | None => {
             rune_common::CRATES_IO_INDEX.to_string()
         }
-        Some(s) => s
-            .strip_prefix("registry+")
-            .map(|u| u.to_string())
-            .unwrap_or_else(|| s.to_string()),
+        // `sparse+…`, or `registry+…` for a git-based index: the identity
+        // configuration uses.
+        Some(s) => s.to_string(),
     }
 }
 
@@ -807,6 +803,18 @@ pub fn resolve_fresh(
     existing: Option<&Lockfile>,
     refresh: bool,
 ) -> Result<(ResolvedGraph, Lockfile)> {
+    resolve_fresh_with(ws, offline, existing, refresh, &[])
+}
+
+/// [`resolve_fresh`], preferring the given `(registry index, name, version)`s
+/// wherever a requirement allows them.
+pub fn resolve_fresh_with(
+    ws: &Workspace,
+    offline: bool,
+    existing: Option<&Lockfile>,
+    refresh: bool,
+    preferred: &[(String, String, semver::Version)],
+) -> Result<(ResolvedGraph, Lockfile)> {
     let _timer = phase("resolve (fresh)");
     configure_git(ws, offline, refresh, existing);
     let locals = Locals::load(ws)?;
@@ -817,6 +825,12 @@ pub fn resolve_fresh(
     let req = whole_workspace_request(&profile, offline, &features, &targets, &selected);
     let roots = resolution_roots(ws, &locals, &req)?;
 
+    // Even when not seeded by it (`rune update`), the current lockfile says
+    // which index entries the resolution will need.
+    let on_disk = existing
+        .is_none()
+        .then(|| LockfileManager::load_fast(ws.root()))
+        .flatten();
     let mut resolver = if refresh {
         DependencyResolver::refreshing_resolver()
     } else {
@@ -824,13 +838,41 @@ pub fn resolve_fresh(
     }
     .offline(offline)
     .with_patches(ws.patches.clone())
-    .with_msrv(msrv_for_resolution(ws));
+    .with_msrv(msrv_for_resolution(ws))
+    .with_prefetch_hint(on_disk.as_ref())
+    .with_preferred(preferred);
     let resolved = resolver
         .resolve_with_workspace(ws.root(), &roots, existing, ws.workspace_manifest())
         .context("Dependency resolution failed")?;
     let lock = refine_lock(ws, &locals, &resolved.to_lockfile());
     let resolved = prune_resolved(resolved, &lock);
+    warn_unused_patches(ws, &resolved);
     Ok((resolved, lock))
+}
+
+/// A `[patch]` that matched nothing is almost always a mistake (a version
+/// the graph does not ask for, a misspelt name); Cargo says so, and so do we.
+fn warn_unused_patches(ws: &Workspace, resolved: &ResolvedGraph) {
+    for entry in ws.patches.entries() {
+        let name = entry.spec.package.as_deref().unwrap_or(&entry.name);
+        let used = resolved
+            .packages
+            .values()
+            .any(|p| p.name == name && !matches!(p.source, PackageSource::Registry(_)));
+        if !used {
+            let from = entry
+                .spec
+                .path
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .or_else(|| entry.spec.git.clone())
+                .unwrap_or_default();
+            ui::warn(format!(
+                "patch `{name}` ({from}) was not used in the crate graph; check that its \
+                 version matches what the graph requires (`rune tree -i {name}`)"
+            ));
+        }
+    }
 }
 
 /// Writes `lock` as the project's lockfile and records the resolution as
@@ -886,17 +928,16 @@ fn resolve(ws: &Workspace, locals: &Locals, req: &Request) -> Result<(ResolvedGr
 
     // Fast path: nothing changed since the last resolution, and we have the
     // binary lockfile that carries its feature sets.
-    if unchanged {
-        if let Some(lock) = LockfileManager::load_binary(root) {
-            if !lock.packages.is_empty() {
-                // Cheap check only: the lockfile can be missing (deleted, or a
-                // fresh checkout with only our cache present).
-                if !root.join("Cargo.lock").is_file() {
-                    sync_cargo_lock(ws, &lock, req.locked)?;
-                }
-                return Ok((resolved_from_lock(&lock), lock));
-            }
+    if unchanged
+        && let Some(lock) = LockfileManager::load_binary(root)
+        && !lock.packages.is_empty()
+    {
+        // Cheap check only: the lockfile can be missing (deleted, or a
+        // fresh checkout with only our cache present).
+        if !root.join("Cargo.lock").is_file() {
+            sync_cargo_lock(ws, &lock, req.locked)?;
         }
+        return Ok((resolved_from_lock(&lock), lock));
     }
 
     // Cargo.lock (if present) seeds version choices so that adopting Rune on
@@ -921,6 +962,7 @@ fn resolve(ws: &Workspace, locals: &Locals, req: &Request) -> Result<(ResolvedGr
 
     let lockfile = refine_lock(ws, locals, &resolved.to_lockfile());
     let resolved = prune_resolved(resolved, &lockfile);
+    warn_unused_patches(ws, &resolved);
     if req.locked
         && existing_lock.as_ref().map(locked_registry_packages)
             != Some(locked_registry_packages(&lockfile))
@@ -1392,10 +1434,10 @@ fn pick_registry(
 ) -> Option<usize> {
     let fits = |i: usize| req.is_none_or(|r| r.matches(&uni.version[i]));
     for id in locked_edges {
-        if let Some(&i) = candidates.iter().find(|&&i| uni.id[i] == *id) {
-            if fits(i) {
-                return Some(i);
-            }
+        if let Some(&i) = candidates.iter().find(|&&i| uni.id[i] == *id)
+            && fits(i)
+        {
+            return Some(i);
         }
     }
     candidates
@@ -1762,14 +1804,12 @@ impl Planner<'_> {
                 continue;
             }
             let alias = decl.renamed.then(|| decl.alias.clone());
-            if add {
-                if let Some(node) = node {
-                    if decl.kind == DependencyKind::Build {
-                        self.graph.add_build_edge(node, child, alias.as_deref());
-                    } else {
-                        self.graph
-                            .add_edge_with_extern(node, child, alias.as_deref());
-                    }
+            if add && let Some(node) = node {
+                if decl.kind == DependencyKind::Build {
+                    self.graph.add_build_edge(node, child, alias.as_deref());
+                } else {
+                    self.graph
+                        .add_edge_with_extern(node, child, alias.as_deref());
                 }
             }
             if decl.kind != DependencyKind::Build {
@@ -2156,11 +2196,11 @@ pub fn plan(ws: &Workspace, req: &Request) -> Result<Plan> {
                 );
             let mut externs = planner.wire(Some(node), (li, false), with_dev, true);
             let own_lib = planner.lib_node.get(&(li, false)).copied();
-            if pick.kind != TargetKind::Lib {
-                if let Some(lib) = own_lib {
-                    planner.graph.add_edge(node, lib);
-                    externs.push((planner.graph.node(lib).unit.rustc_crate_name(), lib));
-                }
+            if pick.kind != TargetKind::Lib
+                && let Some(lib) = own_lib
+            {
+                planner.graph.add_edge(node, lib);
+                externs.push((planner.graph.node(lib).unit.rustc_crate_name(), lib));
             }
             if matches!(pick.kind, TargetKind::Test | TargetKind::Bench) {
                 for &bin in bin_nodes.values() {
@@ -2184,37 +2224,35 @@ pub fn plan(ws: &Workspace, req: &Request) -> Result<Plan> {
         if req.mode == Mode::Test
             && req.doctests
             && (req.targets.doc_only || !req.targets.any_explicit() || req.targets.all_targets)
-        {
-            if let (Some(lib), Some(&lib_node)) =
+            && let (Some(lib), Some(&lib_node)) =
                 (&member.manifest.lib, planner.lib_node.get(&(li, false)))
-            {
-                if lib.doctest && !lib.proc_macro {
-                    let mut externs = match harness_lib_externs.take() {
-                        Some(e) => e,
-                        // No lib harness node (e.g. `--doc`): work out the
-                        // dependency list without adding a compile unit.
-                        None => planner.wire(None, (li, false), true, false),
-                    };
-                    externs.push((
-                        planner.graph.node(lib_node).unit.rustc_crate_name(),
-                        lib_node,
-                    ));
-                    extra_roots.push(lib_node);
-                    extra_roots.extend(externs.iter().map(|(_, n)| *n));
-                    doc_tests.push(DocTest {
-                        member: mi,
-                        lib_source: member.dir.join(
-                            lib.path
-                                .clone()
-                                .unwrap_or_else(|| PathBuf::from("src/lib.rs")),
-                        ),
-                        crate_name: planner.graph.node(lib_node).unit.rustc_crate_name(),
-                        externs,
-                        features: active.clone(),
-                        edition: member.edition,
-                    });
-                }
-            }
+            && lib.doctest
+            && !lib.proc_macro
+        {
+            let mut externs = match harness_lib_externs.take() {
+                Some(e) => e,
+                // No lib harness node (e.g. `--doc`): work out the
+                // dependency list without adding a compile unit.
+                None => planner.wire(None, (li, false), true, false),
+            };
+            externs.push((
+                planner.graph.node(lib_node).unit.rustc_crate_name(),
+                lib_node,
+            ));
+            extra_roots.push(lib_node);
+            extra_roots.extend(externs.iter().map(|(_, n)| *n));
+            doc_tests.push(DocTest {
+                member: mi,
+                lib_source: member.dir.join(
+                    lib.path
+                        .clone()
+                        .unwrap_or_else(|| PathBuf::from("src/lib.rs")),
+                ),
+                crate_name: planner.graph.node(lib_node).unit.rustc_crate_name(),
+                externs,
+                features: active.clone(),
+                edition: member.edition,
+            });
         }
     }
 

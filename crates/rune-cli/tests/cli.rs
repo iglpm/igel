@@ -151,6 +151,227 @@ fn second_build_is_fully_cached_and_edits_recompile_only_what_changed() {
 }
 
 #[test]
+fn binaries_compile_in_deps_and_only_their_names_appear_in_the_profile_dir() {
+    let p = Project::new();
+    p.write("Cargo.toml", LIB_MANIFEST);
+    p.write("src/main.rs", "fn main() { println!(\"hi\"); }\n");
+    p.ok(&["build"]);
+    let debug = p.path().join(".rune/target/debug");
+    let run = Command::new(debug.join("demo")).output().unwrap();
+    assert_eq!(String::from_utf8_lossy(&run.stdout), "hi\n");
+    // The hash-named binary and anything the compiler leaves beside it
+    // (object files under `split-debuginfo=unpacked` on macOS) stay in `deps/`.
+    let files: Vec<String> = std::fs::read_dir(&debug)
+        .unwrap()
+        .flatten()
+        .filter(|e| e.file_type().unwrap().is_file())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(files, ["demo"], "{files:?}");
+    // Tools reading `--message-format json` get that name too, as from Cargo.
+    let json = p.ok(&["build", "--message-format", "json"]);
+    let exe = json
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .find_map(|v| v["executable"].as_str().map(str::to_string))
+        .expect("an executable in the JSON output");
+    assert!(exe.ends_with(".rune/target/debug/demo"), "{exe}");
+    // Restored from the store, the name comes back too.
+    std::fs::remove_dir_all(p.path().join(".rune/target")).unwrap();
+    assert!(p.ok(&["build"]).contains("0 compiled"));
+    assert!(debug.join("demo").is_file());
+}
+
+/// A `-sys`-style crate whose build script builds a *dynamic* C library with
+/// the system compiler, as `pkg-config`/`cmake`-driven crates end up doing.
+#[cfg(unix)]
+fn native_dylib_workspace() -> Project {
+    let p = Project::new();
+    p.write(
+        "Cargo.toml",
+        "[workspace]\nmembers = [\"natsys\", \"mid\", \"app\"]\nresolver = \"2\"\n",
+    );
+    p.write(
+        "natsys/Cargo.toml",
+        "[package]\nname = \"natsys\"\nversion = \"0.1.0\"\nedition = \"2021\"\nlinks = \"nat\"\n",
+    );
+    p.write("natsys/nat.c", "int nat_answer(void) { return 42; }\n");
+    p.write(
+        "natsys/build.rs",
+        r#"fn main() {
+    let out = std::env::var("OUT_DIR").unwrap();
+    let mac = std::env::var("CARGO_CFG_TARGET_OS").unwrap() == "macos";
+    let lib = format!("{out}/libnat.{}", if mac { "dylib" } else { "so" });
+    let mut cc = std::process::Command::new(std::env::var("CC").unwrap_or("cc".into()));
+    cc.args(["-shared", "-fPIC", "nat.c", "-o", &lib]);
+    if mac {
+        // Found through the loader's search path at run time, not by path.
+        cc.args(["-install_name", "libnat.dylib"]);
+    }
+    assert!(cc.status().unwrap().success());
+    println!("cargo::rerun-if-changed=nat.c");
+    println!("cargo::rustc-link-search=native={out}");
+    println!("cargo::rustc-link-lib=dylib=nat");
+}
+"#,
+    );
+    p.write(
+        "natsys/src/lib.rs",
+        "unsafe extern \"C\" { fn nat_answer() -> i32; }\npub fn answer() -> i32 { unsafe { nat_answer() } }\n",
+    );
+    p.write(
+        "mid/Cargo.toml",
+        "[package]\nname = \"mid\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[dependencies]\nnatsys = { path = \"../natsys\" }\n",
+    );
+    p.write(
+        "mid/src/lib.rs",
+        "pub fn doubled() -> i32 { natsys::answer() * 2 }\n",
+    );
+    p.write(
+        "app/Cargo.toml",
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[dependencies]\nmid = { path = \"../mid\" }\n",
+    );
+    p.write(
+        "app/src/main.rs",
+        "fn main() { println!(\"native says {}\", mid::doubled()); }\n#[test]\nfn links() { assert_eq!(mid::doubled(), 84); }\n",
+    );
+    p
+}
+
+#[cfg(unix)]
+#[test]
+fn native_libraries_of_dependencies_link_and_load_two_levels_up() {
+    // The library directory is known only to `natsys`'s build script; the
+    // link that needs it happens in `app`, and so does loading it.
+    let p = native_dylib_workspace();
+    let out = p.ok(&["run", "-p", "app"]);
+    assert!(out.contains("native says 84"), "{out}");
+    let out = p.ok(&["test", "-p", "app"]);
+    assert!(out.contains("1 passed"), "{out}");
+    // Restored from the store, the directories are known again.
+    std::fs::remove_dir_all(p.path().join(".rune/target")).unwrap();
+    let out = p.ok(&["run", "-p", "app"]);
+    assert!(
+        out.contains("0 compiled") && out.contains("native says 84"),
+        "{out}"
+    );
+}
+
+#[test]
+fn library_outputs_get_cargos_names_in_the_profile_directory() {
+    let p = lib_project();
+    p.write(
+        "Cargo.toml",
+        &format!("{LIB_MANIFEST}[lib]\ncrate-type = [\"cdylib\", \"staticlib\", \"rlib\"]\n"),
+    );
+    p.ok(&["build"]);
+    let debug = p.path().join(".rune/target/debug");
+    let dylib = if cfg!(target_os = "macos") {
+        "libdemo.dylib"
+    } else if cfg!(windows) {
+        "demo.dll"
+    } else {
+        "libdemo.so"
+    };
+    let staticlib = if cfg!(windows) {
+        "demo.lib"
+    } else {
+        "libdemo.a"
+    };
+    for name in [dylib, staticlib, "libdemo.rlib"] {
+        assert!(debug.join(name).is_file(), "missing {name}");
+    }
+}
+
+#[test]
+fn doctests_see_the_build_scripts_out_dir_and_cfgs() {
+    let p = Project::new();
+    p.write(
+        "Cargo.toml",
+        "[package]\nname = \"gen\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    p.write(
+        "build.rs",
+        r#"fn main() {
+    let out = std::env::var("OUT_DIR").unwrap();
+    std::fs::write(format!("{out}/gen.rs"), "pub const GEN: u32 = 5;").unwrap();
+    println!("cargo::rustc-check-cfg=cfg(gen_ok)");
+    println!("cargo::rustc-cfg=gen_ok");
+}
+"#,
+    );
+    p.write(
+        "src/lib.rs",
+        r#"include!(concat!(env!("OUT_DIR"), "/gen.rs"));
+
+/// ```
+/// assert_eq!(gen::GEN, 5);
+/// ```
+pub fn uses_generated() {}
+
+/// Only documented, and tested, when the build script's cfg is on.
+/// ```
+/// assert!(gen::only_with_cfg());
+/// ```
+#[cfg(gen_ok)]
+pub fn only_with_cfg() -> bool {
+    true
+}
+"#,
+    );
+    let out = p.ok(&["test", "--doc"]);
+    assert!(out.contains("2 passed"), "{out}");
+}
+
+#[cfg(unix)]
+#[test]
+fn config_aliases_and_external_subcommands_work_like_cargos() {
+    let p = Project::new();
+    p.write("Cargo.toml", LIB_MANIFEST);
+    p.write(
+        "src/main.rs",
+        "fn main() { println!(\"args: {:?}\", std::env::args().skip(1).collect::<Vec<_>>()); }\n",
+    );
+    p.write(
+        ".cargo/config.toml",
+        "[alias]\ngreet = \"run -q --\"\nloud = [\"greet\", \"LOUD\"]\n",
+    );
+    // An alias, and an alias of an alias, with arguments passed through.
+    assert!(p.ok(&["greet", "hi"]).contains("args: [\"hi\"]"));
+    assert!(p.ok(&["loud", "x"]).contains("args: [\"LOUD\", \"x\"]"));
+
+    // A `cargo-<name>` program on PATH is a subcommand, told where cargo is.
+    let bin = tempfile::tempdir().unwrap();
+    let plugin = bin.path().join("cargo-hello");
+    std::fs::write(
+        &plugin,
+        "#!/bin/sh\necho \"plugin got: $*\"\n[ -n \"$CARGO\" ] && echo \"CARGO is set\"\n",
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&plugin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let path = format!(
+        "{}:{}",
+        bin.path().display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let out = Command::new(env!("CARGO_BIN_EXE_rune"))
+        .args(["hello", "--flag", "x"])
+        .current_dir(p.path())
+        .env("RUNE_HOME", p.home())
+        .env("PATH", path)
+        .output()
+        .unwrap();
+    let out = text(&out);
+    assert!(out.contains("plugin got: hello --flag x"), "{out}");
+    assert!(out.contains("CARGO is set"), "{out}");
+
+    // Anything else is still an error.
+    let out = p.rune(&["definitely-not-a-command"]);
+    assert!(!out.status.success());
+}
+
+#[test]
 fn cleaning_the_target_dir_restores_from_the_cas() {
     let p = lib_project();
     p.ok(&["build"]);
@@ -309,6 +530,65 @@ fn workspace() -> Project {
     );
     p.write("crates/bad/src/lib.rs", "this does not compile\n");
     p
+}
+
+#[test]
+fn check_after_build_reuses_the_build_and_still_checks_edits() {
+    let p = Project::new();
+    p.write(
+        "Cargo.toml",
+        "[workspace]\nmembers = [\"base\", \"mid\", \"app\"]\nresolver = \"2\"\n",
+    );
+    let pkg = |name: &str, deps: &str| {
+        format!(
+            "[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[dependencies]\n{deps}"
+        )
+    };
+    p.write("base/Cargo.toml", &pkg("base", ""));
+    p.write(
+        "base/build.rs",
+        "fn main() { let out = std::env::var(\"OUT_DIR\").unwrap(); std::fs::write(format!(\"{out}/n.rs\"), \"pub const N: u32 = 7;\").unwrap(); }\n",
+    );
+    p.write(
+        "base/src/lib.rs",
+        "include!(concat!(env!(\"OUT_DIR\"), \"/n.rs\"));\n",
+    );
+    p.write(
+        "mid/Cargo.toml",
+        &pkg("mid", "base = { path = \"../base\" }\n"),
+    );
+    p.write("mid/src/lib.rs", "pub fn m() -> u32 { base::N * 2 }\n");
+    p.write(
+        "app/Cargo.toml",
+        &pkg(
+            "app",
+            "base = { path = \"../base\" }\nmid = { path = \"../mid\" }\n",
+        ),
+    );
+    let main = "fn main() { let unused = 1; println!(\"{}\", mid::m() + base::N); }\n";
+    p.write("app/src/main.rs", main);
+
+    p.ok(&["build"]);
+    // Nothing to do: every unit's fully built result stands in for its check,
+    // and the build's warnings are replayed.
+    let out = p.ok(&["check"]);
+    assert!(out.contains("0 compiled"), "{out}");
+    assert!(out.contains("unused"), "{out}");
+
+    // An edit is checked for real, against the reused `.rmeta`s below it.
+    p.write("mid/src/lib.rs", "pub fn m() -> u32 { base::N * 3 }\n");
+    let out = p.ok(&["check"]);
+    assert!(out.contains("2 compiled"), "{out}");
+    p.write("app/src/main.rs", "fn main() { let x: u32 = \"no\"; }\n");
+    let out = p.rune(&["check"]);
+    assert!(!out.status.success(), "{}", text(&out));
+    assert!(text(&out).contains("mismatched types"), "{}", text(&out));
+
+    // And back: build, then check once more.
+    p.write("app/src/main.rs", main);
+    p.ok(&["build"]);
+    let out = p.ok(&["check"]);
+    assert!(out.contains("0 compiled"), "{out}");
 }
 
 #[test]
@@ -1415,9 +1695,17 @@ fn patch_project(patch_section: &str) -> Project {
 
 #[test]
 fn patches_replace_a_dependency_for_every_dependent() {
-    let p = patch_project("[patch.crates-io]\nfoo = { path = \"foo-fork\" }\n");
+    let p = patch_project(
+        "[patch.crates-io]\nfoo = { path = \"foo-fork\" }\nnobody-uses-this = { path = \"foo-fork\" }\n",
+    );
     let out = p.ok(&["run"]);
     assert!(out.contains("direct=the fork via_mid=the fork"), "{out}");
+    // A patch that matches nothing is reported; the one in use is not.
+    assert!(
+        out.contains("patch `nobody-uses-this`") && out.contains("was not used"),
+        "{out}"
+    );
+    assert!(!out.contains("patch `foo`"), "{out}");
     // One `foo`, the fork: a local package in the lockfile, at its own version.
     let lock = p.read("Cargo.lock");
     assert!(
@@ -1470,6 +1758,12 @@ fn replace_and_configuration_patches_work_too() {
 /// Packs `name-version/` into a `.crate` and returns its bytes and SHA-256.
 #[cfg(unix)]
 fn make_crate(name: &str, version: &str, lib_rs: &str) -> (Vec<u8>, String) {
+    make_crate_with(name, version, &[("src/lib.rs", lib_rs)])
+}
+
+/// Like [`make_crate`], with any files (paths relative to the package).
+#[cfg(unix)]
+fn make_crate_with(name: &str, version: &str, files: &[(&str, &str)]) -> (Vec<u8>, String) {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().join(format!("{name}-{version}"));
     std::fs::create_dir_all(root.join("src")).unwrap();
@@ -1478,7 +1772,11 @@ fn make_crate(name: &str, version: &str, lib_rs: &str) -> (Vec<u8>, String) {
         format!("[package]\nname = \"{name}\"\nversion = \"{version}\"\nedition = \"2021\"\n"),
     )
     .unwrap();
-    std::fs::write(root.join("src/lib.rs"), lib_rs).unwrap();
+    for (path, content) in files {
+        let path = root.join(path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, content).unwrap();
+    }
     let out = tmp.path().join("out.crate");
     let status = Command::new("tar")
         .args(["-czf"])
@@ -1516,6 +1814,7 @@ fn registry_app(dep: &str) -> Project {
     p
 }
 
+#[cfg(unix)]
 const FOO_LIB: &str = "pub fn says() -> &'static str { \"hello from the registry\" }\n";
 
 #[cfg(unix)]
@@ -1548,6 +1847,439 @@ fn a_local_registry_replaces_crates_io_but_the_lockfile_keeps_the_identity() {
         "{lock}"
     );
     assert!(lock.contains(&format!("checksum = \"{sum}\"")), "{lock}");
+}
+
+/// `(name, version, [(dependency, requirement)])`.
+#[cfg(unix)]
+type RegistryCrate<'a> = (&'a str, &'a str, &'a [(&'a str, &'a str)]);
+
+/// A local registry holding these crates.
+#[cfg(unix)]
+fn local_registry(crates: &[RegistryCrate]) -> tempfile::TempDir {
+    let reg = tempfile::tempdir().unwrap();
+    let mut index: std::collections::BTreeMap<String, String> = Default::default();
+    for (name, version, deps) in crates {
+        let (bytes, sum) = make_crate(name, version, "pub fn f() {}\n");
+        std::fs::write(reg.path().join(format!("{name}-{version}.crate")), bytes).unwrap();
+        let deps: Vec<String> = deps
+            .iter()
+            .map(|(d, req)| format!(
+                "{{\"name\":\"{d}\",\"req\":\"{req}\",\"features\":[],\"optional\":false,\"default_features\":true,\"target\":null,\"kind\":\"normal\"}}"
+            ))
+            .collect();
+        index.entry(name.to_string()).or_default().push_str(&format!(
+            "{{\"name\":\"{name}\",\"vers\":\"{version}\",\"deps\":[{}],\"cksum\":\"{sum}\",\"features\":{{}},\"yanked\":false}}\n",
+            deps.join(",")
+        ));
+    }
+    for (name, lines) in index {
+        let dir = match name.len() {
+            1 => reg.path().join("index/1"),
+            2 => reg.path().join("index/2"),
+            3 => reg.path().join("index/3").join(&name[..1]),
+            _ => reg.path().join("index").join(&name[..2]).join(&name[2..4]),
+        };
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(&name), lines).unwrap();
+    }
+    reg
+}
+
+/// An app depending on `deps` from `reg` (replacing crates.io).
+#[cfg(unix)]
+fn app_with(reg: &tempfile::TempDir, deps: &str) -> Project {
+    let p = Project::new();
+    p.write(
+        "Cargo.toml",
+        &format!("[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[dependencies]\n{deps}"),
+    );
+    p.write("src/main.rs", "fn main() {}\n");
+    p.write(
+        ".cargo/config.toml",
+        &format!(
+            "[source.crates-io]\nreplace-with = \"local\"\n[source.local]\nlocal-registry = {:?}\n",
+            reg.path()
+        ),
+    );
+    p
+}
+
+/// `name version` of every package in `Cargo.lock`.
+#[cfg(unix)]
+fn locked(p: &Project) -> Vec<String> {
+    let lock: toml::Table = p.read("Cargo.lock").parse().unwrap();
+    let mut out: Vec<String> = lock["package"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|pkg| {
+            format!(
+                "{} {}",
+                pkg["name"].as_str().unwrap(),
+                pkg["version"].as_str().unwrap()
+            )
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+#[cfg(unix)]
+#[test]
+fn one_version_per_compatible_range_like_cargo() {
+    // The first requirement alone would take `a 1.1.0`; `b` needs exactly
+    // `1.0.0`, and one `1.x` is all Cargo allows.
+    let reg = local_registry(&[
+        ("a", "1.0.0", &[]),
+        ("a", "1.1.0", &[]),
+        ("b", "1.0.0", &[("a", "=1.0.0")]),
+    ]);
+    let p = app_with(&reg, "a = \"1.0\"\nb = \"1\"\n");
+    p.ok(&["build"]);
+    assert_eq!(locked(&p), ["a 1.0.0", "app 0.1.0", "b 1.0.0"]);
+}
+
+#[cfg(unix)]
+#[test]
+fn resolution_backtracks_to_an_older_release_that_fits() {
+    // The newest `b` needs an `a` the app's pin rules out; an older `b` fits.
+    let reg = local_registry(&[
+        ("a", "1.0.0", &[]),
+        ("a", "1.1.0", &[]),
+        ("b", "1.0.0", &[("a", "^1.0")]),
+        ("b", "2.0.0", &[("a", "^1.1")]),
+    ]);
+    let p = app_with(&reg, "a = \"=1.0.0\"\nb = \"*\"\n");
+    p.ok(&["build"]);
+    assert_eq!(locked(&p), ["a 1.0.0", "app 0.1.0", "b 1.0.0"]);
+}
+
+#[cfg(unix)]
+#[test]
+fn resolution_backtracks_several_crates_when_one_is_not_enough() {
+    // Both newest `b` and newest `c` need an `a` the app's pin rules out:
+    // no single requirement is the odd one out, both must move back.
+    let reg = local_registry(&[
+        ("a", "1.0.0", &[]),
+        ("a", "1.1.0", &[]),
+        ("b", "1.0.0", &[("a", "^1.0")]),
+        ("b", "2.0.0", &[("a", "^1.1")]),
+        ("c", "1.0.0", &[("a", "^1.0")]),
+        ("c", "2.0.0", &[("a", "^1.1")]),
+    ]);
+    let p = app_with(&reg, "a = \"=1.0.0\"\nb = \"*\"\nc = \"*\"\n");
+    p.ok(&["build"]);
+    assert_eq!(locked(&p), ["a 1.0.0", "app 0.1.0", "b 1.0.0", "c 1.0.0"]);
+}
+
+#[cfg(unix)]
+#[test]
+fn update_precise_and_dry_run_move_one_package_like_cargo() {
+    let reg = local_registry(&[
+        ("foo", "1.0.0", &[]),
+        ("foo", "1.1.0", &[]),
+        ("foo", "1.2.0", &[]),
+    ]);
+    let p = app_with(&reg, "foo = \"1\"\n");
+    p.ok(&["build"]);
+    assert_eq!(locked(&p), ["app 0.1.0", "foo 1.2.0"]);
+
+    // A dry run reports and changes nothing.
+    let out = p.ok(&["update", "-p", "foo", "--precise", "1.0.0", "--dry-run"]);
+    assert!(out.contains("foo v1.2.0 -> v1.0.0"), "{out}");
+    assert_eq!(locked(&p), ["app 0.1.0", "foo 1.2.0"]);
+
+    p.ok(&["update", "-p", "foo", "--precise", "1.0.0"]);
+    assert_eq!(locked(&p), ["app 0.1.0", "foo 1.0.0"]);
+    // …and the build uses it without resolving again.
+    assert!(p.ok(&["build"]).contains("compiled"));
+    assert_eq!(locked(&p), ["app 0.1.0", "foo 1.0.0"]);
+
+    // A version the requirements rule out is an error, and changes nothing.
+    let out = p.rune(&["update", "foo", "--precise", "2.0.0"]);
+    assert!(!out.status.success());
+    assert!(
+        text(&out).contains("cannot update `foo` to 2.0.0"),
+        "{}",
+        text(&out)
+    );
+    assert_eq!(locked(&p), ["app 0.1.0", "foo 1.0.0"]);
+
+    // Updating it normally goes back to the newest.
+    p.ok(&["update", "foo"]);
+    assert_eq!(locked(&p), ["app 0.1.0", "foo 1.2.0"]);
+}
+
+#[cfg(unix)]
+#[test]
+fn add_supports_renames_platforms_workspace_deps_and_replaced_sources() {
+    let reg = local_registry(&[("foo", "1.0.0", &[]), ("foo", "1.4.2", &[])]);
+    let p = app_with(&reg, "");
+    // The index comes from the replaced source, not crates.io.
+    p.ok(&["add", "foo", "--rename", "bar", "--target", "cfg(unix)"]);
+    let manifest = p.read("Cargo.toml");
+    assert!(
+        manifest.contains("[target.'cfg(unix)'.dependencies]")
+            && manifest.contains("bar = { version = \"1.4.2\", package = \"foo\" }"),
+        "{manifest}"
+    );
+    // `--dry-run` changes nothing.
+    let out = p.ok(&["add", "foo@1.0", "--dev", "--dry-run"]);
+    assert!(out.contains("would add"), "{out}");
+    assert_eq!(p.read("Cargo.toml"), manifest);
+
+    // In a workspace that declares it, a member inherits it.
+    let w = Project::new();
+    w.write(
+        "Cargo.toml",
+        "[workspace]\nmembers = [\"m\"]\n\n[workspace.dependencies]\nfoo = \"1.0.0\"\n",
+    );
+    w.write(
+        "m/Cargo.toml",
+        "[package]\nname = \"m\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    w.write("m/src/lib.rs", "");
+    w.write(".cargo/config.toml", &p.read(".cargo/config.toml"));
+    w.ok(&["add", "foo", "-p", "m"]);
+    assert!(
+        w.read("m/Cargo.toml")
+            .contains("foo = { workspace = true }")
+    );
+}
+
+#[test]
+fn clippy_lints_members_while_build_scripts_see_the_real_rustc() {
+    if Command::new("clippy-driver")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        eprintln!("clippy-driver not installed; skipping");
+        return;
+    }
+    let p = Project::new();
+    p.write("Cargo.toml", LIB_MANIFEST);
+    // What libc's and serde's build scripts do.
+    p.write(
+        "build.rs",
+        r#"fn main() {
+    let rustc = std::env::var("RUSTC").unwrap();
+    let out = std::process::Command::new(rustc).arg("--version").output().unwrap();
+    let v = String::from_utf8(out.stdout).unwrap();
+    assert!(v.starts_with("rustc "), "RUSTC is not rustc: {v}");
+}
+"#,
+    );
+    p.write(
+        "src/main.rs",
+        "fn five() -> i32 { return 5; }\nfn main() { println!(\"{}\", five()); }\n",
+    );
+    // A warn-level lint: reported, but not fatal…
+    let out = p.ok(&["clippy"]);
+    assert!(
+        out.contains("needless_return") || out.contains("unneeded `return`"),
+        "{out}"
+    );
+    // …until `-D warnings` says so.
+    let out = p.rune(&["clippy", "--", "-D", "warnings"]);
+    assert!(!out.status.success(), "{}", text(&out));
+}
+
+#[test]
+fn trim_paths_keeps_this_machines_paths_out_of_the_binary() {
+    let p = Project::new();
+    p.write(
+        "Cargo.toml",
+        &format!("{LIB_MANIFEST}\n[profile.release]\ntrim-paths = true\n"),
+    );
+    p.write("src/main.rs", "fn main() { panic!(\"where am I\"); }\n");
+    p.ok(&["build", "--release"]);
+    let exe = p.path().join(".rune/target/release/demo");
+    let run = Command::new(&exe).output().unwrap();
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert!(stderr.contains("src/main.rs:1"), "{stderr}");
+    let root = p.path().canonicalize().unwrap();
+    assert!(!stderr.contains(root.to_str().unwrap()), "{stderr}");
+    let bytes = std::fs::read(&exe).unwrap();
+    for path in [root.to_str().unwrap(), p.home().to_str().unwrap()] {
+        assert!(
+            !bytes.windows(path.len()).any(|w| w == path.as_bytes()),
+            "the binary still names {path}"
+        );
+    }
+
+    // Without it, the absolute path is there, as with Cargo.
+    p.write("Cargo.toml", LIB_MANIFEST);
+    p.ok(&["build", "--release"]);
+    let run = Command::new(&exe).output().unwrap();
+    assert!(String::from_utf8_lossy(&run.stderr).contains(root.to_str().unwrap()));
+}
+
+#[test]
+fn explain_says_what_changed_since_the_last_build() {
+    let p = Project::new();
+    p.write(
+        "Cargo.toml",
+        "[workspace]\nmembers = [\"core\", \"app\"]\nresolver = \"2\"\n",
+    );
+    p.write(
+        "core/Cargo.toml",
+        "[package]\nname = \"core\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    p.write("core/src/lib.rs", "pub fn f() -> u8 { 1 }\n");
+    p.write(
+        "app/Cargo.toml",
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[dependencies]\ncore = { path = \"../core\" }\n",
+    );
+    p.write("app/src/main.rs", "fn main() { core::f(); }\n");
+    p.ok(&["build"]);
+    assert!(p.ok(&["explain"]).contains("nothing would be compiled"));
+
+    // A file edited and one added: named, and the dependent follows.
+    p.write("core/src/lib.rs", "pub fn f() -> u8 { 2 }\n");
+    p.write("core/src/extra.rs", "\n");
+    let out = p.ok(&["explain"]);
+    assert!(
+        out.contains("sources changed: src/extra.rs (added), src/lib.rs (modified)"),
+        "{out}"
+    );
+    assert!(out.contains("a dependency changed: core"), "{out}");
+    assert!(out.contains("2 of 2 units would be compiled"), "{out}");
+
+    // After building, it is all in the store again.
+    p.ok(&["build"]);
+    assert!(p.ok(&["explain"]).contains("nothing would be compiled"));
+}
+
+#[test]
+fn fmt_check_after_the_separator_works_as_in_ci() {
+    let p = Project::new();
+    p.write("Cargo.toml", LIB_MANIFEST);
+    p.write("src/main.rs", "fn main(){let x=1;println!(\"{}\",x);}\n");
+    // `cargo fmt --all -- --check`, the usual CI step.
+    let out = p.rune(&["fmt", "--all", "--", "--check"]);
+    assert!(!out.status.success(), "{}", text(&out));
+    assert!(
+        p.read("src/main.rs").starts_with("fn main(){"),
+        "--check must not write"
+    );
+    p.ok(&["fmt"]);
+    p.ok(&["fmt", "--all", "--", "--check"]);
+}
+
+#[cfg(unix)]
+#[test]
+fn install_from_a_registry_lists_upgrades_and_uninstalls_like_cargo() {
+    let reg = tempfile::tempdir().unwrap();
+    let mut index = String::new();
+    for version in ["1.0.0", "1.1.0"] {
+        let main = format!("fn main() {{ println!(\"tool {version}\"); }}\n");
+        let (bytes, sum) = make_crate_with("tool", version, &[("src/main.rs", &main)]);
+        std::fs::write(reg.path().join(format!("tool-{version}.crate")), bytes).unwrap();
+        index.push_str(&format!(
+            "{{\"name\":\"tool\",\"vers\":\"{version}\",\"deps\":[],\"cksum\":\"{sum}\",\"features\":{{}},\"yanked\":false}}\n"
+        ));
+    }
+    std::fs::create_dir_all(reg.path().join("index/to/ol")).unwrap();
+    std::fs::write(reg.path().join("index/to/ol/tool"), index).unwrap();
+
+    // No project: the configuration of the working directory applies.
+    let p = Project::new();
+    p.write(
+        ".cargo/config.toml",
+        &format!(
+            "[source.crates-io]\nreplace-with = \"local\"\n[source.local]\nlocal-registry = {:?}\n",
+            reg.path()
+        ),
+    );
+    let root = p.path().join("installed");
+    let root_arg = root.to_str().unwrap();
+    let run_tool = || {
+        let out = Command::new(root.join("bin/tool")).output().unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+
+    p.ok(&["install", "tool@1.0.0", "--root", root_arg]);
+    assert_eq!(run_tool(), "tool 1.0.0");
+    let list = p.ok(&["install", "--list", "--root", root_arg]);
+    assert!(list.contains("tool v1.0.0:\n    tool"), "{list}");
+    // Cargo's tracking file, so `cargo install --list` agrees.
+    let tracking = std::fs::read_to_string(root.join(".crates.toml")).unwrap();
+    assert!(
+        tracking.contains(
+            "\"tool 1.0.0 (registry+https://github.com/rust-lang/crates.io-index)\" = [\"tool\"]"
+        ),
+        "{tracking}"
+    );
+    assert!(root.join(".crates2.json").is_file());
+
+    // The same version again is a no-op; a newer one replaces it.
+    let again = p.ok(&["install", "tool@1.0.0", "--root", root_arg]);
+    assert!(again.contains("already installed"), "{again}");
+    p.ok(&["install", "tool", "--root", root_arg]);
+    assert_eq!(run_tool(), "tool 1.1.0");
+    let tracking = std::fs::read_to_string(root.join(".crates.toml")).unwrap();
+    assert!(
+        tracking.contains("tool 1.1.0") && !tracking.contains("tool 1.0.0"),
+        "{tracking}"
+    );
+
+    p.ok(&["uninstall", "tool", "--root", root_arg]);
+    assert!(!root.join("bin/tool").exists());
+    let out = p.rune(&["uninstall", "tool", "--root", root_arg]);
+    assert!(!out.status.success());
+    assert!(text(&out).contains("not installed"), "{}", text(&out));
+    // Nothing is left behind from the scratch build.
+    let scratch = p.home().join("install");
+    assert!(
+        !scratch.exists() || std::fs::read_dir(&scratch).unwrap().next().is_none(),
+        "scratch builds were not cleaned up"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_cargo_lock_changed_outside_rune_is_respected_not_reverted() {
+    // `git pull` / `git checkout` / `cargo update --precise` change
+    // `Cargo.lock` behind Rune's back; its binary cache must not win.
+    let reg = tempfile::tempdir().unwrap();
+    let mut index = String::new();
+    let mut sums = Vec::new();
+    for (version, says) in [("1.0.0", "one-oh"), ("1.1.0", "one-one")] {
+        let lib = format!("pub fn says() -> &'static str {{ \"{says}\" }}\n");
+        let (bytes, sum) = make_crate("foo", version, &lib);
+        std::fs::write(reg.path().join(format!("foo-{version}.crate")), bytes).unwrap();
+        index.push_str(&format!(
+            "{{\"name\":\"foo\",\"vers\":\"{version}\",\"deps\":[],\"cksum\":\"{sum}\",\"features\":{{}},\"yanked\":false}}\n"
+        ));
+        sums.push(sum);
+    }
+    std::fs::create_dir_all(reg.path().join("index/3/f")).unwrap();
+    std::fs::write(reg.path().join("index/3/f/foo"), index).unwrap();
+
+    let p = registry_app("\"1\"");
+    p.write(
+        ".cargo/config.toml",
+        &format!(
+            "[source.crates-io]\nreplace-with = \"local\"\n[source.local]\nlocal-registry = {:?}\n",
+            reg.path()
+        ),
+    );
+    assert!(p.ok(&["run"]).contains("foo says one-one"));
+
+    // The lockfile now pins 1.0.0, as after checking out an older commit.
+    let older = p
+        .read("Cargo.lock")
+        .replace("version = \"1.1.0\"", "version = \"1.0.0\"")
+        .replace(&sums[1], &sums[0]);
+    p.write("Cargo.lock", &older);
+    let out = p.ok(&["run"]);
+    assert!(out.contains("foo says one-oh"), "{out}");
+    assert_eq!(p.read("Cargo.lock"), older);
+    // `fetch` and `tree` do not move it either.
+    p.ok(&["fetch"]);
+    assert!(p.ok(&["tree"]).contains("foo v1.0.0"));
+    assert_eq!(p.read("Cargo.lock"), older);
 }
 
 #[cfg(unix)]
@@ -1638,6 +2370,424 @@ fn serve_registry(token: &'static str, crate_bytes: Vec<u8>, index_line: String)
         }
     });
     port
+}
+
+/// What the publishing mock registry holds: `(name, version)` → crate bytes,
+/// and each crate's index lines.
+#[cfg(unix)]
+#[derive(Default)]
+struct MockRegistry {
+    crates: std::collections::HashMap<(String, String), Vec<u8>>,
+    index: std::collections::BTreeMap<String, Vec<serde_json::Value>>,
+}
+
+/// A registry with a web API: reads are open, `/api/v1/…` writes need `token`.
+#[cfg(unix)]
+fn serve_publishing_registry(
+    token: &'static str,
+) -> (u16, std::sync::Arc<std::sync::Mutex<MockRegistry>>) {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    let state = std::sync::Arc::new(std::sync::Mutex::new(MockRegistry::default()));
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let shared = state.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let state = shared.clone();
+            std::thread::spawn(move || {
+                let mut stream = stream;
+                let mut head = Vec::new();
+                let mut byte = [0u8; 1];
+                while !head.ends_with(b"\r\n\r\n") {
+                    match stream.read(&mut byte) {
+                        Ok(1) => head.push(byte[0]),
+                        _ => return,
+                    }
+                }
+                let head = String::from_utf8_lossy(&head).into_owned();
+                let mut first = head.lines().next().unwrap_or("").split_whitespace();
+                let method = first.next().unwrap_or("").to_string();
+                let target = first.next().unwrap_or("/").to_string();
+                let header = |name: &str| {
+                    head.lines().find_map(|l| {
+                        let (k, v) = l.split_once(':')?;
+                        k.eq_ignore_ascii_case(name).then(|| v.trim().to_string())
+                    })
+                };
+                let len: usize = header("content-length")
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0);
+                let mut body = vec![0u8; len];
+                if stream.read_exact(&mut body).is_err() {
+                    return;
+                }
+                let authorized = header("authorization").as_deref() == Some(token);
+                let (path, query) = target.split_once('?').unwrap_or((&target, ""));
+                let segs: Vec<&str> = path.trim_matches('/').split('/').collect();
+                let json = |v: serde_json::Value| ("200 OK", v.to_string().into_bytes());
+                let mut st = state.lock().unwrap();
+                let (status, out): (&str, Vec<u8>) = match (method.as_str(), segs.as_slice()) {
+                    ("GET", ["config.json"]) => json(serde_json::json!({
+                        "dl": format!("http://127.0.0.1:{port}/dl"),
+                        "api": format!("http://127.0.0.1:{port}"),
+                    })),
+                    ("GET", ["dl", name, version, "download"]) => {
+                        match st.crates.get(&(name.to_string(), version.to_string())) {
+                            Some(b) => ("200 OK", b.clone()),
+                            None => ("404 Not Found", Vec::new()),
+                        }
+                    }
+                    ("PUT", ["api", "v1", "crates", "new"]) if authorized => {
+                        let n = u32::from_le_bytes(body[0..4].try_into().unwrap()) as usize;
+                        let meta: serde_json::Value =
+                            serde_json::from_slice(&body[4..4 + n]).unwrap();
+                        let c = u32::from_le_bytes(body[4 + n..8 + n].try_into().unwrap()) as usize;
+                        let bytes = body[8 + n..8 + n + c].to_vec();
+                        let tmp = tempfile::NamedTempFile::new().unwrap();
+                        std::fs::write(tmp.path(), &bytes).unwrap();
+                        let sum = Command::new("sha256sum").arg(tmp.path()).output().unwrap();
+                        let sum = String::from_utf8_lossy(&sum.stdout)
+                            .split_whitespace()
+                            .next()
+                            .unwrap()
+                            .to_string();
+                        let name = meta["name"].as_str().unwrap().to_string();
+                        let vers = meta["vers"].as_str().unwrap().to_string();
+                        let deps: Vec<serde_json::Value> = meta["deps"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .map(|d| {
+                                let alias = d["explicit_name_in_toml"].as_str();
+                                serde_json::json!({
+                                    "name": alias.unwrap_or(d["name"].as_str().unwrap()),
+                                    "package": alias.map(|_| d["name"].clone()),
+                                    "req": d["version_req"],
+                                    "features": d["features"],
+                                    "optional": d["optional"],
+                                    "default_features": d["default_features"],
+                                    "target": d["target"],
+                                    "kind": d["kind"],
+                                    "registry": d["registry"],
+                                })
+                            })
+                            .collect();
+                        st.index
+                            .entry(name.clone())
+                            .or_default()
+                            .push(serde_json::json!({
+                                "name": name, "vers": vers, "deps": deps, "cksum": sum,
+                                "features": meta["features"], "yanked": false,
+                            }));
+                        st.crates.insert((name, vers), bytes);
+                        json(
+                            serde_json::json!({"warnings": {"invalid_categories": [], "invalid_badges": [], "other": []}}),
+                        )
+                    }
+                    ("DELETE" | "PUT", ["api", "v1", "crates", name, version, action])
+                        if authorized && (*action == "yank" || *action == "unyank") =>
+                    {
+                        for line in st.index.get_mut(*name).into_iter().flatten() {
+                            if line["vers"] == *version {
+                                line["yanked"] = serde_json::json!(*action == "yank");
+                            }
+                        }
+                        json(serde_json::json!({"ok": true}))
+                    }
+                    ("GET", ["api", "v1", "crates", _, "owners"]) if authorized => {
+                        json(serde_json::json!({"users": [{"login": "ada", "name": "Ada"}]}))
+                    }
+                    ("GET", ["api", "v1", "crates"]) => {
+                        let q = query
+                            .split('&')
+                            .find_map(|kv| kv.strip_prefix("q="))
+                            .unwrap_or("");
+                        let hits: Vec<serde_json::Value> = st
+                            .index
+                            .iter()
+                            .filter(|(n, _)| n.contains(q))
+                            .map(|(n, lines)| {
+                                serde_json::json!({
+                                    "name": n,
+                                    "max_version": lines.last().unwrap()["vers"],
+                                    "description": "mock crate",
+                                })
+                            })
+                            .collect();
+                        json(serde_json::json!({"crates": hits, "meta": {"total": hits.len()}}))
+                    }
+                    ("GET", [.., name]) if st.index.contains_key(*name) => {
+                        let text: String =
+                            st.index[*name].iter().map(|l| format!("{l}\n")).collect();
+                        ("200 OK", text.into_bytes())
+                    }
+                    ("PUT" | "DELETE", ["api", ..]) => (
+                        "403 Forbidden",
+                        br#"{"errors":[{"detail":"must be logged in"}]}"#.to_vec(),
+                    ),
+                    _ => ("404 Not Found", Vec::new()),
+                };
+                drop(st);
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    out.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.write_all(&out);
+                let _ = stream.flush();
+            });
+        }
+    });
+    (port, state)
+}
+
+#[cfg(unix)]
+#[test]
+fn packages_are_published_installed_yanked_and_owned_through_a_registry_api() {
+    let (port, state) = serve_publishing_registry("tok-123");
+    let p = Project::new();
+    p.write(
+        "Cargo.toml",
+        "[workspace]\nmembers = [\"lib\", \"app\"]\nresolver = \"2\"\n\n[workspace.package]\nversion = \"0.3.0\"\nedition = \"2021\"\nlicense = \"MIT\"\n",
+    );
+    p.write(
+        "lib/Cargo.toml",
+        "[package]\nname = \"mocklib\"\nversion.workspace = true\nedition.workspace = true\nlicense.workspace = true\ndescription = \"lib\"\n",
+    );
+    p.write("lib/src/lib.rs", "pub fn answer() -> u32 { 42 }\n");
+    p.write(
+        "app/Cargo.toml",
+        "[package]\nname = \"mockapp\"\nversion.workspace = true\nedition.workspace = true\nlicense.workspace = true\ndescription = \"app\"\n\n[dependencies]\nmocklib = { path = \"../lib\", version = \"0.3.0\", registry = \"mock\" }\n",
+    );
+    p.write(
+        "app/src/main.rs",
+        "fn main() { println!(\"published answer {}\", mocklib::answer()); }\n",
+    );
+    p.write(".gitignore", ".rune\n");
+    p.write(
+        ".cargo/config.toml",
+        &format!("[registries.mock]\nindex = \"sparse+http://127.0.0.1:{port}/\"\n"),
+    );
+    let git = |args: &[&str]| {
+        assert!(
+            Command::new("git")
+                .args(args)
+                .current_dir(p.path())
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .status()
+                .unwrap()
+                .success()
+        )
+    };
+    git(&["init", "-q"]);
+    git(&["add", "-A"]);
+    git(&["commit", "-qm", "init"]);
+
+    // Credentials go to a CARGO_HOME of the test's own.
+    let cargo_home = tempfile::tempdir().unwrap();
+    let rune = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_rune"))
+            .args(args)
+            .current_dir(p.path())
+            .env("RUNE_HOME", p.home())
+            .env("CARGO_HOME", cargo_home.path())
+            .env("NO_COLOR", "1")
+            .output()
+            .unwrap()
+    };
+    let ok = |args: &[&str]| {
+        let out = rune(args);
+        assert!(
+            out.status.success(),
+            "`rune {}` failed:\n{}",
+            args.join(" "),
+            text(&out)
+        );
+        text(&out)
+    };
+
+    // Without a token the registry refuses, with a clear message.
+    let out = rune(&[
+        "publish",
+        "-p",
+        "mocklib",
+        "--registry",
+        "mock",
+        "--no-verify",
+    ]);
+    assert!(!out.status.success());
+    assert!(
+        text(&out).contains("rune login --registry mock"),
+        "{}",
+        text(&out)
+    );
+
+    ok(&["login", "--registry", "mock", "tok-123"]);
+    let creds = std::fs::read_to_string(cargo_home.path().join("credentials.toml")).unwrap();
+    assert!(
+        creds.contains("[registries.mock]") && creds.contains("tok-123"),
+        "{creds}"
+    );
+
+    let out = ok(&["publish", "-p", "mocklib", "--registry", "mock"]);
+    assert!(out.contains("uploaded mocklib v0.3.0"), "{out}");
+    // The app depends on the library through the registry now.
+    ok(&["publish", "-p", "mockapp", "--registry", "mock"]);
+    {
+        let st = state.lock().unwrap();
+        let app = &st.index["mockapp"][0];
+        assert_eq!(app["deps"][0]["name"], "mocklib");
+        assert_eq!(app["deps"][0]["req"], "^0.3.0");
+        assert!(app["deps"][0]["registry"].is_null(), "{app}");
+        // The uploaded manifest has no path dependency left.
+        let bytes = st.crates[&("mockapp".to_string(), "0.3.0".to_string())].clone();
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("a.crate"), bytes).unwrap();
+        let manifest = Command::new("tar")
+            .args(["xzf", "a.crate", "-O", "mockapp-0.3.0/Cargo.toml"])
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+        let manifest = String::from_utf8_lossy(&manifest.stdout);
+        assert!(!manifest.contains("path ="), "{manifest}");
+        assert!(manifest.contains("version = \"0.3.0\""), "{manifest}");
+    }
+
+    // Anyone can install it from there.
+    let root = p.path().join("bin-root");
+    ok(&[
+        "install",
+        "mockapp",
+        "--registry",
+        "mock",
+        "--root",
+        root.to_str().unwrap(),
+    ]);
+    let run = Command::new(root.join("bin/mockapp")).output().unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout),
+        "published answer 42\n"
+    );
+
+    let found = ok(&["search", "mock", "--registry", "mock"]);
+    assert!(found.contains("mocklib = \"0.3.0\""), "{found}");
+    assert!(ok(&["owner", "--list", "mocklib", "--registry", "mock"]).contains("ada (Ada)"));
+    ok(&["yank", "mocklib@0.3.0", "--registry", "mock"]);
+    assert_eq!(state.lock().unwrap().index["mocklib"][0]["yanked"], true);
+    ok(&["yank", "mocklib@0.3.0", "--undo", "--registry", "mock"]);
+    assert_eq!(state.lock().unwrap().index["mocklib"][0]["yanked"], false);
+
+    ok(&["logout", "--registry", "mock"]);
+    let creds = std::fs::read_to_string(cargo_home.path().join("credentials.toml")).unwrap();
+    assert!(!creds.contains("tok-123"), "{creds}");
+}
+
+#[cfg(unix)]
+#[test]
+fn registry_tokens_come_from_external_credential_providers() {
+    let (port, state) = serve_publishing_registry("tok-from-provider");
+    state
+        .lock()
+        .unwrap()
+        .index
+        .entry("foo".into())
+        .or_default()
+        .push(serde_json::json!({"name": "foo", "vers": "1.0.0", "deps": [], "cksum": "00", "features": {}, "yanked": false}));
+    let p = Project::new();
+    // A provider per Cargo's credential protocol, and nothing in
+    // credentials.toml.
+    p.write(
+        "provider.sh",
+        "#!/bin/sh\necho '{\"v\":[1]}'\nread req\necho '{\"Ok\":{\"kind\":\"get\",\"token\":\"tok-from-provider\",\"cache\":\"session\",\"operation_independent\":true}}'\n",
+    );
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(
+        p.path().join("provider.sh"),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    p.write(
+        ".cargo/config.toml",
+        &format!(
+            "[registries.mock]\nindex = \"sparse+http://127.0.0.1:{port}/\"\ncredential-provider = {:?}\n",
+            p.path().join("provider.sh").display().to_string()
+        ),
+    );
+    let cargo_home = tempfile::tempdir().unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_rune"))
+        .args(["yank", "foo@1.0.0", "--registry", "mock"])
+        .current_dir(p.path())
+        .env("RUNE_HOME", p.home())
+        .env("CARGO_HOME", cargo_home.path())
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", text(&out));
+    assert_eq!(state.lock().unwrap().index["foo"][0]["yanked"], true);
+}
+
+#[cfg(unix)]
+#[test]
+fn git_based_registry_indexes_resolve_download_and_lock_like_cargo() {
+    // The index is a git repository; the `.crate` files come from the `dl`
+    // URL its `config.json` names.
+    let (port, state) = serve_publishing_registry("unused");
+    let (bytes, sum) = make_crate("foo", "1.0.0", FOO_LIB);
+    state
+        .lock()
+        .unwrap()
+        .crates
+        .insert(("foo".into(), "1.0.0".into()), bytes);
+    let index = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(index.path().join("3/f")).unwrap();
+    std::fs::write(
+        index.path().join("3/f/foo"),
+        format!("{{\"name\":\"foo\",\"vers\":\"1.0.0\",\"deps\":[],\"cksum\":\"{sum}\",\"features\":{{}},\"yanked\":false}}\n"),
+    )
+    .unwrap();
+    std::fs::write(
+        index.path().join("config.json"),
+        format!("{{\"dl\":\"http://127.0.0.1:{port}/dl\"}}"),
+    )
+    .unwrap();
+    for args in [
+        &["init", "-q"][..],
+        &["add", "-A"],
+        &["commit", "-qm", "index"],
+    ] {
+        assert!(
+            Command::new("git")
+                .args(args)
+                .current_dir(index.path())
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+    let url = format!("file://{}", index.path().display());
+    let p = registry_app("{ version = \"1\", registry = \"corp\" }");
+    p.write(
+        ".cargo/config.toml",
+        &format!("[registries.corp]\nindex = \"{url}\"\n"),
+    );
+    let out = p.ok(&["run"]);
+    assert!(out.contains("foo says hello from the registry"), "{out}");
+    let lock = p.read("Cargo.lock");
+    assert!(
+        lock.contains(&format!("source = \"registry+{url}\"")),
+        "{lock}"
+    );
+    assert!(lock.contains(&format!("checksum = \"{sum}\"")), "{lock}");
+    // And again from the lockfile, offline.
+    std::fs::remove_dir_all(p.path().join(".rune")).unwrap();
+    assert!(p.ok(&["run", "--offline"]).contains("foo says"));
 }
 
 #[cfg(unix)]
@@ -2131,6 +3281,40 @@ fn json_lines(out: &Output) -> Vec<serde_json::Value> {
         .lines()
         .map(|l| serde_json::from_str(l).unwrap_or_else(|e| panic!("not JSON: {l:?} ({e})")))
         .collect()
+}
+
+#[test]
+fn test_no_run_json_names_every_test_executable_like_cargo() {
+    // What `cargo nextest` (and IDEs) run to find the test binaries.
+    let p = lib_project();
+    p.write("tests/it.rs", "#[test] fn it() {}\n");
+    let out = p.rune(&[
+        "test",
+        "--no-run",
+        "--message-format",
+        "json-render-diagnostics",
+    ]);
+    assert!(out.status.success(), "{}", text(&out));
+    let tests: Vec<(String, String)> = json_lines(&out)
+        .iter()
+        .filter(|l| l["reason"] == "compiler-artifact" && l["profile"]["test"] == true)
+        .map(|l| {
+            (
+                l["target"]["kind"][0].as_str().unwrap().to_string(),
+                l["executable"].as_str().unwrap_or_default().to_string(),
+            )
+        })
+        .collect();
+    let kinds: Vec<&str> = tests.iter().map(|(k, _)| k.as_str()).collect();
+    assert!(
+        kinds.contains(&"lib") && kinds.contains(&"test"),
+        "{tests:?}"
+    );
+    for (kind, exe) in &tests {
+        assert!(!exe.is_empty(), "{kind} test has no executable: {tests:?}");
+        let run = Command::new(exe).output().unwrap();
+        assert!(run.status.success() && String::from_utf8_lossy(&run.stdout).contains("1 passed"));
+    }
 }
 
 #[test]

@@ -18,6 +18,11 @@ pub struct Cli {
     #[arg(long, global = true, value_parser = ["auto", "always", "never"], default_value = "auto")]
     pub color: String,
 
+    /// Override a configuration value (`KEY=VALUE` in TOML, e.g.
+    /// `profile.release.lto=true`), or read a configuration file (`PATH.toml`)
+    #[arg(long = "config", global = true, value_name = "KEY=VALUE|PATH")]
+    pub config_overrides: Vec<String>,
+
     #[command(subcommand)]
     pub command: Commands,
 }
@@ -40,10 +45,18 @@ pub enum Commands {
     Bench(TestArgs),
     /// Format every local crate's source with rustfmt
     Fmt(FmtArgs),
-    /// Lint every local crate with clippy
-    Clippy(BuildArgs),
+    /// Lint every local crate with clippy (`rune clippy -- -D warnings`)
+    Clippy(ClippyArgs),
     /// Build the package's documentation
     Doc(DocArgs),
+    /// Compile a package, passing extra arguments to rustc for its targets
+    Rustc(RustcArgs),
+    /// Apply the compiler's machine-applicable suggestions to the source
+    Fix(FixArgs),
+    /// Say which units a build would compile, and what changed in each
+    Explain(BuildArgs),
+    /// Document a package, passing extra arguments to rustdoc
+    Rustdoc(RustdocArgs),
     /// Create a new package in a new directory
     New(NewArgs),
     /// Create a new package in an existing directory
@@ -69,6 +82,30 @@ pub enum Commands {
     Metadata(MetadataArgs),
     /// Build a package and install its binaries
     Install(InstallArgs),
+    /// Remove binaries installed with `rune install` (or `cargo install`)
+    Uninstall(UninstallArgs),
+    /// Assemble the package into a distributable `.crate` file
+    Package(PackageArgs),
+    /// Package and upload a crate to the registry
+    Publish(PublishArgs),
+    /// Save a registry API token
+    Login(LoginArgs),
+    /// Remove a saved registry API token
+    Logout(LoginArgs),
+    /// Remove (or with --undo, restore) a published version from the index
+    Yank(YankArgs),
+    /// Manage a crate's owners on the registry
+    Owner(OwnerArgs),
+    /// Search the registry for crates
+    Search(SearchArgs),
+    /// Show a crate's description, features and dependencies
+    Info(InfoArgs),
+    /// Vendor every dependency into a local directory
+    Vendor(VendorArgs),
+    /// Print a fully qualified package specification
+    Pkgid(PkgidArgs),
+    /// Check that the manifest is well-formed
+    VerifyProject(ManifestArgs),
     /// Remove generated target artifacts
     Clean(CleanArgs),
     /// Check the toolchain, machine and project for what slows builds down
@@ -320,6 +357,10 @@ pub struct FmtArgs {
     /// would be reformatted
     #[arg(long)]
     pub check: bool,
+
+    /// Arguments for rustfmt (after `--`), e.g. `-- --check`
+    #[arg(last = true, value_name = "ARGS")]
+    pub rustfmt_args: Vec<String>,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -334,6 +375,60 @@ pub struct DocArgs {
     /// Open the docs in a browser afterwards
     #[arg(long)]
     pub open: bool,
+
+    /// Document private items too
+    #[arg(long)]
+    pub document_private_items: bool,
+
+    /// Document only the library (what is documented anyway; accepted for
+    /// compatibility with Cargo)
+    #[arg(long)]
+    pub lib: bool,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct RustdocArgs {
+    #[command(flatten)]
+    pub doc: DocArgs,
+    /// Extra arguments for rustdoc on the selected packages (after `--`)
+    #[arg(last = true, value_name = "ARGS")]
+    pub args: Vec<String>,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct RustcArgs {
+    #[command(flatten)]
+    pub build: BuildArgs,
+    /// Extra arguments for rustc on the selected targets (after `--`)
+    #[arg(last = true, value_name = "ARGS")]
+    pub args: Vec<String>,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct FixArgs {
+    #[command(flatten)]
+    pub build: BuildArgs,
+    /// Fix even with uncommitted changes in the working directory
+    #[arg(long)]
+    pub allow_dirty: bool,
+    /// Fix even with staged (but otherwise no uncommitted) changes
+    #[arg(long)]
+    pub allow_staged: bool,
+    /// Fix even when the package is not under version control
+    #[arg(long)]
+    pub allow_no_vcs: bool,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct ClippyArgs {
+    #[command(flatten)]
+    pub build: BuildArgs,
+    /// Apply clippy's suggested fixes to the source
+    #[arg(long)]
+    pub fix: bool,
+    /// Lint flags for the workspace's own crates, e.g. `-- -D warnings`
+    #[arg(last = true, value_name = "ARGS")]
+    pub args: Vec<String>,
 }
 
 #[derive(Args, Debug, Clone, Default)]
@@ -426,8 +521,37 @@ pub struct AddArgs {
     pub optional: bool,
 
     /// Add a path dependency
-    #[arg(long, value_name = "PATH")]
+    #[arg(long, value_name = "PATH", conflicts_with = "git")]
     pub path: Option<PathBuf>,
+
+    /// Add a git dependency
+    #[arg(long, value_name = "URL")]
+    pub git: Option<String>,
+    /// Branch of the git dependency
+    #[arg(long, requires = "git")]
+    pub branch: Option<String>,
+    /// Tag of the git dependency
+    #[arg(long, requires = "git")]
+    pub tag: Option<String>,
+    /// Commit of the git dependency
+    #[arg(long, requires = "git")]
+    pub rev: Option<String>,
+
+    /// Name the dependency differently in this crate (`package = "..."`)
+    #[arg(long, value_name = "NAME")]
+    pub rename: Option<String>,
+
+    /// Add it only for this platform (`cfg(unix)` or a target triple)
+    #[arg(long, value_name = "TARGET")]
+    pub target: Option<String>,
+
+    /// Registry to take it from (a name from `[registries]`)
+    #[arg(long, value_name = "NAME")]
+    pub registry: Option<String>,
+
+    /// Show what would be added without changing the manifest
+    #[arg(long)]
+    pub dry_run: bool,
 
     /// Package to modify in a workspace
     #[arg(short = 'p', long = "package")]
@@ -456,8 +580,17 @@ pub struct RemoveArgs {
 pub struct UpdateArgs {
     #[command(flatten)]
     pub manifest: ManifestArgs,
-    /// Optional specific packages to update
+    /// Packages to update (`NAME` or `NAME@VERSION`); all when none are given
     pub packages: Vec<String>,
+    /// Package to update (the same as naming it)
+    #[arg(short = 'p', long = "package", value_name = "SPEC")]
+    pub package: Vec<String>,
+    /// Update the package to exactly this version
+    #[arg(long, value_name = "VERSION")]
+    pub precise: Option<String>,
+    /// Show what would change without writing the lockfile
+    #[arg(long)]
+    pub dry_run: bool,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -518,18 +651,56 @@ pub struct MetadataArgs {
 pub struct InstallArgs {
     #[command(flatten)]
     pub common: CommonArgs,
+    /// Crates to install from the registry (`name` or `name@version`); with
+    /// `--git`, the package to install from the repository
+    #[arg(value_name = "CRATE")]
+    pub crates: Vec<String>,
+    /// Version requirement to install (a bare version means exactly it)
+    #[arg(long, value_name = "VERSION", alias = "vers")]
+    pub version: Option<String>,
     /// Install the package at this path
-    #[arg(long, value_name = "PATH", default_value = ".")]
-    pub path: PathBuf,
-    /// Directory to install binaries into (default: `~/.cargo/bin`)
+    #[arg(long, value_name = "PATH", conflicts_with = "git")]
+    pub path: Option<PathBuf>,
+    /// Install from this git repository
+    #[arg(long, value_name = "URL")]
+    pub git: Option<String>,
+    /// Branch to use with `--git`
+    #[arg(long, requires = "git")]
+    pub branch: Option<String>,
+    /// Tag to use with `--git`
+    #[arg(long, requires = "git")]
+    pub tag: Option<String>,
+    /// Commit to use with `--git`
+    #[arg(long, requires = "git")]
+    pub rev: Option<String>,
+    /// Registry to install from (a name from `[registries]`)
+    #[arg(long, value_name = "NAME")]
+    pub registry: Option<String>,
+    /// Installation root: binaries go into `<DIR>/bin` (default: `$CARGO_INSTALL_ROOT`, else `$CARGO_HOME` or `~/.cargo`)
     #[arg(long, value_name = "DIR")]
     pub root: Option<PathBuf>,
     /// Install only this binary
     #[arg(long, value_name = "NAME")]
     pub bin: Vec<String>,
-    /// Overwrite existing binaries
+    /// Reinstall even if the same version is installed, overwriting binaries
     #[arg(short = 'f', long)]
     pub force: bool,
+    /// List installed packages and their binaries
+    #[arg(long)]
+    pub list: bool,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct UninstallArgs {
+    /// Packages to uninstall
+    #[arg(value_name = "PACKAGE")]
+    pub packages: Vec<String>,
+    /// Installation root the packages were installed into
+    #[arg(long, value_name = "DIR")]
+    pub root: Option<PathBuf>,
+    /// Only uninstall this binary
+    #[arg(long, value_name = "NAME")]
+    pub bin: Vec<String>,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -780,4 +951,144 @@ pub struct ScriptArgs {
         value_name = "ARGS"
     )]
     pub args: Vec<String>,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct PackageArgs {
+    #[command(flatten)]
+    pub manifest: ManifestArgs,
+    /// Package to assemble (in a workspace)
+    #[arg(short = 'p', long = "package")]
+    pub package: Vec<String>,
+    /// Every workspace member
+    #[arg(long)]
+    pub workspace: bool,
+    /// Print the files that would be packaged, and nothing else
+    #[arg(short = 'l', long)]
+    pub list: bool,
+    /// Don't build the packaged crate to check it
+    #[arg(long)]
+    pub no_verify: bool,
+    /// Allow uncommitted changes in the working directory
+    #[arg(long)]
+    pub allow_dirty: bool,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct PublishArgs {
+    #[command(flatten)]
+    pub manifest: ManifestArgs,
+    /// Package to publish (in a workspace)
+    #[arg(short = 'p', long = "package")]
+    pub package: Vec<String>,
+    /// Do everything except the upload
+    #[arg(long, short = 'n')]
+    pub dry_run: bool,
+    /// Registry to publish to (a name from `[registries]`)
+    #[arg(long, value_name = "NAME")]
+    pub registry: Option<String>,
+    /// API token to use instead of the saved one
+    #[arg(long, value_name = "TOKEN")]
+    pub token: Option<String>,
+    /// Don't build the packaged crate before uploading it
+    #[arg(long)]
+    pub no_verify: bool,
+    /// Allow uncommitted changes in the working directory
+    #[arg(long)]
+    pub allow_dirty: bool,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct LoginArgs {
+    /// The token (read from standard input when omitted)
+    pub token: Option<String>,
+    /// Registry the token is for (a name from `[registries]`)
+    #[arg(long, value_name = "NAME")]
+    pub registry: Option<String>,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct YankArgs {
+    /// `NAME@VERSION`, or `NAME` with `--version`
+    #[arg(value_name = "CRATE")]
+    pub krate: String,
+    /// The version to yank
+    #[arg(long, value_name = "VERSION", alias = "vers")]
+    pub version: Option<String>,
+    /// Undo a yank
+    #[arg(long)]
+    pub undo: bool,
+    #[arg(long, value_name = "NAME")]
+    pub registry: Option<String>,
+    #[arg(long, value_name = "TOKEN")]
+    pub token: Option<String>,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct OwnerArgs {
+    /// The crate (default: the package in the current directory)
+    #[arg(value_name = "CRATE")]
+    pub krate: Option<String>,
+    /// Invite these logins as owners
+    #[arg(short = 'a', long, value_name = "LOGIN")]
+    pub add: Vec<String>,
+    /// Remove these owners
+    #[arg(short = 'r', long, value_name = "LOGIN")]
+    pub remove: Vec<String>,
+    /// List the owners
+    #[arg(short = 'l', long)]
+    pub list: bool,
+    #[arg(long, value_name = "NAME")]
+    pub registry: Option<String>,
+    #[arg(long, value_name = "TOKEN")]
+    pub token: Option<String>,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct SearchArgs {
+    /// What to search for
+    #[arg(required = true, value_name = "QUERY")]
+    pub query: Vec<String>,
+    /// How many results to show (at most 100)
+    #[arg(long, default_value = "10")]
+    pub limit: u32,
+    #[arg(long, value_name = "NAME")]
+    pub registry: Option<String>,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct InfoArgs {
+    /// `NAME` or `NAME@VERSION`
+    #[arg(value_name = "CRATE")]
+    pub krate: String,
+    #[arg(long, value_name = "NAME")]
+    pub registry: Option<String>,
+    /// Use only the local index cache
+    #[arg(long)]
+    pub offline: bool,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct VendorArgs {
+    #[command(flatten)]
+    pub manifest: ManifestArgs,
+    /// Where to put the sources
+    #[arg(default_value = "vendor")]
+    pub path: PathBuf,
+    /// Name directories `name-version` even when only one version is used
+    #[arg(long)]
+    pub versioned_dirs: bool,
+    /// Keep what is already in the directory
+    #[arg(long)]
+    pub no_delete: bool,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct PkgidArgs {
+    #[command(flatten)]
+    pub manifest: ManifestArgs,
+    /// A package of the workspace or of its dependency graph (`name` or `name@version`)
+    pub spec: Option<String>,
+    #[arg(short = 'p', long = "package")]
+    pub package: Option<String>,
 }

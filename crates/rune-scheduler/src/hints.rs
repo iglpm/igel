@@ -222,22 +222,22 @@ pub fn hint_for_failure(output: &str, family: Family) -> Option<String> {
 
     // The pkg-config search failing for one specific library is a different
     // problem from pkg-config being absent, and the message names the file.
-    if let Some(pc) = missing_pkg_config_package(&lower) {
-        if !lower.contains("openssl") || !lower.contains("could not find directory of openssl") {
-            let mut hint = format!(
-                "hint: a system library is missing: pkg-config found no `{pc}.pc`. \
+    if let Some(pc) = missing_pkg_config_package(&lower)
+        && (!lower.contains("openssl") || !lower.contains("could not find directory of openssl"))
+    {
+        let mut hint = format!(
+            "hint: a system library is missing: pkg-config found no `{pc}.pc`. \
                  Install the development package that provides it"
-            );
-            hint.push_str(match family {
-                Family::Debian => {
-                    " (apt-file search {pc}.pc  finds its name; usually `lib<name>-dev`)."
-                }
-                Family::Fedora => " (dnf provides '*/{pc}.pc'; usually `<name>-devel`).",
-                Family::Arch => " (pacman -F {pc}.pc).",
-                _ => ".",
-            });
-            return Some(hint.replace("{pc}", &pc));
-        }
+        );
+        hint.push_str(match family {
+            Family::Debian => {
+                " (apt-file search {pc}.pc  finds its name; usually `lib<name>-dev`)."
+            }
+            Family::Fedora => " (dnf provides '*/{pc}.pc'; usually `<name>-devel`).",
+            Family::Arch => " (pacman -F {pc}.pc).",
+            _ => ".",
+        });
+        return Some(hint.replace("{pc}", &pc));
     }
 
     RULES

@@ -170,10 +170,10 @@ pub fn resolve(
                     continue;
                 }
             }
-            if let Some(t) = &dep.target {
-                if !(opts.platform_matches)(t, host) {
-                    continue;
-                }
+            if let Some(t) = &dep.target
+                && !(opts.platform_matches)(t, host)
+            {
+                continue;
             }
             let child_host =
                 role(host || dep.kind == DependencyKind::Build || pkgs[target_pkg].proc_macro);

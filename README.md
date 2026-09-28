@@ -45,13 +45,31 @@ rune affected --since origin/main     # packages a change can influence, for sel
 rune script hello.rs           # single-file scripts with `---cargo` dependencies (or a shebang)
 rune doctor                    # what slows your builds down, with the fix
 rune cas du                    # what takes the space in the store, and how much is idle
+
+rune install ripgrep           # from crates.io (also --git URL, --path DIR); rune install --list
+rune uninstall ripgrep
+rune clippy -- -D warnings     # lint flags for the workspace's own crates
+rune fmt --all -- --check      # the usual CI formatting check
+rune fix                       # apply the compiler's machine-applicable suggestions (clippy --fix too)
+rune rustc --lib -- --emit=asm # extra rustc arguments for one target (rune rustdoc -- … likewise)
+rune update -p serde --precise 1.0.200   # pin one dependency (--dry-run to preview)
+rune package / rune publish    # build and upload a .crate (login, logout, yank, owner too)
+rune search http client        # crates.io search; rune info tokio for one crate
+rune vendor                    # every dependency into vendor/, with the config to use it
+rune pkgid serde / rune verify-project
+rune nextest run               # any `cargo-<name>` / `rune-<name>` on PATH is a subcommand
 ```
 
 Cargo's selection flags work as expected: `-p/--package`, `--workspace`,
 `--exclude`, `--bin`, `--lib`, `--example`, `--test`, `--bench`, `--all-targets`,
 `-F/--features`, `--all-features`, `--no-default-features`, `--profile`,
 `--target`, `--manifest-path`, `--locked`, `--offline`, `--frozen`,
-`--ignore-rust-version`.
+`--ignore-rust-version`. `[alias]` entries from `.cargo/config.toml`
+(`xtask = "run --package xtask --"`) work as commands, and `[profile.*]` in
+configuration and `CARGO_PROFILE_<NAME>_<KEY>` variables override the
+manifest's profiles, as with Cargo. Status lines go to stderr; stdout carries only
+what a command produces (`metadata`, `vendor`'s configuration, your program's
+output), so it can be piped.
 
 ## What is supported
 
@@ -89,6 +107,24 @@ environment (`TARGET`, `HOST`, `OUT_DIR`, `CARGO_PKG_*`, `CARGO_FEATURE_*`,
 `CARGO_ENCODED_RUSTFLAGS`, …); one run per package shared by its library,
 binaries and tests; `links` conflicts detected.
 
+**C, C++ and other bindings.** Everything the binding ecosystem relies on
+works as with Cargo, verified with real crates on macOS: `cc` (C and C++),
+`bindgen`, `cxx`/`cxx-build`, bundled C libraries (`rusqlite` with `bundled`),
+`libz-sys`/`flate2`, frameworks (`core-foundation`), `pyo3` both as a Python
+extension module and embedding Python, `cbindgen` headers, and `cdylib` plugins
+loaded with `libloading`. In particular:
+- native library directories a `-sys` crate's build script reports reach every
+  crate that links it, however far up (a dynamic `-lpython3.9`, OpenSSL from
+  Homebrew), and doc tests;
+- `rune run`/`rune test` find dynamic libraries built by build scripts and by
+  the workspace (`DYLD_FALLBACK_LIBRARY_PATH`, `LD_LIBRARY_PATH` or `PATH`);
+- a workspace library's `staticlib`/`cdylib`/`dylib`/`rlib` also appears under
+  Cargo's names in `target/debug/` (`libfoo.a`, `libfoo.so`/`.dylib`,
+  `foo.dll`), where C build systems, Python packaging and plugin loaders look;
+- doc tests and `rune doc` see the build script's `OUT_DIR` (generated
+  bindings), `cfg`s and environment;
+- warnings from dependencies' build scripts are silenced, as Cargo does.
+
 **Toolchain and configuration.** `RUSTC`, `RUSTC_WRAPPER`,
 `RUSTC_WORKSPACE_WRAPPER`, `RUSTFLAGS`, `CARGO_ENCODED_RUSTFLAGS`,
 `rust-toolchain(.toml)` (resolved through `rustup`), and the hierarchical
@@ -99,8 +135,29 @@ binaries and tests; `links` conflicts detected.
 
 **Profiles.** `dev`/`release`/`test`/`bench`, custom profiles with `inherits`,
 `[profile.*.package.<name|*>]` and `[profile.*.build-override]` (by default
-build scripts and proc-macros compile unoptimized, as in Cargo). The key uses
-the *effective* profile of each unit.
+build scripts and proc-macros compile unoptimized, as in Cargo), also from
+`.cargo/config.toml` and `CARGO_PROFILE_<NAME>_<KEY>`. The key uses the
+*effective* profile of each unit. On Apple targets, `split-debuginfo` defaults
+to `unpacked` like Cargo's (no `dsymutil` run per binary).
+
+**Resolution.** Newest compatible versions, seeded by `Cargo.lock` (which stays
+the source of truth: a lockfile changed by `git pull` or `cargo update` is
+respected), MSRV-aware with resolver 3, and one version per semver-compatible
+range as Cargo requires: when a stricter requirement turns up late, resolution
+settles on the version every requirement accepts, or backtracks to an older
+release of the crate that brought the conflict in. A fresh lockfile for Rune's
+own 229-package workspace is byte-identical to `cargo generate-lockfile`'s.
+Index entries a lockfile names are fetched in one concurrent wave rather than
+level by level (`rune update`: 3.2 s → 0.7–1.2 s, faster than Cargo's 1.7 s).
+
+**Registry workflow.** `rune install` (crates.io, `--git`, `--path`; tracked in
+Cargo's own `.crates.toml`, so `cargo install --list`/`uninstall` agree),
+`package` (normalized manifest, workspace inheritance resolved, path/git
+dependencies turned into registry ones, `.cargo_vcs_info.json`, verification
+build), `publish` (then waits until the index has it), `login`/`logout` (in
+Cargo's `credentials.toml`), `yank`, `owner`, `search`, `info`, `vendor` (with
+`.cargo-checksum.json`, so Cargo accepts the directory too; vendored git
+dependencies included).
 
 ## Manifests: `Cargo.toml` or `Rune.toml`
 
@@ -229,15 +286,20 @@ Rune targets Cargo compatibility, so these are the things it does **not** do (ye
   A build script that reads the outside world without declaring it (no
   `rerun-if-*`) is treated like Cargo treats it, which cannot be detected
   without tracing or sandboxing — planned.
-- **The resolver is greedy**, seeded from `Cargo.lock`: it picks the newest
-  version that fits and does not backtrack to find a set Cargo's solver would
-  find in unusual conflict situations.
+- **The resolver is not a full SAT/PubGrub solver.** It picks the newest
+  version that fits, then settles each semver-compatible range on one version,
+  backtracking one requirer at a time. A conflict that needs several crates
+  moved at once is reported as a warning and left with two versions side by
+  side, where Cargo would find a solution or refuse.
 - **Git dependencies need `git` on `PATH`** (Rune uses your own git, so your
   credential helpers and `insteadOf` rules just work).
 - **Structured diagnostics.** Warnings are replayed as rendered text.
-- Linux is the platform this was developed and tested on; Windows and macOS
-  have not been exercised.
-- `publish`, `audit`, `outdated` and `deny` are not implemented.
+- Linux is the platform this was developed on; the test suite also passes on
+  macOS (Apple Silicon). Windows has not been exercised.
+- `audit`, `outdated` and `deny` are not built in; installed as the usual
+  `cargo-audit`/`cargo-outdated`/`cargo-deny`, they work as `rune audit` etc.
+  (external subcommands get `CARGO` pointing at the real `cargo`, since plugins
+  are written against it; `RUNE_PLUGIN_CARGO=rune` points them at Rune).
 
 See [ROADMAP.md](ROADMAP.md) for the full status against the compatibility
 specification and what comes next.
@@ -344,6 +406,21 @@ everything that depends on them; `--format args` gives `-p a -p b` for
 `rune test $(rune affected --since origin/main --format args)`. A change to
 `Cargo.lock`, the root `Cargo.toml`, `rust-toolchain` or `.cargo/config.toml`
 affects everything.
+
+## `check` after `build`
+
+`rune check` reuses what `rune build` already compiled: a checked crate takes
+the stored result of the same crate fully built, whose `.rmeta` is what its
+dependents type-check against, and its warnings are replayed. On Rune's own
+workspace (181 units), `check` right after `build` compiles nothing (0.3 s;
+before, it recompiled 148 units in 6 s). After an edit, only the edited crate
+and what depends on it are checked for real.
+
+rustc gives a checked and a built `.rmeta` of the same crate different crate
+hashes, so the two must never meet in one dependency chain. A crate is reused
+this way only if everything below it is too, and it then carries the built
+crate's key, so each dependent's key records which kind it was checked against.
+`build` after `check` still compiles: a check produces no code.
 
 ## Several `rune` processes at once
 

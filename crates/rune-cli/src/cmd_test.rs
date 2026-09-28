@@ -196,6 +196,7 @@ pub fn run(args: TestArgs, mode: Mode) -> Result<()> {
             order: usize,
             doc: usize,
             externs: Vec<(String, PathBuf)>,
+            script: DocScript,
         },
     }
     let (job_tx, job_rx) = unbounded::<Job>();
@@ -264,8 +265,15 @@ pub fn run(args: TestArgs, mode: Mode) -> Result<()> {
                             order,
                             doc,
                             externs,
+                            script,
                         } => {
-                            let r = run_doctest(sess, &plan_ref.doc_tests[doc], &externs, args_ref);
+                            let r = run_doctest(
+                                sess,
+                                &plan_ref.doc_tests[doc],
+                                &externs,
+                                &script,
+                                args_ref,
+                            );
                             TestResult { order, ..r }
                         }
                         Job::Binary {
@@ -444,6 +452,8 @@ pub fn run(args: TestArgs, mode: Mode) -> Result<()> {
         };
 
         let artifacts_seen: std::cell::RefCell<HashMap<NodeId, Vec<PathBuf>>> = Default::default();
+        let scripts_seen: std::cell::RefCell<HashMap<NodeId, rune_common::BuildScriptOutput>> =
+            Default::default();
         let doc_dispatched = std::cell::RefCell::new(vec![false; plan.doc_tests.len()]);
         let doc_slots: Vec<bool> = plan
             .doc_tests
@@ -491,16 +501,21 @@ pub fn run(args: TestArgs, mode: Mode) -> Result<()> {
                     .collect();
                 if let Some(externs) = ready {
                     doc_dispatched.borrow_mut()[i] = true;
+                    let script = doc_script(&sess, &plan.graph, doc, &scripts_seen.borrow());
                     let _ = job_tx.send(Job::Doc {
                         order: doc_base + i,
                         doc: i,
                         externs,
+                        script,
                     });
                 }
             }
         };
 
         let (build, _failures) = drive(&sess, &plan.graph, |event| match event {
+            PipelineEvent::ScriptOutput { node_id, output } => {
+                scripts_seen.borrow_mut().insert(*node_id, output.clone());
+            }
             PipelineEvent::BuildFinished {
                 node_id, artifacts, ..
             }
@@ -516,16 +531,16 @@ pub fn run(args: TestArgs, mode: Mode) -> Result<()> {
                 try_dispatch_docs();
             }
             PipelineEvent::BuildFailed { node_id, .. } => {
-                if let Some(&idx) = by_node.get(node_id) {
-                    if !std::mem::replace(&mut dispatched.borrow_mut()[idx], true) {
-                        let _ = res_tx.send(TestResult {
-                            order: runnables[idx].order,
-                            outcome: Outcome::CompileFailed,
-                            counts: Counts::default(),
-                            output: "failed to compile (see the errors above)".into(),
-                            took: Duration::ZERO,
-                        });
-                    }
+                if let Some(&idx) = by_node.get(node_id)
+                    && !std::mem::replace(&mut dispatched.borrow_mut()[idx], true)
+                {
+                    let _ = res_tx.send(TestResult {
+                        order: runnables[idx].order,
+                        outcome: Outcome::CompileFailed,
+                        counts: Counts::default(),
+                        output: "failed to compile (see the errors above)".into(),
+                        took: Duration::ZERO,
+                    });
                 }
             }
             _ => {}
@@ -668,18 +683,23 @@ fn find_executable(
 ) -> Option<PathBuf> {
     // The harness binary is the artifact without an extension (`.d`, `.rmeta`
     // and `.rlib` are never executable).
-    let found = artifacts.iter().find(|p| p.extension().is_none());
+    let found = artifacts.iter().find(|p| {
+        matches!(
+            p.extension().and_then(|e| e.to_str()),
+            None | Some("exe" | "wasm" | "js")
+        )
+    });
     if let Some(p) = found {
         return Some(p.clone());
     }
     // Fall back to the conventional location.
     let unit = &plan.graph.node(r.exe_dir_key).unit;
     let dir = out_dir_for(sess.config(), &sess.profile, unit);
-    let guess = dir.join(format!(
+    let guess = dir.join(unit.executable_name(&format!(
         "{}-{}",
         unit.rustc_crate_name(),
         unit.metadata_hash()
-    ));
+    )));
     guess.exists().then_some(guess)
 }
 
@@ -741,18 +761,17 @@ fn has_doctests(dir: &std::path::Path) -> bool {
                 if scan(&path) {
                     return true;
                 }
-            } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
-                if let Ok(text) = std::fs::read_to_string(&path) {
-                    if text.lines().any(|line| {
-                        let t = line.trim_start();
-                        ((t.starts_with("///") || t.starts_with("//!") || t.starts_with('*'))
-                            && t.contains("```"))
-                            || ((t.starts_with("#[doc") || t.starts_with("#![doc"))
-                                && (t.contains("include_str!") || t.contains("```")))
-                    }) {
-                        return true;
-                    }
-                }
+            } else if path.extension().and_then(|e| e.to_str()) == Some("rs")
+                && let Ok(text) = std::fs::read_to_string(&path)
+                && text.lines().any(|line| {
+                    let t = line.trim_start();
+                    ((t.starts_with("///") || t.starts_with("//!") || t.starts_with('*'))
+                        && t.contains("```"))
+                        || ((t.starts_with("#[doc") || t.starts_with("#![doc"))
+                            && (t.contains("include_str!") || t.contains("```")))
+                })
+            {
+                return true;
             }
         }
         false
@@ -760,10 +779,78 @@ fn has_doctests(dir: &std::path::Path) -> bool {
     scan(&dir.join("src"))
 }
 
+/// What a library's build scripts give its doc tests, as they give the
+/// library itself: its `cfg`s, environment and `OUT_DIR`, and the native
+/// library directories of everything below it.
+#[derive(Default)]
+struct DocScript {
+    args: Vec<String>,
+    env: Vec<(String, String)>,
+}
+
+fn doc_script(
+    sess: &Session,
+    graph: &rune_graph::BuildGraph,
+    doc: &DocTest,
+    scripts: &HashMap<NodeId, rune_common::BuildScriptOutput>,
+) -> DocScript {
+    let mut out = DocScript::default();
+    let Some(&(_, lib)) = doc.externs.iter().find(|(n, _)| *n == doc.crate_name) else {
+        return out;
+    };
+    let unit = &graph.node(lib).unit;
+    if unit.build_script.is_some() {
+        let key = unit
+            .ext
+            .script_owner
+            .clone()
+            .unwrap_or_else(|| rune_scheduler::executor::script_key(unit));
+        let dir = sess
+            .config()
+            .build_script_out_dir_by_key(sess.profile.output_dir_name(), &key);
+        out.env.push(("OUT_DIR".into(), dir.display().to_string()));
+    }
+    if let Some(own) = scripts.get(&lib) {
+        for cfg in &own.cfgs {
+            out.args.extend(["--cfg".to_string(), cfg.clone()]);
+        }
+        out.env.extend(own.env_vars.iter().cloned());
+    }
+    // Native search paths of the library and everything it links.
+    let mut seen = std::collections::HashSet::new();
+    let mut stack = vec![lib];
+    while let Some(id) = stack.pop() {
+        let node = graph.node(id);
+        if !seen.insert(id)
+            || (id != lib && node.unit.crate_type == rune_common::CrateType::ProcMacro)
+        {
+            continue;
+        }
+        if let Some(o) = scripts.get(&id) {
+            for ls in &o.link_search {
+                let arg = match &ls.kind {
+                    Some(kind) => format!("{kind}={}", ls.path.display()),
+                    None => ls.path.display().to_string(),
+                };
+                if !out.args.windows(2).any(|w| w[0] == "-L" && w[1] == arg) {
+                    out.args.extend(["-L".to_string(), arg]);
+                }
+            }
+        }
+        stack.extend(
+            node.dependencies
+                .iter()
+                .filter(|d| node.normal_dependencies.contains(d)),
+        );
+    }
+    out
+}
+
 fn run_doctest(
     sess: &Session,
     doc: &DocTest,
     externs: &[(String, PathBuf)],
+    script: &DocScript,
     args: &TestArgs,
 ) -> TestResult {
     let start = Instant::now();
@@ -788,6 +875,7 @@ fn run_doctest(
     for f in &doc.features {
         cmd.arg("--cfg").arg(format!("feature=\"{f}\""));
     }
+    cmd.args(&script.args);
     for (name, path) in externs {
         cmd.arg("--extern")
             .arg(format!("{name}={}", path.display()));
@@ -808,6 +896,7 @@ fn run_doctest(
     }
     apply_run_env(&mut cmd, member, sess);
     cmd.env("CARGO_CRATE_NAME", &doc.crate_name);
+    cmd.envs(script.env.iter().map(|(k, v)| (k, v)));
     cmd.stdin(Stdio::null());
 
     match cmd.output() {

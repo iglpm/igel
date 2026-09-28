@@ -34,6 +34,9 @@ pub struct BuildResult {
     pub artifact_paths: HashMap<NodeId, Vec<PathBuf>>,
     /// The content-addressable cache key computed for each node.
     pub cache_keys: HashMap<NodeId, String>,
+    /// What each unit's build script reported (run or restored): the `cfg`s,
+    /// environment and native search paths later steps (`rune doc`) need.
+    pub build_script_outputs: HashMap<NodeId, BuildScriptOutput>,
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -185,10 +188,43 @@ impl BuildExecutor {
         let keys_timer = rune_common::timing::phase("cache keys");
         let mut unit_base_keys: HashMap<NodeId, String> = HashMap::with_capacity(topo.len());
         let mut unit_cas_keys: HashMap<NodeId, String> = HashMap::with_capacity(topo.len());
+        // `rune check` after `rune build` reuses the build: a checked unit
+        // takes the stored result of the same unit fully compiled (its
+        // `.rmeta` is what dependents type-check against). rustc gives the
+        // two `.rmeta` flavours different crate hashes, so they must never
+        // mix in one dependency chain: a unit is substituted only if its whole
+        // dependency closure is, and then carries the full unit's key so that
+        // every dependent's key says which flavour it was compiled against.
+        let substitute = self.cas.is_some() && !self.force_rebuild;
+        let mut full_keys: HashMap<NodeId, String> = HashMap::new();
+        let mut substituted: HashSet<NodeId> = HashSet::new();
         for &id in &topo {
-            let (base, key) = self.compute_keys(graph, id, &unit_cas_keys, &mut source_cache);
+            let node = graph.node(id);
+            let (mut base, mut key) =
+                self.compute_keys(graph, id, &unit_cas_keys, &mut source_cache, false);
+            if substitute && node.unit.check_only {
+                let (full_base, full_key) =
+                    self.compute_keys(graph, id, &full_keys, &mut source_cache, true);
+                let closure_full = node
+                    .dependencies
+                    .iter()
+                    .all(|d| !graph.node(*d).unit.check_only || substituted.contains(d));
+                if closure_full && self.cas.as_ref().is_some_and(|c| c.contains(&full_key)) {
+                    substituted.insert(id);
+                    base = full_base;
+                    key = full_key.clone();
+                }
+                full_keys.insert(id, full_key);
+            } else if substitute {
+                // Not a check unit (a build script's or proc-macro's
+                // dependency): the same unit in both modes.
+                full_keys.insert(id, key.clone());
+            }
             unit_base_keys.insert(id, base);
             unit_cas_keys.insert(id, key);
+        }
+        if !substituted.is_empty() {
+            debug!("{} checked units reuse full builds", substituted.len());
         }
         drop(keys_timer);
 
@@ -234,7 +270,11 @@ impl BuildExecutor {
                 // `OUT_DIR`) still need. Restore it from the store.
                 if unit.build_script.is_some() {
                     let script_key_name = format!("{}-buildscript", unit_cas_keys[&id]);
-                    if let Some(output) = cas.get_value(&script_key_name) {
+                    if let Some(output) = cas.get_value::<BuildScriptOutput>(&script_key_name) {
+                        let _ = self.event_tx.send(PipelineEvent::ScriptOutput {
+                            node_id: id,
+                            output: output.clone(),
+                        });
                         build_script_outputs.insert(id, output);
                     }
                     // The generated files too: the package's other units
@@ -253,9 +293,7 @@ impl BuildExecutor {
                 {
                     metadata_paths.insert(id, rmeta.clone());
                 }
-                if unit.crate_type == CrateType::Bin && !unit.harness {
-                    alias_binaries(&self.config, &self.profile, unit, &linked);
-                }
+                uplift_artifacts(&self.config, &self.profile, unit, &linked);
                 // Cargo replays a cached crate's warnings; so do we.
                 let warnings = if unit.crate_id.source == CrateSource::Local {
                     cas.get_value::<String>(&format!("{}-warnings", unit_cas_keys[&id]))
@@ -424,6 +462,10 @@ impl BuildExecutor {
                         metadata_paths.insert(node_id, rmeta_path);
                     }
                     WorkerMsg::BuildScriptDone { node_id, output } => {
+                        let _ = self.event_tx.send(PipelineEvent::ScriptOutput {
+                            node_id,
+                            output: output.clone(),
+                        });
                         build_script_outputs.insert(node_id, output);
                     }
                     WorkerMsg::KeyUpdate { node_id, key } => {
@@ -448,8 +490,13 @@ impl BuildExecutor {
                             {
                                 continue;
                             }
-                            let (base, key) =
-                                self.compute_keys(graph, id, &unit_cas_keys, &mut source_cache);
+                            let (base, key) = self.compute_keys(
+                                graph,
+                                id,
+                                &unit_cas_keys,
+                                &mut source_cache,
+                                false,
+                            );
                             let moved = unit_cas_keys.get(&id) != Some(&key);
                             unit_base_keys.insert(id, base);
                             unit_cas_keys.insert(id, key);
@@ -522,6 +569,14 @@ impl BuildExecutor {
             }
         }
 
+        let failed_set: HashSet<NodeId> = failed.iter().copied().collect();
+        self.save_identities(
+            graph,
+            &topo,
+            |id| completed.contains(&id) && !failed_set.contains(&id),
+            &unit_cas_keys,
+            &mut source_cache,
+        );
         let _ = source_cache.save_if_changed(&source_cache_path);
         timings.save(&timings_path, &global_timings_path);
         if rune_common::timing::enabled() && !spans.is_empty() {
@@ -567,6 +622,7 @@ impl BuildExecutor {
             total_duration,
             artifact_paths,
             cache_keys: unit_cas_keys,
+            build_script_outputs,
         })
     }
 
@@ -577,12 +633,123 @@ impl BuildExecutor {
         id: NodeId,
         keys: &HashMap<NodeId, String>,
         source_cache: &mut rune_fingerprint::FingerprintCache,
+        as_full_build: bool,
     ) -> (String, String) {
         let node = graph.node(id);
-        // What a unit depends on includes *how*: under which name it links a
-        // dependency (`package = "..."` renames), and whether it is a normal
-        // or a build dependency. The manifest that says so is not hashed, so
-        // the key has to.
+        // The key the unit would have outside `rune check` (see `execute`).
+        let full_unit;
+        let unit = if as_full_build && node.unit.check_only {
+            full_unit = CompilationUnit {
+                check_only: false,
+                ..node.unit.clone()
+            };
+            &full_unit
+        } else {
+            &node.unit
+        };
+        let dep_keys = dep_keys_of(graph, id, keys);
+        let base = compute_unit_cas_key(unit, &self.profile, &dep_keys, source_cache);
+        let recorded: Option<DeclaredInputs> = self
+            .cas
+            .as_ref()
+            .and_then(|c| c.get_value(&format!("{base}-inputs")));
+        let key = effective_key(&base, recorded.as_ref(), unit.build_script.is_some());
+        (base, key)
+    }
+
+    /// What a unit's key is made of now (see [`UnitIdentity`]), given its
+    /// dependencies' keys.
+    fn unit_identity(
+        &self,
+        graph: &BuildGraph,
+        id: NodeId,
+        keys: &HashMap<NodeId, String>,
+        source_cache: &mut rune_fingerprint::FingerprintCache,
+    ) -> UnitIdentity {
+        let unit = &graph.node(id).unit;
+        let dep_keys = dep_keys_of(graph, id, keys);
+        let mut identity = compute_unit_identity(unit, &self.profile, &dep_keys, source_cache);
+        let recorded: Option<DeclaredInputs> = self
+            .cas
+            .as_ref()
+            .and_then(|c| c.get_value(&format!("{}-inputs", identity.key)));
+        let key = effective_key(&identity.key, recorded.as_ref(), unit.build_script.is_some());
+        if key != identity.key {
+            identity.parts.insert(
+                "outside inputs (environment variables and files it read)".into(),
+                key.clone(),
+            );
+            identity.key = key;
+        }
+        identity
+    }
+
+    /// Every unit's current identity, dependencies first, with its label —
+    /// what `rune explain` compares with the last build.
+    pub fn current_identities(
+        &self,
+        graph: &BuildGraph,
+    ) -> RuneResult<Vec<(NodeId, String, UnitIdentity)>> {
+        let topo = graph.topological_sort()?;
+        let cache_path = self.config.fingerprint_dir.join("source-cache.json");
+        let mut source_cache =
+            rune_fingerprint::FingerprintCache::load(&cache_path).unwrap_or_default();
+        let mut keys = HashMap::new();
+        let mut out = Vec::new();
+        for id in topo {
+            let identity = self.unit_identity(graph, id, &keys, &mut source_cache);
+            keys.insert(id, identity.key.clone());
+            out.push((id, unit_label(&graph.node(id).unit, &self.profile), identity));
+        }
+        Ok(out)
+    }
+
+    /// Whether the store has a result for `key`.
+    pub fn is_cached(&self, key: &str) -> bool {
+        self.cas.as_ref().is_some_and(|c| c.contains(key))
+    }
+
+    /// Records what each unit built now was built from, for `rune explain`.
+    fn save_identities(
+        &self,
+        graph: &BuildGraph,
+        topo: &[NodeId],
+        built: impl Fn(NodeId) -> bool,
+        keys: &HashMap<NodeId, String>,
+        source_cache: &mut rune_fingerprint::FingerprintCache,
+    ) {
+        let mut all = load_identities(&self.config.fingerprint_dir);
+        let before = all.clone();
+        for &id in topo {
+            if !built(id) {
+                continue;
+            }
+            let mut identity = self.unit_identity(graph, id, keys, source_cache);
+            if let Some(key) = keys.get(&id) {
+                identity.key = key.clone();
+            }
+            all.insert(unit_label(&graph.node(id).unit, &self.profile), identity);
+        }
+        if all != before
+            && let Ok(text) = serde_json::to_string(&all)
+        {
+            let path = self.config.fingerprint_dir.join("identities.json");
+            let _ = rune_common::fsutil::write_atomic(&path, text.as_bytes());
+        }
+    }
+}
+
+/// A unit's dependencies' keys, named by *how* it depends on them: under
+/// which name it links a dependency (`package = "..."` renames), and whether
+/// it is a normal or a build dependency. The manifest that says so is not
+/// hashed, so the key has to.
+fn dep_keys_of(
+    graph: &BuildGraph,
+    id: NodeId,
+    keys: &HashMap<NodeId, String>,
+) -> Vec<(String, String)> {
+    let node = graph.node(id);
+    {
         let mut dep_keys: Vec<(String, String)> = Vec::new();
         for d in &node.dependencies {
             let Some(k) = keys.get(d) else { continue };
@@ -604,14 +771,11 @@ impl BuildExecutor {
                 dep_keys.push((format!("build-dep:{name}:{}", dep.crate_id.name), k.clone()));
             }
         }
-        let base = compute_unit_cas_key(&node.unit, &self.profile, &dep_keys, source_cache);
-        let recorded: Option<DeclaredInputs> = self
-            .cas
-            .as_ref()
-            .and_then(|c| c.get_value(&format!("{base}-inputs")));
-        let key = effective_key(&base, recorded.as_ref(), node.unit.build_script.is_some());
-        (base, key)
+        dep_keys
     }
+}
+
+impl BuildExecutor {
 
     /// Gathers everything a worker thread needs, by value.
     #[allow(clippy::too_many_arguments)]
@@ -699,8 +863,8 @@ impl BuildExecutor {
             for &dep_id in &node.dependencies {
                 let dep = &graph.node(dep_id).unit;
                 if dep.crate_type == CrateType::Bin && dep.kind == TargetKind::Bin {
-                    let exe =
-                        out_dir_for(&self.config, &self.profile, dep).join(&dep.crate_id.name);
+                    let exe = bin_dir_for(&self.config, &self.profile, dep)
+                        .join(dep.executable_name(&dep.crate_id.name));
                     extra_env.push((
                         format!("CARGO_BIN_EXE_{}", dep.crate_id.name),
                         exe.display().to_string(),
@@ -709,8 +873,43 @@ impl BuildExecutor {
             }
         }
 
+        // `cargo::rustc-link-search` from the build scripts of everything this
+        // unit links against. A library records which native libraries it
+        // needs, not where they are; the directory only matters where the
+        // final link happens (a `-lpython3.9` from `pyo3-ffi`, found under a
+        // path only its build script knows). Cargo passes them to every
+        // dependent; build-dependencies and proc-macros are not linked in.
+        let mut dep_link_search: Vec<(Option<String>, PathBuf)> = Vec::new();
+        let mut seen: HashSet<NodeId> = HashSet::new();
+        let mut stack: Vec<NodeId> = node
+            .dependencies
+            .iter()
+            .filter(|d| node.normal_dependencies.contains(d))
+            .copied()
+            .collect();
+        while let Some(id) = stack.pop() {
+            let dep = graph.node(id);
+            if !seen.insert(id) || dep.unit.crate_type == CrateType::ProcMacro {
+                continue;
+            }
+            if let Some(out) = build_script_outputs.get(&id) {
+                for ls in &out.link_search {
+                    let entry = (ls.kind.clone(), ls.path.clone());
+                    if !dep_link_search.contains(&entry) {
+                        dep_link_search.push(entry);
+                    }
+                }
+            }
+            stack.extend(
+                dep.dependencies
+                    .iter()
+                    .filter(|d| dep.normal_dependencies.contains(d)),
+            );
+        }
+
         let unit_owner_key = unit.ext.script_owner.clone();
         UnitJob {
+            dep_link_search,
             node_id,
             unit,
             extern_deps,
@@ -758,6 +957,8 @@ struct UnitJob {
     /// about external inputs).
     cas_key: String,
     build_output: Option<BuildScriptOutput>,
+    /// Link search paths from the build scripts of the unit's dependencies.
+    dep_link_search: Vec<(Option<String>, PathBuf)>,
     config: RuneConfig,
     profile: Profile,
     cas: Option<CasStore>,
@@ -817,7 +1018,7 @@ impl UnitJob {
         }
         if has_script {
             let script_key_name = format!("{key}-buildscript");
-            if let Some(output) = cas.get_value(&script_key_name) {
+            if let Some(output) = cas.get_value::<BuildScriptOutput>(&script_key_name) {
                 let _ = self.worker_tx.send(WorkerMsg::BuildScriptDone {
                     node_id: self.node_id,
                     output,
@@ -839,9 +1040,7 @@ impl UnitJob {
                 rmeta_path: rmeta.clone(),
             });
         }
-        if unit.crate_type == CrateType::Bin && !unit.harness {
-            alias_binaries(&self.config, &self.profile, unit, &linked);
-        }
+        uplift_artifacts(&self.config, &self.profile, unit, &linked);
         let warnings = if unit.crate_id.source == CrateSource::Local {
             cas.get_value::<String>(&format!("{key}-warnings"))
                 .unwrap_or_default()
@@ -936,14 +1135,16 @@ impl UnitJob {
                 let _ = self.worker_tx.send(WorkerMsg::KeyUpdate { node_id, key });
             }
         };
-        if effective_build_output.is_none() && !self.force_rebuild && !shares_script {
-            if let Some(cas_store) = &self.cas {
-                let restored = cas_store
-                    .restore_dir_tree(&build_script_cache_key, &script_out_dir)
-                    .unwrap_or(false);
-                if restored {
-                    effective_build_output = cas_store.get_value(&build_script_cache_key);
-                }
+        if effective_build_output.is_none()
+            && !self.force_rebuild
+            && !shares_script
+            && let Some(cas_store) = &self.cas
+        {
+            let restored = cas_store
+                .restore_dir_tree(&build_script_cache_key, &script_out_dir)
+                .unwrap_or(false);
+            if restored {
+                effective_build_output = cas_store.get_value(&build_script_cache_key);
             }
         }
 
@@ -1021,12 +1222,22 @@ impl UnitJob {
                 .script_profile
                 .as_ref()
                 .map(|p| {
-                    with_profile_flags(RustcCommandBuilder::new(PathBuf::new()), p, true)
-                        .into_args()
+                    with_profile_flags(
+                        RustcCommandBuilder::new(PathBuf::new()),
+                        p,
+                        &self.toolchain.host,
+                        true,
+                    )
+                    .into_args()
                 })
                 .unwrap_or_default();
             let configure = |cmd: &mut std::process::Command| {
                 cmd.args(&script_flags);
+                // A dependency's build script is not the user's code: its
+                // warnings are noise, exactly as for the crate itself.
+                if unit.crate_id.source != CrateSource::Local {
+                    cmd.arg("--cap-lints").arg("allow");
+                }
                 if let Some(js) = &self.jobserver {
                     js.configure(cmd);
                 }
@@ -1054,9 +1265,11 @@ impl UnitJob {
                     let immutable_before = (unit.crate_id.source != CrateSource::Local)
                         .then(|| tree_stamp(&unit.manifest_dir));
                     let outcome = BuildScriptRunner::execute_with(&bin_path, &env, &run_configure);
-                    if let Some(before) = immutable_before {
-                        if outcome.is_ok() && tree_stamp(&unit.manifest_dir) != before {
-                            self.fail(
+                    if let Some(before) = immutable_before
+                        && outcome.is_ok()
+                        && tree_stamp(&unit.manifest_dir) != before
+                    {
+                        self.fail(
                                 "build script modified its package source".into(),
                                 format!(
                                     "the build script of `{} v{}` modified its own source directory \
@@ -1067,8 +1280,7 @@ impl UnitJob {
                                     unit.manifest_dir.display()
                                 ),
                             );
-                            return;
-                        }
+                        return;
                     }
                     match outcome {
                         Ok(out) => {
@@ -1139,6 +1351,16 @@ impl UnitJob {
             effective_build_output.as_ref(),
             self.color,
         );
+        let own_search: Vec<(Option<String>, PathBuf)> = effective_build_output
+            .iter()
+            .flat_map(|o| &o.link_search)
+            .map(|ls| (ls.kind.clone(), ls.path.clone()))
+            .collect();
+        for (kind, path) in &self.dep_link_search {
+            if !own_search.contains(&(kind.clone(), path.clone())) {
+                cmd_builder = cmd_builder.link_search(kind.as_deref(), path);
+            }
+        }
         for (k, v) in &self.extra_env {
             cmd_builder = cmd_builder.env(k, v);
         }
@@ -1246,9 +1468,7 @@ impl UnitJob {
                             cas_store.put_value(&format!("{}-inputs", self.base_key), &declared);
                     }
                 }
-                if unit.crate_type == CrateType::Bin && !unit.harness {
-                    alias_binaries(config, profile, unit, &artifacts);
-                }
+                uplift_artifacts(config, profile, unit, &artifacts);
 
                 let _ = self.event_tx.send(PipelineEvent::BuildFinished {
                     node_id,
@@ -1323,22 +1543,32 @@ pub fn script_key(unit: &CompilationUnit) -> String {
     format!("{}-{}", unit.rustc_crate_name(), unit.metadata_hash())
 }
 
-/// Where a unit's primary artifacts go: binaries into the profile directory
-/// (under a per-target subdirectory when cross-compiling, as Cargo does),
-/// everything else (and everything under `rune check`) into `deps/`.
+/// Where a unit is compiled to (and restored from the store to): `deps/`, or
+/// `examples/` for examples, as in Cargo. Binaries get their friendly names
+/// in [`bin_dir_for`]; keeping the hash-named file and whatever else the
+/// compiler leaves beside it (object files under `split-debuginfo=unpacked`)
+/// in `deps/` keeps the profile directory clean.
 pub fn out_dir_for(config: &RuneConfig, profile: &Profile, unit: &CompilationUnit) -> PathBuf {
-    let dir = profile.output_dir_name();
-    if unit.check_only || unit.harness {
-        return config.deps_dir(dir);
+    match (unit.crate_type, unit.kind) {
+        (CrateType::Bin, TargetKind::Example) if !unit.check_only && !unit.harness => {
+            bin_dir_for(config, profile, unit)
+        }
+        _ => config.deps_dir(profile.output_dir_name()),
     }
-    let bin_dir = || match &unit.target {
+}
+
+/// Where a binary's friendly names (`target/debug/my-app`) live: the profile
+/// directory (under a per-target subdirectory when cross-compiling, as Cargo
+/// does), or its `examples/`.
+pub fn bin_dir_for(config: &RuneConfig, profile: &Profile, unit: &CompilationUnit) -> PathBuf {
+    let dir = profile.output_dir_name();
+    let base = match &unit.target {
         Some(t) => config.profile_target_dir(dir).join(target_dir_name(&t.0)),
         None => config.profile_target_dir(dir),
     };
-    match (unit.crate_type, unit.kind) {
-        (CrateType::Bin, TargetKind::Example) => bin_dir().join("examples"),
-        (CrateType::Bin, _) => bin_dir(),
-        _ => config.deps_dir(dir),
+    match unit.kind {
+        TargetKind::Example => base.join("examples"),
+        _ => base,
     }
 }
 
@@ -1456,28 +1686,54 @@ fn remove_stale_outputs(out_dir: &Path, unit: &CompilationUnit) {
     }
 }
 
-/// Gives a freshly built or restored binary its friendly names (`name` and the
-/// underscore-normalized `name`) next to the hash-suffixed real file.
+/// Gives a freshly built or restored artifact the names Cargo gives it in the
+/// profile directory, next to the hash-suffixed real file in `deps/`:
+///
+/// * a binary: `name` (and the underscore-normalized `name`), `name.exe` on
+///   Windows;
+/// * a workspace member's library: `libname.rlib`, `libname.a`,
+///   `libname.so`/`.dylib`, `name.dll`/`name.lib` — what C build systems,
+///   Python packaging and plugin loaders look for.
 ///
 /// Hard links, not copies: a debug binary can be tens of megabytes, and copying
 /// it on every no-op build was a large part of a "nothing changed" build's cost.
-fn alias_binaries(
+fn uplift_artifacts(
     config: &RuneConfig,
     profile: &Profile,
     unit: &CompilationUnit,
     artifacts: &[PathBuf],
 ) {
-    let bin_dir = out_dir_for(config, profile, unit);
+    if unit.harness || unit.check_only {
+        return;
+    }
+    let is_bin = unit.crate_type == CrateType::Bin;
+    if !is_bin && (!unit.ext.member || unit.crate_type == CrateType::ProcMacro) {
+        return;
+    }
+    let bin_dir = bin_dir_for(config, profile, unit);
+    let _ = std::fs::create_dir_all(&bin_dir);
+    let suffix = format!("-{}", unit.metadata_hash());
     for artifact in artifacts {
         let ext = artifact.extension().and_then(|e| e.to_str());
-        if matches!(ext, Some("d") | Some("rmeta") | Some("rlib")) {
-            continue;
-        }
-        let primary = bin_dir.join(&unit.crate_id.name);
-        let normalized = bin_dir.join(unit.crate_id.crate_name_normalized());
-        link_or_copy_replace(artifact, &primary);
-        if normalized != primary {
-            link_or_copy_replace(artifact, &normalized);
+        if is_bin {
+            if matches!(ext, Some("d" | "rmeta" | "rlib")) {
+                continue;
+            }
+            let with_ext = |name: String| match ext {
+                Some(e) => format!("{name}.{e}"),
+                None => name,
+            };
+            let primary = bin_dir.join(with_ext(unit.crate_id.name.clone()));
+            let normalized = bin_dir.join(with_ext(unit.crate_id.crate_name_normalized()));
+            link_or_copy_replace(artifact, &primary);
+            if normalized != primary {
+                link_or_copy_replace(artifact, &normalized);
+            }
+        } else if matches!(ext, Some("rlib" | "a" | "so" | "dylib" | "dll" | "lib")) {
+            let Some(name) = artifact.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            link_or_copy_replace(artifact, &bin_dir.join(name.replacen(&suffix, "", 1)));
         }
     }
 }
@@ -1488,10 +1744,11 @@ fn link_or_copy_replace(src: &Path, dest: &Path) {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        if let (Ok(a), Ok(b)) = (std::fs::metadata(src), std::fs::metadata(dest)) {
-            if a.ino() == b.ino() && a.dev() == b.dev() {
-                return;
-            }
+        if let (Ok(a), Ok(b)) = (std::fs::metadata(src), std::fs::metadata(dest))
+            && a.ino() == b.ino()
+            && a.dev() == b.dev()
+        {
+            return;
         }
     }
     let _ = rune_common::fsutil::replace_with_link(src, dest);
@@ -1822,6 +2079,7 @@ pub fn with_cargo_env(
 pub fn with_profile_flags(
     mut builder: RustcCommandBuilder,
     profile: &Profile,
+    target: &str,
     links_final_artifact: bool,
 ) -> RustcCommandBuilder {
     // Only spell out settings that differ from what rustc does on its own for
@@ -1874,7 +2132,7 @@ pub fn with_profile_flags(
     if profile.rpath {
         builder = builder.codegen_flag("rpath=yes");
     }
-    if let Some(split) = &profile.split_debuginfo {
+    if let Some(split) = profile.split_debuginfo_for(target) {
         builder = builder.codegen_flag(&format!("split-debuginfo={split}"));
     }
     builder
@@ -1882,6 +2140,38 @@ pub fn with_profile_flags(
 
 fn on_off(b: bool) -> &'static str {
     if b { "on" } else { "off" }
+}
+
+/// The triple a unit is compiled for: its `--target`, or the host for host
+/// units (build-script dependencies, proc-macros) and native builds.
+fn compiled_for(unit: &CompilationUnit) -> &str {
+    unit.compiled_for()
+}
+
+/// `--remap-path-prefix` flags for `trim-paths`: a registry or git package's
+/// sources become `name-version/src/…` (or the checkout's own relative path),
+/// the workspace's become relative to its root — what Cargo's `trim-paths`
+/// does. The standard library is remapped by rustc itself. The flags are not
+/// part of the key (they name this machine's paths; the result does not).
+fn trim_path_flags(unit: &CompilationUnit, config: &RuneConfig) -> Vec<String> {
+    let with_slash = |p: &Path| {
+        let mut s = p.to_string_lossy().into_owned();
+        if !s.ends_with(std::path::MAIN_SEPARATOR) {
+            s.push(std::path::MAIN_SEPARATOR);
+        }
+        s
+    };
+    let root = &config.project_root;
+    let mut flags = Vec::new();
+    // rustc applies the last matching rule, so the most specific comes last.
+    if unit.crate_id.source != CrateSource::Local || !unit.manifest_dir.starts_with(root) {
+        if let Some(parent) = unit.manifest_dir.parent() {
+            flags.push(format!("--remap-path-prefix={}=", with_slash(parent)));
+        }
+    } else {
+        flags.push(format!("--remap-path-prefix={}=", with_slash(root)));
+    }
+    flags
 }
 
 /// Helper to build a complete `rustc` command for a compilation unit.
@@ -1917,8 +2207,11 @@ pub fn build_rustc_command(
                 CrateType::Bin | CrateType::Cdylib | CrateType::Dylib | CrateType::Staticlib
             )
         });
-    builder = with_profile_flags(builder, eff, links_final_artifact);
+    builder = with_profile_flags(builder, eff, compiled_for(unit), links_final_artifact);
     builder = with_cargo_env(builder, unit);
+    if eff.trim_paths {
+        builder = builder.extra_flags(trim_path_flags(unit, config));
+    }
 
     // Host units (proc-macros, build-script dependencies) are built for the
     // machine running the compiler, whatever `--target` says.
@@ -2095,39 +2388,96 @@ pub fn compute_unit_cas_key(
     dep_keys: &[(String, String)],
     source_cache: &mut rune_fingerprint::FingerprintCache,
 ) -> String {
-    let mut hb = rune_common::hash::HashBuilder::new();
-    hb.update(unit.metadata_hash().as_bytes());
+    compute_unit_identity(unit, profile, dep_keys, source_cache).key
+}
+
+/// What a unit's key is made of, part by part: what `rune explain` compares
+/// to say why a unit is (or would be) compiled again.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct UnitIdentity {
+    pub key: String,
+    /// Part (`sources`, `toolchain`, `dependency serde`, …) → digest.
+    pub parts: std::collections::BTreeMap<String, String>,
+    /// Local packages: each file (relative to the package) → content hash.
+    #[serde(default)]
+    pub files: std::collections::BTreeMap<String, String>,
+}
+
+/// Feeds the key hasher exactly as before, and a hasher per named part.
+struct KeyRecorder {
+    key: rune_common::hash::HashBuilder,
+    parts: std::collections::BTreeMap<String, rune_common::hash::HashBuilder>,
+}
+
+impl KeyRecorder {
+    fn update(&mut self, part: &str, bytes: &[u8]) {
+        self.key.update(bytes);
+        self.parts
+            .entry(part.to_string())
+            .or_insert_with(rune_common::hash::HashBuilder::new)
+            .update(bytes);
+    }
+}
+
+/// [`compute_unit_cas_key`], with the key's parts.
+pub fn compute_unit_identity(
+    unit: &CompilationUnit,
+    profile: &Profile,
+    dep_keys: &[(String, String)],
+    source_cache: &mut rune_fingerprint::FingerprintCache,
+) -> UnitIdentity {
+    let mut hb = KeyRecorder {
+        key: rune_common::hash::HashBuilder::new(),
+        parts: Default::default(),
+    };
+    const UNIT: &str = "unit (features, crate type, edition, target)";
+    hb.update(UNIT, unit.metadata_hash().as_bytes());
+    let eff = unit.effective_profile(profile);
+    hb.update("profile", eff.codegen_fingerprint().as_bytes());
+    // A platform default (not in the profile itself) that changes what rustc
+    // emits. Only added when it applies, so other platforms' keys are unchanged.
+    if eff.split_debuginfo.is_none()
+        && let Some(split) = eff.split_debuginfo_for(compiled_for(unit))
+    {
+        hb.update("profile", b"\0split-default=");
+        hb.update("profile", split.as_bytes());
+    }
+    hb.update("toolchain", b"\0toolchain=");
     hb.update(
-        unit.effective_profile(profile)
-            .codegen_fingerprint()
-            .as_bytes(),
+        "toolchain",
+        toolchain::global().identity_for(unit.ext.member).as_bytes(),
     );
-    hb.update(b"\0toolchain=");
-    hb.update(toolchain::global().identity_for(unit.ext.member).as_bytes());
     for flag in &unit.ext.rustflags {
-        hb.update(b"\0rustflag=");
-        hb.update(flag.as_bytes());
+        hb.update("rustflags", b"\0rustflag=");
+        hb.update("rustflags", flag.as_bytes());
     }
     if let Some(linker) = &unit.ext.linker {
-        hb.update(b"\0linker=");
-        hb.update(linker.as_bytes());
+        hb.update("linker", b"\0linker=");
+        hb.update("linker", linker.as_bytes());
     }
     for (k, v) in &unit.ext.env {
-        hb.update(b"\0env=");
-        hb.update(k.as_bytes());
-        hb.update(b"=");
-        hb.update(v.as_bytes());
+        hb.update("environment", b"\0env=");
+        hb.update("environment", k.as_bytes());
+        hb.update("environment", b"=");
+        hb.update("environment", v.as_bytes());
     }
     // How the build script is compiled and what it links against is part of
     // what the package produces.
-    if let Some(p) = &unit.ext.script_profile {
-        if unit.build_script.is_some() {
-            hb.update(b"\0script-profile=");
-            hb.update(p.codegen_fingerprint().as_bytes());
-            for f in &unit.ext.script_rustflags {
-                hb.update(b"\0script-flag=");
-                hb.update(f.as_bytes());
-            }
+    if let Some(p) = &unit.ext.script_profile
+        && unit.build_script.is_some()
+    {
+        const SCRIPT: &str = "build script profile and flags";
+        hb.update(SCRIPT, b"\0script-profile=");
+        hb.update(SCRIPT, p.codegen_fingerprint().as_bytes());
+        if p.split_debuginfo.is_none()
+            && let Some(split) = p.split_debuginfo_for(&toolchain::global().host)
+        {
+            hb.update(SCRIPT, b"\0script-split-default=");
+            hb.update(SCRIPT, split.as_bytes());
+        }
+        for f in &unit.ext.script_rustflags {
+            hb.update(SCRIPT, b"\0script-flag=");
+            hb.update(SCRIPT, f.as_bytes());
         }
     }
     let m = &unit.meta;
@@ -2141,30 +2491,32 @@ pub fn compute_unit_cas_key(
         &m.readme,
         &m.rust_version,
     ] {
-        hb.update(field.as_bytes());
-        hb.update(b"\0");
+        hb.update("package metadata (CARGO_PKG_*)", field.as_bytes());
+        hb.update("package metadata (CARGO_PKG_*)", b"\0");
     }
 
     for arg in &unit.lint_args {
-        hb.update(b"\0lint=");
-        hb.update(arg.as_bytes());
+        hb.update("lints", b"\0lint=");
+        hb.update("lints", arg.as_bytes());
     }
     for f in &unit.ext.declared_features {
-        hb.update(b"\0declared=");
-        hb.update(f.as_bytes());
+        hb.update("declared features", b"\0declared=");
+        hb.update("declared features", f.as_bytes());
     }
 
+    let mut files = std::collections::BTreeMap::new();
     if unit.crate_id.source == CrateSource::Local {
         // Where the crate root lives is an input too (`[lib] path = ...`).
         let rel_root = unit
             .source_root
             .strip_prefix(&unit.manifest_dir)
             .unwrap_or(&unit.source_root);
-        hb.update(rel_root.to_string_lossy().as_bytes());
+        hb.update("crate root", rel_root.to_string_lossy().as_bytes());
         let package_hash =
             rune_fingerprint::hasher::compute_package_hash(&unit.manifest_dir, source_cache)
                 .unwrap_or_default();
-        hb.update(package_hash.as_bytes());
+        hb.update("sources", package_hash.as_bytes());
+        files.extend(source_cache.package_file_hashes(&unit.manifest_dir));
         // A build script (or crate root) can live outside the package
         // directory (`build = "../shared/build.rs"`), where the walk above
         // doesn't see it.
@@ -2177,7 +2529,7 @@ pub fn compute_unit_cas_key(
         .filter(|p| !p.starts_with(&unit.manifest_dir))
         {
             if let Ok(h) = rune_common::hash::xxhash3_file(outside) {
-                hb.update(&h.to_le_bytes());
+                hb.update("sources outside the package", &h.to_le_bytes());
             }
         }
     }
@@ -2189,11 +2541,60 @@ pub fn compute_unit_cas_key(
     let mut sorted_dep_keys: Vec<&(String, String)> = dep_keys.iter().collect();
     sorted_dep_keys.sort();
     for (dep_name, dep_key) in sorted_dep_keys {
-        hb.update(dep_name.as_bytes());
-        hb.update(dep_key.as_bytes());
+        // `dep:alias:crate` / `build-dep:alias:crate`.
+        let mut it = dep_name.splitn(3, ':');
+        let part = match (it.next(), it.nth(1)) {
+            (Some("build-dep"), Some(krate)) => format!("build dependency {krate}"),
+            (_, Some(krate)) => format!("dependency {krate}"),
+            _ => format!("dependency {dep_name}"),
+        };
+        hb.update(&part, dep_name.as_bytes());
+        hb.update(&part, dep_key.as_bytes());
     }
 
-    hb.finish_blake3()
+    UnitIdentity {
+        key: hb.key.finish_blake3(),
+        parts: hb
+            .parts
+            .into_iter()
+            .map(|(k, v)| (k, v.finish_blake3()))
+            .collect(),
+        files,
+    }
+}
+
+/// A stable name for a unit across builds (its key and hash change with
+/// what it is built from; this does not): package, target, role, profile.
+pub fn unit_label(unit: &CompilationUnit, profile: &Profile) -> String {
+    let mut label = format!(
+        "{} v{} ({} `{}`",
+        unit.crate_id.name,
+        unit.crate_id.version,
+        unit.kind.as_str(),
+        unit.rustc_crate_name()
+    );
+    if unit.harness {
+        label.push_str(", test");
+    }
+    if unit.check_only {
+        label.push_str(", check");
+    }
+    if unit.ext.for_host {
+        label.push_str(", host");
+    }
+    if let Some(t) = &unit.target {
+        label.push_str(&format!(", {}", t.0));
+    }
+    label.push_str(&format!(") [{}]", profile.name));
+    label
+}
+
+/// The identities of the last build, by [`unit_label`].
+pub fn load_identities(fingerprint_dir: &Path) -> HashMap<String, UnitIdentity> {
+    std::fs::read_to_string(fingerprint_dir.join("identities.json"))
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -2288,7 +2689,13 @@ mod tests {
         p.codegen_units = Some(1);
         p.strip = Some("symbols".into());
         p.panic = rune_common::PanicStrategy::Abort;
-        let cmd = with_profile_flags(RustcCommandBuilder::new("x.rs".into()), &p, true).build();
+        let cmd = with_profile_flags(
+            RustcCommandBuilder::new("x.rs".into()),
+            &p,
+            "x86_64-unknown-linux-gnu",
+            true,
+        )
+        .build();
         let args: Vec<String> = cmd
             .get_args()
             .map(|a| a.to_string_lossy().into_owned())
@@ -2316,7 +2723,13 @@ mod tests {
         let mut odd = Profile::release();
         odd.debug_assertions = true;
         odd.overflow_checks = true;
-        let cmd = with_profile_flags(RustcCommandBuilder::new("x.rs".into()), &odd, true).build();
+        let cmd = with_profile_flags(
+            RustcCommandBuilder::new("x.rs".into()),
+            &odd,
+            "x86_64-unknown-linux-gnu",
+            true,
+        )
+        .build();
         let args: Vec<String> = cmd
             .get_args()
             .map(|a| a.to_string_lossy().into_owned())
@@ -2325,7 +2738,13 @@ mod tests {
         assert!(args.iter().any(|a| a == "overflow-checks=on"), "{args:?}");
 
         // LTO is a link-time flag: libraries and proc-macros never get it.
-        let cmd = with_profile_flags(RustcCommandBuilder::new("x.rs".into()), &p, false).build();
+        let cmd = with_profile_flags(
+            RustcCommandBuilder::new("x.rs".into()),
+            &p,
+            "x86_64-unknown-linux-gnu",
+            false,
+        )
+        .build();
         let lib_args: Vec<String> = cmd
             .get_args()
             .map(|a| a.to_string_lossy().into_owned())

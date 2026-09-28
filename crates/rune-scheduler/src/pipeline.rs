@@ -1,10 +1,13 @@
+use rune_common::BuildScriptOutput;
 use rune_common::CompilationUnit;
 use rune_graph::NodeId;
 use std::path::PathBuf;
 use std::time::Duration;
 
-/// Events emitted during the build pipeline.
+/// Events emitted during the build pipeline. A few hundred per build, so the
+/// size of the largest variant does not matter.
 #[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)]
 pub enum PipelineEvent {
     /// A compilation unit has started.
     BuildStarted {
@@ -41,6 +44,12 @@ pub enum PipelineEvent {
         error: String,
         /// The compiler's diagnostics as raw JSON (errors included).
         diagnostics: Vec<String>,
+    },
+    /// What a unit's build script reported (run now or restored from the
+    /// store): what doc tests and other later steps compile with.
+    ScriptOutput {
+        node_id: NodeId,
+        output: BuildScriptOutput,
     },
     /// Build script started.
     BuildScriptStarted { node_id: NodeId, crate_name: String },

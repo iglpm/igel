@@ -173,6 +173,9 @@ fn compute_package_hash_uncached(
         }
         files.push(entry.into_path());
     }
+    cache
+        .package_files
+        .insert(package_dir.to_path_buf(), files.clone());
     hash_files(package_dir, files, cache)
 }
 

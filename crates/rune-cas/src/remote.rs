@@ -595,14 +595,14 @@ fn pull_slot(t: &dyn Transport, key: &str, local: &Path, slot: Slot) -> io::Resu
             return Ok(false);
         }
         // A file that is not what the manifest says is a broken entry: do not keep it.
-        if let Some(size) = size {
-            if fs::metadata(&dest)?.len() != size {
-                let _ = fs::remove_file(&dest);
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("{rel} does not match its manifest"),
-                ));
-            }
+        if let Some(size) = size
+            && fs::metadata(&dest)?.len() != size
+        {
+            let _ = fs::remove_file(&dest);
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{rel} does not match its manifest"),
+            ));
         }
     }
     atomic_write(&local.join(slot.marker()), false, |f| {
@@ -934,10 +934,10 @@ mod tests {
         p.a.flush_remote();
         let dir = p.remote.join("objects").join("ke").join("keybad");
         let file = dir.join("libfoo-abc.rlib");
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&file, fs::Permissions::from_mode(0o644)).unwrap();
-        }
+        let mut perms = fs::metadata(&file).unwrap().permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        perms.set_readonly(false);
+        fs::set_permissions(&file, perms).unwrap();
         fs::write(&file, "truncated").unwrap();
         assert!(
             p.b.get("keybad").is_none(),
@@ -1026,6 +1026,8 @@ mod http_tests {
         url: String,
         files: Files,
         put_headers: PutLog,
+        // Only the (Unix) execute-bit tests look at it.
+        #[cfg_attr(not(unix), allow(dead_code))]
         exec: NameSet,
         requests: Arc<AtomicUsize>,
         stop: Arc<AtomicBool>,

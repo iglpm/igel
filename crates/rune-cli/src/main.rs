@@ -4,10 +4,16 @@ mod affected;
 mod args;
 mod cmd_build;
 mod cmd_deps;
+mod cmd_explain;
+mod cmd_install;
 mod cmd_misc;
+mod cmd_publish;
 mod cmd_test;
+mod cmd_vendor;
 mod cmd_watch;
 mod doctor;
+mod external;
+mod fix;
 mod graph;
 mod messages;
 mod script;
@@ -22,9 +28,17 @@ use args::{Cli, Commands};
 use graph::Mode;
 
 fn main() {
+    // `rune tree | head`: when the reader goes away, stop quietly, as Cargo
+    // and every Unix tool do, instead of panicking on the next write.
+    #[cfg(unix)]
+    // SAFETY: called first thing, before any other thread exists.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
     ui::setup_logging();
 
-    let cli = Cli::parse();
+    let cli = Cli::parse_from(external::expand(std::env::args_os().collect()));
+    rune_common::cargo_config::set_cli_overrides(cli.config_overrides.clone());
     match cli.color.as_str() {
         "always" => colored::control::set_override(true),
         "never" => colored::control::set_override(false),
@@ -40,6 +54,10 @@ fn main() {
         Commands::Fmt(a) => cmd_misc::fmt(a),
         Commands::Clippy(a) => cmd_build::clippy(a),
         Commands::Doc(a) => cmd_build::doc(a),
+        Commands::Rustc(a) => cmd_build::rustc(a),
+        Commands::Rustdoc(a) => cmd_build::rustdoc(a),
+        Commands::Fix(a) => cmd_build::fix(a),
+        Commands::Explain(a) => cmd_explain::explain(a),
         Commands::New(a) => cmd_misc::new(a),
         Commands::Init(a) => cmd_misc::init(a),
         Commands::Add(a) => cmd_deps::add(a),
@@ -51,7 +69,19 @@ fn main() {
         Commands::GenerateLockfile(a) => cmd_deps::generate_lockfile(a),
         Commands::LocateProject(a) => cmd_deps::locate_project(a),
         Commands::Metadata(a) => cmd_deps::metadata(a),
-        Commands::Install(a) => cmd_build::install(a),
+        Commands::Install(a) => cmd_install::install(a),
+        Commands::Uninstall(a) => cmd_install::uninstall(a),
+        Commands::Package(a) => cmd_publish::package(a),
+        Commands::Publish(a) => cmd_publish::publish(a),
+        Commands::Login(a) => cmd_publish::login(a),
+        Commands::Logout(a) => cmd_publish::logout(a),
+        Commands::Yank(a) => cmd_publish::yank(a),
+        Commands::Owner(a) => cmd_publish::owner(a),
+        Commands::Search(a) => cmd_publish::search(a),
+        Commands::Info(a) => cmd_publish::info(a),
+        Commands::Vendor(a) => cmd_vendor::vendor(a),
+        Commands::Pkgid(a) => cmd_deps::pkgid(a),
+        Commands::VerifyProject(a) => cmd_deps::verify_project(a),
         Commands::Clean(a) => cmd_misc::clean(a),
         Commands::Config(c) => cmd_misc::config(c),
         Commands::Cas(c) => cmd_misc::cas(c),

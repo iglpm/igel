@@ -34,6 +34,10 @@ pub struct Session {
     pub json: bool,
     pub force_rebuild: bool,
     pub ignore_rust_version: bool,
+    /// Directories of native libraries that build scripts produced inside the
+    /// build directory (`cargo::rustc-link-search=…/out`): a program run by
+    /// `rune run`/`rune test` finds its dynamic libraries there, as with Cargo.
+    pub native_dirs: std::sync::Mutex<Vec<std::path::PathBuf>>,
 }
 
 impl Session {
@@ -45,7 +49,6 @@ impl Session {
         }
         crate::messages::validate(&common.message_format).map_err(|e| anyhow::anyhow!(e))?;
         let json = crate::messages::wants_json(&common.message_format);
-        crate::ui::set_machine_output(json);
         crate::ui::set_quiet(common.quiet);
         let mut ws = Workspace::load(common.manifest_path.as_deref())?;
 
@@ -119,6 +122,7 @@ impl Session {
             json,
             force_rebuild,
             ignore_rust_version: common.ignore_rust_version,
+            native_dirs: Default::default(),
         })
     }
 
@@ -220,10 +224,10 @@ impl Session {
             return v.split_whitespace().map(str::to_string).collect();
         }
         let cfg = &self.ws.cargo_config;
-        if let Some(target) = &self.target {
-            if let Some(f) = cfg.string_list(&["target", target, "rustdocflags"]) {
-                return f;
-            }
+        if let Some(target) = &self.target
+            && let Some(f) = cfg.string_list(&["target", target, "rustdocflags"])
+        {
+            return f;
         }
         cfg.string_list(&["build", "rustdocflags"])
             .unwrap_or_default()
@@ -271,7 +275,9 @@ pub fn drive(
                 };
                 if let Some(node) = node {
                     let unit = &graph.node(node).unit;
-                    for line in crate::messages::lines_for(unit, &sess.profile, &event) {
+                    for line in
+                        crate::messages::lines_for(unit, sess.config(), &sess.profile, &event)
+                    {
                         println!("{line}");
                     }
                 }
@@ -280,6 +286,15 @@ pub fn drive(
                 }
             }
             match &event {
+                PipelineEvent::ScriptOutput { output, .. } => {
+                    let root = &sess.config().target_dir;
+                    let mut dirs = sess.native_dirs.lock().unwrap();
+                    for ls in &output.link_search {
+                        if ls.path.starts_with(root) && !dirs.contains(&ls.path) {
+                            dirs.push(ls.path.clone());
+                        }
+                    }
+                }
                 PipelineEvent::BuildFailed { node_id, error, .. } => {
                     let unit = &graph.node(*node_id).unit;
                     failures.push((

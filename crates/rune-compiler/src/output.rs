@@ -39,21 +39,22 @@ pub fn parse_rustc_output(stderr: &str) -> (Vec<ArtifactEvent>, Vec<Diagnostic>)
     let mut diagnostics = Vec::new();
 
     for line in stderr.lines() {
-        if line.starts_with('{') {
-            if let Ok(value) = serde_json::from_str::<serde_json::Value>(line) {
-                if value.get("$message_type").and_then(|v| v.as_str()) == Some("artifact") {
-                    if let Ok(artifact) = serde_json::from_value::<ArtifactEvent>(value.clone()) {
-                        artifacts.push(artifact);
-                    }
-                } else if value.get("message").is_some() && value.get("level").is_some() {
-                    if let Ok(diag) = serde_json::from_value::<RawDiagnostic>(value) {
-                        diagnostics.push(Diagnostic {
-                            level: diag.level,
-                            message: diag.message,
-                            rendered: diag.rendered,
-                        });
-                    }
+        if line.starts_with('{')
+            && let Ok(value) = serde_json::from_str::<serde_json::Value>(line)
+        {
+            if value.get("$message_type").and_then(|v| v.as_str()) == Some("artifact") {
+                if let Ok(artifact) = serde_json::from_value::<ArtifactEvent>(value.clone()) {
+                    artifacts.push(artifact);
                 }
+            } else if value.get("message").is_some()
+                && value.get("level").is_some()
+                && let Ok(diag) = serde_json::from_value::<RawDiagnostic>(value)
+            {
+                diagnostics.push(Diagnostic {
+                    level: diag.level,
+                    message: diag.message,
+                    rendered: diag.rendered,
+                });
             }
         }
     }

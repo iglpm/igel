@@ -101,7 +101,7 @@ impl Workspace {
             find_workspace_root(&start_dir, &start).unwrap_or_else(|| start_dir.clone())
         };
 
-        let root_manifest = if root_dir == start_dir {
+        let mut root_manifest = if root_dir == start_dir {
             start
         } else {
             let p = rune_common::manifest_file::manifest_in(&root_dir);
@@ -116,6 +116,10 @@ impl Workspace {
         // is fixed for the whole process from here on.
         let cwd = std::env::current_dir().unwrap_or_else(|_| root_dir.clone());
         let cargo_config = CargoConfig::load(&cwd);
+        if let Some(e) = cargo_config.error() {
+            anyhow::bail!(e);
+        }
+        apply_profile_config(&mut root_manifest.profile, &cargo_config, std::env::vars())?;
         toolchain::set_global(Toolchain::discover(&cargo_config, &root_dir));
         // Alternative registries, mirrors and vendored sources.
         rune_registry::source::configure(rune_registry::source::RegistryDefs::from_config(
@@ -263,17 +267,16 @@ fn find_workspace_root(member_dir: &Path, member: &Manifest) -> Option<PathBuf> 
     }
     let mut cur = member_dir.parent()?.to_path_buf();
     loop {
-        if let Some(candidate) = rune_common::manifest_file::find_manifest(&cur) {
-            if let Ok(m) = Manifest::from_path(&candidate) {
-                if let Some(ws) = &m.workspace {
-                    let members = ws.resolve_members(&cur).unwrap_or_default();
-                    let is_member = members
-                        .iter()
-                        .any(|d| d.canonicalize().unwrap_or_else(|_| d.clone()) == member_dir);
-                    if is_member {
-                        return Some(cur);
-                    }
-                }
+        if let Some(candidate) = rune_common::manifest_file::find_manifest(&cur)
+            && let Ok(m) = Manifest::from_path(&candidate)
+            && let Some(ws) = &m.workspace
+        {
+            let members = ws.resolve_members(&cur).unwrap_or_default();
+            let is_member = members
+                .iter()
+                .any(|d| d.canonicalize().unwrap_or_else(|_| d.clone()) == member_dir);
+            if is_member {
+                return Some(cur);
             }
         }
         if !cur.pop() {
@@ -296,4 +299,155 @@ pub fn find_project_root(manifest_path: Option<&Path>) -> Option<PathBuf> {
         return Some(dir);
     }
     Some(find_workspace_root(&dir, &manifest).unwrap_or(dir))
+}
+
+/// `[profile.*]` from configuration and `CARGO_PROFILE_<NAME>_<KEY>` from
+/// the environment, over the manifest's own profile tables (in that order of
+/// precedence, as with Cargo): key by key, nested tables (`package.*`,
+/// `build-override`) merged too.
+fn apply_profile_config(
+    profiles: &mut std::collections::HashMap<String, rune_manifest::cargo_toml::ProfileOverride>,
+    config: &CargoConfig,
+    env: impl Iterator<Item = (String, String)>,
+) -> Result<()> {
+    let mut layers: toml::Table = config
+        .file_value(&["profile"])
+        .and_then(|v| v.as_table())
+        .cloned()
+        .unwrap_or_default();
+
+    // Environment: `CARGO_PROFILE_RELEASE_LTO=true`,
+    // `CARGO_PROFILE_DEV_BUILD_OVERRIDE_OPT_LEVEL=3`. A name is matched
+    // against the known profiles, longest first (`release-lto` before
+    // `release`).
+    let mut names: Vec<String> = ["dev", "release", "test", "bench"]
+        .iter()
+        .map(|s| s.to_string())
+        .chain(profiles.keys().cloned())
+        .chain(layers.keys().cloned())
+        .collect();
+    names.sort_by_key(|n| std::cmp::Reverse(n.len()));
+    names.dedup();
+    let upper = |s: &str| s.to_ascii_uppercase().replace('-', "_");
+    for (var, value) in env {
+        let Some(rest) = var.strip_prefix("CARGO_PROFILE_") else {
+            continue;
+        };
+        let Some(name) = names
+            .iter()
+            .find(|n| rest.starts_with(&format!("{}_", upper(n))))
+        else {
+            continue;
+        };
+        let key = &rest[upper(name).len() + 1..];
+        let (table_path, key): (Vec<&str>, &str) = match key.strip_prefix("BUILD_OVERRIDE_") {
+            Some(k) => (vec!["build-override"], k),
+            None => (vec![], key),
+        };
+        let value = match value.as_str() {
+            "true" => toml::Value::Boolean(true),
+            "false" => toml::Value::Boolean(false),
+            v => v
+                .parse::<i64>()
+                .map(toml::Value::Integer)
+                .unwrap_or_else(|_| toml::Value::String(v.to_string())),
+        };
+        let mut table = layers
+            .entry(name.clone())
+            .or_insert_with(|| toml::Value::Table(Default::default()));
+        for part in table_path {
+            table = table
+                .as_table_mut()
+                .context("profile configuration is not a table")?
+                .entry(part)
+                .or_insert_with(|| toml::Value::Table(Default::default()));
+        }
+        table
+            .as_table_mut()
+            .context("profile configuration is not a table")?
+            .insert(key.to_ascii_lowercase().replace('_', "-"), value);
+    }
+
+    for (name, layer) in layers {
+        let mut merged = profiles
+            .get(&name)
+            .map(toml::Value::try_from)
+            .transpose()?
+            .unwrap_or_else(|| toml::Value::Table(Default::default()));
+        deep_merge(&mut merged, layer);
+        let parsed: rune_manifest::cargo_toml::ProfileOverride = merged
+            .try_into()
+            .with_context(|| format!("invalid `[profile.{name}]` in configuration"))?;
+        profiles.insert(name, parsed);
+    }
+    Ok(())
+}
+
+fn deep_merge(base: &mut toml::Value, over: toml::Value) {
+    match (base, over) {
+        (toml::Value::Table(b), toml::Value::Table(o)) => {
+            for (k, v) in o {
+                match b.get_mut(&k) {
+                    Some(existing) => deep_merge(existing, v),
+                    None => {
+                        b.insert(k, v);
+                    }
+                }
+            }
+        }
+        (b, o) => *b = o,
+    }
+}
+
+#[cfg(test)]
+mod profile_config_tests {
+    use super::*;
+
+    #[test]
+    fn config_and_environment_override_manifest_profiles() {
+        let manifest: toml::Table =
+            "[release]\nlto = \"thin\"\nopt-level = 2\n[release.package.foo]\nopt-level = 1\n"
+                .parse()
+                .unwrap();
+        let mut profiles: std::collections::HashMap<
+            String,
+            rune_manifest::cargo_toml::ProfileOverride,
+        > = manifest
+            .into_iter()
+            .map(|(k, v)| (k, v.try_into().unwrap()))
+            .collect();
+        let mut config = CargoConfig::default();
+        config
+            .add_str(
+                "[profile.release]\nopt-level = 3\n[profile.release.package.foo]\ndebug = true\n",
+                std::path::Path::new("/p"),
+            )
+            .unwrap();
+        let env = vec![
+            ("CARGO_PROFILE_RELEASE_LTO".to_string(), "false".to_string()),
+            (
+                "CARGO_PROFILE_DEV_BUILD_OVERRIDE_OPT_LEVEL".to_string(),
+                "3".to_string(),
+            ),
+            (
+                "CARGO_PROFILE_RELEASE_CODEGEN_UNITS".to_string(),
+                "1".to_string(),
+            ),
+        ];
+        apply_profile_config(&mut profiles, &config, env.into_iter()).unwrap();
+        let release = &profiles["release"];
+        // Config beats the manifest, the environment beats both.
+        assert_eq!(release.opt_level, Some(toml::Value::Integer(3)));
+        assert_eq!(release.extra.get("lto"), Some(&toml::Value::Boolean(false)));
+        assert_eq!(
+            release.extra.get("codegen-units"),
+            Some(&toml::Value::Integer(1))
+        );
+        // Nested tables merge rather than replace.
+        let foo = &release.package["foo"];
+        assert_eq!(foo.opt_level, Some(toml::Value::Integer(1)));
+        assert_eq!(foo.debug, Some(toml::Value::Boolean(true)));
+        let dev_build = profiles["dev"].build_override.as_ref().unwrap();
+        assert_eq!(dev_build.opt_level, Some(toml::Value::Integer(3)));
+    }
 }

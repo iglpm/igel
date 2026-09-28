@@ -167,15 +167,15 @@ pub fn resolve_unit_profile(
         let Some(table) = tables.get(level) else {
             continue;
         };
-        if role.host {
-            if let Some(over) = &table.build_override {
-                apply(&mut profile, name, over)?;
-            }
+        if role.host
+            && let Some(over) = &table.build_override
+        {
+            apply(&mut profile, name, over)?;
         }
-        if !role.workspace_member {
-            if let Some(over) = table.package.get("*") {
-                apply(&mut profile, name, over)?;
-            }
+        if !role.workspace_member
+            && let Some(over) = table.package.get("*")
+        {
+            apply(&mut profile, name, over)?;
         }
         for (spec, over) in &table.package {
             if spec != "*" && matches_spec(spec) {
@@ -313,6 +313,31 @@ fn apply(profile: &mut Profile, name: &str, table: &ProfileOverride) -> Result<(
                         return Err(invalid(key, "expected \"off\", \"packed\" or \"unpacked\""));
                     }
                 };
+            }
+            "trim-paths" => {
+                // `true`/`"all"`, a scope or a list of scopes: paths are
+                // trimmed; `false`/`"none"`/`[]`: they are not. Rune cannot
+                // limit the trimming to some scopes on stable rustc, so any
+                // scope means all of them.
+                const SCOPES: [&str; 5] = ["macro", "diagnostics", "object", "all", "none"];
+                let on = match value {
+                    toml::Value::Boolean(b) => *b,
+                    toml::Value::String(s) if SCOPES.contains(&s.as_str()) => s != "none",
+                    toml::Value::Array(a)
+                        if a
+                            .iter()
+                            .all(|v| v.as_str().is_some_and(|s| SCOPES.contains(&s))) =>
+                    {
+                        a.iter().any(|v| v.as_str() != Some("none"))
+                    }
+                    _ => {
+                        return Err(invalid(
+                            key,
+                            "expected a bool, \"none\", \"macro\", \"diagnostics\", \"object\", \"all\" or a list of them",
+                        ));
+                    }
+                };
+                profile.trim_paths = on;
             }
             // `inherits`, `package`, `build-override`, ...
             // are either handled elsewhere or don't affect what we pass to rustc.

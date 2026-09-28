@@ -9,9 +9,9 @@ order in which to close the gaps.
 Legend: ✅ done and verified (by automated tests unless a note says otherwise) · 🟡 partial (what exists and what is
 missing is stated) · ⬜ not started.
 
-_Status as of the performance-and-reliability update (Sep 2026, §8). Everything
-below was developed and verified on Linux x86_64; Windows and macOS have not been
-run._
+_Status as of the daily-driver update (2026-09-28, §11). Everything below was
+developed and verified on Linux x86_64 and macOS aarch64 (Apple M5). Windows has
+not been run._
 
 ---
 
@@ -75,11 +75,19 @@ set, dependency edges, ordering and format (a regenerated lock differs only
 where crates.io has published newer releases than the ones pinned).
 
 **Proof points**
-- 332 automated tests (`cargo test --workspace` and `rune test` both pass),
+- 353 automated tests (`cargo test --workspace` and `rune test` both pass),
   including end-to-end tests for build scripts, host/target roles, features per
   selection, git (tag/branch/rev/submodules/foreign workspaces), patches,
   local/vendored/authenticated registries, wrappers, runners, config, CAS
-  immutability and external-input invalidation.
+  immutability and external-input invalidation, native libraries across
+  dependency levels, installing, packaging and publishing against a mock
+  registry API, and version unification with backtracking.
+- A fresh `rune generate-lockfile` for Rune's own 229-package workspace is
+  byte-identical to `cargo generate-lockfile`'s.
+- Eleven binding scenarios build and run as with Cargo (§11): `cc` C/C++,
+  `bindgen`, `cxx`, bundled SQLite, `libz-sys` + CoreFoundation, `pyo3`
+  extension module and embedded Python, `cbindgen` + staticlib/cdylib used from C,
+  `libloading` plugins.
 - Rune builds and tests **itself** (182 units, 208 tests) from an empty CAS
   against live crates.io, restores everything from the CAS after `rm -rf
   .rune/target` (0 compiled), and a no-op build takes ~0.02 s.
@@ -103,7 +111,7 @@ where crates.io has published newer releases than the ones pinned).
 | 11 | Local hash optimisation | ✅ | size+mtime cache: warm = walk+stat. |
 | 12 | Manifest semantics | ✅ | `Cargo.toml` is not hashed; aliases, kinds, features, profile, lints, meta are in the key; a manifest read via `include_str!`/build script becomes a declared input. |
 | 13 | Features | ✅ | Complete model; resolver 1/2/3 (3 = 2 plus MSRV-aware version choice). |
-| 14 | Resolution | 🟡 | Greedy, seeded by the lock; patches, MSRV, multiple versions, renames, platform gating done. **No backtracking** (M2). |
+| 14 | Resolution | 🟡 | Seeded by the lock (which stays the source of truth); patches, MSRV, multiple versions, renames, platform gating; one version per semver-compatible range with preference and single-step backtracking (§11). Not a full PubGrub solver (M2). |
 | 15 | Merkle dependency keys | ✅ | Dependency *keys* (incl. external inputs) feed dependents. |
 | 16 | Host vs target | ✅ | Distinct host units (build scripts, proc-macros, their deps) with their own features/profile/flags. |
 | 17 | Target support | 🟡 | Any rustc target (delegated to rustc), exact `cfg`, target rustflags/linker/runner ✅. Custom JSON targets: identity implemented, end-to-end unverified (needs nightly `build-std`). |
@@ -123,16 +131,16 @@ where crates.io has published newer releases than the ones pinned).
 | 31 | Effective rustc flags | ✅ | `CARGO_ENCODED_RUSTFLAGS` > `RUSTFLAGS` > `target.*.rustflags` > `build.rustflags`; host units ignore the first/second/last when cross-compiling. |
 | 32 | Lints | ✅ | `[lints]`, workspace lints, in the key. |
 | 33 | Diagnostics | 🟡 | Rendered warnings stored with the artifact and replayed. Not structured (level/location/spans) yet (M4). |
-| 34–35 | Profiles & overrides | ✅ | Package/`"*"`/`name@ver`/build-override with Cargo's precedence; `split-debuginfo`. Newer profile keys (`trim-paths`, …) ⬜. |
+| 34–35 | Profiles & overrides | ✅ | Package/`"*"`/`name@ver`/build-override with Cargo's precedence; `split-debuginfo`, with Cargo's `unpacked` default on Apple targets (§10). Newer profile keys (`trim-paths`, …) ⬜. |
 | 36 | Incremental | ✅ | Local-only, never in the CAS. |
 | 37 | Environment | ✅ | Standard `CARGO_*`, `TARGET`, `HOST`, `OUT_DIR`, `PROFILE`, `OPT_LEVEL`, `DEBUG`, `DEP_*`, `CARGO_BIN_EXE_*`. (`DEBUG_ASSERTIONS` is not a Cargo variable; `CARGO_CFG_DEBUG_ASSERTIONS` is set.) |
 | 38 | `env!`/`option_env!` | ✅ | Read from rustc's dep-info; values are part of the key. |
 | 39 | Linker configuration | ✅ | `target.<t>.linker`, `runner` (used by `run` and `test`). |
 | 40 | Custom targets | 🟡 | See §17. |
-| 41 | Cargo/Rune configuration | 🟡 | `[build] [target] [env] [registries] [source] [patch]` ✅. `[profile]` in config, config `include`, OS credential providers ⬜. |
-| 42 | Source replacement | 🟡 | registry/directory/local-registry ✅; replacement by a **git source** ⬜. |
+| 41 | Cargo/Rune configuration | 🟡 | `[build] [target] [env] [registries] [source] [patch] [profile] [alias]` ✅, `CARGO_PROFILE_*`, `--config KEY=VALUE`, malformed files are errors (§11). Config `include`, OS credential providers ⬜. |
+| 42 | Source replacement | 🟡 | registry/directory/local-registry ✅; git dependencies replaced by a vendor directory ✅ (§11); replacement *by* a git source ⬜. |
 | 43 | Alternative registries | 🟡 | Sparse index, `config.json` download templates, tokens (env/config/`token-from-stdout`) ✅. Git-based indexes and OS keychain providers ⬜. |
-| 44 | Dependency overrides | ✅ | `[patch]`, `[replace]`, config patches. "Unused patch" warnings ⬜. |
+| 44 | Dependency overrides | ✅ | `[patch]`, `[replace]`, config patches, "unused patch" warnings (§11). |
 | 45 | Lockfile semantics | ✅ | Lockfile is not hashed; the resolved graph is. |
 | 46 | `links` constraints | ✅ | Conflicts reported like Cargo. |
 | 47 | Jobserver | ✅ | GNU jobserver shared with rustc and scripts. |
@@ -174,15 +182,16 @@ into `DeclaredInputs`; classify units whose reads cannot be determined as
 non-hermetic (never stored globally). Extend native tool identity to `cmake`,
 `nasm`, `pkg-config`, the linker and platform SDKs.
 
-**G2 — Resolver fidelity (§14).** Greedy resolution picks the newest fitting
-version and only errors when nothing fits. *Plan:* PubGrub-style backtracking,
-and a differential test that resolves the top-N crates on crates.io against
-`cargo generate-lockfile`. (Today's evidence: Rune's own 229-package lock matches
-Cargo's.)
+**G2 — Resolver fidelity (§14).** *Done (§11):* one version per compatible range,
+settled by preference or by backtracking one requirer at a time; a fresh lock of
+Rune's own graph is byte-identical to Cargo's. *Still to do:* a full PubGrub
+solver for conflicts that need several crates moved at once (today: a warning and
+two versions side by side), and a differential test over the top-N crates.
 
-**G3 — Registry breadth (§41–43).** Git-based indexes, replacement by a git
-source, OS keychain credential providers, config `include`, `[profile]` in
-config. `rune publish`, `yank`, `owner`, `login`.
+**G3 — Registry breadth (§41–43).** *Done (§11):* `[profile]` in config,
+`publish`, `yank`, `owner`, `login`/`logout`, `search`, `info`, `install` from a
+registry or git. *Still to do:* git-based indexes, replacement by a git source,
+OS keychain credential providers, config `include`.
 
 **G4 — Structured diagnostics and build-result records (§33, §54, §57).** Store
 the JSON diagnostics (level, code, spans) in the CAS object, replay them
@@ -193,15 +202,18 @@ faithfully (incl. `--message-format`), and record the identity breakdown for
 `--merge=none`/`--parts-out-dir` (nightly today) so docs can be shared across
 projects like compiled artifacts.
 
-**G6 — Platforms.** Windows/macOS: path handling, `.exe`/`.dll`/`.dylib`
-artifact names, `rpath`, SDK identity, CI matrix.
+**G6 — Platforms.** *macOS (aarch64):* the full test suite passes, Rune builds
+and restores itself, and Cargo's `split-debuginfo = "unpacked"` default is applied
+(§10). Still to do: macOS SDK identity (`SDKROOT`, `xcrun`) in native tool
+identity, `rpath`/`.dylib` end-to-end tests, a CI job. *Windows:* path handling,
+`.exe`/`.dll` artifact names, CI matrix — not started.
 
 **G7 — Custom targets end to end (§17, §40).** A nightly CI job building a
 `no_std` project for a JSON target with `-Zbuild-std`.
 
-**G8 — Newer Cargo surface.** `trim-paths`, `hint-mostly-unused`, `-Z`
-unit-graph output, `--message-format`, `--future-incompat-report`, `cargo
-vendor`/`rune vendor`, `[hints]`.
+**G8 — Newer Cargo surface.** `rune vendor` ✅ (§11). Still: `trim-paths`
+(unstable in Cargo too), `hint-mostly-unused`, `-Z` unit-graph output,
+`--future-incompat-report`, `[hints]`.
 
 ---
 
@@ -210,7 +222,7 @@ vendor`/`rune vendor`, `[hints]`.
 Rune only earns its place if it is *noticeably* better than Cargo where Cargo
 hurts. This section collects what Rust users actually complain about, checks it
 against what Rune does today, and says what to build. Evidence comes from the
-Rust project's own surveys and Cargo's design discussions (links in §10);
+Rust project's own surveys and Cargo's design discussions (each entry names its source);
 entries without a source are my own suggestions and are marked *(idea)*.
 
 "Rune today" describes the code **as of the start of the 2026-09-20 work**;
@@ -219,9 +231,9 @@ a test or benchmark before they are claimed in the README.
 
 | Item | Status |
 | --- | --- |
-| P2 check ⇄ build sharing | 🟡 measured: 6 of 9 units shared in a probe (all registry crates); local crates and proc-macros are compiled twice. |
+| P2 check ⇄ build sharing | ✅ `check` after `build` compiles nothing (Rune itself: 148 → 0 units, 6.1 s → 0.3 s); tested end to end (§10). `build` after `check` still compiles, as it must. |
 | P3 concurrent processes | ✅ fixed and tested (§8): it was a real bug — 3 of 4 concurrent builds failed. |
-| P4 debuginfo | ✅ dependencies default to `line-tables-only` (−10 % cold build); `rune doctor` covers linkers. Link-step caching ⬜. |
+| P4 debuginfo | ✅ dependencies default to `line-tables-only` (−10 % cold build); `split-debuginfo = "unpacked"` on macOS (−11 %, §10); `rune doctor` covers linkers. Link-step caching ⬜. |
 | P5 self-diagnosis | 🟡 `rune doctor`, `--timings` trace. The "slow build" hint ⬜. |
 | P6 disk | 🟡 `rune cas du` ✅; gc by last use already existed; pinning, zstd ⬜. |
 | P7 CI/Docker | 🟡 `rune build --deps-only` ✅; `cas export/import` ⬜. |
@@ -261,8 +273,9 @@ times before building").
 - *Rune today:* measured on a small project (9 units): `build` after `check`
   compiled 3 and restored 6; `check` after `build` likewise. The shared ones are
   the registry crates; local crates and the proc-macro are built twice.
-- *Plan:* let a `check` unit take the `.rmeta` of the equivalent `build` unit
-  (and vice versa) so `check` after `build` compiles nothing, and test it.
+- *Done (§10):* a `check` unit takes the stored result of the equivalent
+  `build` unit when its whole dependency closure can, so `check` after `build`
+  compiles nothing. The reverse is impossible: a check produces no code.
 
 **P3 — The IDE and the terminal block each other.** 35 %+ of survey respondents
 say IDE and Cargo "block one another"; the rust-analyzer issue tracker is full of
@@ -441,7 +454,7 @@ Cheapest and most valuable first:
    for worktree sharing.
 3. ✅ **`rune build --deps-only`** (P7) — small, and beats `cargo-chef`.
 4. ✅ **`--message-format=json`** (P3, P17); rust-analyzer recipe written, unverified live.
-5. **check ⇄ build metadata sharing** (P2) — partly there; finish and test.
+5. ✅ **check ⇄ build metadata sharing** (P2).
 6. ✅ **`rune doctor` and `rune cas du`** (P4–P6).
 7. Bigger bets: interface early-cutoff (P1), sandbox-as-security (P15), cached
    tests (P9), remote CAS (M5).
@@ -500,10 +513,10 @@ spans; `rune timings --compare <ref>` to fail CI when the build gets slower by a
 threshold; feed the same data into the scheduler (already weighted by measured
 compile times).
 
-**F11 — Packaging tooling.** `rune package --list`, `rune publish --dry-run`
-that *builds the packaged tarball* to catch files missing from `include`,
-`rune vendor` (also G8), `rune yank`/`owner`/`login` (G3), plus `rune audit`,
-`deny`, `outdated`, `coverage` (M3).
+**F11 — Packaging tooling.** ✅ *(§11)* `rune package --list`, `rune publish
+--dry-run` that builds the packaged tarball, `rune vendor`, `rune
+yank`/`owner`/`login`. `audit`, `deny`, `outdated`, `coverage` run as the usual
+Cargo plugins through external subcommands; built-in versions are not planned.
 
 **F12 — Workspace ergonomics.** `rune graph` (DOT/Mermaid of packages and
 units), `rune run -p x` from anywhere, `[workspace.metadata.rune]` for
@@ -526,11 +539,11 @@ and cache lookups for IDEs, Bazel-style wrappers and corporate tooling (see P17)
 | --- | --- | --- |
 | **M1** | Hermeticity | G1: sandboxed/recorded build-script reads, non-hermetic class, full native tool identity. |
 | **M2** | Ecosystem confidence | G2 + a compatibility corpus: build the top ~500 crates (and their tests) with Rune vs Cargo in CI; fix every divergence; backtracking resolver. |
-| **M3** | Registry & tooling | G3 + `publish`/`audit`/`outdated`/`deny`/`coverage` (F11). |
+| **M3** | Registry & tooling | *Done:* `install`/`uninstall`, `package`, `publish`, `login`/`logout`, `yank`, `owner`, `search`, `info`, `vendor`, `pkgid`, `verify-project`, external subcommands and aliases (§11). *Open:* the rest of G3. |
 | **M4** | Observability | G4 + `rune cas inspect`, `rune explain-miss` (F2), structured diagnostics. |
 | **M5** | Sharing | *Done:* shared-directory store ✅, HTTP backend ✅, **Cairn** server with peers/replication/sharding ✅, `--deps-only` ✅. *Open:* signed manifests, TLS in Cairn, S3 backend, `cas export/import` (P7); G5 shared documentation. |
-| **M6** | Platforms | G6 + G7 + CI on Windows/macOS; `-Zbuild-std` in the CAS (F8). |
-| **M7** | Daily driver | *Started:* P3 concurrency ✅, P4–P6 `rune doctor`/`cas du`/dependency debuginfo ✅, `--message-format=json` ✅, `--deps-only` ✅. `rune watch` ✅, scripts ✅, `rune affected` ✅, build-script hints ✅. *Open:* P2 completion, better test runner (F7), JSON for `test`. Start this before M4–M6: it is what users feel first. |
+| **M6** | Platforms | *Started:* macOS aarch64 test suite passes, Apple debuginfo default ✅. *Open:* G6 (Windows, macOS SDK identity) + G7 + CI on Windows/macOS; `-Zbuild-std` in the CAS (F8). |
+| **M7** | Daily driver | *Started:* P3 concurrency ✅, P4–P6 `rune doctor`/`cas du`/dependency debuginfo ✅, `--message-format=json` ✅, `--deps-only` ✅. `rune watch` ✅, scripts ✅, `rune affected` ✅, build-script hints ✅, P2 check ⇄ build ✅, `fix`/`clippy --fix`/`clippy -- flags`/`fmt -- --check`/`rustc`/`rustdoc`, `update --precise`, `add --git/--rename/--target`, status on stderr (§11). *Open:* better test runner (F7), JSON for `test`. Start this before M4–M6: it is what users feel first. |
 | **M8** | Supply chain | P15/P16: sandbox as a security boundary, exec-surface report, `min-release-age`, SBOM/attestation, reproducibility check. Builds on M1. |
 | **M9** | Faster than Cargo on edits | P9 cached tests: opt-in ✅, default-on after M1. P1 early cutoff is blocked on compiler support, see P1. |
 
@@ -539,7 +552,7 @@ and cache lookups for IDEs, Bazel-style wrappers and corporate tooling (see P17)
 ## 7. How to verify the current state
 
 ```bash
-cargo test --workspace                       # 332 tests, no network needed
+cargo test --workspace                       # 353 tests, no network needed
 cargo clippy --workspace --all-targets
 
 # Rune builds and tests itself against live crates.io (use a scratch copy
@@ -719,3 +732,159 @@ ignored (`cdylib`/`staticlib` never built); `autolib` was misspelt; build
 scripts saw the *host's* `CARGO_CFG_*` and empty `CARGO_PKG_*`; a re-run build
 script could write through hard links into the shared CAS; resolution depended
 on the command line, and `-p a` unified features requested only by `b`.
+
+---
+
+## 10. What changed in the macOS and check-reuse update (2026-09-24)
+
+First run on macOS (aarch64-apple-darwin, Apple M5, 10 cores, rustc 1.98.1):
+all 332 existing tests passed unchanged. A cold build of Rune itself took 13.7 s
+with Rune and 11.5 s with Cargo, so Rune was ~20 % *slower* on macOS despite
+cheaper dependency debuginfo.
+
+**macOS debuginfo default (P4, G6).** Cargo compiles with
+`split-debuginfo = "unpacked"` on Apple targets whenever there is debuginfo;
+rustc's own default there is `packed`, which runs `dsymutil` over every binary it
+links. Rune passed nothing, so it paid for `dsymutil` on every binary and test.
+Now `Profile::split_debuginfo_for(target)` applies Cargo's rule (an explicit
+setting always wins), the value goes to rustc for both units and build scripts,
+and it is in the key, so old `packed` results are not reused. Measured: cold build
+13.9 s → 12.4 s (−11 %, 3 interleaved pairs). Against Cargo, single runs after the
+change gave 12.8 s and 11.8 s (Cargo 11.7 s). Noise on this machine is too high to
+call the remaining gap without medians.
+
+*Output layout.* With `unpacked`, rustc leaves each binary's object files next to
+it. Binaries used to be compiled straight into `target/debug/`, which would have
+filled it with `*.rcgu.o`. They now compile into `deps/`, as in Cargo, and only the
+friendly name is linked into `target/debug/` (`executor::bin_dir_for`).
+`--message-format json` reports that name as `executable`, like Cargo. Examples
+stay in `examples/`. Test:
+`binaries_compile_in_deps_and_only_their_names_appear_in_the_profile_dir`.
+
+**`check` after `build` (P2).** Before: `check` right after `build` recompiled 148
+of 181 units (6.1 s); only host-side units were shared. Now it compiles 0
+(0.3 s). An edit to `rune-common` rechecks just the 10 crates above it, and
+`build` → `check` → `build` → `check` stays at 0 after each switch.
+
+The finding that shaped the design: on stable rustc, a check-only `.rmeta` and a
+full build's `.rmeta` of the same crate, with identical `-C metadata` and flags,
+are **not interchangeable**. The bytes differ, and a crate checked against one
+fails with E0460 ("found possibly newer version of crate") when the other shows up
+in the same compilation. So a naive "use the build's `.rmeta`" would break builds
+whenever the store held full results for some crates but not others. The rule
+implemented in `Executor::execute`:
+- for every check unit, also compute the key it would have in a full build (from
+  its dependencies' full keys);
+- the check unit takes the full result only if that entry is in the local store
+  **and** every check-mode dependency was substituted too (host-side units are the
+  same in both modes);
+- a substituted unit then *carries the full key*, so every dependent's key records
+  which flavour of `.rmeta` it was compiled against.
+
+Test: `check_after_build_reuses_the_build_and_still_checks_edits`. It covers a
+build script's `OUT_DIR` restored for the substituted unit, a real check of an
+edited crate against reused `.rmeta`s, a type error still reported, and the build's
+warnings replayed by the check.
+
+**A false alarm worth recording.** Benchmark loops sometimes took 10+ minutes
+wall-clock for builds that reported ~14 s. Sampling showed `rustc` processes
+"alive for 15 minutes". Cause: the laptop went into idle/maintenance sleep on
+battery (`pmset -g log`). Rust's `Instant` on macOS does not count sleep, while
+`ps` and the wall clock do. Not a Rune bug. Run benchmarks under `caffeinate -i`.
+
+**Not done:** P8 path remapping (still the precondition for byte-identical shared
+artifacts), macOS SDK identity, a median-of-N cold-build comparison against Cargo
+on macOS.
+
+---
+
+## 11. What changed in the daily-driver update (2026-09-28)
+
+Measured and developed on macOS aarch64 (Apple M5), rustc 1.98.1; the network
+here moves about 1.5 MB/s, which bounds every cold number below.
+
+**Resolver speed.** On a warm cache every command was already fast (a
+re-resolution after a manifest edit: 55 ms; `tree`/`metadata`: 0.12 s, like
+Cargo's 0.10 s). The slow paths were network ones:
+- `rune update` took 3.2 s (Cargo: 1.7 s): the index was revalidated one
+  dependency *level* at a time, 17 sequential waves. The crates the current
+  lockfile names are now requested in one concurrent wave before the walk
+  (`DependencyResolver::with_prefetch_hint`); the walk then reads from memory.
+  Now 0.7–1.2 s.
+- A cold `fetch` (empty `RUNE_HOME`, lockfile present) measured 62 s vs Cargo's
+  36 s. Most of that was the bug below; with it fixed, 34 s vs Cargo's 35–38 s.
+  The rest is bandwidth: `curl` alone needs 25 s for the same 221 `.crate` files,
+  and the index server sends uncompressed responses whatever is asked for.
+
+**A lockfile bug that looked like a slow resolver.** `LockfileManager::load_fast`
+preferred Rune's binary cache (`Rune.lock.bin`) over `Cargo.lock`. After a
+`git pull`, a checkout of an older commit or a `cargo update --precise`, the next
+Rune command re-resolved from the *stale* cache and wrote the old versions back
+into `Cargo.lock` — a full resolution with network traffic each time, and with
+rust-analyzer running `cargo` next door, a tug of war. `Cargo.lock` is now the
+source of truth; the binary cache is used only while it describes the same
+packages. Test: `a_cargo_lock_changed_outside_rune_is_respected_not_reverted`.
+
+**Resolution fidelity (G2).** Cargo allows one version per semver-compatible range
+of a crate. The greedy walk took the newest version per requirement, so a stricter
+requirement arriving later (an `=` pin next to a newer crate's own pin) left two
+`1.x` versions in the graph. After each walk, every such range is now settled:
+if one version satisfies all the requirements in force (optional dependencies only
+when activated), it is preferred and the walk re-run; if none does, the requirement
+that is the odd one out is found and its requirer's release excluded, so an older
+release that agrees is picked. Each round reuses the in-memory index, so a graph
+without conflicts costs one extra scan. A fresh lock for Rune's 229-package
+workspace is byte-identical to `cargo generate-lockfile`'s; on the backtracking
+test graph old Rune produced `a 1.0.0 + a 1.1.0 + b 2.0.0`, new Rune and Cargo
+`a 1.0.0 + b 1.0.0`. Not a full PubGrub solver: see G2.
+
+**Bindings.** Eleven scenarios, each compared with Cargo (the two `pyo3` ones set
+up as pyo3 documents for macOS): `cc` (C and C++), `bindgen`, `cxx`, bundled
+SQLite, `libz-sys` + `flate2` + CoreFoundation, `pyo3` extension module imported
+from Python, `pyo3` embedding Python, `cbindgen` + `staticlib` linked from a C
+program, a `cdylib` loaded with `libloading`. What was wrong:
+- *Native search paths did not propagate.* A library records which native
+  libraries it needs, not where they are; Cargo passes every dependency build
+  script's `rustc-link-search` to each rustc invocation above it. Rune passed only
+  the unit's own, so any `-sys` crate linking a **dynamic** library from a
+  non-default directory failed at the final link (embedding Python:
+  `library 'python3.9' not found`). Static libraries worked because they are
+  bundled into the rlib.
+- *`rune run`/`test` could not load them either:* only `LD_LIBRARY_PATH` was
+  set (ignored on macOS). Now `DYLD_FALLBACK_LIBRARY_PATH`/`LD_LIBRARY_PATH`/`PATH`
+  with build-script library directories inside the build directory, `deps/` and
+  the profile directory, plus macOS's defaults.
+- *No plain library names.* Cargo puts `libfoo.a`, `libfoo.dylib`/`.so`,
+  `foo.dll`, `libfoo.rlib` of workspace libraries in `target/debug/`; Rune only had
+  hash-named files in `deps/`.
+- *Doc tests and `rune doc` lacked the build script's `OUT_DIR`, `cfg`s and
+  environment:* a bindings crate (`include!(concat!(env!("OUT_DIR"), …))`)
+  could not be documented, and its doc tests failed.
+- *Dependency build scripts' warnings leaked* (`--cap-lints` was not passed when
+  compiling them).
+
+**Commands.** `install` from crates.io/git/path with Cargo's tracking files
+(verified: `cargo install --list` and `cargo uninstall` see Rune's installs),
+`uninstall`, `package`, `publish`, `login`, `logout`, `yank`, `owner`, `search`,
+`info`, `vendor` (Rune and Cargo both build offline from it with empty caches),
+`fix` and `clippy --fix` (applying machine-applicable suggestions from the JSON
+diagnostics Rune already stores), `rustc`/`rustdoc` with extra arguments,
+`pkgid`, `verify-project`, `clippy -- <lint flags>` (in the key, so a cached
+warning never passes `-D warnings`), `fmt -- --check`, `update --precise
+--dry-run -p`, `add --git/--branch/--tag/--rev/--rename/--target/--registry
+--dry-run` (and `{ workspace = true }` when the workspace declares the
+dependency), `[alias]`, external `rune-*`/`cargo-*` subcommands, `--config`,
+`[profile]` in configuration and `CARGO_PROFILE_*`, unused-`[patch]` warnings.
+
+**Behaviour fixes found on the way.** Status lines went to stdout, so
+`rune vendor > config.toml` or anything piping a command's output got them mixed
+in; they now go to stderr like Cargo's. A malformed `.cargo/config.toml` was
+silently ignored (a vendoring or mirror setup would just not apply); it is now an
+error. `rune doc --open` used `xdg-open` everywhere.
+
+**Tests:** 353 (18 new: 12 end-to-end, 6 unit), all passing under
+`cargo test` and under `rune test` on Rune's own workspace; clippy clean.
+
+**Not done:** Windows, full PubGrub, P8 `trim-paths` (unstable in Cargo too),
+structured diagnostics (G4), JSON test output, `-Z` flags, config `include`,
+OS keychain credential providers.

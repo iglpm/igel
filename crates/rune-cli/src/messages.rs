@@ -3,7 +3,7 @@
 //! `build-finished`), so rust-analyzer, CI annotators and editors that already
 //! understand `cargo --message-format=json` work unchanged.
 
-use rune_common::{CompilationUnit, CrateSource, CrateType, Profile, TargetKind};
+use rune_common::{CompilationUnit, CrateSource, CrateType, Profile, RuneConfig, TargetKind};
 use rune_scheduler::pipeline::PipelineEvent;
 use serde_json::{Value, json};
 use std::path::PathBuf;
@@ -96,21 +96,35 @@ fn compiler_messages(unit: &CompilationUnit, diagnostics: &[String]) -> Vec<Stri
 
 fn artifact_line(
     unit: &CompilationUnit,
+    config: &RuneConfig,
     profile: &Profile,
     artifacts: &[PathBuf],
     fresh: bool,
 ) -> String {
     let unit_profile = unit.effective_profile(profile);
-    let executable = (unit.crate_type == CrateType::Bin)
-        .then(|| {
-            artifacts.iter().find(|p| {
-                !matches!(
-                    p.extension().and_then(|e| e.to_str()),
-                    Some("d" | "rmeta" | "rlib")
-                )
-            })
-        })
-        .flatten();
+    let mut artifacts = artifacts.to_vec();
+    let mut executable = None;
+    // Binaries, and every test harness (a library's unit tests included):
+    // `cargo test --no-run --message-format json` is how test runners such as
+    // nextest find the test executables.
+    if (unit.crate_type == CrateType::Bin || unit.harness) && !unit.check_only {
+        // The linked program: no extension, or the target's (`.exe`,
+        // `.wasm`) — never the debug info next to it (`.pdb`, `.dSYM`).
+        if let Some(bin) = artifacts.iter_mut().find(|p| {
+            matches!(
+                p.extension().and_then(|e| e.to_str()),
+                None | Some("exe" | "wasm" | "js")
+            )
+        }) {
+            // A binary is reported by its friendly name, as Cargo reports the
+            // uplifted `target/debug/app`; a test binary by its hashed file.
+            if !unit.harness {
+                *bin = rune_scheduler::executor::bin_dir_for(config, profile, unit)
+                    .join(unit.executable_name(&unit.crate_id.name));
+            }
+            executable = Some(bin.clone());
+        }
+    }
     let mut m = common(unit, "compiler-artifact");
     m.insert(
         "profile".into(),
@@ -133,7 +147,12 @@ fn artifact_line(
 }
 
 /// The JSON lines a pipeline event produces (usually none).
-pub fn lines_for(unit: &CompilationUnit, profile: &Profile, event: &PipelineEvent) -> Vec<String> {
+pub fn lines_for(
+    unit: &CompilationUnit,
+    config: &RuneConfig,
+    profile: &Profile,
+    event: &PipelineEvent,
+) -> Vec<String> {
     match event {
         PipelineEvent::BuildFinished {
             artifacts,
@@ -141,7 +160,7 @@ pub fn lines_for(unit: &CompilationUnit, profile: &Profile, event: &PipelineEven
             ..
         } => {
             let mut lines = compiler_messages(unit, diagnostics);
-            lines.push(artifact_line(unit, profile, artifacts, false));
+            lines.push(artifact_line(unit, config, profile, artifacts, false));
             lines
         }
         PipelineEvent::CacheHit {
@@ -150,7 +169,7 @@ pub fn lines_for(unit: &CompilationUnit, profile: &Profile, event: &PipelineEven
             ..
         } => {
             let mut lines = compiler_messages(unit, diagnostics);
-            lines.push(artifact_line(unit, profile, artifacts, true));
+            lines.push(artifact_line(unit, config, profile, artifacts, true));
             lines
         }
         PipelineEvent::BuildFailed { diagnostics, .. } => compiler_messages(unit, diagnostics),

@@ -3,7 +3,7 @@ use rune_manifest::dependency::{DependencyKind, DependencySpec};
 use rune_registry::source::{CRATES_IO, IndexClient};
 use rune_registry::{CrateIndex, IndexRecord};
 use semver::{Version, VersionReq};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use thiserror::Error;
@@ -242,6 +242,15 @@ pub struct DependencyResolver {
     offline: bool,
     /// `[patch]` / `[replace]` substitutions.
     patches: crate::patch::Patches,
+    /// Registry crates a previous resolution needed (`(registry, name)`):
+    /// fetched together before the walk starts, see [`Self::with_prefetch_hint`].
+    hints: Vec<(String, String)>,
+    /// `(registry, name)` → the version to take whenever a requirement allows
+    /// it: how a round settles on one version per compatible range.
+    prefer: HashMap<(String, String), Vec<Version>>,
+    /// `(registry, name, version)` never to choose: backtracking away from a
+    /// release whose requirements conflict with the rest of the graph.
+    exclude: HashSet<(String, String, Version)>,
 }
 
 impl Default for DependencyResolver {
@@ -260,7 +269,40 @@ impl DependencyResolver {
             refresh: false,
             offline: false,
             patches: Default::default(),
+            hints: Vec::new(),
+            prefer: HashMap::new(),
+            exclude: HashSet::new(),
         }
+    }
+
+    /// Versions to take whenever a requirement allows them (`(registry index,
+    /// name, version)`): `rune update --precise`.
+    pub fn with_preferred(mut self, preferred: &[(String, String, Version)]) -> Self {
+        for (registry, name, version) in preferred {
+            self.prefer
+                .entry((registry.clone(), name.clone()))
+                .or_default()
+                .push(version.clone());
+        }
+        self
+    }
+
+    /// Names the registry crates of an earlier lockfile as likely needed.
+    ///
+    /// The resolution walk discovers dependencies one level at a time, and
+    /// each level waits for the index entries of the one before: 15–20
+    /// network round trips in a row for a typical graph. With a lockfile,
+    /// nearly every crate is known up front, so their entries are requested
+    /// together in one concurrent wave before the walk starts. A hint only
+    /// warms the cache; it never decides a version.
+    pub fn with_prefetch_hint(mut self, lock: Option<&Lockfile>) -> Self {
+        if let Some(lock) = lock {
+            self.hints.extend(lock.packages.iter().filter_map(|p| {
+                let registry = registry_of_lock_source(p.source.as_deref()?)?;
+                Some((registry, p.name.clone()))
+            }));
+        }
+        self
     }
 
     /// Applies `[patch]` and `[replace]` substitutions.
@@ -372,6 +414,191 @@ impl DependencyResolver {
         existing_lock: Option<&Lockfile>,
         workspace: Option<&rune_manifest::workspace::WorkspaceManifest>,
     ) -> Result<ResolvedGraph> {
+        // Cargo allows one version per semver-compatible range of a crate
+        // (`1.x`, `0.4.x`, …). The walk below takes the newest version a
+        // requirement allows, which can leave two in one range when a later
+        // requirement is stricter (`=1.0.200` next to a newer crate's
+        // `=1.0.228`). Each such conflict is settled — by preferring the one
+        // version every requirement accepts, or, when there is none, by
+        // backtracking away from the release that brought the odd requirement
+        // in — and the walk re-run. Almost every graph needs one round.
+        let mut last: Option<ResolvedGraph> = None;
+        for _ in 0..64 {
+            let round =
+                self.resolve_round(project_root, root_dependencies, existing_lock, workspace);
+            let (graph, edges) = match round {
+                Ok(r) => r,
+                // A backtracking step left nothing to choose: keep the last
+                // complete resolution.
+                Err(e) => {
+                    let Some(graph) = last else { return Err(e) };
+                    for (_, name, versions) in compatible_duplicates(&graph) {
+                        tracing::warn!(
+                            "could not settle on one version of `{name}` ({}); using them side by side",
+                            versions
+                                .iter()
+                                .map(|v| v.to_string())
+                                .collect::<Vec<_>>()
+                                .join(" and ")
+                        );
+                    }
+                    return Ok(graph);
+                }
+            };
+            let conflicts = compatible_duplicates(&graph);
+            if conflicts.is_empty() {
+                return Ok(graph);
+            }
+            let _timer = rune_common::timing::phase("version unification");
+            let mut progressed = false;
+            for (registry, name, versions) in conflicts {
+                progressed |= self.settle(&registry, &name, &versions, &edges, &graph);
+            }
+            if !progressed {
+                for (_, name, versions) in compatible_duplicates(&graph) {
+                    tracing::warn!(
+                        "no single version of `{name}` satisfies every requirement in the \
+                         graph; using {} side by side (Cargo would refuse)",
+                        versions
+                            .iter()
+                            .map(|v| v.to_string())
+                            .collect::<Vec<_>>()
+                            .join(" and ")
+                    );
+                }
+                return Ok(graph);
+            }
+            last = Some(graph);
+        }
+        last.ok_or_else(|| ResolverError::Manifest("version resolution did not settle".into()))
+    }
+
+    /// One conflict: `versions` of `name` share a compatible range. Returns
+    /// whether a preference or exclusion was added.
+    fn settle(
+        &mut self,
+        registry: &str,
+        name: &str,
+        versions: &[Version],
+        edges: &[Edge],
+        graph: &ResolvedGraph,
+    ) -> bool {
+        let reqs: Vec<&Edge> = edges
+            .iter()
+            .filter(|e| {
+                e.name == name
+                    && e.registry == registry
+                    && versions.iter().any(|v| e.req.matches(v))
+            })
+            .collect();
+        let class = compat_class(&versions[0]);
+        let Ok(index) = self.get_or_fetch_index(registry, name) else {
+            return false;
+        };
+        let mut candidates: Vec<Version> = index
+            .available_versions()
+            .into_iter()
+            .filter_map(|r| Version::parse(&r.vers).ok())
+            .filter(|v| compat_class(v) == class)
+            .collect();
+        candidates.sort_by(|a, b| b.cmp(a));
+        candidates.retain(|v| {
+            !self
+                .exclude
+                .contains(&(registry.to_string(), name.to_string(), v.clone()))
+        });
+        let fits = |subset: &[&&Edge], v: &Version| subset.iter().all(|e| e.req.matches(v));
+        let all: Vec<&&Edge> = reqs.iter().collect();
+        if let Some(v) = candidates.iter().find(|v| fits(&all, v)) {
+            let key = (registry.to_string(), name.to_string());
+            let list = self.prefer.entry(key).or_default();
+            if list.contains(v) {
+                return false;
+            }
+            list.retain(|p| compat_class(p) != class);
+            list.push(v.clone());
+            return true;
+        }
+        // No version fits them all: find the requirement that is the odd one
+        // out and move its requirer to another release.
+        for (i, culprit) in reqs.iter().enumerate() {
+            let others: Vec<&&Edge> = reqs
+                .iter()
+                .enumerate()
+                .filter(|(j, _)| *j != i)
+                .map(|(_, e)| e)
+                .collect();
+            if !candidates.iter().any(|v| fits(&others, v)) {
+                continue;
+            }
+            let Some(from) = &culprit.from else { continue };
+            let Some(pkg) = graph.packages.get(from) else {
+                continue;
+            };
+            if let PackageSource::Registry(r) = &pkg.source
+                && self
+                    .exclude
+                    .insert((r.clone(), pkg.name.clone(), pkg.version.clone()))
+            {
+                return true;
+            }
+        }
+
+        // More than one requirement is in the way. Those of the workspace and
+        // path packages cannot move; every registry release whose
+        // requirement is incompatible with them must, so all go at once.
+        let registry_release = |e: &Edge| -> Option<(String, String, Version)> {
+            let pkg = graph.packages.get(e.from.as_ref()?)?;
+            match &pkg.source {
+                PackageSource::Registry(r) => {
+                    Some((r.clone(), pkg.name.clone(), pkg.version.clone()))
+                }
+                _ => None,
+            }
+        };
+        let fixed: Vec<&&Edge> = reqs
+            .iter()
+            .filter(|e| registry_release(e).is_none())
+            .collect();
+        let mut progressed = false;
+        if !fixed.is_empty() && candidates.iter().any(|v| fits(&fixed, v)) {
+            for e in &reqs {
+                let compatible = candidates
+                    .iter()
+                    .any(|v| e.req.matches(v) && fixed.iter().all(|f| f.req.matches(v)));
+                if !compatible && let Some(release) = registry_release(e) {
+                    progressed |= self.exclude.insert(release);
+                }
+            }
+            if progressed {
+                return true;
+            }
+        }
+        // Otherwise move the release with the most restrictive requirement
+        // and look again.
+        let mut movable: Vec<(usize, (String, String, Version))> = reqs
+            .iter()
+            .filter_map(|e| {
+                let release = registry_release(e)?;
+                let allowed = candidates.iter().filter(|v| e.req.matches(v)).count();
+                Some((allowed, release))
+            })
+            .collect();
+        movable.sort();
+        movable
+            .into_iter()
+            .any(|(_, release)| self.exclude.insert(release))
+    }
+
+    /// One pass of the resolution walk, with the current preferences and
+    /// exclusions. Also returns every active requirement edge.
+    fn resolve_round(
+        &mut self,
+        project_root: &Path,
+        root_dependencies: &[(String, DependencySpec)],
+        existing_lock: Option<&Lockfile>,
+        workspace: Option<&rune_manifest::workspace::WorkspaceManifest>,
+    ) -> Result<(ResolvedGraph, Vec<Edge>)> {
         // Target-gated dependencies (`[target.'cfg(...)'.dependencies]`) are
         // evaluated against the host triple. Cross-compilation with
         // `--target` doesn't yet feed a different triple through here (a
@@ -382,6 +609,18 @@ impl DependencyResolver {
         // Like `Cargo.lock`, the resolution covers *every* platform: which
         // target-gated dependencies a build actually compiles is decided when
         // the build is planned, against the platform it is built for.
+
+        // Everything the lockfile (or an earlier one) names, in one wave.
+        let mut hints = std::mem::take(&mut self.hints);
+        if let Some(lock) = existing_lock {
+            hints.extend(lock.packages.iter().filter_map(|p| {
+                let registry = registry_of_lock_source(p.source.as_deref()?)?;
+                Some((registry, p.name.clone()))
+            }));
+        }
+        if !self.offline {
+            self.prefetch(hints.iter().map(|(r, n)| (r.as_str(), n.as_str())));
+        }
 
         let mut resolved_packages: HashMap<String, ResolvedPackage> = HashMap::new();
         let mut feature_resolver = DynamicFeatureResolver::new();
@@ -473,16 +712,70 @@ impl DependencyResolver {
         // 3. Unify features across resolved packages
         let _timer = rune_common::timing::phase("feature unification");
         let feature_results = feature_resolver.resolve();
+
+        // Every requirement in force: roots, and each package's dependencies
+        // that are not optional or were switched on.
+        let mut edges = Vec::new();
+        for (name, spec) in root_dependencies {
+            if spec.path.is_some() || spec.git.is_some() {
+                continue;
+            }
+            let Ok(registry) =
+                rune_registry::source::defs().index_for_name(spec.registry.as_deref())
+            else {
+                continue;
+            };
+            edges.push(Edge {
+                from: None,
+                name: spec.package.clone().unwrap_or_else(|| name.clone()),
+                registry,
+                req: spec.version.clone().unwrap_or(VersionReq::STAR),
+            });
+        }
+        for (pkg_id, pkg) in &resolved_packages {
+            let feats = feature_results.get(pkg_id);
+            for dep in &pkg.dependencies {
+                if dep.kind == DependencyKind::Dev {
+                    continue;
+                }
+                let real = dep.package.clone().unwrap_or_else(|| dep.name.clone());
+                let active = !dep.optional
+                    || feats.is_some_and(|f| {
+                        f.activated_dependencies.contains(&dep.name)
+                            || f.active_features.contains(&dep.name)
+                            || f.activated_dependencies.contains(&real)
+                            || f.active_features.contains(&real)
+                    });
+                let Ok(req) = VersionReq::from_str(&dep.req) else {
+                    continue;
+                };
+                if active {
+                    edges.push(Edge {
+                        from: Some(pkg_id.clone()),
+                        name: real,
+                        registry: dep.registry.clone().unwrap_or_else(|| match &pkg.source {
+                            PackageSource::Registry(r) => r.clone(),
+                            _ => CRATES_IO.to_string(),
+                        }),
+                        req,
+                    });
+                }
+            }
+        }
+
         for (pkg_id, resolved_pkg) in &mut resolved_packages {
             if let Some(feats) = feature_results.get(pkg_id) {
                 resolved_pkg.features = feats.active_features.clone();
             }
         }
 
-        Ok(ResolvedGraph {
-            root_packages: root_names,
-            packages: resolved_packages,
-        })
+        Ok((
+            ResolvedGraph {
+                root_packages: root_names,
+                packages: resolved_packages,
+            },
+            edges,
+        ))
     }
 
     fn get_or_fetch_index(&mut self, registry: &str, name: &str) -> Result<&CrateIndex> {
@@ -498,6 +791,61 @@ impl DependencyResolver {
             self.cached_indices.insert(key.clone(), index);
         }
         Ok(&self.cached_indices[&key])
+    }
+}
+
+/// A requirement in force: `from` (a package id, `None` for a root) needs
+/// `name` from `registry` matching `req`.
+struct Edge {
+    from: Option<String>,
+    name: String,
+    registry: String,
+    req: VersionReq,
+}
+
+/// Which versions Cargo counts as compatible (one allowed per class):
+/// the same major, the same minor for `0.x`, the same patch for `0.0.x`.
+fn compat_class(v: &Version) -> (u64, u64, u64) {
+    match (v.major, v.minor) {
+        (0, 0) => (0, 0, v.patch),
+        (0, m) => (0, m, 0),
+        (m, _) => (m, 0, 0),
+    }
+}
+
+/// Registry crates present in more than one version of one compatible class.
+fn compatible_duplicates(graph: &ResolvedGraph) -> Vec<(String, String, Vec<Version>)> {
+    type Class = (String, String, (u64, u64, u64));
+    let mut classes: BTreeMap<Class, Vec<Version>> = BTreeMap::new();
+    for p in graph.packages.values() {
+        if let PackageSource::Registry(r) = &p.source {
+            classes
+                .entry((r.clone(), p.name.clone(), compat_class(&p.version)))
+                .or_default()
+                .push(p.version.clone());
+        }
+    }
+    classes
+        .into_iter()
+        .filter(|(_, v)| v.len() > 1)
+        .map(|((r, n, _), mut v)| {
+            v.sort();
+            (r, n, v)
+        })
+        .collect()
+}
+
+/// The registry (as the resolver identifies it) of a lockfile `source`, or
+/// `None` for git and path packages.
+fn registry_of_lock_source(source: &str) -> Option<String> {
+    if source == "registry+https://github.com/rust-lang/crates.io-index" {
+        Some(rune_common::CRATES_IO_INDEX.to_string())
+    } else if source.starts_with("sparse+") || source.starts_with("registry+") {
+        // A registry is identified by its index URL as configuration spells
+        // it: `sparse+…`, or `registry+…` for a git-based index.
+        Some(source.to_string())
+    } else {
+        None
     }
 }
 
@@ -690,22 +1038,41 @@ fn resolve_one_queue_item(
     // `getrandom` 0.2 and 0.3 for different dependents), so pick the highest
     // pinned version *that matches this requirement* rather than the first
     // entry with the right name.
+    // Releases an earlier round backtracked away from.
+    let excluded_versions: HashSet<Version> = resolver
+        .exclude
+        .iter()
+        .filter(|(r, n, _)| *r == registry && *n == name)
+        .map(|(_, _, v)| v.clone())
+        .collect();
+    let excluded = |v: &Version| excluded_versions.contains(v);
     let mut chosen_record = None;
-    if let Some(lock) = existing_lock {
+    // A version an earlier round settled on for this compatible range.
+    let preferred = resolver
+        .prefer
+        .get(&(registry.clone(), name.clone()))
+        .and_then(|list| list.iter().filter(|v| req.matches(v) && !excluded(v)).max())
+        .cloned();
+    if let Some(ver) = preferred
+        && let Ok(index) = resolver.get_or_fetch_index(&registry, &name)
+        && let Some(rec) = index.get_version(&ver.to_string())
+    {
+        chosen_record = Some(rec.clone());
+    }
+    if let (Some(lock), None) = (existing_lock, &chosen_record) {
         let wanted_source = PackageSource::Registry(registry.clone()).lock_source();
         let pinned = lock
             .packages
             .iter()
             .filter(|p| p.name == name && p.source == wanted_source)
             .filter_map(|p| Version::parse(&p.version).ok())
-            .filter(|v| req.matches(v))
+            .filter(|v| req.matches(v) && !excluded(v))
             .max();
-        if let Some(ver) = pinned {
-            if let Ok(index) = resolver.get_or_fetch_index(&registry, &name) {
-                if let Some(rec) = index.get_version(&ver.to_string()) {
-                    chosen_record = Some(rec.clone());
-                }
-            }
+        if let Some(ver) = pinned
+            && let Ok(index) = resolver.get_or_fetch_index(&registry, &name)
+            && let Some(rec) = index.get_version(&ver.to_string())
+        {
+            chosen_record = Some(rec.clone());
         }
     }
 
@@ -718,7 +1085,7 @@ fn resolve_one_queue_item(
             .into_iter()
             .filter(|rec| {
                 if let Ok(ver) = Version::parse(&rec.vers) {
-                    req.matches(&ver)
+                    req.matches(&ver) && !excluded(&ver)
                 } else {
                     false
                 }
@@ -869,7 +1236,9 @@ fn normalize_registry(url: &str) -> String {
     } else if url.starts_with("sparse+") || url.starts_with("registry+") {
         url.to_string()
     } else {
-        format!("sparse+{}", url.trim_end_matches('/').to_string() + "/")
+        // In an index, a plain URL names a git-based index (sparse ones
+        // carry their `sparse+`).
+        format!("registry+{}", url.trim_end_matches('/'))
     }
 }
 
