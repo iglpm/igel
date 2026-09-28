@@ -318,6 +318,10 @@ Rune targets Cargo compatibility, so these are the things it does **not** do (ye
   A build script that reads the outside world without declaring it (no
   `rerun-if-*`) is treated like Cargo treats it, which cannot be detected
   without tracing or sandboxing — planned.
+- **Packages are identified by name and version.** A workspace crate whose
+  dev-dependencies use its *published release of exactly the same version*
+  gets the local crate there too; Cargo keeps the two apart. (With any other
+  version they are kept apart, as in Cargo.)
 - **The resolver is not a full SAT/PubGrub solver.** It picks the newest
   version that fits, then settles each semver-compatible range on one version,
   backtracking one requirer at a time. A conflict that needs several crates
