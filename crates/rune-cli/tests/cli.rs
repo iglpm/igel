@@ -4106,3 +4106,181 @@ fn doctor_warns_when_rune_toml_shadows_a_cargo_toml() {
     p.write("Rune.toml", "[build]\njobs = 2\n");
     assert!(!p.ok(&["doctor"]).contains("both `Rune.toml`"));
 }
+
+// ---------------------------------------------------------------------------
+// Build scripts as their own step
+// ---------------------------------------------------------------------------
+
+/// A build script that appends `<name> <event> <nanoseconds>` to the file
+/// named by `RUNE_T_STAMPS`, optionally sleeping in between.
+fn stamping_script(name: &str, sleep_ms: u64, extra: &str) -> String {
+    format!(
+        r#"use std::io::Write;
+fn stamp(event: &str) {{
+    let path = std::env::var("RUNE_T_STAMPS").unwrap();
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+    let mut f = std::fs::OpenOptions::new().create(true).append(true).open(path).unwrap();
+    writeln!(f, "{name} {{event}} {{now}}").unwrap();
+}}
+fn main() {{
+    stamp("start");
+    std::thread::sleep(std::time::Duration::from_millis({sleep_ms}));
+    stamp("end");
+    println!("cargo::rerun-if-changed=build.rs");
+    {extra}
+}}
+"#
+    )
+}
+
+fn stamps(path: &Path) -> std::collections::HashMap<String, u128> {
+    std::fs::read_to_string(path)
+        .unwrap()
+        .lines()
+        .map(|l| {
+            let mut it = l.split_whitespace();
+            let (who, what, at) = (it.next().unwrap(), it.next().unwrap(), it.next().unwrap());
+            (format!("{who} {what}"), at.parse().unwrap())
+        })
+        .collect()
+}
+
+#[test]
+fn a_build_script_runs_while_its_packages_dependencies_are_still_compiling() {
+    // `app`'s script needs nothing from `slow` (an ordinary dependency), so it
+    // must not wait for `slow` — whose own script takes 1.5 s — to finish.
+    let p = Project::new();
+    p.write(
+        "Cargo.toml",
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\
+         [dependencies]\nslow = { path = \"slow\" }\n",
+    );
+    p.write("build.rs", &stamping_script("app", 0, ""));
+    p.write("src/lib.rs", "pub fn v() -> u32 { slow::v() + 1 }\n");
+    p.write(
+        "slow/Cargo.toml",
+        "[package]\nname = \"slow\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    p.write("slow/build.rs", &stamping_script("slow", 1500, ""));
+    p.write("slow/src/lib.rs", "pub fn v() -> u32 { 1 }\n");
+    let log = p.home().join("stamps.txt");
+    let out = Command::new(env!("CARGO_BIN_EXE_rune"))
+        .args(["build", "-j", "4"])
+        .current_dir(p.path())
+        .env("RUNE_HOME", p.home())
+        .env("RUNE_T_STAMPS", &log)
+        .env("NO_COLOR", "1")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", text(&out));
+    let s = stamps(&log);
+    assert!(
+        s["app start"] < s["slow end"],
+        "app's build script waited for its dependency: {s:?}"
+    );
+}
+
+#[test]
+fn check_only_type_checks_the_ordinary_dependencies_of_a_crate_with_a_build_script() {
+    let p = Project::new();
+    p.write(
+        "Cargo.toml",
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\
+         [dependencies]\nplain = { path = \"plain\" }\n\
+         [build-dependencies]\nhelper = { path = \"helper\" }\n",
+    );
+    p.write(
+        "build.rs",
+        "fn main() { assert_eq!(helper::h(), 7); println!(\"cargo::rerun-if-changed=build.rs\"); }\n",
+    );
+    p.write("src/lib.rs", "pub fn v() -> u32 { plain::v() }\n");
+    for (name, body) in [
+        ("plain", "pub fn v() -> u32 { 1 }\n"),
+        ("helper", "pub fn h() -> u32 { 7 }\n"),
+    ] {
+        p.write(
+            &format!("{name}/Cargo.toml"),
+            &format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"),
+        );
+        p.write(&format!("{name}/src/lib.rs"), body);
+    }
+    p.ok(&["check"]);
+    let deps: Vec<String> = std::fs::read_dir(p.path().join(".rune/target/debug/deps"))
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    let has = |prefix: &str, ext: &str| {
+        deps.iter()
+            .any(|f| f.starts_with(prefix) && f.ends_with(ext))
+    };
+    assert!(has("libplain-", ".rmeta"), "{deps:?}");
+    assert!(
+        !has("libplain-", ".rlib"),
+        "an ordinary dependency was compiled to machine code by `check`: {deps:?}"
+    );
+    // The build script links `helper`, so that one is really built.
+    assert!(has("libhelper-", ".rlib"), "{deps:?}");
+}
+
+#[test]
+fn a_dependency_that_learns_an_outside_input_late_still_rekeys_its_dependents() {
+    // `base`'s script is slow and declares an environment variable; `app`'s
+    // script has long finished by then. `app` must still be stored under a
+    // key that includes `base`'s input: an identical second build is fully
+    // cached, and changing the variable rebuilds both.
+    let p = Project::new();
+    p.write(
+        "Cargo.toml",
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\
+         [dependencies]\nbase = { path = \"base\" }\n",
+    );
+    p.write("build.rs", &stamping_script("app", 0, ""));
+    p.write(
+        "src/main.rs",
+        "fn main() { println!(\"mode={}\", base::mode()); }\n",
+    );
+    p.write(
+        "base/Cargo.toml",
+        "[package]\nname = \"base\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    p.write(
+        "base/build.rs",
+        &stamping_script(
+            "base",
+            800,
+            r#"println!("cargo::rerun-if-env-changed=RUNE_T_MODE");
+    println!("cargo::rustc-env=MODE={}", std::env::var("RUNE_T_MODE").unwrap_or_default());"#,
+        ),
+    );
+    p.write(
+        "base/src/lib.rs",
+        "pub fn mode() -> &'static str { env!(\"MODE\") }\n",
+    );
+    let log = p.home().join("stamps.txt");
+    let run = |mode: &str, args: &[&str]| {
+        let out = Command::new(env!("CARGO_BIN_EXE_rune"))
+            .args(args)
+            .current_dir(p.path())
+            .env("RUNE_HOME", p.home())
+            .env("RUNE_T_STAMPS", &log)
+            .env("RUNE_T_MODE", mode)
+            .env("NO_COLOR", "1")
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{}", text(&out));
+        text(&out)
+    };
+    run("one", &["build", "-j", "4"]);
+    let s = stamps(&log);
+    assert!(
+        s["app end"] < s["base end"],
+        "the race did not happen: {s:?}"
+    );
+    let again = run("one", &["build", "-j", "4"]);
+    assert!(again.contains("0 compiled"), "{again}");
+    assert!(run("two", &["run", "-j", "4"]).contains("mode=two"));
+    let back = run("one", &["run", "-j", "4"]);
+    assert!(back.contains("mode=one"), "{back}");
+    assert!(back.contains("0 compiled"), "{back}");
+}

@@ -50,7 +50,9 @@ impl BuildProgress {
                     unit.crate_id.name, unit.crate_id.version
                 ));
                 pb.enable_steady_tick(std::time::Duration::from_millis(100));
-                self.active_bars.insert(*node_id, pb);
+                if let Some(old) = self.active_bars.insert(*node_id, pb) {
+                    old.finish_and_clear();
+                }
             }
             PipelineEvent::BuildScriptStarted {
                 node_id,
@@ -60,7 +62,9 @@ impl BuildProgress {
                 pb.set_style(spinner_style);
                 pb.set_message(format!("running build script · {}", crate_name));
                 pb.enable_steady_tick(std::time::Duration::from_millis(100));
-                self.active_bars.insert(*node_id, pb);
+                if let Some(old) = self.active_bars.insert(*node_id, pb) {
+                    old.finish_and_clear();
+                }
             }
             PipelineEvent::BuildScriptFinished { node_id, .. } => {
                 if let Some(pb) = self.active_bars.remove(node_id) {

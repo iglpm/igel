@@ -67,6 +67,43 @@ enum WorkerMsg {
         node_id: NodeId,
         error: String,
     },
+    /// A unit's build script ran (or its result was restored); the unit's
+    /// compilation is scheduled separately, holding on to the unit's lock.
+    ScriptPhaseDone {
+        node_id: NodeId,
+        duration: Duration,
+        lock: Option<rune_common::fsutil::FileLock>,
+        lock_waited: bool,
+    },
+    /// A waiter thread obtained the lock of a unit another process held.
+    LockAcquired {
+        node_id: NodeId,
+        lock: rune_common::fsutil::FileLock,
+    },
+}
+
+/// The name a unit has in `--timings` traces.
+fn span_name(unit: &CompilationUnit) -> String {
+    format!(
+        "{} {} ({})",
+        unit.crate_id.name,
+        unit.crate_id.version,
+        unit.kind.as_str()
+    )
+}
+
+/// The advisory lock file that makes concurrent `rune` processes take turns
+/// on one unit's outputs.
+fn unit_lock_path(
+    config: &RuneConfig,
+    profile: &Profile,
+    graph: &BuildGraph,
+    id: NodeId,
+) -> PathBuf {
+    config
+        .profile_target_dir(profile.output_dir_name())
+        .join(".rune-locks")
+        .join(script_key(&graph.node(id).unit))
 }
 
 /// Which artifact flavor a compilation needs from its dependencies.
@@ -339,9 +376,9 @@ impl BuildExecutor {
                     }
                 },
                 |dep, dependent, dep_cost| {
-                    let pipelined = !dependent.unit.needs_real_link()
+                    let pipelined = !dependent.unit.produces_real_artifact()
                         && dep.unit.crate_type != CrateType::ProcMacro
-                        && !dep.unit.needs_real_link();
+                        && !dep.unit.produces_real_artifact();
                     if pipelined {
                         dep_cost * METADATA_FRACTION
                     } else {
@@ -378,6 +415,51 @@ impl BuildExecutor {
             map
         };
 
+        // A package's build script is its own step, as in Cargo: it needs its
+        // build-dependencies fully built (it links them) and the scripts of
+        // the `links` crates it depends on (their `DEP_*` metadata), but not
+        // the package's ordinary dependencies. So it compiles and runs while
+        // those are still compiling, and the library itself then starts as
+        // soon as their `.rmeta` exists. (Running the script first and only
+        // then the library, both after *every* dependency was fully linked,
+        // put each such crate's whole script on the critical path.)
+        let own_script = |id: NodeId| {
+            let u = &graph.node(id).unit;
+            u.build_script.is_some() && u.ext.script_owner.is_none()
+        };
+        let script_prereqs: HashMap<NodeId, (Vec<NodeId>, Vec<NodeId>)> = topo
+            .iter()
+            .copied()
+            .filter(|&id| own_script(id))
+            .map(|id| {
+                let node = graph.node(id);
+                let mut built: HashSet<NodeId> = HashSet::new();
+                for bd in &node.build_dependencies {
+                    built.insert(*bd);
+                    built.extend(transitive_deps[bd].iter().copied());
+                }
+                let links: Vec<NodeId> = node
+                    .dependencies
+                    .iter()
+                    .copied()
+                    .filter(|d| graph.node(*d).unit.links.is_some())
+                    .collect();
+                (id, (built.into_iter().collect(), links))
+            })
+            .collect();
+        let mut script_done: HashSet<NodeId> = HashSet::new();
+        // Units whose script step is running (their key may still change as
+        // their dependencies learn about outside inputs).
+        let mut in_script_phase: HashSet<NodeId> = HashSet::new();
+        // A unit's lock is held from its script step through its compilation,
+        // so another process never re-runs the script (and rewrites `OUT_DIR`)
+        // under a compiler reading it. `bool`: whether we had to wait for it.
+        let mut held_locks: HashMap<NodeId, (rune_common::fsutil::FileLock, bool)> = HashMap::new();
+        // Units another process holds the lock of; a waiter thread (not a job
+        // slot) blocks on it and hands it over.
+        let mut lock_waiting: HashSet<NodeId> = HashSet::new();
+        let mut job_threads: Vec<std::thread::JoinHandle<()>> = Vec::new();
+
         // Nodes still to schedule, in stable graph order.
         let mut unscheduled: Vec<NodeId> = graph
             .nodes()
@@ -392,12 +474,22 @@ impl BuildExecutor {
             }
 
             if failed.is_empty() && in_flight.len() < self.max_jobs {
-                let mut ready: Vec<NodeId> = unscheduled
+                let mut ready: Vec<(NodeId, bool)> = unscheduled
                     .iter()
                     .copied()
-                    .filter(|&id| {
+                    .filter(|id| !in_flight.contains(id) && !lock_waiting.contains(id))
+                    .filter_map(|id| {
                         let node = graph.node(id);
-                        if node.unit.needs_real_link() {
+                        if let Some((built, links)) = script_prereqs.get(&id)
+                            && !script_done.contains(&id)
+                        {
+                            let ready = built.iter().all(|d| completed.contains(d))
+                                && links.iter().all(|d| {
+                                    completed.contains(d) || build_script_outputs.contains_key(d)
+                                });
+                            return ready.then_some((id, true));
+                        }
+                        let ready = if node.unit.produces_real_artifact() {
                             transitive_deps[&id].iter().all(|d| completed.contains(d))
                         } else {
                             node.dependencies.iter().all(|dep_id| {
@@ -407,25 +499,55 @@ impl BuildExecutor {
                                     completed.contains(dep_id) || metadata_ready.contains(dep_id)
                                 }
                             })
-                        }
+                        };
+                        ready.then_some((id, false))
                     })
                     .collect();
 
                 // Longest remaining chain first.
-                ready.sort_by(|a, b| {
+                ready.sort_by(|(a, _), (b, _)| {
                     let wa = weights.get(a).copied().unwrap_or(0.0);
                     let wb = weights.get(b).copied().unwrap_or(0.0);
                     wb.partial_cmp(&wa).unwrap_or(std::cmp::Ordering::Equal)
                 });
 
-                for node_id in ready {
+                for (node_id, script_only) in ready {
                     if in_flight.len() >= self.max_jobs {
                         break;
                     }
-                    unscheduled.retain(|id| *id != node_id);
+                    // Another `rune` process may be building this very unit into
+                    // the same target directory (an editor's background check
+                    // next to a terminal build). Whoever holds the unit's lock
+                    // owns its output files; everyone else waits — without
+                    // tying up a job slot — and then usually finds the finished
+                    // result in the store instead of compiling it again.
+                    let (lock, lock_waited) = match held_locks.remove(&node_id) {
+                        Some(held) => held,
+                        None => {
+                            let path = unit_lock_path(&self.config, &self.profile, graph, node_id);
+                            match rune_common::fsutil::FileLock::try_exclusive(&path) {
+                                rune_common::fsutil::TryLock::Locked(lock) => (lock, false),
+                                rune_common::fsutil::TryLock::Busy => {
+                                    lock_waiting.insert(node_id);
+                                    let tx = worker_tx.clone();
+                                    std::thread::spawn(move || {
+                                        let (lock, _) =
+                                            rune_common::fsutil::FileLock::exclusive(&path);
+                                        let _ = tx.send(WorkerMsg::LockAcquired { node_id, lock });
+                                    });
+                                    continue;
+                                }
+                            }
+                        }
+                    };
+                    if !script_only {
+                        unscheduled.retain(|id| *id != node_id);
+                    } else {
+                        in_script_phase.insert(node_id);
+                    }
                     in_flight.insert(node_id);
                     started.insert(node_id, start_time.elapsed().as_secs_f64());
-                    let job = self.prepare_job(
+                    let mut job = self.prepare_job(
                         graph,
                         node_id,
                         &unit_base_keys[&node_id],
@@ -435,11 +557,14 @@ impl BuildExecutor {
                         &build_script_outputs,
                         worker_tx.clone(),
                     );
-                    std::thread::spawn(move || job.run());
+                    job.script_only = script_only;
+                    job.lock = Some(lock);
+                    job.lock_waited = lock_waited;
+                    job_threads.push(std::thread::spawn(move || job.run()));
                 }
             }
 
-            if in_flight.is_empty() {
+            if in_flight.is_empty() && lock_waiting.is_empty() {
                 if completed.len() + failed.len() < total_nodes {
                     error!(
                         "Build stalled: no tasks in flight and remaining tasks cannot be scheduled."
@@ -468,11 +593,47 @@ impl BuildExecutor {
                         });
                         build_script_outputs.insert(node_id, output);
                     }
+                    WorkerMsg::LockAcquired { node_id, lock } => {
+                        lock_waiting.remove(&node_id);
+                        held_locks.insert(node_id, (lock, true));
+                    }
+                    WorkerMsg::ScriptPhaseDone {
+                        node_id,
+                        duration,
+                        lock,
+                        lock_waited,
+                    } => {
+                        in_flight.remove(&node_id);
+                        in_script_phase.remove(&node_id);
+                        script_done.insert(node_id);
+                        if let Some(lock) = lock {
+                            held_locks.insert(node_id, (lock, lock_waited));
+                        }
+                        let unit = &graph.node(node_id).unit;
+                        timings.record_script(unit, &self.profile, duration);
+                        spans.push(TraceSpan {
+                            name: format!(
+                                "{} {} (build script)",
+                                unit.crate_id.name, unit.crate_id.version
+                            ),
+                            kind: "build-script",
+                            start: started.get(&node_id).copied().unwrap_or(0.0),
+                            dur: duration.as_secs_f64(),
+                            after: graph
+                                .node(node_id)
+                                .build_dependencies
+                                .iter()
+                                .map(|d| span_name(&graph.node(*d).unit))
+                                .collect(),
+                        });
+                    }
                     WorkerMsg::KeyUpdate { node_id, key } => {
                         // The unit's key changed; so do those of everything
-                        // above it that has not started yet (nothing above
-                        // it can have, apart from pipelined dependents, which
-                        // wait for the metadata that follows this message).
+                        // above it whose compilation has not started yet
+                        // (nothing above it can have, apart from pipelined
+                        // dependents, which wait for the metadata that follows
+                        // this message — and units running only their build
+                        // script, which are keyed again here too).
                         unit_cas_keys.insert(node_id, key);
                         // Only what transitively depends on this unit can have
                         // changed: one pass in dependency order, recomputing a
@@ -481,7 +642,7 @@ impl BuildExecutor {
                         for &id in &topo {
                             if id == node_id
                                 || completed.contains(&id)
-                                || in_flight.contains(&id)
+                                || (in_flight.contains(&id) && !in_script_phase.contains(&id))
                                 || !graph
                                     .node(id)
                                     .dependencies
@@ -513,6 +674,9 @@ impl BuildExecutor {
                     } => {
                         debug!("Finished compiling node {:?}", node_id);
                         in_flight.remove(&node_id);
+                        in_script_phase.remove(&node_id);
+                        unscheduled.retain(|id| *id != node_id);
+                        held_locks.remove(&node_id);
                         completed.insert(node_id);
                         metadata_ready.insert(node_id);
                         artifact_paths.insert(node_id, artifacts);
@@ -521,16 +685,9 @@ impl BuildExecutor {
                             timings.record(unit, &self.profile, duration);
                         }
                         spans.push(TraceSpan {
-                            name: format!(
-                                "{} {} ({})",
-                                unit.crate_id.name,
-                                unit.crate_id.version,
-                                unit.kind.as_str()
-                            ),
+                            name: span_name(unit),
                             kind: if unit.crate_type == CrateType::ProcMacro {
                                 "proc-macro"
-                            } else if unit.build_script.is_some() {
-                                "build-script"
                             } else {
                                 unit.kind.as_str()
                             },
@@ -540,15 +697,7 @@ impl BuildExecutor {
                                 .node(node_id)
                                 .dependencies
                                 .iter()
-                                .map(|d| {
-                                    let u = &graph.node(*d).unit;
-                                    format!(
-                                        "{} {} ({})",
-                                        u.crate_id.name,
-                                        u.crate_id.version,
-                                        u.kind.as_str()
-                                    )
-                                })
+                                .map(|d| span_name(&graph.node(*d).unit))
                                 .collect(),
                         });
                         if restored {
@@ -563,10 +712,18 @@ impl BuildExecutor {
                         // themselves, so this is just a trace breadcrumb.
                         debug!("Failed to compile node {:?}: {}", node_id, error);
                         in_flight.remove(&node_id);
+                        in_script_phase.remove(&node_id);
+                        held_locks.remove(&node_id);
                         failed.push(node_id);
                     }
                 }
             }
+        }
+        // Units report `Finished` before they are stored (so their dependents
+        // start sooner); the build is over once every store has landed.
+        drop(held_locks);
+        for t in job_threads {
+            let _ = t.join();
         }
 
         let failed_set: HashSet<NodeId> = failed.iter().copied().collect();
@@ -946,6 +1103,9 @@ impl BuildExecutor {
             extra_env,
             color: self.color,
             jobserver: self.jobserver.clone(),
+            script_only: false,
+            lock: None,
+            lock_waited: false,
         }
     }
 }
@@ -980,6 +1140,13 @@ struct UnitJob {
     extra_env: Vec<(String, String)>,
     color: bool,
     jobserver: Option<jobserver::Client>,
+    /// Only run (or restore) the unit's build script; its compilation is a
+    /// separate job, started once its dependencies' metadata exists.
+    script_only: bool,
+    /// The unit's lock, taken by the scheduler (see `execute`).
+    lock: Option<rune_common::fsutil::FileLock>,
+    /// Another process held the lock first: it may have built the unit.
+    lock_waited: bool,
 }
 
 impl UnitJob {
@@ -1077,31 +1244,30 @@ impl UnitJob {
         true
     }
 
-    fn run(self) {
+    fn run(mut self) {
         // Hold one jobserver token for as long as this unit runs; the compiler
         // may borrow more for its own codegen threads while others are idle.
-        let _token = self.jobserver.as_ref().and_then(|js| js.acquire().ok());
+        let token = self.jobserver.as_ref().and_then(|js| js.acquire().ok());
         let start = Instant::now();
+        // Held until the unit is stored (or, for a script step, handed back to
+        // the scheduler for the compilation that follows).
+        let mut unit_lock = self.lock.take();
         let node_id = self.node_id;
         let unit = &self.unit;
         let profile = &self.profile;
         let config = &self.config;
-        let _ = self.event_tx.send(PipelineEvent::BuildStarted {
-            node_id,
-            unit: unit.clone(),
-        });
+        if !self.script_only {
+            let _ = self.event_tx.send(PipelineEvent::BuildStarted {
+                node_id,
+                unit: unit.clone(),
+            });
+        }
 
-        // Another `rune` process may be building this very unit into the same
-        // target directory (an editor's background check next to a terminal
-        // build). Whoever holds the unit's lock owns its output files; everyone
-        // else waits — and then usually finds the finished result in the store
-        // instead of compiling it again.
-        let lock_path = config
-            .profile_target_dir(profile.output_dir_name())
-            .join(".rune-locks")
-            .join(script_key(unit));
-        let (_unit_lock, acquired) = rune_common::fsutil::FileLock::exclusive(&lock_path);
-        if acquired == rune_common::fsutil::Acquired::AfterWaiting
+        // The process we waited for may have built this unit. (Not checked by
+        // a script step: its dependencies may not have their final keys yet,
+        // so neither has the unit.)
+        if self.lock_waited
+            && !self.script_only
             && !self.force_rebuild
             && self.restore_finished_elsewhere(start)
         {
@@ -1135,11 +1301,17 @@ impl UnitJob {
         let mut store_key = self.cas_key.clone();
         let mut script_ran: Option<BuildScriptOutput> = None;
         let has_script = unit.build_script.is_some();
+        // A script step does not announce keys: its dependencies may still
+        // change theirs, and the compilation that follows keys the unit again
+        // (with the same script output) once they are settled.
+        let script_only = self.script_only;
         let bump = |declared: &DeclaredInputs, store_key: &mut String| {
             let key = effective_key(&self.base_key, Some(declared), has_script);
             if key != *store_key {
                 *store_key = key.clone();
-                let _ = self.worker_tx.send(WorkerMsg::KeyUpdate { node_id, key });
+                if !script_only {
+                    let _ = self.worker_tx.send(WorkerMsg::KeyUpdate { node_id, key });
+                }
             }
         };
         if effective_build_output.is_none()
@@ -1341,6 +1513,15 @@ impl UnitJob {
                 output: output.clone(),
             });
         }
+        if self.script_only {
+            let _ = self.worker_tx.send(WorkerMsg::ScriptPhaseDone {
+                node_id,
+                duration: start.elapsed(),
+                lock: unit_lock.take(),
+                lock_waited: self.lock_waited,
+            });
+            return;
+        }
 
         // 2. Build the rustc command. Any leftover output from an earlier
         // build is unlinked first: outputs are hard links into the CAS, and a
@@ -1453,9 +1634,29 @@ impl UnitJob {
                 };
                 let artifacts: Vec<PathBuf> =
                     comp_res.artifacts.into_iter().map(|a| a.artifact).collect();
+                uplift_artifacts(config, profile, unit, &artifacts);
+
+                // Dependents can start now; storing the result is not their
+                // concern (the files they use are the ones just written).
+                let _ = self.event_tx.send(PipelineEvent::BuildFinished {
+                    node_id,
+                    artifacts: artifacts.clone(),
+                    duration,
+                    warnings: warnings.clone(),
+                    diagnostics: diagnostics.clone(),
+                });
+                let _ = self.worker_tx.send(WorkerMsg::Finished {
+                    node_id,
+                    artifacts: artifacts.clone(),
+                    duration,
+                    restored: false,
+                });
+                // Storing is disk work, not compiler work: give the job slot's
+                // token back so another compiler can use the core meanwhile.
+                drop(token);
 
                 if let Some(cas_store) = &self.cas {
-                    let _ = cas_store.put(
+                    let _ = cas_store.put_adopted(
                         &store_key,
                         &unit.crate_id.name,
                         &unit.crate_id.version.to_string(),
@@ -1474,22 +1675,19 @@ impl UnitJob {
                         let _ =
                             cas_store.put_value(&format!("{}-inputs", self.base_key), &declared);
                     }
+                    // The script's result under the key the unit is finally
+                    // stored under, which is what a later cache hit restores
+                    // it by (the script step stored it under the key the unit
+                    // had then, which its dependencies may have changed since).
+                    if let (Some(out), false) = (&effective_build_output, shares_script) {
+                        let key = format!("{store_key}-buildscript");
+                        if !cas_store.contains_tree(&key) {
+                            let _ = cas_store.put_dir_tree(&key, &script_out_dir);
+                            let _ = cas_store.put_value(&key, out);
+                        }
+                    }
                 }
-                uplift_artifacts(config, profile, unit, &artifacts);
-
-                let _ = self.event_tx.send(PipelineEvent::BuildFinished {
-                    node_id,
-                    artifacts: artifacts.clone(),
-                    duration,
-                    warnings,
-                    diagnostics,
-                });
-                let _ = self.worker_tx.send(WorkerMsg::Finished {
-                    node_id,
-                    artifacts,
-                    duration,
-                    restored: false,
-                });
+                drop(unit_lock);
             }
             Ok(comp_res) => {
                 let err_msg = render_compile_error(&comp_res);
@@ -1830,6 +2028,31 @@ impl Timings {
     /// Seconds this unit is expected to take: measured if we have seen it
     /// before, otherwise guessed from the size of its package's sources.
     fn estimate(&self, unit: &CompilationUnit, profile: &Profile) -> f64 {
+        // A unit that runs its own build script also waits for that (measured
+        // separately, since it can overlap the unit's dependencies).
+        let script = if unit.build_script.is_some() && unit.ext.script_owner.is_none() {
+            self.secs
+                .get(&Self::script_key(unit, profile))
+                .copied()
+                .unwrap_or(1.0)
+        } else {
+            0.0
+        };
+        script + self.estimate_compile(unit, profile)
+    }
+
+    fn script_key(unit: &CompilationUnit, profile: &Profile) -> String {
+        format!("{} script", Self::key(unit, profile))
+    }
+
+    fn record_script(&mut self, unit: &CompilationUnit, profile: &Profile, took: Duration) {
+        self.secs
+            .insert(Self::script_key(unit, profile), took.as_secs_f64());
+        self.dirty = true;
+    }
+
+    /// Seconds the unit's own compilation is expected to take.
+    fn estimate_compile(&self, unit: &CompilationUnit, profile: &Profile) -> f64 {
         if let Some(&secs) = self.secs.get(&Self::key(unit, profile)) {
             return secs;
         }
@@ -1843,9 +2066,6 @@ impl Timings {
         // matters to the scheduler, not the absolute value).
         let mb = bytes / (1024.0 * 1024.0);
         let mut secs = 0.3 + 3.0 * mb.powf(0.6);
-        if unit.build_script.is_some() || unit.is_build_script {
-            secs += 1.0; // compile + run the script
-        }
         if unit.harness {
             secs *= 1.2;
         }
@@ -2421,7 +2641,7 @@ impl KeyRecorder {
         self.key.update(bytes);
         self.parts
             .entry(part.to_string())
-            .or_insert_with(rune_common::hash::HashBuilder::new)
+            .or_default()
             .update(bytes);
     }
 }

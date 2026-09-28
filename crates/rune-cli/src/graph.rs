@@ -2395,18 +2395,32 @@ fn check_named_targets(req: &Request, locals: &Locals, _ws: &Workspace) -> Resul
 /// loaded into the compiler process — both need actual linked `.rlib`s (or a
 /// dylib) from their dependencies, not just `.rmeta`.
 ///
-/// This walks the graph once, seeded from every build-script-having or
-/// proc-macro node, and lifts `check_only` back to `false` across each one's
-/// *dependencies* (never the seed itself: a crate that merely *has* a build
-/// script still only needs its own code type-checked).
+/// This walks the graph once, seeded from every proc-macro's dependencies and
+/// every build script's build-dependencies, and lifts `check_only` back to
+/// `false` across them and everything below them (never the seed itself: a
+/// crate that merely *has* a build script still only needs its own code
+/// type-checked, and so do its ordinary dependencies).
 fn exempt_real_link_requirements_from_check(graph: &mut BuildGraph) {
     let mut must_be_real: HashSet<NodeId> = HashSet::new();
-    let mut stack: Vec<NodeId> = graph
-        .nodes()
-        .iter()
-        .filter(|n| n.unit.build_script.is_some() || n.unit.crate_type == CrateType::ProcMacro)
-        .map(|n| n.id)
-        .collect();
+    // What is linked into something that runs: a proc-macro's dependencies,
+    // and a build script's *build*-dependencies (its package's ordinary
+    // dependencies are only type-checked, like any other library's).
+    let mut stack: Vec<NodeId> = Vec::new();
+    for n in graph.nodes() {
+        if n.unit.crate_type == CrateType::ProcMacro {
+            stack.extend(n.dependencies.iter().copied());
+        } else if n.unit.build_script.is_some() {
+            stack.extend(
+                n.dependencies
+                    .iter()
+                    .copied()
+                    .filter(|d| n.build_dependencies.contains(d)),
+            );
+        }
+    }
+    for &id in &stack {
+        must_be_real.insert(id);
+    }
     while let Some(id) = stack.pop() {
         for &dep_id in &graph.node(id).dependencies {
             if must_be_real.insert(dep_id) {

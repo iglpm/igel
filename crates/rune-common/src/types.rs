@@ -773,10 +773,10 @@ impl CompilationUnit {
     /// being faster than `rune build` and being a relabeled copy of it.
     ///
     /// Deliberately independent of whether the crate merely *has* a build
-    /// script (see [`Self::needs_real_link`] for that): a build script is a
-    /// separate compiled-and-executed unit with its own dependency
-    /// requirements, and says nothing about whether *this* crate's own
-    /// `rustc` invocation needs `.rlib`s instead of `.rmeta`s from its deps.
+    /// script: a build script is a separately scheduled step that needs its
+    /// *build*-dependencies linked, and says nothing about whether *this*
+    /// crate's own `rustc` invocation needs `.rlib`s instead of `.rmeta`s
+    /// from its dependencies.
     pub fn produces_real_artifact(&self) -> bool {
         self.crate_type == CrateType::ProcMacro
             || (self.harness && !self.check_only)
@@ -790,18 +790,6 @@ impl CompilationUnit {
                             | CrateType::Staticlib
                     )
                 }))
-    }
-
-    /// Whether scheduling must wait for every transitive dependency to be
-    /// fully, really compiled (not just metadata-ready) before this unit
-    /// can start. Everything [`Self::produces_real_artifact`] needs that
-    /// for, plus any unit with a build script: the script is a real
-    /// executable, compiled and run before this crate compiles, and needs
-    /// its own dependencies genuinely linked first — true in both `rune
-    /// build` and `rune check`, since a build script must actually run
-    /// either way.
-    pub fn needs_real_link(&self) -> bool {
-        self.build_script.is_some() || self.produces_real_artifact()
     }
 }
 
@@ -1053,7 +1041,6 @@ mod unit_tests {
         assert!(!h.produces_real_artifact());
         h.harness = true;
         assert!(h.produces_real_artifact());
-        assert!(h.needs_real_link());
         h.check_only = true;
         assert!(
             !h.produces_real_artifact(),

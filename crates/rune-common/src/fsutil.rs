@@ -72,7 +72,51 @@ pub enum Acquired {
     AfterWaiting,
 }
 
+/// The outcome of [`FileLock::try_exclusive`].
+#[derive(Debug)]
+pub enum TryLock {
+    /// The lock is ours (or locking is unavailable here, and we proceed
+    /// unlocked, as [`FileLock::exclusive`] does).
+    Locked(FileLock),
+    /// Another process holds it.
+    Busy,
+}
+
 impl FileLock {
+    /// Takes an exclusive lock on `path` if nobody holds it, without waiting.
+    /// A scheduler uses this so that a unit another process is building does
+    /// not tie up one of its own job slots while it waits.
+    pub fn try_exclusive(path: &Path) -> TryLock {
+        if let Some(parent) = path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let Ok(file) = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(path)
+        else {
+            return TryLock::Locked(Self { _file: None });
+        };
+        #[cfg(unix)]
+        {
+            use rustix::fs::{FlockOperation, flock};
+            match flock(&file, FlockOperation::NonBlockingLockExclusive) {
+                Ok(()) => TryLock::Locked(Self { _file: Some(file) }),
+                Err(e) if e == rustix::io::Errno::WOULDBLOCK => TryLock::Busy,
+                Err(_) => TryLock::Locked(Self { _file: None }),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            match file.try_lock() {
+                Ok(()) => TryLock::Locked(Self { _file: Some(file) }),
+                Err(std::fs::TryLockError::WouldBlock) => TryLock::Busy,
+                Err(_) => TryLock::Locked(Self { _file: None }),
+            }
+        }
+    }
+
     /// Takes an exclusive lock on `path` (created if needed), blocking until it
     /// is available. Locking is best effort: if the lock file cannot be
     /// created or locked (read-only directory, unsupported file system), the
@@ -184,5 +228,26 @@ mod tests {
         assert!(!waiter.is_finished(), "must block while the lock is held");
         drop(first);
         assert_eq!(waiter.join().unwrap(), Acquired::AfterWaiting);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn trying_a_held_lock_says_busy_without_waiting() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("locks").join("unit");
+        let first = match FileLock::try_exclusive(&path) {
+            TryLock::Locked(l) => l,
+            TryLock::Busy => panic!("nobody holds it yet"),
+        };
+        let other = std::thread::spawn({
+            let path = path.clone();
+            move || matches!(FileLock::try_exclusive(&path), TryLock::Busy)
+        });
+        assert!(
+            other.join().unwrap(),
+            "a second taker must be told it is busy"
+        );
+        drop(first);
+        assert!(matches!(FileLock::try_exclusive(&path), TryLock::Locked(_)));
     }
 }
