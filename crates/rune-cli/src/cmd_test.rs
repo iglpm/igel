@@ -561,7 +561,7 @@ pub fn run(args: TestArgs, mode: Mode) -> Result<()> {
         let doc_slots: Vec<bool> = plan
             .doc_tests
             .iter()
-            .map(|d| want_doctests && !args.no_run && has_doctests(&sess.ws.members[d.member].dir))
+            .map(|d| want_doctests && !args.no_run && has_doctests(&d.lib_source))
             .collect();
         // Doctests with nothing to run are settled immediately.
         for (i, wanted) in doc_slots.iter().enumerate() {
@@ -990,7 +990,21 @@ fn print_result(label: &str, r: &TestResult, verbose: bool) {
 /// a fenced code block inside a doc comment, or a doc attribute that pulls in
 /// a file (`#![doc = include_str!("../README.md")]`). Most crates have none,
 /// and starting `rustdoc` just to learn that costs tens of milliseconds each.
-fn has_doctests(dir: &std::path::Path) -> bool {
+/// Whether a source file may contain documentation tests. Only a filter
+/// that spares rustdoc runs with nothing to do, so it errs toward yes: a
+/// missed test is worse than a needless rustdoc.
+fn may_hold_doctests(text: &str) -> bool {
+    // Docs in attributes can span lines (`#![cfg_attr(feature = "std", doc =
+    // r#"...```rust ...```"#)]`, `#![doc = include_str!("../README.md")]`).
+    let doc_attribute = text.contains("doc =") || text.contains("doc=");
+    text.lines().any(|line| {
+        let t = line.trim_start();
+        ((t.starts_with("///") || t.starts_with("//!") || t.starts_with('*')) && t.contains("```"))
+            || (doc_attribute && (t.contains("```") || t.contains("include_str!")))
+    })
+}
+
+fn has_doctests(lib_source: &std::path::Path) -> bool {
     fn scan(dir: &std::path::Path) -> bool {
         let Ok(entries) = std::fs::read_dir(dir) else {
             return false;
@@ -998,25 +1012,30 @@ fn has_doctests(dir: &std::path::Path) -> bool {
         for entry in entries.flatten() {
             let path = entry.path();
             if path.is_dir() {
+                // Where the library's root is the package directory itself
+                // (`[lib] path = "lib.rs"`), skip what is not its source.
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if name.starts_with('.')
+                    || matches!(name.as_ref(), "target" | "tests" | "examples" | "benches")
+                {
+                    continue;
+                }
                 if scan(&path) {
                     return true;
                 }
             } else if path.extension().and_then(|e| e.to_str()) == Some("rs")
                 && let Ok(text) = std::fs::read_to_string(&path)
-                && text.lines().any(|line| {
-                    let t = line.trim_start();
-                    ((t.starts_with("///") || t.starts_with("//!") || t.starts_with('*'))
-                        && t.contains("```"))
-                        || ((t.starts_with("#[doc") || t.starts_with("#![doc"))
-                            && (t.contains("include_str!") || t.contains("```")))
-                })
+                && may_hold_doctests(&text)
             {
                 return true;
             }
         }
         false
     }
-    scan(&dir.join("src"))
+    // The directory of the library's root file: `src/` usually, the package
+    // directory for crates like `fnv` whose `lib.rs` sits at the top.
+    lib_source.parent().is_some_and(scan)
 }
 
 /// What a library's build scripts give its doc tests, as they give the
@@ -1100,9 +1119,16 @@ fn run_doctest(
 
     let mut cmd = Command::new(&rustdoc);
     cmd.args(sess.rustdoc_flags());
+    // Relative to the package, as Cargo passes it: doc tests are then named
+    // `src/lib.rs - Ident (line 937)`, what `--retries`, filters and CI
+    // reports expect.
     cmd.current_dir(&member.dir)
         .arg("--test")
-        .arg(&doc.lib_source)
+        .arg(
+            doc.lib_source
+                .strip_prefix(&member.dir)
+                .unwrap_or(&doc.lib_source),
+        )
         .arg("--crate-name")
         .arg(&doc.crate_name)
         .arg("--edition")
@@ -1200,14 +1226,14 @@ mod tests {
         let src = dir.path().join("src");
         std::fs::create_dir_all(&src).unwrap();
         std::fs::write(src.join("lib.rs"), "/// plain docs\npub fn f() {}\n").unwrap();
-        assert!(!has_doctests(dir.path()));
+        assert!(!has_doctests(&src.join("lib.rs")));
 
         std::fs::write(
             src.join("lib.rs"),
             "/// ```\n/// assert!(true);\n/// ```\npub fn f() {}\n",
         )
         .unwrap();
-        assert!(has_doctests(dir.path()));
+        assert!(has_doctests(&src.join("lib.rs")));
 
         std::fs::write(
             src.join("lib.rs"),
@@ -1215,14 +1241,31 @@ mod tests {
         )
         .unwrap();
         assert!(
-            has_doctests(dir.path()),
+            has_doctests(&src.join("lib.rs")),
             "README-driven docs may contain tests"
         );
 
         std::fs::create_dir_all(src.join("nested")).unwrap();
         std::fs::write(src.join("lib.rs"), "mod nested;\n").unwrap();
         std::fs::write(src.join("nested/mod.rs"), "//! ```\n//! ```\n").unwrap();
-        assert!(has_doctests(dir.path()), "nested modules are scanned");
+        assert!(
+            has_doctests(&src.join("lib.rs")),
+            "nested modules are scanned"
+        );
+
+        // Docs in a `cfg_attr`, over several lines (`fnv`).
+        std::fs::write(
+            src.join("lib.rs"),
+            "#![cfg_attr(feature = \"std\", doc = r#\"\n```rust\nassert!(true);\n```\n\"#)]\n",
+        )
+        .unwrap();
+        assert!(has_doctests(&src.join("lib.rs")));
+
+        // A library whose root is at the top of the package, as in `fnv`.
+        let top = tempfile::tempdir().unwrap();
+        std::fs::write(top.path().join("lib.rs"), "//! ```\n//! ```\n").unwrap();
+        std::fs::create_dir_all(top.path().join("target")).unwrap();
+        assert!(has_doctests(&top.path().join("lib.rs")));
     }
 
     #[test]

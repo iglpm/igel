@@ -5547,3 +5547,30 @@ fn a_links_package_with_integration_tests_is_not_its_own_conflict() {
     let out = p.ok(&["test"]);
     assert!(out.contains("(test aead_tests) · 1 passed"), "{out}");
 }
+
+#[cfg(unix)]
+#[test]
+fn a_workspace_crate_does_not_stand_in_for_its_published_release() {
+    // `helper` (a dev-dependency) depends on the published `core_lib 1.0.0`;
+    // the workspace develops `core_lib 1.1.0`. As with Cargo, `helper` gets
+    // the published release, not the local one.
+    let reg = local_registry(&[
+        ("core_lib", "1.0.0", &[]),
+        ("helper", "1.0.0", &[("core_lib", "^1.0")]),
+    ]);
+    let p = app_with(&reg, "");
+    p.write(
+        "Cargo.toml",
+        "[package]\nname = \"core_lib\"\nversion = \"1.1.0\"\nedition = \"2021\"\n\n\
+         [dev-dependencies]\nhelper = \"1\"\n",
+    );
+    p.write("src/lib.rs", "pub fn local() {}\n");
+    p.ok(&["generate-lockfile"]);
+    assert_eq!(
+        locked(&p),
+        ["core_lib 1.0.0", "core_lib 1.1.0", "helper 1.0.0"]
+    );
+    let lock = p.read("Cargo.lock");
+    assert!(lock.contains("\"core_lib 1.0.0\""), "{lock}");
+    p.ok(&["test"]);
+}

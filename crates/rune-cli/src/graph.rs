@@ -768,14 +768,28 @@ pub fn sync_cargo_lock(ws: &Workspace, lock: &Lockfile, locked: bool) -> Result<
         );
     }
     let mut out = lock.clone();
-    // An existing file keeps its format version; a new one gets the newest
-    // format the active toolchain reads (4 since Rust 1.83), like Cargo.
+    // An existing file keeps its format version. A new one gets the newest
+    // format the active toolchain reads (4 since Rust 1.83) — unless the
+    // workspace promises to build with an older Rust (`rust-version`), whose
+    // Cargo must be able to read it: then 3, as Cargo does. (Cargo would go
+    // down to 2 for a `rust-version` before 1.53; Rune writes 3 at least.)
     let newest = if toolchain::global().satisfies_msrv("1.83") {
         4
     } else {
         3
     };
-    out.version = existing.as_ref().map_or(newest, |e| e.version.max(1));
+    let lowest_rust = ws
+        .members
+        .iter()
+        .filter_map(|m| rune_common::toolchain::parse_rust_version(&m.meta.rust_version))
+        .min();
+    let for_msrv = match lowest_rust {
+        Some(v) if v < semver::Version::new(1, 83, 0) => 3,
+        _ => newest,
+    };
+    out.version = existing
+        .as_ref()
+        .map_or(newest.min(for_msrv), |e| e.version.max(1));
     LockfileManager::write_cargo(&out, &path).context("Failed to write Cargo.lock")?;
     ui::action(
         if existing.is_some() {

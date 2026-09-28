@@ -199,14 +199,21 @@ impl ResolvedGraph {
     ) -> Option<&ResolvedPackage> {
         let req =
             VersionReq::from_str(req_str).unwrap_or_else(|_| VersionReq::from_str("*").unwrap());
-        self.packages
-            .values()
-            .filter(|p| p.name == name && req.matches(&p.version))
-            .filter(|p| match &p.source {
-                PackageSource::Registry(r) => r == registry,
-                _ => true,
-            })
+        let candidates = || {
+            self.packages
+                .values()
+                .filter(|p| p.name == name && req.matches(&p.version))
+        };
+        // That registry's package first; a local or git one only when none
+        // is locked (a patch standing in for it).
+        candidates()
+            .filter(|p| matches!(&p.source, PackageSource::Registry(r) if r == registry))
             .max_by(|a, b| a.version.cmp(&b.version))
+            .or_else(|| {
+                candidates()
+                    .filter(|p| !matches!(p.source, PackageSource::Registry(_)))
+                    .max_by(|a, b| a.version.cmp(&b.version))
+            })
     }
 
     /// Finds a resolved package matching name and version requirement.
@@ -1033,14 +1040,16 @@ fn resolve_one_queue_item(
         }
     }
 
-    // If already resolved with a version that matches req, reuse and request features
+    // If already resolved with a version that matches req, reuse and request
+    // features. Only a package from that registry: a workspace or path
+    // package of the same name does not stand in for a registry requirement
+    // (a `[patch]` does, and was handled above) — as in Cargo, where a crate
+    // under development and the published release its dev-dependencies use
+    // are two packages.
     if let Some((pkg_id, _existing)) = resolved_packages.iter().find(|(_, p)| {
         p.name == name
             && req.matches(&p.version)
-            && match &p.source {
-                PackageSource::Registry(r) => *r == registry,
-                _ => true,
-            }
+            && matches!(&p.source, PackageSource::Registry(r) if *r == registry)
     }) {
         feature_resolver.request_features(pkg_id, &features, default_features);
         return Ok(());
@@ -1186,6 +1195,16 @@ fn resolve_one_queue_item(
         Version::parse(&record.vers).map_err(|e| ResolverError::Manifest(e.to_string()))?;
 
     let pkg_id = format!("{} {}", name, parsed_version);
+    // Packages are identified by name and version, so the release with the
+    // very version of a local package of that name cannot sit beside it:
+    // the local one serves (Cargo would lock both).
+    if resolved_packages
+        .get(&pkg_id)
+        .is_some_and(|p| !matches!(p.source, PackageSource::Registry(_)))
+    {
+        feature_resolver.request_features(&pkg_id, &features, default_features);
+        return Ok(());
+    }
     feature_resolver.register_package_features(&pkg_id, record.all_features());
     let aliases: HashMap<String, String> = record
         .deps
