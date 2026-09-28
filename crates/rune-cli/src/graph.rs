@@ -1295,7 +1295,33 @@ fn pick_targets(member: &Member, req: &Request, active: &[String]) -> Result<Vec
         });
     }
 
+    ensure_target_exists(member, &out)?;
     Ok(out)
+}
+
+/// Cargo's error for a declared target whose source file is missing (a
+/// published crate whose examples were left out of the package, say),
+/// rather than rustc's "couldn't read" halfway through the build.
+fn ensure_target_exists(member: &Member, picks: &[Pick]) -> Result<()> {
+    for p in picks {
+        let path = member.dir.join(&p.path);
+        if !p.path.as_os_str().is_empty() && !path.exists() {
+            let kind = match p.kind {
+                TargetKind::Lib => "library",
+                TargetKind::Bin => "bin",
+                TargetKind::Example => "example",
+                TargetKind::Test => "test",
+                TargetKind::Bench => "bench",
+            };
+            bail!(
+                "can't find {kind} `{}` at path `{}` (declared in {})",
+                p.name,
+                path.display(),
+                member.manifest_path.display()
+            );
+        }
+    }
+    Ok(())
 }
 
 fn explicit_other_than_lib(sel: &TargetSelection) -> bool {

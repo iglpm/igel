@@ -5510,3 +5510,23 @@ fn json_messages_report_build_scripts_for_rust_analyzer() {
         assert!(out_dir.join("generated.rs").is_file(), "{m}");
     }
 }
+
+#[test]
+fn a_declared_target_without_its_file_is_reported_like_cargo() {
+    let p = Project::new();
+    p.write(
+        "Cargo.toml",
+        "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
+         [[example]]\nname = \"gone\"\npath = \"examples/gone.rs\"\n",
+    );
+    p.write("src/lib.rs", "");
+    // Not asked for: no error (plain `build` does not build examples).
+    p.ok(&["build"]);
+    let out = p.rune(&["test"]);
+    assert!(!out.status.success());
+    assert!(
+        text(&out).contains("can't find example `gone` at path"),
+        "{}",
+        text(&out)
+    );
+}
