@@ -1672,7 +1672,12 @@ impl Planner<'_> {
             lean_debuginfo: matches!(self.uni.origin[pkg], Origin::Registry)
                 && !self.ws.config.settings.dependency_debuginfo(),
         };
-        let p = resolve_unit_profile(&self.req.profile.name, tables, role).ok()?;
+        let mut p = resolve_unit_profile(&self.req.profile.name, tables, role).ok()?;
+        // Everything a test or benchmark links unwinds, whatever the profile
+        // says: the harness needs it (Cargo does the same).
+        if matches!(self.req.mode, Mode::Test | Mode::Bench) {
+            p.panic = rune_common::PanicStrategy::Unwind;
+        }
         (p != *self.req.profile).then_some(p)
     }
 

@@ -972,9 +972,15 @@ pub struct CasGcArgs {
     #[arg(long)]
     pub max_size: Option<String>,
 
-    /// Maximum entry age in seconds
-    #[arg(long)]
+    /// Remove entries no build has used for this long (`30d`, `12h`, or
+    /// seconds)
+    #[arg(long, value_name = "DURATION", value_parser = parse_age)]
     pub max_age: Option<u64>,
+}
+
+fn parse_age(s: &str) -> Result<u64, String> {
+    rune_common::time::parse_duration(s)
+        .ok_or_else(|| format!("`{s}` is not a duration such as `30d`, `12h` or `3600`"))
 }
 
 #[derive(Subcommand, Debug)]

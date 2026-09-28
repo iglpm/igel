@@ -1742,9 +1742,14 @@ impl UnitJob {
                 .script_profile
                 .as_ref()
                 .map(|p| {
+                    // Build scripts ignore `panic`, as in Cargo.
+                    let p = Profile {
+                        panic: rune_common::PanicStrategy::Unwind,
+                        ..p.clone()
+                    };
                     with_profile_flags(
                         RustcCommandBuilder::new(PathBuf::new()),
-                        p,
+                        &p,
                         &self.toolchain.host,
                         true,
                     )
@@ -2814,6 +2819,20 @@ pub fn build_rustc_command(
                 CrateType::Bin | CrateType::Cdylib | CrateType::Dylib | CrateType::Staticlib
             )
         });
+    // The test harness needs unwinding, and a panicking proc-macro must not
+    // take the compiler down: both ignore `panic = "abort"`, as in Cargo.
+    let unwinding;
+    let eff = if eff.panic != rune_common::PanicStrategy::Unwind
+        && (unit.harness || unit.crate_type == CrateType::ProcMacro)
+    {
+        unwinding = Profile {
+            panic: rune_common::PanicStrategy::Unwind,
+            ..eff.clone()
+        };
+        &unwinding
+    } else {
+        eff
+    };
     builder = with_profile_flags(builder, eff, compiled_for(unit), links_final_artifact);
     builder = with_cargo_env(builder, unit);
     if eff.trim_paths {
@@ -2845,9 +2864,11 @@ pub fn build_rustc_command(
         builder = builder.cap_lints("allow");
     }
 
-    // Declare which `feature = "..."` values exist, so `unexpected_cfgs`
-    // catches typos in this package's own `cfg(feature = ...)` (Cargo does).
-    if unit.crate_id.source == CrateSource::Local && !unit.ext.declared_features.is_empty() {
+    // Declare the cfgs Cargo declares for every package it lints: `docsrs`
+    // and `test`, and which `feature = "..."` values exist (none is a list
+    // too), so `unexpected_cfgs` catches typos but not `#[cfg(test)]` — a
+    // crate that denies warnings fails otherwise.
+    if unit.crate_id.source == CrateSource::Local {
         let values = unit
             .ext
             .declared_features
@@ -2855,7 +2876,9 @@ pub fn build_rustc_command(
             .map(|f| format!("\"{f}\""))
             .collect::<Vec<_>>()
             .join(", ");
-        builder = builder.check_cfg(&format!("cfg(feature, values({values}))"));
+        builder = builder
+            .check_cfg("cfg(docsrs,test)")
+            .check_cfg(&format!("cfg(feature, values({values}))"));
     }
 
     if unit.crate_type == CrateType::ProcMacro {
@@ -3149,6 +3172,11 @@ fn identity_with(
     for arg in &unit.lint_args {
         hb.update("lints", b"\0lint=");
         hb.update("lints", arg.as_bytes());
+    }
+    // The cfgs declared for `unexpected_cfgs` (see `build_rustc_command`)
+    // decide which warnings a local crate's result replays.
+    if unit.crate_id.source == CrateSource::Local {
+        hb.update("lints", b"\0check-cfg=docsrs,test,features");
     }
     for f in &unit.ext.declared_features {
         hb.update("declared features", b"\0declared=");

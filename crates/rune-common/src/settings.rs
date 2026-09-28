@@ -198,6 +198,14 @@ pub const KEYS: &[KeyDef] = &[
                       beyond this size.",
     },
     KeyDef {
+        name: "cas.max-age",
+        kind: ValueKind::Duration,
+        default: "30d",
+        description: "Remove store entries no build has used for this long (`30d`, `2w`; `0` \
+                      keeps everything). Checked at most once a day, in the background after a \
+                      build, like Cargo's automatic cleanup of its caches.",
+    },
+    KeyDef {
         name: "cas.verify",
         kind: ValueKind::Bool,
         default: "false",
@@ -516,6 +524,14 @@ impl Settings {
     /// `cas.max-size` in bytes.
     pub fn cas_max_size(&self) -> Option<u64> {
         self.uint("cas.max-size")
+    }
+
+    /// `cas.max-age` in seconds (30 days unless set; `None` when `0`).
+    pub fn cas_max_age(&self) -> Option<u64> {
+        match self.values.get("cas.max-age") {
+            Some((Value::Text(t), _)) => crate::time::parse_duration(t).filter(|s| *s > 0),
+            _ => Some(30 * 86_400),
+        }
     }
 
     /// `cas.verify`.

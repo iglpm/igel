@@ -5316,3 +5316,102 @@ fn example_binary_is_there() {
     );
     assert!(out.contains("✓ 2 passed"), "{out}");
 }
+
+#[cfg(unix)]
+#[test]
+fn panic_abort_profiles_still_test_with_unwinding_like_cargo() {
+    let p = Project::new();
+    p.write(
+        "Cargo.toml",
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
+         [profile.dev]\npanic = \"abort\"\n",
+    );
+    p.write(
+        "src/lib.rs",
+        "pub fn two() -> u32 { 2 }\n#[test]\nfn unit() { assert_eq!(two(), 2); }\n",
+    );
+    p.write(
+        "src/main.rs",
+        "fn main() { if std::env::args().count() > 1 { panic!(\"boom\") } }\n",
+    );
+    p.write(
+        "tests/it.rs",
+        "#[test]\n#[should_panic]\nfn unwinds() { panic!(\"caught by the harness\") }\n",
+    );
+    let out = p.ok(&["test"]);
+    assert!(out.contains("✓ 2 passed"), "{out}");
+
+    // An ordinary build keeps the profile's `panic = "abort"`.
+    p.ok(&["build"]);
+    use std::os::unix::process::ExitStatusExt;
+    let status = Command::new(p.path().join(".rune/target/debug/app"))
+        .arg("panic")
+        .stderr(std::process::Stdio::null())
+        .status()
+        .unwrap();
+    assert_eq!(status.signal(), Some(6), "aborted, not unwound: {status:?}");
+}
+
+#[test]
+fn store_entries_unused_for_a_month_are_removed_in_the_background() {
+    let p = Project::new();
+    p.write("Cargo.toml", LIB_MANIFEST);
+    let cas = p.home().join("cas");
+    let manifests = || -> std::collections::BTreeSet<PathBuf> {
+        walkdir::WalkDir::new(cas.join("objects"))
+            .into_iter()
+            .flatten()
+            .filter(|e| e.file_name() == "manifest.json")
+            .map(|e| e.into_path())
+            .collect()
+    };
+    // An old version of the code, then the current one.
+    p.write("src/lib.rs", "pub fn f() {}\n");
+    p.ok(&["build"]);
+    let old = manifests();
+    p.write("src/lib.rs", "pub fn f() {}\npub fn g() {}\n");
+    p.ok(&["build"]);
+    let current: Vec<PathBuf> = manifests().difference(&old).cloned().collect();
+    assert!(!old.is_empty() && !current.is_empty());
+    let stamp = cas.join("last-gc");
+    assert!(stamp.exists(), "a new store only gets its stamp");
+
+    // The old version's entries were stored and last used 40 days ago.
+    let days_ago =
+        |d: u64| std::time::SystemTime::now() - std::time::Duration::from_secs(d * 86_400);
+    for m in &old {
+        let mut json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(m).unwrap()).unwrap();
+        let then = days_ago(40)
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        json["stored_at"] = then.into();
+        let mut perms = std::fs::metadata(m).unwrap().permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        perms.set_readonly(false);
+        std::fs::set_permissions(m, perms).unwrap();
+        std::fs::write(m, json.to_string()).unwrap();
+        std::fs::File::open(m)
+            .unwrap()
+            .set_modified(days_ago(40))
+            .unwrap();
+    }
+    // Not due yet (the last run was today): nothing happens.
+    p.ok(&["build"]);
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    assert!(old.iter().all(|m| m.exists()));
+
+    // A day after the last run, the next build starts one in the background.
+    std::fs::File::open(&stamp)
+        .unwrap()
+        .set_modified(days_ago(2))
+        .unwrap();
+    p.ok(&["build"]);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while old.iter().any(|m| m.exists()) && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(old.iter().all(|m| !m.exists()), "unused entries removed");
+    assert!(current.iter().all(|m| m.exists()), "what builds use stays");
+}

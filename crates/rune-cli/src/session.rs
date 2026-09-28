@@ -184,9 +184,15 @@ impl Session {
         executor
     }
 
-    /// Evicts old CAS entries if `cas.max-size` is set and exceeded.
+    /// Evicts old CAS entries if `cas.max-size` is set and exceeded, and —
+    /// at most once a day — starts `rune cas gc --max-age` in the background
+    /// for entries unused for `cas.max-age`.
     pub fn maybe_gc(&self) {
-        let (Some(max), Some(cas)) = (self.ws.config.settings.cas_max_size(), self.cas()) else {
+        let Some(cas) = self.cas() else { return };
+        if let Some(age) = self.ws.config.settings.cas_max_age() {
+            spawn_daily_gc(cas.root(), age);
+        }
+        let Some(max) = self.ws.config.settings.cas_max_size() else {
             return;
         };
         if cas.stats().map(|s| s.total_size_bytes).unwrap_or(0) > max {
@@ -204,6 +210,39 @@ impl Session {
     pub fn profile_label(&self) -> String {
         self.profile.name.clone()
     }
+}
+
+/// Starts `rune cas gc --max-age` for the store at `root` in the background
+/// when the last run was more than a day ago; the build does not wait for it.
+/// A store seen for the first time only gets its stamp: nothing in it can
+/// have gone unused for long, and short-lived stores (tests, CI) never pay.
+fn spawn_daily_gc(root: &std::path::Path, max_age_secs: u64) {
+    let stamp = root.join("last-gc");
+    let due = match std::fs::metadata(&stamp).and_then(|m| m.modified()) {
+        Ok(t) => t
+            .elapsed()
+            .is_ok_and(|e| e > std::time::Duration::from_secs(86_400)),
+        Err(_) => {
+            let _ = std::fs::write(&stamp, b"");
+            false
+        }
+    };
+    if !due {
+        return;
+    }
+    // Claim the day first, so concurrent builds do not all start one.
+    let _ = std::fs::write(&stamp, b"");
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let _ = std::process::Command::new(exe)
+        .args(["cas", "gc", "--max-age"])
+        .arg(max_age_secs.to_string())
+        .env("RUNE_CAS_DIR", root)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
 }
 
 impl Session {
