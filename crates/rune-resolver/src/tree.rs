@@ -1,9 +1,95 @@
 //! Rendering of the resolved dependency graph: `rune tree` and `rune why`.
 
-use crate::resolver::{ResolvedGraph, ResolvedPackage};
+use crate::resolver::{ResolvedDependencyRef, ResolvedGraph, ResolvedPackage};
 use colored::*;
 use rune_manifest::dependency::DependencyKind;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+
+/// How each line of a tree starts (`--prefix`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Prefix {
+    /// Tree lines (`├── `).
+    #[default]
+    Indent,
+    /// The depth as a number (`2serde v1.0.0`), for tools.
+    Depth,
+    /// Nothing: one package per line.
+    None,
+}
+
+/// Which dependency edges a tree follows (`-e/--edges`), as in Cargo.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Edges {
+    pub normal: bool,
+    pub build: bool,
+    /// Development dependencies (of the workspace's own packages only).
+    pub dev: bool,
+    /// Features as nodes: which package turns on which feature of which.
+    pub features: bool,
+}
+
+impl Default for Edges {
+    fn default() -> Self {
+        Self {
+            normal: true,
+            build: true,
+            dev: true,
+            features: false,
+        }
+    }
+}
+
+impl Edges {
+    /// Cargo's `-e` values: `all`, `normal`, `build`, `dev`, `features`,
+    /// `no-normal`, `no-build`, `no-dev` (comma-separated or repeated).
+    /// Naming a kind shows only the kinds named; `no-` removes one.
+    pub fn parse(values: &[String]) -> Result<Self, String> {
+        let words: Vec<&str> = values
+            .iter()
+            .flat_map(|v| v.split(','))
+            .map(str::trim)
+            .filter(|w| !w.is_empty())
+            .collect();
+        let mut e = Self::default();
+        let named: Vec<&str> = words
+            .iter()
+            .copied()
+            .filter(|w| matches!(*w, "normal" | "build" | "dev"))
+            .collect();
+        if !named.is_empty() {
+            e.normal = named.contains(&"normal");
+            e.build = named.contains(&"build");
+            e.dev = named.contains(&"dev");
+        }
+        for w in words {
+            match w {
+                "all" | "normal" | "build" | "dev" => {}
+                "features" => e.features = true,
+                "no-normal" => e.normal = false,
+                "no-build" => e.build = false,
+                "no-dev" => e.dev = false,
+                "no-proc-macro" | "public" => {
+                    return Err(format!("`-e {w}` is not supported yet"));
+                }
+                other => {
+                    return Err(format!(
+                        "unknown edge kind `{other}` (expected all, normal, build, dev, \
+                         features, no-normal, no-build or no-dev)"
+                    ));
+                }
+            }
+        }
+        Ok(e)
+    }
+
+    fn follows(&self, kind: DependencyKind) -> bool {
+        match kind {
+            DependencyKind::Normal => self.normal,
+            DependencyKind::Build => self.build,
+            DependencyKind::Dev => self.dev,
+        }
+    }
+}
 
 /// Options for [`render_tree`].
 #[derive(Debug, Clone, Default)]
@@ -17,8 +103,15 @@ pub struct TreeOptions {
     pub duplicates: bool,
     /// Show the reverse tree of this package name: what depends on it.
     pub invert: Option<String>,
-    /// Include dev-dependencies.
+    /// Include dev-dependencies even if `edges` leaves them out.
     pub dev: bool,
+    pub edges: Edges,
+    pub prefix: Prefix,
+    /// Only dependencies that apply to this target triple (`None`: all).
+    pub target: Option<String>,
+    /// The workspace's packages (ids): only their development dependencies
+    /// are shown. Empty: the roots.
+    pub members: Vec<String>,
 }
 
 fn id_of(pkg: &ResolvedPackage) -> String {
@@ -41,23 +134,251 @@ fn children(graph: &ResolvedGraph, pkg: &ResolvedPackage, dev: bool) -> Vec<Stri
     out.into_iter().map(|(_, id)| id).collect()
 }
 
-/// Reverse edges: package id → the ids that depend on it.
-fn dependents(graph: &ResolvedGraph, dev: bool) -> BTreeMap<String, BTreeSet<String>> {
-    let mut map: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-    for pkg in graph.packages.values() {
-        for child in children(graph, pkg, dev) {
-            map.entry(child).or_default().insert(id_of(pkg));
-        }
-    }
-    map
+/// A node of the tree: a package, or (with `-e features`) one feature of one.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+enum Node {
+    Pkg(String),
+    Feat(String, String),
 }
 
-fn label(pkg: &ResolvedPackage, opts: &TreeOptions) -> String {
-    let mut s = format!("{} v{}", pkg.name.bold(), pkg.version);
-    if opts.features && !pkg.features.is_empty() {
-        s.push_str(&format!(" [{}]", pkg.features.join(", ").dimmed()));
+/// The graph as a tree shows it: which edges apply under the options.
+struct View<'a> {
+    graph: &'a ResolvedGraph,
+    opts: &'a TreeOptions,
+    members: HashSet<String>,
+    edges: Edges,
+}
+
+impl<'a> View<'a> {
+    fn new(graph: &'a ResolvedGraph, roots: &[String], opts: &'a TreeOptions) -> Self {
+        let members = if opts.members.is_empty() {
+            roots.iter().cloned().collect()
+        } else {
+            opts.members.iter().cloned().collect()
+        };
+        let mut edges = opts.edges;
+        edges.dev |= opts.dev;
+        Self {
+            graph,
+            opts,
+            members,
+            edges,
+        }
     }
-    s
+
+    fn pkg(&self, id: &str) -> Option<&'a ResolvedPackage> {
+        self.graph.packages.get(id)
+    }
+
+    /// Whether `p` turns its optional dependency `dep` on. A package whose
+    /// feature table is unknown (a local one) is taken to, when the
+    /// dependency is in the graph at all.
+    fn activated(&self, p: &ResolvedPackage, dep: &ResolvedDependencyRef) -> bool {
+        if !dep.optional || p.declared_features.is_empty() {
+            return true;
+        }
+        let name = dep.name.as_str();
+        p.features.iter().any(|f| {
+            f == name
+                || p.declared_features.get(f).is_some_and(|vals| {
+                    vals.iter().any(|v| {
+                        v == name
+                            || v.strip_prefix("dep:") == Some(name)
+                            || v.split_once('/').is_some_and(|(d, _)| d == name)
+                    })
+                })
+        })
+    }
+
+    /// The dependency edges of `p` that apply, with the package each leads to.
+    fn dep_edges(
+        &self,
+        p: &'a ResolvedPackage,
+    ) -> Vec<(&'a ResolvedDependencyRef, &'a ResolvedPackage)> {
+        let mut out: Vec<(&ResolvedDependencyRef, &ResolvedPackage)> = Vec::new();
+        for dep in &p.dependencies {
+            if !self.edges.follows(dep.kind)
+                || (dep.kind == DependencyKind::Dev && !self.members.contains(&id_of(p)))
+            {
+                continue;
+            }
+            if let Some(t) = &self.opts.target
+                && !crate::resolver::matches_target(dep.target.as_deref(), t)
+            {
+                continue;
+            }
+            if !self.activated(p, dep) {
+                continue;
+            }
+            let real = dep.package.as_deref().unwrap_or(&dep.name);
+            if let Some(found) = self.graph.find_matching(real, &dep.req) {
+                out.push((dep, found));
+            }
+        }
+        out.sort_by(|a, b| (&a.1.name, &a.1.version).cmp(&(&b.1.name, &b.1.version)));
+        out
+    }
+
+    /// Whether feature `f` of `p` is on (always, when that is unknown).
+    fn enabled(&self, p: &ResolvedPackage, f: &str) -> bool {
+        p.features.iter().any(|x| x == f)
+            || (p.declared_features.is_empty() && p.features.is_empty())
+    }
+
+    /// A node's children, each with the kind of the dependency edge it comes
+    /// from (for the `[build-dependencies]` / `[dev-dependencies]` sections).
+    fn children(&self, node: &Node) -> Vec<(DependencyKind, Node)> {
+        let mut out: Vec<(DependencyKind, Node)> = Vec::new();
+        let mut push = |kind: DependencyKind, n: Node| {
+            if !out.iter().any(|(k, m)| *k == kind && *m == n) {
+                out.push((kind, n));
+            }
+        };
+        match node {
+            Node::Pkg(id) => {
+                let Some(p) = self.pkg(id) else { return out };
+                for (dep, child) in self.dep_edges(p) {
+                    let cid = id_of(child);
+                    if !self.edges.features {
+                        push(dep.kind, Node::Pkg(cid));
+                        continue;
+                    }
+                    // An optional dependency is reached through the feature
+                    // that turns it on (when the feature table is known).
+                    if dep.optional && !p.declared_features.is_empty() {
+                        continue;
+                    }
+                    let mut feats: Vec<&str> = dep.features.iter().map(String::as_str).collect();
+                    if dep.default_features
+                        && (child.declared_features.contains_key("default")
+                            || child.features.iter().any(|f| f == "default"))
+                    {
+                        feats.push("default");
+                    }
+                    feats.retain(|f| !f.contains('/') && self.enabled(child, f));
+                    if feats.is_empty() {
+                        push(dep.kind, Node::Pkg(cid.clone()));
+                    }
+                    for f in feats {
+                        push(dep.kind, Node::Feat(cid.clone(), f.to_string()));
+                    }
+                }
+            }
+            Node::Feat(id, f) => {
+                let Some(p) = self.pkg(id) else { return out };
+                push(DependencyKind::Normal, Node::Pkg(id.clone()));
+                let edges = self.dep_edges(p);
+                let dep_named = |name: &str| {
+                    edges
+                        .iter()
+                        .filter(|(d, _)| d.name == name)
+                        .collect::<Vec<_>>()
+                };
+                for v in p.declared_features.get(f).into_iter().flatten() {
+                    if let Some(name) = v.strip_prefix("dep:") {
+                        for (d, c) in dep_named(name) {
+                            push(d.kind, Node::Pkg(id_of(c)));
+                        }
+                    } else if let Some((name, g)) = v.split_once('/') {
+                        for (d, c) in dep_named(name.trim_end_matches('?')) {
+                            if self.enabled(c, g) {
+                                push(d.kind, Node::Feat(id_of(c), g.to_string()));
+                            }
+                        }
+                    } else if p.declared_features.contains_key(v) {
+                        if self.enabled(p, v) {
+                            push(DependencyKind::Normal, Node::Feat(id.clone(), v.clone()));
+                        }
+                    } else {
+                        for (d, c) in dep_named(v) {
+                            push(d.kind, Node::Pkg(id_of(c)));
+                        }
+                    }
+                }
+            }
+        }
+        out.sort_by(|a, b| self.order(&a.1).cmp(&self.order(&b.1)));
+        out
+    }
+
+    /// Sort key: package name, then version (numerically), then feature.
+    fn order<'n>(&self, node: &'n Node) -> (&'a str, Option<&'a semver::Version>, &'n str, u8) {
+        let (id, feature, rank) = match node {
+            Node::Pkg(id) => (id, "", 0),
+            Node::Feat(id, f) => (id, f.as_str(), 1),
+        };
+        match self.pkg(id) {
+            Some(p) => (p.name.as_str(), Some(&p.version), feature, rank),
+            None => ("", None, feature, rank),
+        }
+    }
+
+    fn label(&self, node: &Node) -> String {
+        match node {
+            Node::Pkg(id) => match self.pkg(id) {
+                Some(p) => {
+                    let mut s = format!("{} v{}", p.name.bold(), p.version);
+                    // Where it comes from, when not a registry (as Cargo shows).
+                    match &p.source {
+                        crate::resolver::PackageSource::Path(dir) => {
+                            s.push_str(&format!(" ({})", dir.display()));
+                        }
+                        crate::resolver::PackageSource::Git { url, commit, .. } => {
+                            s.push_str(&format!(" ({url}#{})", commit.get(..8).unwrap_or(commit)));
+                        }
+                        crate::resolver::PackageSource::Registry(_) => {}
+                    }
+                    if self.opts.features && !p.features.is_empty() {
+                        s.push_str(&format!(" [{}]", p.features.join(", ").dimmed()));
+                    }
+                    s
+                }
+                None => id.clone(),
+            },
+            Node::Feat(id, f) => {
+                let name = self.pkg(id).map_or(id.as_str(), |p| p.name.as_str());
+                format!("{} feature \"{}\"", name.bold(), f)
+            }
+        }
+    }
+
+    /// Every edge between nodes reachable from `roots` (and from the enabled
+    /// features of the workspace's packages, which the command line turns on),
+    /// reversed: node → the nodes that lead to it.
+    fn reverse(&self, roots: &[String]) -> BTreeMap<Node, Vec<(DependencyKind, Node)>> {
+        let mut starts: Vec<Node> = roots.iter().cloned().map(Node::Pkg).collect();
+        if roots.is_empty() {
+            starts.extend(self.graph.packages.keys().cloned().map(Node::Pkg));
+        }
+        if self.edges.features {
+            for m in &self.members {
+                if let Some(p) = self.pkg(m) {
+                    for f in &p.features {
+                        starts.push(Node::Feat(m.clone(), f.clone()));
+                    }
+                }
+            }
+        }
+        let mut rev: BTreeMap<Node, Vec<(DependencyKind, Node)>> = BTreeMap::new();
+        let mut seen: HashSet<Node> = HashSet::new();
+        let mut queue: VecDeque<Node> = starts.into_iter().collect();
+        while let Some(n) = queue.pop_front() {
+            if !seen.insert(n.clone()) {
+                continue;
+            }
+            for (kind, c) in self.children(&n) {
+                let parents = rev.entry(c.clone()).or_default();
+                if !parents.iter().any(|(k, p)| *k == kind && *p == n) {
+                    parents.push((kind, n.clone()));
+                }
+                queue.push_back(c);
+            }
+        }
+        for parents in rev.values_mut() {
+            parents.sort_by(|a, b| self.order(&a.1).cmp(&self.order(&b.1)));
+        }
+        rev
+    }
 }
 
 /// Resolves a user-typed root (`name` or `name version`) to package ids.
@@ -65,152 +386,157 @@ fn ids_for_name(graph: &ResolvedGraph, name: &str) -> Vec<String> {
     let mut ids: Vec<String> = graph
         .packages
         .values()
-        .filter(|p| p.name == name || id_of(p) == name)
+        .filter(|p| {
+            p.name == name
+                || id_of(p) == name
+                || name
+                    .split_once('@')
+                    .is_some_and(|(n, v)| p.name == n && p.version.to_string() == v)
+        })
         .map(id_of)
         .collect();
     ids.sort();
     ids
 }
 
-/// Renders a tree rooted at each id in `roots`.
-pub fn render_tree(graph: &ResolvedGraph, roots: &[String], opts: &TreeOptions) -> String {
-    let mut out = String::new();
+/// Writes the lines below one node: its children (from `next`), grouped as
+/// Cargo groups them, recursively.
+struct Printer<'v, 'a, F: Fn(&Node) -> Vec<(DependencyKind, Node)>> {
+    view: &'v View<'a>,
+    next: F,
+    expanded: HashSet<Node>,
+    out: String,
+}
 
-    if opts.duplicates {
-        let mut by_name: BTreeMap<&str, Vec<&ResolvedPackage>> = BTreeMap::new();
-        for p in graph.packages.values() {
-            by_name.entry(&p.name).or_default().push(p);
+impl<F: Fn(&Node) -> Vec<(DependencyKind, Node)>> Printer<'_, '_, F> {
+    fn line(&mut self, prefix: &str, depth: usize, branch: &str, text: &str) {
+        match self.view.opts.prefix {
+            Prefix::Indent => self
+                .out
+                .push_str(&format!("{prefix}{}{text}\n", branch.green())),
+            Prefix::Depth => self.out.push_str(&format!("{depth}{text}\n")),
+            Prefix::None => self.out.push_str(&format!("{text}\n")),
         }
-        let rev = dependents(graph, opts.dev);
-        for (_, mut versions) in by_name {
-            if versions.len() < 2 {
-                continue;
-            }
-            versions.sort_by(|a, b| a.version.cmp(&b.version));
-            for v in versions {
-                out.push_str(&format!("{}\n", label(v, opts)));
-                render_inverted(
-                    graph,
-                    &rev,
-                    &id_of(v),
-                    "",
-                    1,
-                    opts,
-                    &mut HashSet::new(),
-                    &mut out,
-                );
-            }
-            out.push('\n');
-        }
-        if out.is_empty() {
-            out.push_str("no duplicate packages\n");
-        }
-        return out;
     }
 
-    if let Some(target) = &opts.invert {
-        let rev = dependents(graph, opts.dev);
-        for id in ids_for_name(graph, target) {
-            if let Some(pkg) = graph.packages.get(&id) {
-                out.push_str(&format!("{}\n", label(pkg, opts)));
-                render_inverted(graph, &rev, &id, "", 1, opts, &mut HashSet::new(), &mut out);
+    fn root(&mut self, node: &Node, cyan: bool) {
+        let text = self.view.label(node);
+        let text = if cyan { text.cyan().to_string() } else { text };
+        self.line("", 0, "", &text);
+        self.expanded.insert(node.clone());
+        self.below(node, "", 1);
+    }
+
+    fn below(&mut self, node: &Node, prefix: &str, depth: usize) {
+        if depth > self.view.opts.max_depth.unwrap_or(usize::MAX) {
+            return;
+        }
+        let kids = (self.next)(node);
+        // Normal edges first, then `[build-dependencies]`, then
+        // `[dev-dependencies]`, each under its heading.
+        for kind in [
+            DependencyKind::Normal,
+            DependencyKind::Build,
+            DependencyKind::Dev,
+        ] {
+            let group: Vec<&Node> = kids
+                .iter()
+                .filter(|(k, _)| *k == kind)
+                .map(|(_, n)| n)
+                .collect();
+            if group.is_empty() {
+                continue;
+            }
+            let heading = match kind {
+                DependencyKind::Normal => None,
+                DependencyKind::Build => Some("[build-dependencies]"),
+                DependencyKind::Dev => Some("[dev-dependencies]"),
+            };
+            if let Some(h) = heading
+                && matches!(node, Node::Pkg(_))
+                && self.view.opts.prefix == Prefix::Indent
+            {
+                self.line(prefix, depth, "", h);
+            }
+            for (i, child) in group.iter().enumerate() {
+                let last = i + 1 == group.len();
+                let seen = !self.expanded.insert((*child).clone());
+                let mut text = self.view.label(child);
+                if seen && !(self.next)(child).is_empty() {
+                    text.push_str(&" (*)".yellow().to_string());
+                }
+                self.line(prefix, depth, if last { "└── " } else { "├── " }, &text);
+                if !seen {
+                    let next = format!("{prefix}{}", if last { "    " } else { "│   " });
+                    self.below(child, &next, depth + 1);
+                }
             }
         }
-        if out.is_empty() {
-            out.push_str(&format!(
+    }
+}
+
+/// Renders a tree rooted at each id in `roots`.
+pub fn render_tree(graph: &ResolvedGraph, roots: &[String], opts: &TreeOptions) -> String {
+    let view = View::new(graph, roots, opts);
+
+    if opts.duplicates || opts.invert.is_some() {
+        let rev = view.reverse(roots);
+        let up =
+            |n: &Node| -> Vec<(DependencyKind, Node)> { rev.get(n).cloned().unwrap_or_default() };
+        let mut printer = Printer {
+            view: &view,
+            next: up,
+            expanded: HashSet::new(),
+            out: String::new(),
+        };
+        if opts.duplicates {
+            let mut by_name: BTreeMap<&str, Vec<&ResolvedPackage>> = BTreeMap::new();
+            for p in graph.packages.values() {
+                by_name.entry(&p.name).or_default().push(p);
+            }
+            for (_, mut versions) in by_name {
+                if versions.len() < 2 {
+                    continue;
+                }
+                versions.sort_by(|a, b| a.version.cmp(&b.version));
+                for v in versions {
+                    printer.expanded.clear();
+                    printer.root(&Node::Pkg(id_of(v)), false);
+                }
+                printer.out.push('\n');
+            }
+            if printer.out.is_empty() {
+                printer.out.push_str("no duplicate packages\n");
+            }
+            return printer.out;
+        }
+        let target = opts.invert.as_deref().unwrap_or_default();
+        for id in ids_for_name(graph, target) {
+            printer.expanded.clear();
+            // With features, a package's features lead to it: start there,
+            // so each enabled feature shows who turned it on.
+            printer.root(&Node::Pkg(id), false);
+        }
+        if printer.out.is_empty() {
+            printer.out.push_str(&format!(
                 "package `{target}` is not in the dependency graph\n"
             ));
         }
-        return out;
+        return printer.out;
     }
 
-    let mut expanded: HashSet<String> = HashSet::new();
+    let mut printer = Printer {
+        view: &view,
+        next: |n: &Node| view.children(n),
+        expanded: HashSet::new(),
+        out: String::new(),
+    };
     for root in roots {
-        let Some(pkg) = graph.packages.get(root) else {
-            continue;
-        };
-        out.push_str(&format!("{}\n", label(pkg, opts).cyan()));
-        expanded.insert(root.clone());
-        render_node(graph, pkg, "", 1, opts, &mut expanded, &mut out);
-    }
-    out
-}
-
-fn render_node(
-    graph: &ResolvedGraph,
-    pkg: &ResolvedPackage,
-    prefix: &str,
-    depth: usize,
-    opts: &TreeOptions,
-    expanded: &mut HashSet<String>,
-    out: &mut String,
-) {
-    if depth > opts.max_depth.unwrap_or(usize::MAX) {
-        return;
-    }
-    let kids = children(graph, pkg, opts.dev);
-    for (i, id) in kids.iter().enumerate() {
-        let last = i + 1 == kids.len();
-        let Some(child) = graph.packages.get(id) else {
-            continue;
-        };
-        let seen = !expanded.insert(id.clone());
-        out.push_str(&format!(
-            "{}{}{}{}\n",
-            prefix,
-            if last { "└── " } else { "├── " }.green(),
-            label(child, opts),
-            if seen {
-                " (*)".yellow().to_string()
-            } else {
-                String::new()
-            }
-        ));
-        if !seen {
-            let next = format!("{}{}", prefix, if last { "    " } else { "│   " });
-            render_node(graph, child, &next, depth + 1, opts, expanded, out);
+        if graph.packages.contains_key(root) {
+            printer.root(&Node::Pkg(root.clone()), true);
         }
     }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn render_inverted(
-    graph: &ResolvedGraph,
-    rev: &BTreeMap<String, BTreeSet<String>>,
-    id: &str,
-    prefix: &str,
-    depth: usize,
-    opts: &TreeOptions,
-    expanded: &mut HashSet<String>,
-    out: &mut String,
-) {
-    if depth > opts.max_depth.unwrap_or(usize::MAX) {
-        return;
-    }
-    let Some(parents) = rev.get(id) else { return };
-    let parents: Vec<&String> = parents.iter().collect();
-    for (i, pid) in parents.iter().enumerate() {
-        let last = i + 1 == parents.len();
-        let Some(parent) = graph.packages.get(*pid) else {
-            continue;
-        };
-        let seen = !expanded.insert((*pid).clone());
-        out.push_str(&format!(
-            "{}{}{}{}\n",
-            prefix,
-            if last { "└── " } else { "├── " }.green(),
-            label(parent, opts),
-            if seen {
-                " (*)".yellow().to_string()
-            } else {
-                String::new()
-            }
-        ));
-        if !seen {
-            let next = format!("{}{}", prefix, if last { "    " } else { "│   " });
-            render_inverted(graph, rev, pid, &next, depth + 1, opts, expanded, out);
-        }
-    }
+    printer.out
 }
 
 /// Compatibility wrapper: renders a tree from `graph.root_packages`.
@@ -316,8 +642,9 @@ mod tests {
             pkg("a", "1.0.0", &[("shared", "1")]),
             pkg("b", "1.0.0", &[("shared", "1"), ("old", "0.1")]),
             pkg("old", "0.1.0", &[("shared", "0.9")]),
-            pkg("shared", "1.2.0", &[]),
+            pkg("shared", "1.2.0", &[("leaf", "1")]),
             pkg("shared", "0.9.0", &[]),
+            pkg("leaf", "1.0.0", &[]),
         ]
         .into_iter()
         .collect();
@@ -359,9 +686,11 @@ mod tests {
         assert!(out.contains("shared v1.2.0"), "{out}");
         assert!(out.contains("shared v0.9.0"), "{out}");
         assert!(
-            out.contains("(*)"),
+            out.contains("shared v1.2.0 (*)"),
             "second occurrence of shared 1.2.0 is collapsed: {out}"
         );
+        // A leaf has nothing to hide: repeated without the marker, as in Cargo.
+        assert!(!out.contains("leaf v1.0.0 (*)"), "{out}");
     }
 
     #[test]
@@ -426,5 +755,161 @@ mod tests {
             !dups.lines().any(|l| l.starts_with("app")),
             "app is not a duplicate, so it is not a tree root: {dups}"
         );
+    }
+
+    fn dep(
+        name: &str,
+        kind: DependencyKind,
+        features: &[&str],
+        optional: bool,
+    ) -> ResolvedDependencyRef {
+        ResolvedDependencyRef {
+            name: name.into(),
+            req: "*".into(),
+            kind,
+            optional,
+            features: features.iter().map(|f| f.to_string()).collect(),
+            default_features: true,
+            package: None,
+            target: None,
+            registry: None,
+        }
+    }
+
+    /// app → serde (with `derive`), build → cc, dev → tmp; serde's `derive`
+    /// turns on its optional `serde_derive`; `cc` has a dev-dependency (not
+    /// a workspace package, so never shown) and a Windows-only one.
+    fn featured() -> ResolvedGraph {
+        let mk = |name: &str,
+                  deps: Vec<ResolvedDependencyRef>,
+                  features: &[&str],
+                  declared: &[(&str, &[&str])]| {
+            let (id, mut p) = pkg(name, "1.0.0", &[]);
+            p.dependencies = deps;
+            p.features = features.iter().map(|f| f.to_string()).collect();
+            p.declared_features = declared
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.iter().map(|x| x.to_string()).collect()))
+                .collect();
+            (id, p)
+        };
+        let mut win = dep("winapi", DependencyKind::Normal, &[], false);
+        win.target = Some("cfg(windows)".into());
+        let packages: HashMap<_, _> = [
+            mk(
+                "app",
+                vec![
+                    dep("serde", DependencyKind::Normal, &["derive"], false),
+                    dep("cc", DependencyKind::Build, &[], false),
+                    dep("tmp", DependencyKind::Dev, &[], false),
+                ],
+                &[],
+                &[],
+            ),
+            mk(
+                "serde",
+                vec![dep("serde_derive", DependencyKind::Normal, &[], true)],
+                &["default", "derive", "std"],
+                &[
+                    ("default", &["std"]),
+                    ("std", &[]),
+                    ("derive", &["serde_derive"]),
+                ],
+            ),
+            mk("serde_derive", vec![], &[], &[]),
+            mk(
+                "cc",
+                vec![dep("tmp", DependencyKind::Dev, &[], false), win],
+                &[],
+                &[],
+            ),
+            mk("tmp", vec![], &[], &[]),
+            mk("winapi", vec![], &[], &[]),
+        ]
+        .into_iter()
+        .collect();
+        ResolvedGraph {
+            root_packages: vec!["app".into()],
+            packages,
+        }
+    }
+
+    #[test]
+    fn edges_parse_like_cargo() {
+        assert_eq!(Edges::parse(&[]).unwrap(), Edges::default());
+        let e = Edges::parse(&["normal".into()]).unwrap();
+        assert!(e.normal && !e.build && !e.dev);
+        let e = Edges::parse(&["no-dev,features".into()]).unwrap();
+        assert!(e.normal && e.build && !e.dev && e.features);
+        assert!(Edges::parse(&["bogus".into()]).is_err());
+    }
+
+    #[test]
+    fn build_and_dev_dependencies_get_their_sections() {
+        colored::control::set_override(false);
+        let opts = TreeOptions {
+            target: Some("x86_64-unknown-linux-gnu".into()),
+            ..Default::default()
+        };
+        let out = plain(render_tree(&featured(), &["app 1.0.0".into()], &opts));
+        let lines: Vec<&str> = out.lines().collect();
+        let build = lines
+            .iter()
+            .position(|l| *l == "[build-dependencies]")
+            .unwrap();
+        let dev = lines
+            .iter()
+            .position(|l| *l == "[dev-dependencies]")
+            .unwrap();
+        assert!(lines[1].contains("serde v1.0.0") && build < dev, "{out}");
+        assert!(lines[build + 1].contains("cc v1.0.0"), "{out}");
+        // `cc`'s own dev-dependency and its Windows-only dependency are not
+        // shown; `serde`'s optional dependency is, since `derive` is on.
+        assert_eq!(out.matches("tmp v1.0.0").count(), 1, "{out}");
+        assert!(!out.contains("winapi"), "{out}");
+        assert!(out.contains("serde_derive v1.0.0"), "{out}");
+
+        let no_dev = TreeOptions {
+            edges: Edges::parse(&["no-dev".into()]).unwrap(),
+            ..opts.clone()
+        };
+        let out = plain(render_tree(&featured(), &["app 1.0.0".into()], &no_dev));
+        assert!(
+            !out.contains("[dev-dependencies]") && !out.contains("tmp"),
+            "{out}"
+        );
+
+        let flat = TreeOptions {
+            prefix: Prefix::Depth,
+            target: None,
+            ..opts
+        };
+        let out = plain(render_tree(&featured(), &["app 1.0.0".into()], &flat));
+        assert!(out.lines().any(|l| l == "1serde v1.0.0"), "{out}");
+        assert!(out.contains("winapi"), "every platform: {out}");
+    }
+
+    #[test]
+    fn features_as_nodes_say_who_turned_each_on() {
+        colored::control::set_override(false);
+        let opts = TreeOptions {
+            edges: Edges::parse(&["features".into()]).unwrap(),
+            ..Default::default()
+        };
+        let out = plain(render_tree(&featured(), &["app 1.0.0".into()], &opts));
+        assert!(out.contains("├── serde feature \"default\""), "{out}");
+        assert!(out.contains("serde feature \"derive\""), "{out}");
+        assert!(out.contains("serde feature \"std\""), "{out}");
+
+        // Inverted: why is serde's `std` on? Its `default`, which app asked for.
+        let why = TreeOptions {
+            invert: Some("serde_derive".into()),
+            ..opts
+        };
+        let out = plain(render_tree(&featured(), &["app 1.0.0".into()], &why));
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines[0], "serde_derive v1.0.0", "{out}");
+        assert!(lines[1].ends_with("serde feature \"derive\""), "{out}");
+        assert!(lines[2].ends_with("app v1.0.0"), "{out}");
     }
 }

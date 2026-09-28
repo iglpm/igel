@@ -579,6 +579,70 @@ fn prune_resolved(mut resolved: ResolvedGraph, refined: &Lockfile) -> ResolvedGr
     resolved
 }
 
+/// The resolved graph as a build of every workspace member (default
+/// features, development dependencies included) sees it on `target`
+/// (`None`: every platform) — what `rune tree` shows, as `cargo tree` does:
+/// only the packages and edges the feature resolver reaches, each package
+/// with the features it is built with (both roles' together).
+pub fn tree_view(ws: &Workspace, offline: bool, target: Option<&str>) -> Result<ResolvedGraph> {
+    let existing = LockfileManager::load_fast(ws.root());
+    let (resolved, lock) = resolve_fresh(ws, offline, existing.as_ref(), false)?;
+    let mut locals = Locals::load(ws)?;
+    locals.extend_from_lock(ws, &lock)?;
+    let uni = Universe::build(ws, &locals, &lock);
+    let roots: Vec<RootRequest> = ws
+        .members
+        .iter()
+        .enumerate()
+        .filter_map(|(mi, _)| locals.member_of.iter().position(|m| *m == Some(mi)))
+        .map(|li| RootRequest {
+            package: li,
+            features: Vec::new(),
+            default_features: true,
+            dev: true,
+        })
+        .collect();
+    let host = rune_common::toolchain::global().host.clone();
+    let applies = |platform: &str, for_host: bool| match target {
+        None => true,
+        Some(t) => rune_resolver::resolver::matches_target(
+            Some(platform),
+            if for_host { &host } else { t },
+        ),
+    };
+    let res = unit_features::resolve(
+        &uni.views,
+        &roots,
+        &FeatureOptions {
+            resolver: ws.root_manifest.resolver_version(),
+            platform_matches: &applies,
+            weak_activates: false,
+        },
+    );
+    let mut features: HashMap<String, BTreeSet<String>> = HashMap::new();
+    for ((pkg, _), feats) in &res.features {
+        features
+            .entry(uni.id[*pkg].clone())
+            .or_default()
+            .extend(feats.iter().cloned());
+    }
+    // (package id, dependency alias, kind) of every edge a build follows.
+    let mut edges: HashSet<(String, String, rune_manifest::dependency::DependencyKind)> =
+        HashSet::new();
+    for e in &res.edges {
+        let d = &uni.views[e.from.0].deps[e.dep];
+        edges.insert((uni.id[e.from.0].clone(), d.alias.clone(), d.kind));
+    }
+    let mut view = resolved;
+    view.packages.retain(|id, _| features.contains_key(id));
+    for (id, pkg) in view.packages.iter_mut() {
+        pkg.dependencies
+            .retain(|d| edges.contains(&(id.clone(), d.name.clone(), d.kind)));
+        pkg.features = features[id].iter().cloned().collect();
+    }
+    Ok(view)
+}
+
 /// Tightens a freshly resolved lockfile to exactly what Cargo would lock.
 ///
 /// The version resolver over-approximates which optional dependencies are

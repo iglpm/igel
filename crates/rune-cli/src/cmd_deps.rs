@@ -636,9 +636,36 @@ pub fn tree(args: TreeArgs) -> Result<()> {
         return crate::cmd_surface::exec_surface(&args);
     }
     let (ws, offline) = load(&args.manifest)?;
-    let resolved = resolved_for_inspection(&ws, offline)?;
+    let edges = rune_resolver::tree::Edges::parse(&args.edges).map_err(|e| anyhow::anyhow!(e))?;
+    let target = match args.target.as_deref() {
+        Some("all") => None,
+        Some(t) => Some(t.to_string()),
+        None => Some(rune_common::toolchain::global().host.to_string()),
+    };
+    // What a build on that platform uses, with the features it is built with.
+    let resolved = graph::tree_view(&ws, offline, target.as_deref())?;
     let selected = ws.select(&args.package, args.workspace, &[])?;
     let roots: Vec<String> = selected.iter().map(|&i| ws.members[i].id()).collect();
+    let prefix = match args.prefix.as_str() {
+        "depth" => rune_resolver::tree::Prefix::Depth,
+        "none" => rune_resolver::tree::Prefix::None,
+        _ => rune_resolver::tree::Prefix::Indent,
+    };
+    // The resolved graph knows registry packages' feature tables; the
+    // workspace's own come from their manifests.
+    let mut resolved = resolved;
+    for m in &ws.members {
+        if let Some(p) = resolved.packages.get_mut(&m.id())
+            && p.declared_features.is_empty()
+        {
+            p.declared_features = m
+                .manifest
+                .features
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+        }
+    }
     print!(
         "{}",
         render_tree(
@@ -650,6 +677,10 @@ pub fn tree(args: TreeArgs) -> Result<()> {
                 duplicates: args.duplicates,
                 invert: args.invert.clone(),
                 dev: args.dev,
+                edges,
+                prefix,
+                target,
+                members: ws.members.iter().map(|m| m.id()).collect(),
             }
         )
     );

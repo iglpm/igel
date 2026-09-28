@@ -720,7 +720,7 @@ pub struct TreeArgs {
     pub workspace: bool,
 
     /// Maximum tree depth to display
-    #[arg(long, short = 'd')]
+    #[arg(long)]
     pub depth: Option<usize>,
 
     /// Show features enabled for each dependency
@@ -728,15 +728,32 @@ pub struct TreeArgs {
     pub show_features: bool,
 
     /// Show only packages present in more than one version
-    #[arg(long, short = 'D')]
+    #[arg(long, short = 'd', short_alias = 'D')]
     pub duplicates: bool,
 
-    /// Invert the tree: show what depends on this package
+    /// Invert the tree: show what depends on this package (with `-e features`:
+    /// which package turns on each of its features)
     #[arg(long, short = 'i', value_name = "SPEC")]
     pub invert: Option<String>,
 
-    /// Also show dev-dependencies
-    #[arg(long)]
+    /// Dependency kinds to follow: `normal`, `build`, `dev`, `all` (the
+    /// default), `no-normal`, `no-build`, `no-dev`, and `features` to show
+    /// features as nodes (comma-separated or repeated), as in Cargo
+    #[arg(long, short = 'e', value_name = "KINDS")]
+    pub edges: Vec<String>,
+
+    /// How lines start: `indent` (tree lines), `depth` (the depth as a
+    /// number) or `none`
+    #[arg(long, default_value = "indent", value_parser = ["indent", "depth", "none"])]
+    pub prefix: String,
+
+    /// Only dependencies that apply to this target triple (default: this
+    /// machine's), or `all`
+    #[arg(long, value_name = "TRIPLE")]
+    pub target: Option<String>,
+
+    /// Also show dev-dependencies (the default now, as in Cargo)
+    #[arg(long, hide = true)]
     pub dev: bool,
 
     /// Instead of the tree, list every crate that runs code on this machine

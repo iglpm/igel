@@ -5151,3 +5151,124 @@ fn graph_units_lists_the_build_plan_with_keys_and_cache_state() {
     // The keys are the ones the build used, so they are stable.
     assert_eq!(plan(&p)["units"], after["units"]);
 }
+
+#[cfg(unix)]
+#[test]
+fn a_dependencys_build_script_warnings_stay_quiet_but_the_workspaces_show() {
+    let reg = tempfile::tempdir().unwrap();
+    let (bytes, sum) = make_crate_with(
+        "noisy",
+        "1.0.0",
+        &[
+            ("src/lib.rs", "pub fn f() {}\n"),
+            (
+                "build.rs",
+                "fn main() { println!(\"cargo::warning=from the dependency\"); }\n",
+            ),
+        ],
+    );
+    std::fs::write(reg.path().join("noisy-1.0.0.crate"), bytes).unwrap();
+    let dir = reg.path().join("index/no/is");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("noisy"),
+        format!(
+            "{{\"name\":\"noisy\",\"vers\":\"1.0.0\",\"deps\":[],\"cksum\":\"{sum}\",\"features\":{{}},\"yanked\":false}}\n"
+        ),
+    )
+    .unwrap();
+    let p = app_with(&reg, "noisy = \"1\"\n");
+    p.write(
+        "build.rs",
+        "fn main() { println!(\"cargo::warning=from the workspace\"); }\n",
+    );
+    let out = p.ok(&["build"]);
+    assert!(out.contains("from the workspace"), "{out}");
+    // As with Cargo, a registry package's script warnings are not shown.
+    assert!(!out.contains("from the dependency"), "{out}");
+}
+
+// ---------------------------------------------------------------------------
+// rune tree: sections, platforms, edges, features
+// ---------------------------------------------------------------------------
+
+#[test]
+fn tree_shows_what_a_build_here_uses_like_cargo_tree() {
+    let p = Project::new();
+    p.write(
+        "Cargo.toml",
+        "[workspace]\nresolver = \"2\"\nmembers = [\"app\", \"lib1\", \"bld\", \"devd\", \"win\"]\n",
+    );
+    for (name, extra) in [
+        (
+            "lib1",
+            "[features]\ndefault = [\"std\"]\nstd = []\nextra = []\n",
+        ),
+        ("bld", ""),
+        ("devd", ""),
+        ("win", ""),
+    ] {
+        p.write(
+            &format!("{name}/Cargo.toml"),
+            &format!(
+                "[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n{extra}"
+            ),
+        );
+        p.write(&format!("{name}/src/lib.rs"), "");
+    }
+    p.write(
+        "app/Cargo.toml",
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
+         [dependencies]\nlib1 = { path = \"../lib1\", features = [\"extra\"] }\n\n\
+         [build-dependencies]\nbld = { path = \"../bld\" }\n\n\
+         [dev-dependencies]\ndevd = { path = \"../devd\" }\n\n\
+         [target.'cfg(windows)'.dependencies]\nwin = { path = \"../win\" }\n",
+    );
+    p.write("app/src/lib.rs", "");
+    p.write("app/build.rs", "fn main() {}\n");
+
+    let stdout = |args: &[&str]| {
+        let out = p.rune(args);
+        assert!(out.status.success(), "{}", text(&out));
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    let tree = stdout(&["tree", "-p", "app"]);
+    let lines: Vec<&str> = tree.lines().collect();
+    assert!(lines[0].starts_with("app v0.1.0 ("), "{tree}");
+    assert!(lines[1].starts_with("└── lib1 v0.1.0"), "{tree}");
+    assert_eq!(lines[2], "[build-dependencies]", "{tree}");
+    assert!(lines[3].starts_with("└── bld v0.1.0"), "{tree}");
+    assert_eq!(lines[4], "[dev-dependencies]", "{tree}");
+    assert!(lines[5].starts_with("└── devd v0.1.0"), "{tree}");
+    // Not a Windows machine (these tests run on Linux and macOS).
+    assert!(!tree.contains("win v0.1.0"), "{tree}");
+    assert!(stdout(&["tree", "-p", "app", "--target", "all"]).contains("win v0.1.0"));
+    assert!(
+        stdout(&["tree", "-p", "app", "--target", "x86_64-pc-windows-msvc"]).contains("win v0.1.0")
+    );
+
+    let normal = stdout(&["tree", "-p", "app", "-e", "normal", "--prefix", "none"]);
+    let names: Vec<&str> = normal
+        .lines()
+        .map(|l| l.split(' ').next().unwrap())
+        .collect();
+    assert_eq!(names, ["app", "lib1"], "{normal}");
+
+    // Why is lib1's `std` on? Its `default`, which app did not turn off.
+    let why = stdout(&["tree", "-e", "features", "-i", "lib1", "--prefix", "depth"]);
+    let lines: Vec<&str> = why.lines().collect();
+    let std = lines
+        .iter()
+        .position(|l| *l == "1lib1 feature \"std\"")
+        .unwrap();
+    assert!(
+        lines[std + 1].starts_with("2lib1 feature \"default\""),
+        "{why}"
+    );
+    let default = lines
+        .iter()
+        .position(|l| *l == "1lib1 feature \"default\"")
+        .unwrap();
+    assert!(lines[default + 1].starts_with("2app v0.1.0"), "{why}");
+    assert!(lines.contains(&"1lib1 feature \"extra\""), "{why}");
+}
