@@ -82,7 +82,7 @@ set, dependency edges, ordering and format (a regenerated lock differs only
 where crates.io has published newer releases than the ones pinned).
 
 **Proof points**
-- 430 automated tests (`cargo test --workspace` and `rune test` both pass),
+- 438 automated tests (`cargo test --workspace` and `rune test` both pass),
   including end-to-end tests for build scripts, host/target roles, features per
   selection, git (tag/branch/rev/submodules/foreign workspaces), patches,
   local/vendored/authenticated registries, wrappers, runners, config, CAS
@@ -95,7 +95,7 @@ where crates.io has published newer releases than the ones pinned).
   `bindgen`, `cxx`, bundled SQLite, `libz-sys` + CoreFoundation, `pyo3`
   extension module and embedded Python, `cbindgen` + staticlib/cdylib used from C,
   `libloading` plugins.
-- Rune builds and tests **itself** (183 units, 430 tests) from an empty CAS
+- Rune builds and tests **itself** (183 units, 438 tests) from an empty CAS
   against live crates.io, restores everything from the CAS after `rm -rf
   .rune/target` (0 compiled, 76 ms), and a no-op build takes ~50 ms of wall
   time (Cargo: 180–230 ms) — §12.
@@ -106,7 +106,7 @@ where crates.io has published newer releases than the ones pinned).
 
 | § | Topic | Status | Notes |
 | --- | --- | --- | --- |
-| 1 | Compatibility goal | 🟡 | Broad and verified on Rune's own graph; an ecosystem-wide sweep (top-N crates) is milestone M2. |
+| 1 | Compatibility goal | 🟡 | Verified on Rune's own graph and on a 469-package corpus of popular crates plus 42 crates' own test suites, all ending as under Cargo (§12); a top-500 sweep in CI is milestone M2. |
 | 2 | Manifest fields | ✅ | Compilation-relevant fields honoured; packaging-only fields (`include/exclude/publish/keywords/…`) are parsed and ignored. The manifest may be `Cargo.toml` **or** `Rune.toml` (§8). |
 | 3 | Workspaces | ✅ | members/exclude/default-members/resolver, `[workspace.package/dependencies/lints/metadata]`, `[patch]`, `[replace]`, `[profile]`. |
 | 4 | Package targets | ✅ | All target kinds/options; `doc = false` honoured by `rune doc`. |
@@ -244,7 +244,7 @@ a test or benchmark before they are claimed in the README.
 | P3 concurrent processes | ✅ fixed and tested (§8): it was a real bug — 3 of 4 concurrent builds failed. |
 | P4 debuginfo | ✅ dependencies default to `line-tables-only` (−10 % cold build); `split-debuginfo = "unpacked"` on macOS (−11 %, §10); `rune doctor` covers linkers. Link-step caching ⬜. |
 | P5 self-diagnosis | ✅ `rune doctor`; a build that left cores idle names the chain of crates responsible; `--timings` writes an HTML timeline with that chain highlighted; `rune explain` (§12). |
-| P6 disk | 🟡 `rune cas du` ✅; gc by last use already existed; pinning, zstd ⬜. |
+| P6 disk | 🟡 `rune cas du` ✅; automatic cleanup of entries unused for 30 days (`cas.max-age`, §12) ✅; pinning, zstd ⬜. |
 | P7 CI/Docker | ✅ `rune build --deps-only`; `rune cas export/import` bundles (§12). |
 | P8 path in keys | 🟡 verified: keys do **not** contain the checkout path (a shared store works across paths). Artifacts still embed absolute paths in debuginfo/panics; remapping is only needed for byte-identical builds. |
 | P17 machine interface | 🟡 `--message-format json` for build/check/test ✅, `rune graph --units --format json` ✅ (§12); `rune-api` ⬜. |
@@ -552,7 +552,7 @@ and cache lookups for IDEs, Bazel-style wrappers and corporate tooling (see P17)
 | | Goal | Delivers |
 | --- | --- | --- |
 | **M1** | Hermeticity | G1: sandboxed/recorded build-script reads, non-hermetic class, full native tool identity. |
-| **M2** | Ecosystem confidence | G2 + a compatibility corpus: build the top ~500 crates (and their tests) with Rune vs Cargo in CI; fix every divergence; backtracking resolver. |
+| **M2** | Ecosystem confidence | *Started (§12):* a 469-package corpus builds (faster than Cargo) with a byte-identical lockfile; 42 crates' own test suites end as under Cargo after three fixes. *Open:* the top ~500 crates in CI; G2's full solver. |
 | **M3** | Registry & tooling | *Done:* `install`/`uninstall`, `package`, `publish`, `login`/`logout`, `yank`, `owner`, `search`, `info`, `vendor`, `pkgid`, `verify-project`, external subcommands and aliases (§11). *Open:* the rest of G3. |
 | **M4** | Observability | G4 + `rune cas inspect`, `rune explain-miss` (F2), structured diagnostics. |
 | **M5** | Sharing | *Done:* shared-directory store ✅, HTTP backend ✅, **Cairn** server with peers/replication/sharding ✅, `--deps-only` ✅. `cas export/import` ✅ (§12). *Open:* signed manifests, TLS in Cairn, S3 backend; G5 shared documentation. |
@@ -566,7 +566,7 @@ and cache lookups for IDEs, Bazel-style wrappers and corporate tooling (see P17)
 ## 7. How to verify the current state
 
 ```bash
-cargo test --workspace                       # 430 tests, no network needed
+cargo test --workspace                       # 438 tests, no network needed
 cargo clippy --workspace --all-targets
 
 # Rune builds and tests itself against live crates.io (use a scratch copy
@@ -1028,6 +1028,33 @@ becoming the limit, and makes the remaining limit visible:
   workspace package's script are shown and replayed), and `cargo::warning=` of
   workspace packages is shown.
 
+**Ecosystem check (M2, started).** A project depending on 80 popular crates
+(469 packages: tokio, axum, reqwest, tonic, clap, serde, regex, image, rusqlite
+with bundled SQLite, openssl, git2/libgit2, aws-lc-sys, ring, zstd, bzip2, xz,
+bindgen, ratatui, …):
+- `rune generate-lockfile` is byte-identical to `cargo generate-lockfile`.
+- It builds, and from an empty store **faster than Cargo: 112.5 s vs 122.8 s**
+  (4 cores, same CPU time — the build-script steps overlap the heavy C builds).
+- `rune tree` matches `cargo tree` line for line but for host/target node
+  splitting (above).
+- 42 popular crates' own test suites (unit, integration, doc tests; 7,800+
+  tests) run under both tools. Three real incompatibilities turned up and are
+  fixed: `rune test` did not build examples or run `test = true` ones
+  (`once_cell`); `panic = "abort"` in `[profile.dev]` reached test harnesses
+  (`winnow` — Cargo ignores `panic` for tests, proc-macros and build scripts);
+  `#[cfg(test)]` was an unexpected cfg under `deny(warnings)` because Rune did
+  not declare Cargo's `cfg(docsrs,test)` (`http`, `httparse`). Now every crate
+  ends as under Cargo, test for test: 37 pass identically; `anyhow`, `glob`
+  fail the same test under both, `mime`, `nom` fail to build under both; and
+  `same-file` passes only under Rune (Cargo cannot read the v1 lockfile it ships).
+- Found on the way: a registry crate's `cargo:warning` lines leaked into every
+  build as log lines (Cargo hides dependencies' script warnings).
+
+**Disk.** The store is cleaned automatically: entries no build has used for
+`cas.max-age` (default 30 days) are removed by a `rune cas gc` a build starts in
+the background at most once a day. Before, it only shrank when `cas.max-size`
+was set.
+
 **Measured end to end (4 cores, Rune's own workspace, 183 units):**
 
 | | Rune | Cargo |
@@ -1043,7 +1070,7 @@ On a 10-core M5 a cold build is limited by the chain of crates rather than by
 the cores (the one-line hint and `--timings` show which); everything a store
 hit or a smaller rebuild saves above holds there as well.
 
-**Tests:** 430 (77 new), passing under `cargo test` and under `rune test` on
+**Tests:** 438 (85 new), passing under `cargo test` and under `rune test` on
 Rune's own workspace; clippy clean.
 
 **Not done:** Windows; the sandbox (G1) and with it default-on cached tests;

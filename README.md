@@ -249,6 +249,7 @@ rune config unset build.release-rebuild-all
 | `cas.remote-token` | none | Bearer token for a Cairn server. Prefer `RUNE_CAS_REMOTE_TOKEN`: `Rune.toml` is readable by everyone who can read the project. |
 | `cas.remote-replicas` | `1` | With several Cairn URLs: how many servers hold each entry (`2` survives losing one). |
 | `cas.remote-write` | `true` | Publish to `cas.remote`. Set `false` where only CI should write (e.g. developers). |
+| `cas.max-age` | `30d` | Entries no build has used for this long are removed by a background `rune cas gc` that a build starts at most once a day (like Cargo's automatic cache cleanup). `0` keeps everything. |
 | `cas.max-size` | unlimited | Evict least-recently-used entries after a build when the CAS grows past this (`20GB`, `512MiB`). |
 | `cas.verify` | `false` | Re-hash every artifact restored from the CAS (entries are always checked against their key and recorded sizes). |
 | `resolve.min-release-age` | `0` | Only choose releases published at least this long ago (`14d`, `72h`) when resolving new versions; locked versions stay. Malicious releases are usually yanked within days. |
