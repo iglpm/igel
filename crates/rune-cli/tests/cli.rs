@@ -4489,3 +4489,106 @@ fn out_dir_holds_only_what_the_script_generated_and_script_errors_are_shown() {
         "the compiler's error is shown:\n{msg}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// unused
+// ---------------------------------------------------------------------------
+
+#[test]
+fn unused_dependencies_are_found_by_asking_the_compiler() {
+    let p = Project::new();
+    p.write(
+        "Cargo.toml",
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\
+         [dependencies]\nused = { path = \"used\" }\nidle = { path = \"idle\" }\n\
+         tests-only = { path = \"tests-only\" }\n\
+         [dev-dependencies]\ndev-used = { path = \"dev-used\" }\ndev-idle = { path = \"dev-idle\" }\n\
+         [build-dependencies]\nbuild-used = { path = \"build-used\" }\nbuild-idle = { path = \"build-idle\" }\n",
+    );
+    for name in [
+        "used",
+        "idle",
+        "tests-only",
+        "dev-used",
+        "dev-idle",
+        "build-used",
+        "build-idle",
+    ] {
+        p.write(
+            &format!("{name}/Cargo.toml"),
+            &format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"),
+        );
+        p.write(&format!("{name}/src/lib.rs"), "pub fn f() -> u32 { 1 }\n");
+    }
+    p.write("src/lib.rs", "pub fn g() -> u32 { used::f() }\n");
+    p.write(
+        "tests/it.rs",
+        "#[test] fn t() { assert_eq!(dev_used::f() + tests_only::f() + app::g(), 3); }\n",
+    );
+    p.write(
+        "build.rs",
+        "fn main() { let _ = build_used::f(); println!(\"cargo::rerun-if-changed=build.rs\"); }\n",
+    );
+
+    for round in 0..2 {
+        let out = p.rune(&["unused"]);
+        let msg = text(&out);
+        assert_eq!(out.status.code(), Some(1), "round {round}:\n{msg}");
+        let unused_line = msg.lines().find(|l| l.contains("unused:")).unwrap_or("");
+        for name in ["idle", "dev-idle", "build-idle"] {
+            assert!(
+                unused_line.contains(&format!("{name} ")),
+                "round {round}: `{name}` is unused:\n{msg}"
+            );
+        }
+        for name in ["used [", "dev-used", "build-used"] {
+            assert!(
+                !unused_line.contains(name),
+                "round {round}: `{name}`:\n{msg}"
+            );
+        }
+        let dev_line = msg
+            .lines()
+            .find(|l| l.contains("could be dev-dependencies"))
+            .unwrap_or("");
+        assert!(dev_line.contains("tests-only"), "round {round}:\n{msg}");
+    }
+
+    p.ok(&["unused", "--fix"]);
+    let manifest = p.read("Cargo.toml");
+    for gone in ["idle = ", "dev-idle", "build-idle"] {
+        assert!(!manifest.contains(gone), "{manifest}");
+    }
+    assert!(
+        manifest.contains("used = { path = \"used\" }"),
+        "{manifest}"
+    );
+    let again = p.ok(&["unused"]);
+    assert!(again.contains("no unused dependencies"), "{again}");
+    p.ok(&["test"]);
+}
+
+#[test]
+fn a_dependency_used_only_under_another_cfg_is_reported_but_never_removed() {
+    let p = Project::new();
+    p.write(
+        "Cargo.toml",
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\
+         [dependencies]\nelsewhere = { path = \"elsewhere\" }\n",
+    );
+    p.write(
+        "elsewhere/Cargo.toml",
+        "[package]\nname = \"elsewhere\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    p.write("elsewhere/src/lib.rs", "pub fn f() {}\n");
+    p.write(
+        "src/lib.rs",
+        "#[cfg(target_os = \"plan9\")]\npub fn g() { elsewhere::f() }\n",
+    );
+    let out = p.ok(&["unused", "--fix"]);
+    assert!(out.contains("unused in this configuration"), "{out}");
+    assert!(
+        p.read("Cargo.toml").contains("elsewhere = { path"),
+        "must be kept"
+    );
+}

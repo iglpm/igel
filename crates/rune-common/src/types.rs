@@ -818,6 +818,11 @@ pub struct BuildScriptOutput {
     pub warnings: Vec<String>,
     /// Errors the script reported with `cargo::error=`; any of them fails the build.
     pub errors: Vec<String>,
+    /// What the compiler printed when compiling the script (warnings about
+    /// `build.rs` itself), kept so they can be shown again when the result is
+    /// restored, like a crate's warnings.
+    #[serde(default)]
+    pub compile_warnings: String,
 }
 
 /// Which artifacts a `cargo::rustc-link-arg*` directive applies to.

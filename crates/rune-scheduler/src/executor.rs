@@ -103,6 +103,20 @@ fn frontend_threads(
     (n > 1).then_some(n)
 }
 
+/// Shows again what compiling a restored build script printed.
+fn replay_script_warnings(
+    events: &Sender<PipelineEvent>,
+    node_id: NodeId,
+    output: Option<&BuildScriptOutput>,
+) {
+    if let Some(out) = output.filter(|o| !o.compile_warnings.trim().is_empty()) {
+        let _ = events.send(PipelineEvent::ScriptWarnings {
+            node_id,
+            warnings: out.compile_warnings.clone(),
+        });
+    }
+}
+
 /// The name a unit has in `--timings` traces.
 fn span_name(unit: &CompilationUnit) -> String {
     format!(
@@ -427,6 +441,7 @@ impl BuildExecutor {
                             node_id: id,
                             output: output.clone(),
                         });
+                        replay_script_warnings(&self.event_tx, id, Some(&output));
                         build_script_outputs.insert(id, output);
                     }
                     // The generated files too: the package's other units
@@ -1489,6 +1504,7 @@ impl UnitJob {
                 .unwrap_or(false);
             if restored {
                 effective_build_output = cas_store.get_value(&build_script_cache_key);
+                replay_script_warnings(&self.event_tx, node_id, effective_build_output.as_ref());
             }
         }
 
@@ -1604,12 +1620,13 @@ impl UnitJob {
             );
             match compiled {
                 Ok((bin_path, printed)) => {
-                    if unit.crate_id.source == CrateSource::Local && !printed.trim().is_empty() {
-                        let _ = self.event_tx.send(PipelineEvent::ScriptWarnings {
-                            node_id,
-                            warnings: printed,
-                        });
-                    }
+                    // Warnings about a dependency's `build.rs` are capped, as
+                    // for the crate itself; the workspace's own are kept.
+                    let compile_warnings = if unit.crate_id.source == CrateSource::Local {
+                        printed
+                    } else {
+                        String::new()
+                    };
                     let run_configure = |cmd: &mut std::process::Command| {
                         if let Some(js) = &self.jobserver {
                             js.configure(cmd);
@@ -1639,12 +1656,30 @@ impl UnitJob {
                         return;
                     }
                     match outcome {
-                        Ok(out) => {
+                        Ok(mut out) => {
                             let _ = self.event_tx.send(PipelineEvent::BuildScriptFinished {
                                 node_id,
                                 crate_name: unit.crate_id.name.clone(),
                                 duration: start.elapsed(),
                             });
+                            out.compile_warnings = compile_warnings;
+                            // Shown when the script runs (as Cargo does), for
+                            // the workspace's own packages.
+                            if unit.crate_id.source == CrateSource::Local {
+                                let mut text = out.compile_warnings.clone();
+                                for w in &out.warnings {
+                                    text.push_str(&format!(
+                                        "warning: {}@{}: {w}\n",
+                                        unit.crate_id.name, unit.crate_id.version
+                                    ));
+                                }
+                                if !text.trim().is_empty() {
+                                    let _ = self.event_tx.send(PipelineEvent::ScriptWarnings {
+                                        node_id,
+                                        warnings: text,
+                                    });
+                                }
+                            }
                             script_ran = Some(out.clone());
                             effective_build_output = Some(out);
                         }

@@ -30,6 +30,9 @@ pub struct Session {
     pub selected: Vec<usize>,
     pub verbose: bool,
     pub quiet: bool,
+    /// Print the compiler's warnings as units finish (commands that report
+    /// on warnings themselves, like `rune unused`, turn this off).
+    pub show_warnings: bool,
     /// `--message-format json`: events go to stdout as JSON lines.
     pub json: bool,
     pub force_rebuild: bool,
@@ -119,6 +122,7 @@ impl Session {
             selected,
             verbose: common.verbose,
             quiet: common.quiet,
+            show_warnings: true,
             json,
             force_rebuild,
             ignore_rust_version: common.ignore_rust_version,
@@ -306,7 +310,7 @@ pub fn drive(
                 PipelineEvent::BuildFinished { warnings, .. }
                 | PipelineEvent::CacheHit { warnings, .. }
                 | PipelineEvent::ScriptWarnings { warnings, .. }
-                    if !warnings.is_empty() && !sess.quiet && !sess.json =>
+                    if !warnings.is_empty() && sess.show_warnings && !sess.quiet && !sess.json =>
                 {
                     ui::print_above_progress(warnings);
                 }

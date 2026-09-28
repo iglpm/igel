@@ -73,6 +73,8 @@ pub enum Commands {
     Outdated(OutdatedArgs),
     /// Raise dependency requirements in the manifests to newer releases
     Upgrade(UpgradeArgs),
+    /// Find dependencies the workspace's packages declare but never use
+    Unused(UnusedArgs),
     /// Display the resolved dependency tree
     Tree(TreeArgs),
     /// Explain why a package is in the dependency graph
@@ -613,6 +615,15 @@ pub struct OutdatedArgs {
     /// `human` (a table) or `json`
     #[arg(long, default_value = "human", value_parser = ["human", "json"])]
     pub format: String,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct UnusedArgs {
+    #[command(flatten)]
+    pub common: CommonArgs,
+    /// Remove the unused dependencies from the manifests
+    #[arg(long)]
+    pub fix: bool,
 }
 
 #[derive(Args, Debug, Clone)]
