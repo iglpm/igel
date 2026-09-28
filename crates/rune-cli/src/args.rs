@@ -79,6 +79,8 @@ pub enum Commands {
     Sbom(SbomArgs),
     /// Display the resolved dependency tree
     Tree(TreeArgs),
+    /// Draw the package graph (or a build's units) as Graphviz DOT, Mermaid or JSON
+    Graph(GraphArgs),
     /// Explain why a package is in the dependency graph
     Why(WhyArgs),
     /// Download every dependency without building
@@ -626,6 +628,30 @@ pub struct OutdatedArgs {
     /// `human` (a table) or `json`
     #[arg(long, default_value = "human", value_parser = ["human", "json"])]
     pub format: String,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct GraphArgs {
+    #[command(flatten)]
+    pub common: CommonArgs,
+    #[command(flatten)]
+    pub targets: TargetArgs,
+    /// `dot` (Graphviz), `mermaid` (renders in GitHub/GitLab markdown) or `json`
+    #[arg(long, default_value = "dot", value_parser = ["dot", "mermaid", "json"])]
+    pub format: String,
+    /// The compilation units a build would use, with their keys and whether
+    /// the store has them, instead of packages
+    #[arg(long)]
+    pub units: bool,
+    /// Include the workspace packages' development dependencies
+    #[arg(long)]
+    pub dev: bool,
+    /// Only the workspace's own packages and the edges between them
+    #[arg(long)]
+    pub workspace_only: bool,
+    /// Write to this file instead of stdout
+    #[arg(short = 'o', long, value_name = "FILE")]
+    pub output: Option<PathBuf>,
 }
 
 #[derive(Args, Debug, Clone)]

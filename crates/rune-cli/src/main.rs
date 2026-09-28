@@ -5,6 +5,7 @@ mod args;
 mod cmd_build;
 mod cmd_deps;
 mod cmd_explain;
+mod cmd_graph;
 mod cmd_install;
 mod cmd_misc;
 mod cmd_publish;
@@ -73,6 +74,7 @@ fn main() {
         Commands::Unused(a) => cmd_unused::unused(a),
         Commands::Sbom(a) => cmd_sbom::sbom(a),
         Commands::Tree(a) => cmd_deps::tree(a),
+        Commands::Graph(a) => cmd_graph::graph(a),
         Commands::Why(a) => cmd_deps::why(a),
         Commands::Fetch(a) => cmd_deps::fetch(a),
         Commands::GenerateLockfile(a) => cmd_deps::generate_lockfile(a),

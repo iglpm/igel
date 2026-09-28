@@ -5052,3 +5052,63 @@ fn a_build_script_that_watches_nothing_reruns_on_any_change_like_cargo() {
     p.write("src/lib.rs", &(p.read("src/lib.rs") + "pub fn more() {}\n"));
     assert_eq!(build_counting_runs(&p), 2);
 }
+
+// ---------------------------------------------------------------------------
+// rune graph
+// ---------------------------------------------------------------------------
+
+#[test]
+fn graph_draws_the_package_graph_as_dot_and_mermaid() {
+    let p = chain_project(2);
+    let dot = p.ok(&["graph"]);
+    assert!(dot.starts_with("digraph rune {"), "{dot}");
+    let id = |name: &str| {
+        let line = dot
+            .lines()
+            .find(|l| l.contains(&format!("label=\"{name} 0.1.0\"")))
+            .unwrap_or_else(|| panic!("no node {name}:\n{dot}"));
+        line.split_whitespace().next().unwrap().to_string()
+    };
+    let (app, c1, c0) = (id("app"), id("c1"), id("c0"));
+    assert!(dot.contains(&format!("{app} -> {c1};")), "{dot}");
+    assert!(dot.contains(&format!("{c1} -> {c0};")), "{dot}");
+    assert!(!dot.contains(&format!("{app} -> {c0};")), "{dot}");
+
+    let mermaid = p.ok(&["graph", "--format", "mermaid", "-p", "c1"]);
+    assert!(mermaid.starts_with("flowchart LR"), "{mermaid}");
+    assert!(mermaid.contains("[\"c1 0.1.0\"]:::member"), "{mermaid}");
+    assert!(!mermaid.contains("app"), "only what c1 reaches:\n{mermaid}");
+}
+
+#[test]
+fn graph_units_lists_the_build_plan_with_keys_and_cache_state() {
+    let p = chain_project(2);
+    let plan = |p: &Project| -> serde_json::Value {
+        let out = p.rune(&["graph", "--units", "--format", "json"]);
+        assert!(out.status.success(), "{}", text(&out));
+        serde_json::from_slice(&out.stdout).unwrap()
+    };
+    let before = plan(&p);
+    let units = before["units"].as_array().unwrap();
+    let packages: std::collections::BTreeSet<&str> = units
+        .iter()
+        .map(|u| u["package"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        packages.into_iter().collect::<Vec<_>>(),
+        ["app", "c0", "c1"]
+    );
+    assert!(units.iter().all(|u| u["cached"] == false), "{before:#}");
+    // Dependencies point at other units, by index.
+    let c1 = units.iter().find(|u| u["package"] == "c1").unwrap();
+    let to = c1["dependencies"][0]["index"].as_u64().unwrap() as usize;
+    assert_eq!(units[to]["package"], "c0");
+    assert_eq!(c1["dependencies"][0]["extern_crate_name"], "c0");
+
+    p.ok(&["build"]);
+    let after = plan(&p);
+    let units = after["units"].as_array().unwrap();
+    assert!(units.iter().all(|u| u["cached"] == true), "{after:#}");
+    // The keys are the ones the build used, so they are stable.
+    assert_eq!(plan(&p)["units"], after["units"]);
+}

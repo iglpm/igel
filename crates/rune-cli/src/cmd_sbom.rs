@@ -76,7 +76,7 @@ fn uuid(seed: &str) -> String {
 
 /// The packages to list: the selected members and everything they reach,
 /// through development dependencies only when `dev`.
-fn reachable(pkgs: &[InventoryPackage], roots: &[usize], dev: bool) -> Vec<usize> {
+pub(crate) fn reachable(pkgs: &[InventoryPackage], roots: &[usize], dev: bool) -> Vec<usize> {
     let mut seen: BTreeSet<usize> = BTreeSet::new();
     let mut stack = roots.to_vec();
     while let Some(i) = stack.pop() {
