@@ -68,6 +68,11 @@ pub enum Commands {
     Remove(RemoveArgs),
     /// Update dependencies in lockfiles to latest compatible versions
     Update(UpdateArgs),
+    /// List dependencies with newer releases than the lockfile or the
+    /// manifests allow
+    Outdated(OutdatedArgs),
+    /// Raise dependency requirements in the manifests to newer releases
+    Upgrade(UpgradeArgs),
     /// Display the resolved dependency tree
     Tree(TreeArgs),
     /// Explain why a package is in the dependency graph
@@ -591,6 +596,46 @@ pub struct UpdateArgs {
     #[arg(long, value_name = "VERSION")]
     pub precise: Option<String>,
     /// Show what would change without writing the lockfile
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct OutdatedArgs {
+    #[command(flatten)]
+    pub manifest: ManifestArgs,
+    /// Only these workspace members (all of them when none are given)
+    #[arg(short = 'p', long = "package", value_name = "SPEC")]
+    pub package: Vec<String>,
+    /// Exit with status 1 when anything is outdated (for CI)
+    #[arg(long)]
+    pub exit_code: bool,
+    /// `human` (a table) or `json`
+    #[arg(long, default_value = "human", value_parser = ["human", "json"])]
+    pub format: String,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct UpgradeArgs {
+    #[command(flatten)]
+    pub manifest: ManifestArgs,
+    /// Dependencies to upgrade (every registry dependency when none are given)
+    pub dependencies: Vec<String>,
+    /// Only the manifests of these workspace members
+    #[arg(short = 'p', long = "package", value_name = "SPEC")]
+    pub package: Vec<String>,
+    /// Also move to new major versions (0.x: new minor versions), which may
+    /// need code changes
+    #[arg(long)]
+    pub incompatible: bool,
+    /// Also rewrite `=` requirements
+    #[arg(long)]
+    pub pinned: bool,
+    /// Consider releases that need a newer Rust than the package's
+    /// `rust-version`
+    #[arg(long)]
+    pub ignore_rust_version: bool,
+    /// Show what would change without writing anything
     #[arg(long)]
     pub dry_run: bool,
 }

@@ -4284,3 +4284,180 @@ fn a_dependency_that_learns_an_outside_input_late_still_rekeys_its_dependents() 
     assert!(back.contains("mode=one"), "{back}");
     assert!(back.contains("0 compiled"), "{back}");
 }
+
+// ---------------------------------------------------------------------------
+// outdated / upgrade
+// ---------------------------------------------------------------------------
+
+/// Adds `"rust_version":"<rv>"` to one release in a local registry's index.
+#[cfg(unix)]
+fn require_rust(reg: &tempfile::TempDir, name: &str, version: &str, rv: &str) {
+    let path = reg.path().join("index/1").join(name);
+    let text = std::fs::read_to_string(&path).unwrap().replace(
+        &format!("\"vers\":\"{version}\""),
+        &format!("\"vers\":\"{version}\",\"rust_version\":\"{rv}\""),
+    );
+    std::fs::write(path, text).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn outdated_lists_what_the_lockfile_and_the_manifest_hold_back() {
+    let reg = local_registry(&[
+        ("a", "1.0.0", &[]),
+        ("a", "1.2.0", &[]),
+        ("a", "2.0.0", &[]),
+        ("b", "0.3.0", &[]),
+    ]);
+    let p = app_with(&reg, "a = \"1.0\"\nb = \"0.3\"\n");
+    p.write("Cargo.lock", "");
+    std::fs::remove_file(p.path().join("Cargo.lock")).unwrap();
+    // Lock the old release on purpose.
+    p.ok(&["generate-lockfile"]);
+    p.ok(&["update", "-p", "a", "--precise", "1.0.0"]);
+
+    let out = p.rune(&["outdated", "--exit-code"]);
+    let table = text(&out);
+    assert_eq!(out.status.code(), Some(1), "{table}");
+    let row = table
+        .lines()
+        .find(|l| l.starts_with("a "))
+        .unwrap_or_else(|| panic!("no row for `a`:\n{table}"));
+    let cells: Vec<&str> = row.split_whitespace().collect();
+    assert_eq!(
+        &cells[..5],
+        ["a", "1.0", "1.0.0", "1.2.0", "2.0.0"],
+        "{row}"
+    );
+    assert!(
+        !table.lines().any(|l| l.starts_with("b ")),
+        "b is current:\n{table}"
+    );
+
+    let json = p.rune(&["outdated", "--format", "json"]);
+    let rows: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    assert_eq!(rows[0]["name"], "a");
+    assert_eq!(rows[0]["compatible"], "1.2.0");
+}
+
+#[cfg(unix)]
+#[test]
+fn upgrade_raises_requirements_keeping_the_manifests_formatting() {
+    let reg = local_registry(&[
+        ("a", "1.0.0", &[]),
+        ("a", "1.2.0", &[]),
+        ("a", "2.0.0", &[]),
+        ("bb", "0.3.0", &[]),
+        ("bb", "0.4.1", &[]),
+    ]);
+    let p = app_with(
+        &reg,
+        "a = \"1.0\" # keep this comment\nbb = { version = \"0.3\", default-features = false }\n",
+    );
+    p.ok(&["generate-lockfile"]);
+    p.ok(&["update", "-p", "a", "--precise", "1.0.0"]);
+
+    // Compatible: `a` to 1.2, `bb` stays (0.4 is a breaking release).
+    let out = p.ok(&["upgrade"]);
+    let manifest = p.read("Cargo.toml");
+    assert!(
+        manifest.contains("a = \"1.2\" # keep this comment"),
+        "{manifest}\n{out}"
+    );
+    assert!(
+        manifest.contains("bb = { version = \"0.3\", default-features = false }"),
+        "{manifest}"
+    );
+    assert!(
+        locked(&p).contains(&"a 1.2.0".to_string()),
+        "{:?}",
+        locked(&p)
+    );
+
+    // Incompatible, one dependency: only `bb`, table form kept.
+    p.ok(&["upgrade", "--incompatible", "bb"]);
+    let manifest = p.read("Cargo.toml");
+    assert!(
+        manifest.contains("bb = { version = \"0.4\", default-features = false }"),
+        "{manifest}"
+    );
+    assert!(manifest.contains("a = \"1.2\""), "{manifest}");
+    assert!(
+        locked(&p).contains(&"bb 0.4.1".to_string()),
+        "{:?}",
+        locked(&p)
+    );
+
+    // A dry run writes nothing.
+    let before = p.read("Cargo.toml");
+    p.ok(&["upgrade", "--incompatible", "--dry-run"]);
+    assert_eq!(p.read("Cargo.toml"), before);
+}
+
+#[cfg(unix)]
+#[test]
+fn upgrade_and_outdated_respect_the_packages_rust_version() {
+    let reg = local_registry(&[
+        ("a", "1.0.0", &[]),
+        ("a", "1.5.0", &[]),
+        ("a", "1.9.0", &[]),
+    ]);
+    require_rust(&reg, "a", "1.5.0", "1.50");
+    require_rust(&reg, "a", "1.9.0", "9.99");
+    let p = app_with(&reg, "a = \"1.0.0\"\n");
+    let manifest = p.read("Cargo.toml").replace(
+        "edition = \"2021\"",
+        "edition = \"2021\"\nrust-version = \"1.60\"",
+    );
+    p.write("Cargo.toml", &manifest);
+    p.ok(&["upgrade"]);
+    assert!(
+        p.read("Cargo.toml").contains("a = \"1.5.0\""),
+        "{}",
+        p.read("Cargo.toml")
+    );
+    let table = p.ok(&["outdated"]);
+    assert!(table.contains("1.9.0 needs a newer Rust"), "{table}");
+    p.ok(&["upgrade", "--ignore-rust-version"]);
+    assert!(
+        p.read("Cargo.toml").contains("a = \"1.9.0\""),
+        "{}",
+        p.read("Cargo.toml")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn upgrade_edits_workspace_dependencies_where_members_inherit_them() {
+    let reg = local_registry(&[("a", "1.0.0", &[]), ("a", "1.3.0", &[])]);
+    let p = Project::new();
+    p.write(
+        "Cargo.toml",
+        "[workspace]\nmembers = [\"app\"]\n\n[workspace.dependencies]\na = \"1.0\"\n",
+    );
+    p.write(
+        "app/Cargo.toml",
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\
+         [dependencies]\na = { workspace = true }\n",
+    );
+    p.write("app/src/main.rs", "fn main() {}\n");
+    p.write(
+        ".cargo/config.toml",
+        &format!(
+            "[source.crates-io]\nreplace-with = \"local\"\n[source.local]\nlocal-registry = {:?}\n",
+            reg.path()
+        ),
+    );
+    p.ok(&["upgrade"]);
+    assert!(
+        p.read("Cargo.toml").contains("a = \"1.3\""),
+        "{}",
+        p.read("Cargo.toml")
+    );
+    assert!(
+        p.read("app/Cargo.toml")
+            .contains("a = { workspace = true }")
+    );
+    // `-p app` only looks at the member's own manifest, which inherits.
+    assert!(p.ok(&["upgrade", "-p", "app"]).contains("already allows"));
+}

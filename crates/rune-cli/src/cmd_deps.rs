@@ -292,7 +292,12 @@ pub fn remove(args: RemoveArgs) -> Result<()> {
 }
 
 /// Re-resolves and stores the lockfile, downloading whatever is now needed.
-fn refresh_lockfile(ws: &Workspace, offline: bool, refresh: bool, only: &[String]) -> Result<()> {
+pub(crate) fn refresh_lockfile(
+    ws: &Workspace,
+    offline: bool,
+    refresh: bool,
+    only: &[String],
+) -> Result<()> {
     let mut existing = LockfileManager::load_fast(ws.root());
     if let Some(lock) = existing.as_mut()
         && !only.is_empty()

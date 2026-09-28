@@ -9,6 +9,7 @@ mod cmd_install;
 mod cmd_misc;
 mod cmd_publish;
 mod cmd_test;
+mod cmd_upgrade;
 mod cmd_vendor;
 mod cmd_watch;
 mod doctor;
@@ -63,6 +64,8 @@ fn main() {
         Commands::Add(a) => cmd_deps::add(a),
         Commands::Remove(a) => cmd_deps::remove(a),
         Commands::Update(a) => cmd_deps::update(a),
+        Commands::Outdated(a) => cmd_upgrade::outdated(a),
+        Commands::Upgrade(a) => cmd_upgrade::upgrade(a),
         Commands::Tree(a) => cmd_deps::tree(a),
         Commands::Why(a) => cmd_deps::why(a),
         Commands::Fetch(a) => cmd_deps::fetch(a),
