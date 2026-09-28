@@ -997,6 +997,10 @@ fn may_hold_doctests(text: &str) -> bool {
     // Docs in attributes can span lines (`#![cfg_attr(feature = "std", doc =
     // r#"...```rust ...```"#)]`, `#![doc = include_str!("../README.md")]`).
     let doc_attribute = text.contains("doc =") || text.contains("doc=");
+    // Block doc comments (`/*! ... */`), whose lines need no leading `*`.
+    if (text.contains("/*!") || text.contains("/**")) && text.contains("```") {
+        return true;
+    }
     text.lines().any(|line| {
         let t = line.trim_start();
         ((t.starts_with("///") || t.starts_with("//!") || t.starts_with('*')) && t.contains("```"))
@@ -1262,6 +1266,14 @@ mod tests {
         std::fs::write(
             src.join("lib.rs"),
             "#![cfg_attr(feature = \"std\", doc = r#\"\n```rust\nassert!(true);\n```\n\"#)]\n",
+        )
+        .unwrap();
+        assert!(has_doctests(&src.join("lib.rs")));
+
+        // A block doc comment whose lines have no leading `*` (grep-searcher).
+        std::fs::write(
+            src.join("lib.rs"),
+            "/*!\nDocs.\n\n```\nassert!(true);\n```\n*/\n",
         )
         .unwrap();
         assert!(has_doctests(&src.join("lib.rs")));

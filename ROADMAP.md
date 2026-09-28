@@ -106,7 +106,7 @@ where crates.io has published newer releases than the ones pinned).
 
 | § | Topic | Status | Notes |
 | --- | --- | --- | --- |
-| 1 | Compatibility goal | 🟡 | Verified on Rune's own graph, a 469-package corpus of popular crates, and 72 crates' own test suites, all ending as under Cargo (§12); a top-500 sweep in CI is milestone M2. |
+| 1 | Compatibility goal | 🟡 | Verified on Rune's own graph, a 469-package corpus of popular crates, 72 crates' own test suites and the ripgrep, serde and regex workspaces, all ending as under Cargo (§12); a top-500 sweep in CI is milestone M2. |
 | 2 | Manifest fields | ✅ | Compilation-relevant fields honoured; packaging-only fields (`include/exclude/publish/keywords/…`) are parsed and ignored. The manifest may be `Cargo.toml` **or** `Rune.toml` (§8). |
 | 3 | Workspaces | ✅ | members/exclude/default-members/resolver, `[workspace.package/dependencies/lints/metadata]`, `[patch]`, `[replace]`, `[profile]`. |
 | 4 | Package targets | ✅ | All target kinds/options; `doc = false` honoured by `rune doc`. |
@@ -1062,6 +1062,12 @@ bindgen, ratatui, …):
   `src/lib.rs - Item (line N)` as under Cargo. Remaining difference: packages
   are keyed by name and version, so a published release with *exactly* the
   local version still resolves to the local package (Cargo would lock both).
+- Three real workspaces, `test --workspace` under both tools: ripgrep (10
+  crates) 1229 passed / 3 ignored, serde (5 crates, `test_suite` with derives)
+  479 / 5, regex (6 crates incl. a C API cdylib) 1402 / 5 — identical, after
+  one more fix (doc tests written in block comments `/*! … */` were skipped:
+  `grep-searcher`). Re-running ripgrep's suite with everything in the store
+  took 4.6 s.
 - New lockfiles use format 3 when a member's `rust-version` predates 1.83,
   as Cargo does.
 - Found on the way: a registry crate's `cargo:warning` lines leaked into every
