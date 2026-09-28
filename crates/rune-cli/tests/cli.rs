@@ -4890,6 +4890,20 @@ fn a_store_bundle_carries_a_build_to_a_fresh_machine() {
     assert!(rune(&["cas", "import", bundle.to_str().unwrap()]).contains("imported"));
     let build = rune(&["build"]);
     assert!(build.contains(" 0 compiled"), "{build}");
+    // After an edit the package compiles again, but its build script's
+    // result comes from the bundle too: the script is not compiled.
+    let main = std::fs::read_to_string(p.path().join("src/main.rs")).unwrap();
+    std::fs::write(p.path().join("src/main.rs"), main.clone() + "\n// edited\n").unwrap();
+    let edited = rune(&["build"]);
+    assert!(!edited.contains(" 0 compiled"), "{edited}");
+    std::fs::write(p.path().join("src/main.rs"), main).unwrap();
+    let scripts: Vec<_> = std::fs::read_dir(p.path().join(".rune/target/debug/build"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| e.path().join("script").exists())
+        .collect();
+    assert!(scripts.is_empty(), "{scripts:?}");
     let run = rune(&["run"]);
     assert!(
         run.contains("cfg=true env=ok"),

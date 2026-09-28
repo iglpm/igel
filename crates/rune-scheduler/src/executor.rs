@@ -746,48 +746,15 @@ impl BuildExecutor {
                     job.lock = Some(lock);
                     job.lock_waited = lock_waited;
                     if script_only {
-                        let node = graph.node(node_id);
-                        let build_dep_keys: Vec<(String, String)> = node
-                            .build_dependencies
-                            .iter()
-                            .filter_map(|d| {
-                                let dep = &graph.node(*d).unit;
-                                let alias = node
-                                    .build_aliases
-                                    .get(d)
-                                    .cloned()
-                                    .unwrap_or_else(|| dep.rustc_crate_name());
-                                Some((
-                                    format!("build-dep:{alias}:{}", dep.crate_id.name),
-                                    unit_cas_keys.get(d)?.clone(),
-                                ))
-                            })
-                            .collect();
-                        let base = compute_script_base(
-                            &node.unit,
-                            &self.profile,
-                            &build_dep_keys,
+                        let (base, package_hash, key) = self.script_keys(
+                            graph,
+                            node_id,
+                            &unit_cas_keys,
                             &job.dep_metadata,
                             &mut source_cache,
                         );
-                        job.package_hash = if node.unit.crate_id.source == CrateSource::Local {
-                            rune_fingerprint::hasher::compute_package_hash(
-                                &node.unit.manifest_dir,
-                                &mut source_cache,
-                            )
-                            .unwrap_or_default()
-                        } else {
-                            String::new()
-                        };
-                        let record: Option<inputs::ScriptRecord> = self
-                            .cas
-                            .as_ref()
-                            .and_then(|c| c.get_value(&format!("{base}-script-record")));
-                        let package_hash = job.package_hash.clone();
-                        job.script_cache_key =
-                            Some(inputs::script_result_key(&base, record.as_ref(), || {
-                                package_hash
-                            }));
+                        job.package_hash = package_hash;
+                        job.script_cache_key = Some(key);
                         job.script_base = Some(base);
                     }
                     if !script_only {
@@ -1132,21 +1099,94 @@ impl BuildExecutor {
         let mut source_cache =
             rune_fingerprint::FingerprintCache::load(&cache_path).unwrap_or_default();
         let mut keys: HashMap<NodeId, String> = HashMap::new();
+        // Build script results found so far, by script (for `DEP_*` values).
+        let mut script_outputs: HashMap<String, BuildScriptOutput> = HashMap::new();
         let mut out = Vec::new();
         for id in topo {
             let (base, key) = self.compute_keys(graph, id, &keys, &mut source_cache, false);
-            for slot in [
+            out.extend([
                 key.clone(),
-                format!("{key}-buildscript"),
                 format!("{key}-warnings"),
                 format!("{key}-diagnostics"),
                 format!("{base}-inputs"),
-            ] {
-                out.push(slot);
+            ]);
+            let unit = &graph.node(id).unit;
+            if unit.build_script.is_some() && unit.ext.script_owner.is_none() {
+                let mut dep_metadata = Vec::new();
+                for d in &graph.node(id).dependencies {
+                    let dep = &graph.node(*d).unit;
+                    let owner = dep
+                        .ext
+                        .script_owner
+                        .clone()
+                        .unwrap_or_else(|| script_key(dep));
+                    if let (Some(links), Some(output)) = (&dep.links, script_outputs.get(&owner)) {
+                        for (k, v) in &output.metadata {
+                            dep_metadata.push((links.clone(), k.clone(), v.clone()));
+                        }
+                    }
+                }
+                let (script_base, _, script) =
+                    self.script_keys(graph, id, &keys, &dep_metadata, &mut source_cache);
+                let result = format!("{script}-buildscript");
+                if let Some(output) = self.cas.as_ref().and_then(|c| c.get_value(&result)) {
+                    script_outputs.insert(script_key(unit), output);
+                }
+                out.extend([format!("{script_base}-script-record"), result]);
             }
             keys.insert(id, key);
         }
         Ok(out)
+    }
+
+    /// The keys of a unit's build script result: `(base, package hash, key
+    /// it is looked up under)` (see [`compute_script_base`] and
+    /// [`inputs::script_result_key`]), given its build-dependencies' final
+    /// keys and the `DEP_*` values the script receives.
+    fn script_keys(
+        &self,
+        graph: &BuildGraph,
+        id: NodeId,
+        keys: &HashMap<NodeId, String>,
+        dep_metadata: &[(String, String, String)],
+        source_cache: &mut rune_fingerprint::FingerprintCache,
+    ) -> (String, String, String) {
+        let node = graph.node(id);
+        let build_dep_keys: Vec<(String, String)> = node
+            .build_dependencies
+            .iter()
+            .filter_map(|d| {
+                let dep = &graph.node(*d).unit;
+                let alias = node
+                    .build_aliases
+                    .get(d)
+                    .cloned()
+                    .unwrap_or_else(|| dep.rustc_crate_name());
+                Some((
+                    format!("build-dep:{alias}:{}", dep.crate_id.name),
+                    keys.get(d)?.clone(),
+                ))
+            })
+            .collect();
+        let base = compute_script_base(
+            &node.unit,
+            &self.profile,
+            &build_dep_keys,
+            dep_metadata,
+            source_cache,
+        );
+        let package_hash = if node.unit.crate_id.source == CrateSource::Local {
+            rune_fingerprint::hasher::compute_package_hash(&node.unit.manifest_dir, source_cache)
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
+        let record: Option<inputs::ScriptRecord> = self
+            .cas
+            .as_ref()
+            .and_then(|c| c.get_value(&format!("{base}-script-record")));
+        let key = inputs::script_result_key(&base, record.as_ref(), || package_hash.clone());
+        (base, package_hash, key)
     }
 
     /// Whether the store has a result for `key`.
