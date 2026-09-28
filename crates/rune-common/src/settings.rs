@@ -37,6 +37,8 @@ pub enum ValueKind {
     Size,
     /// Free text (a token, a list of URLs).
     Text,
+    /// `off`, `auto`, or a positive number (of threads).
+    Threads,
 }
 
 impl ValueKind {
@@ -47,8 +49,21 @@ impl ValueKind {
             ValueKind::Path => "a path",
             ValueKind::Text => "text",
             ValueKind::Size => "a size such as `20GB` or `512MiB`",
+            ValueKind::Threads => "`off`, `auto` or a number of threads",
         }
     }
+}
+
+/// How many threads rustc's parallel front end may use (`build.frontend-threads`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FrontendThreads {
+    /// One, as rustc does by default.
+    #[default]
+    Off,
+    /// As many as there are idle cores when a crate starts.
+    Auto,
+    /// Always this many.
+    Fixed(usize),
 }
 
 /// A typed setting value.
@@ -109,6 +124,18 @@ pub const KEYS: &[KeyDef] = &[
         kind: ValueKind::Uint,
         default: "CPUs + one third",
         description: "Default number of parallel compiler jobs (`-j`).",
+    },
+    KeyDef {
+        name: "build.frontend-threads",
+        kind: ValueKind::Threads,
+        default: "off",
+        description: "Threads for rustc's parallel front end (`-Z threads`), which only nightly \
+                      compilers accept; ignored on stable. `auto`: a crate that starts while \
+                      cores are idle — typically the last, largest crates of a build, which \
+                      otherwise type-check on one core — gets as many threads as there are idle \
+                      cores (at most 8); crates started while the machine is busy get one. A \
+                      number: that many for every crate. Whether it pays depends on the crate: \
+                      on Rune's own build (4 cores) it kept the cores busy but saved no time.",
     },
     KeyDef {
         name: "build.target-dir",
@@ -429,6 +456,19 @@ impl Settings {
         self.bool("build.release-rebuild-all", false)
     }
 
+    /// `build.frontend-threads`.
+    pub fn frontend_threads(&self) -> FrontendThreads {
+        match self.values.get("build.frontend-threads") {
+            Some((Value::Text(t), _)) if t == "auto" => FrontendThreads::Auto,
+            Some((Value::Text(t), _)) => t
+                .parse::<usize>()
+                .ok()
+                .filter(|n| *n > 1)
+                .map_or(FrontendThreads::Off, FrontendThreads::Fixed),
+            _ => FrontendThreads::Off,
+        }
+    }
+
     /// `build.jobs`.
     pub fn jobs(&self) -> Option<usize> {
         self.uint("build.jobs")
@@ -659,6 +699,25 @@ fn from_toml(def: &KeyDef, item: &Item) -> Result<Value, &'static str> {
             TomlValue::String(s) => parse_size(s.value()).map(Value::Size).ok_or(expected),
             _ => Err(expected),
         },
+        ValueKind::Threads => match value {
+            TomlValue::Integer(n) => parse_threads(&n.value().to_string()).ok_or(expected),
+            TomlValue::String(s) => parse_threads(s.value()).ok_or(expected),
+            _ => Err(expected),
+        },
+    }
+}
+
+/// `off`, `auto` or a positive count, normalized.
+fn parse_threads(raw: &str) -> Option<Value> {
+    let raw = raw.trim().to_ascii_lowercase();
+    match raw.as_str() {
+        "off" | "false" | "no" | "0" | "1" => Some(Value::Text("off".into())),
+        "auto" | "on" | "true" | "yes" => Some(Value::Text("auto".into())),
+        n => n
+            .parse::<u64>()
+            .ok()
+            .filter(|n| (2..=256).contains(n))
+            .map(|n| Value::Text(n.to_string())),
     }
 }
 
@@ -693,6 +752,7 @@ pub fn parse_value(def: &KeyDef, raw: &str) -> Result<Value, SettingsError> {
         ValueKind::Text if !raw.is_empty() => Ok(Value::Text(raw.to_string())),
         ValueKind::Text => Err(bad()),
         ValueKind::Size => parse_size(raw).map(Value::Size).ok_or_else(bad),
+        ValueKind::Threads => parse_threads(raw).ok_or_else(bad),
     }
 }
 
@@ -957,6 +1017,22 @@ mod tests {
             err.to_string().contains("build.release-rebuild-all"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn frontend_threads_accept_off_auto_or_a_count() {
+        let def = KEYS
+            .iter()
+            .find(|k| k.name == "build.frontend-threads")
+            .unwrap();
+        assert_eq!(
+            parse_value(def, "auto").unwrap(),
+            Value::Text("auto".into())
+        );
+        assert_eq!(parse_value(def, "off").unwrap(), Value::Text("off".into()));
+        assert_eq!(parse_value(def, "1").unwrap(), Value::Text("off".into()));
+        assert_eq!(parse_value(def, "8").unwrap(), Value::Text("8".into()));
+        assert!(parse_value(def, "lots").is_err());
     }
 
     #[test]

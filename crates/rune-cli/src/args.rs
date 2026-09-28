@@ -202,8 +202,10 @@ pub struct CommonArgs {
     #[arg(long)]
     pub frozen: bool,
 
-    /// Print how long each phase of the build takes (and write a Chrome
-    /// trace of the schedule to `.rune/fingerprints/trace.json`)
+    /// Print how long each phase of the build takes and the chain of crates
+    /// that determined its length; write an HTML timeline to
+    /// `.rune/timings/rune-timing.html` and a Chrome trace to
+    /// `.rune/fingerprints/trace.json`
     #[arg(long)]
     pub timings: bool,
 

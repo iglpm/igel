@@ -196,6 +196,19 @@ impl Toolchain {
         out
     }
 
+    /// Whether the compiler accepts `-Z` flags: a nightly or locally built
+    /// one (or any, with `RUSTC_BOOTSTRAP=1` set by the user).
+    pub fn accepts_unstable_flags(&self) -> bool {
+        let release = self
+            .verbose_version
+            .lines()
+            .find_map(|l| l.strip_prefix("release: "))
+            .unwrap_or("");
+        release.contains("nightly")
+            || release.contains("-dev")
+            || std::env::var("RUSTC_BOOTSTRAP").is_ok_and(|v| v == "1")
+    }
+
     /// Whether a `rust-version` requirement (`1.85`, `1.85.0`) is met.
     /// Pre-release suffixes on the toolchain (`-nightly`) are ignored, as
     /// Cargo ignores them for this check.

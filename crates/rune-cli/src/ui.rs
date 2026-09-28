@@ -104,6 +104,15 @@ pub fn summary(message: impl Display) {
     eprintln!("{} {}", "✓".green().bold(), message);
 }
 
+/// Advice after a summary: something the user may want to know or change,
+/// not a problem (on stderr, like every status line).
+pub fn hint(message: impl Display) {
+    if quiet() {
+        return;
+    }
+    eprintln!("  {} {}", "note:".dimmed(), message.to_string().dimmed());
+}
+
 /// A non-fatal warning.
 pub fn warn(message: impl Display) {
     eprintln!("{} {}", "!".yellow().bold(), message.to_string().yellow());

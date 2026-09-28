@@ -172,7 +172,8 @@ impl Session {
                         .map(|e| (e.name, e.value, e.force))
                         .collect(),
                 )
-                .with_color(colored::control::SHOULD_COLORIZE.should_colorize());
+                .with_color(colored::control::SHOULD_COLORIZE.should_colorize())
+                .with_frontend_threads(self.ws.config.settings.frontend_threads());
         if let Some(cas) = self.cas() {
             executor = executor.with_cas(cas);
         }

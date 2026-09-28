@@ -1,5 +1,6 @@
 use crate::inputs::{self, DeclaredInputs, effective_key};
 use crate::pipeline::PipelineEvent;
+use crate::schedule::{Gate, ScheduleReport, Step, StepId};
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use rayon::prelude::*;
 use rune_cas::CasStore;
@@ -37,6 +38,8 @@ pub struct BuildResult {
     /// What each unit's build script reported (run or restored): the `cfg`s,
     /// environment and native search paths later steps (`rune doc`) need.
     pub build_script_outputs: HashMap<NodeId, BuildScriptOutput>,
+    /// How the build was scheduled, when anything was built.
+    pub schedule: Option<ScheduleReport>,
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -82,6 +85,22 @@ enum WorkerMsg {
     },
 }
 
+/// See [`BuildExecutor::frontend_threads_for`].
+fn frontend_threads(
+    setting: rune_common::settings::FrontendThreads,
+    cpus: usize,
+    busy: usize,
+    waiting: usize,
+) -> Option<usize> {
+    use rune_common::settings::FrontendThreads;
+    let n = match setting {
+        FrontendThreads::Off => return None,
+        FrontendThreads::Fixed(n) => n,
+        FrontendThreads::Auto => (cpus.saturating_sub(busy + waiting) + 1).min(8),
+    };
+    (n > 1).then_some(n)
+}
+
 /// The name a unit has in `--timings` traces.
 fn span_name(unit: &CompilationUnit) -> String {
     format!(
@@ -90,6 +109,60 @@ fn span_name(unit: &CompilationUnit) -> String {
         unit.crate_id.version,
         unit.kind.as_str()
     )
+}
+
+fn step_id(node: NodeId, script: bool) -> StepId {
+    StepId {
+        node: node.0,
+        script,
+    }
+}
+
+/// What a step waited for, mirroring the readiness rules in
+/// [`BuildExecutor::execute`].
+fn step_gates(
+    graph: &BuildGraph,
+    id: NodeId,
+    script: bool,
+    transitive_deps: &HashMap<NodeId, HashSet<NodeId>>,
+    script_prereqs: &HashMap<NodeId, (Vec<NodeId>, Vec<NodeId>)>,
+) -> Vec<Gate> {
+    let end = |d: NodeId| Gate::End(step_id(d, false));
+    let node = graph.node(id);
+    if script {
+        let Some((built, links)) = script_prereqs.get(&id) else {
+            return Vec::new();
+        };
+        return built
+            .iter()
+            .map(|d| end(*d))
+            .chain(links.iter().map(|d| {
+                if script_prereqs.contains_key(d) {
+                    Gate::End(step_id(*d, true))
+                } else {
+                    end(*d)
+                }
+            }))
+            .collect();
+    }
+    let mut gates: Vec<Gate> = if node.unit.produces_real_artifact() {
+        transitive_deps[&id].iter().map(|d| end(*d)).collect()
+    } else {
+        node.dependencies
+            .iter()
+            .map(|d| {
+                if graph.node(*d).unit.crate_type == CrateType::ProcMacro {
+                    end(*d)
+                } else {
+                    Gate::Metadata(step_id(*d, false))
+                }
+            })
+            .collect()
+    };
+    if script_prereqs.contains_key(&id) {
+        gates.push(Gate::End(step_id(id, true)));
+    }
+    gates
 }
 
 /// The advisory lock file that makes concurrent `rune` processes take turns
@@ -141,6 +214,10 @@ pub struct BuildExecutor {
     /// internal codegen threads and C compilers draw from one pool of
     /// `max_jobs` tokens instead of each assuming it owns the machine.
     jobserver: Option<jobserver::Client>,
+    /// `build.frontend-threads`.
+    frontend_threads: rune_common::settings::FrontendThreads,
+    /// Cores on this machine.
+    cpus: usize,
 }
 
 impl BuildExecutor {
@@ -158,7 +235,26 @@ impl BuildExecutor {
             config_env: Vec::new(),
             color: false,
             jobserver: jobserver::Client::new(max_jobs.max(1)).ok(),
+            frontend_threads: Default::default(),
+            cpus: std::thread::available_parallelism().map_or(1, |n| n.get()),
         }
+    }
+
+    /// Threads for rustc's parallel front end (nightly compilers only; see
+    /// `build.frontend-threads`).
+    pub fn with_frontend_threads(mut self, t: rune_common::settings::FrontendThreads) -> Self {
+        self.frontend_threads = t;
+        self
+    }
+
+    /// `-Z threads` for a unit started now, with `busy` units running
+    /// (including it) and `waiting` more ready to start: under `auto`, the
+    /// cores nobody else will use, so the long single crates at the end of a
+    /// build type-check on several cores while a busy machine is not
+    /// oversubscribed.
+    fn frontend_threads_for(&self, busy: usize, waiting: usize) -> Option<usize> {
+        frontend_threads(self.frontend_threads, self.cpus, busy, waiting)
+            .filter(|_| toolchain::global().accepts_unstable_flags())
     }
 
     /// Sets the CAS store for artifact caching.
@@ -215,8 +311,13 @@ impl BuildExecutor {
         let timings_path = self.config.fingerprint_dir.join("timings.json");
         let global_timings_path = self.config.cas_dir.join("timings.json");
         let mut timings = Timings::load(&timings_path, &global_timings_path);
-        let mut spans: Vec<TraceSpan> = Vec::new();
-        let mut started: HashMap<NodeId, f64> = HashMap::new();
+        // The schedule as it happened (see `schedule`): when each step became
+        // ready, started, wrote metadata and finished.
+        let mut steps: HashMap<StepId, Step> = HashMap::new();
+        let mut started: HashMap<StepId, f64> = HashMap::new();
+        let mut first_ready: HashMap<StepId, f64> = HashMap::new();
+        let mut metadata_at: HashMap<NodeId, f64> = HashMap::new();
+        let now = || start_time.elapsed().as_secs_f64();
 
         // 1. Cache keys for every node, dependencies first. A unit's *base*
         // key covers its source, configuration and dependencies; the key it is
@@ -473,7 +574,9 @@ impl BuildExecutor {
                 break; // Nothing more can start once something failed.
             }
 
-            if failed.is_empty() && in_flight.len() < self.max_jobs {
+            // Readiness is checked even while every slot is taken, so that the
+            // schedule report knows how long a unit waited for one.
+            if failed.is_empty() {
                 let mut ready: Vec<(NodeId, bool)> = unscheduled
                     .iter()
                     .copied()
@@ -504,6 +607,11 @@ impl BuildExecutor {
                     })
                     .collect();
 
+                for (id, script_only) in &ready {
+                    first_ready
+                        .entry(step_id(*id, *script_only))
+                        .or_insert_with(now);
+                }
                 // Longest remaining chain first.
                 ready.sort_by(|(a, _), (b, _)| {
                     let wa = weights.get(a).copied().unwrap_or(0.0);
@@ -511,7 +619,8 @@ impl BuildExecutor {
                     wb.partial_cmp(&wa).unwrap_or(std::cmp::Ordering::Equal)
                 });
 
-                for (node_id, script_only) in ready {
+                let ready_count = ready.len();
+                for (index, (node_id, script_only)) in ready.into_iter().enumerate() {
                     if in_flight.len() >= self.max_jobs {
                         break;
                     }
@@ -546,7 +655,7 @@ impl BuildExecutor {
                         in_script_phase.insert(node_id);
                     }
                     in_flight.insert(node_id);
-                    started.insert(node_id, start_time.elapsed().as_secs_f64());
+                    started.insert(step_id(node_id, script_only), now());
                     let mut job = self.prepare_job(
                         graph,
                         node_id,
@@ -560,6 +669,10 @@ impl BuildExecutor {
                     job.script_only = script_only;
                     job.lock = Some(lock);
                     job.lock_waited = lock_waited;
+                    if !script_only {
+                        job.frontend_threads =
+                            self.frontend_threads_for(in_flight.len(), ready_count - index - 1);
+                    }
                     job_threads.push(std::thread::spawn(move || job.run()));
                 }
             }
@@ -583,6 +696,7 @@ impl BuildExecutor {
                         rmeta_path,
                     } => {
                         debug!("Metadata ready for node {:?}", node_id);
+                        metadata_at.entry(node_id).or_insert_with(now);
                         metadata_ready.insert(node_id);
                         metadata_paths.insert(node_id, rmeta_path);
                     }
@@ -611,21 +725,29 @@ impl BuildExecutor {
                         }
                         let unit = &graph.node(node_id).unit;
                         timings.record_script(unit, &self.profile, duration);
-                        spans.push(TraceSpan {
-                            name: format!(
-                                "{} {} (build script)",
-                                unit.crate_id.name, unit.crate_id.version
-                            ),
-                            kind: "build-script",
-                            start: started.get(&node_id).copied().unwrap_or(0.0),
-                            dur: duration.as_secs_f64(),
-                            after: graph
-                                .node(node_id)
-                                .build_dependencies
-                                .iter()
-                                .map(|d| span_name(&graph.node(*d).unit))
-                                .collect(),
-                        });
+                        let id = step_id(node_id, true);
+                        let begun = started.get(&id).copied().unwrap_or(0.0);
+                        steps.insert(
+                            id,
+                            Step {
+                                label: format!(
+                                    "{} {} (build script)",
+                                    unit.crate_id.name, unit.crate_id.version
+                                ),
+                                kind: "build-script",
+                                ready: first_ready.get(&id).copied().unwrap_or(begun),
+                                start: begun,
+                                metadata: None,
+                                end: now(),
+                                gates: step_gates(
+                                    graph,
+                                    node_id,
+                                    true,
+                                    &transitive_deps,
+                                    &script_prereqs,
+                                ),
+                            },
+                        );
                     }
                     WorkerMsg::KeyUpdate { node_id, key } => {
                         // The unit's key changed; so do those of everything
@@ -684,22 +806,30 @@ impl BuildExecutor {
                         if !restored {
                             timings.record(unit, &self.profile, duration);
                         }
-                        spans.push(TraceSpan {
-                            name: span_name(unit),
-                            kind: if unit.crate_type == CrateType::ProcMacro {
-                                "proc-macro"
-                            } else {
-                                unit.kind.as_str()
+                        let id = step_id(node_id, false);
+                        let begun = started.get(&id).copied().unwrap_or(0.0);
+                        steps.insert(
+                            id,
+                            Step {
+                                label: span_name(unit),
+                                kind: if unit.crate_type == CrateType::ProcMacro {
+                                    "proc-macro"
+                                } else {
+                                    unit.kind.as_str()
+                                },
+                                ready: first_ready.get(&id).copied().unwrap_or(begun),
+                                start: begun,
+                                metadata: metadata_at.get(&node_id).copied(),
+                                end: now(),
+                                gates: step_gates(
+                                    graph,
+                                    node_id,
+                                    false,
+                                    &transitive_deps,
+                                    &script_prereqs,
+                                ),
                             },
-                            start: started.get(&node_id).copied().unwrap_or(0.0),
-                            dur: duration.as_secs_f64(),
-                            after: graph
-                                .node(node_id)
-                                .dependencies
-                                .iter()
-                                .map(|d| span_name(&graph.node(*d).unit))
-                                .collect(),
-                        });
+                        );
                         if restored {
                             cached += 1;
                         } else {
@@ -736,24 +866,21 @@ impl BuildExecutor {
         );
         let _ = source_cache.save_if_changed(&source_cache_path);
         timings.save(&timings_path, &global_timings_path);
-        if rune_common::timing::enabled() && !spans.is_empty() {
+        let schedule =
+            (!steps.is_empty()).then(|| ScheduleReport::analyze(&steps, self.cpus, self.max_jobs));
+        if let (true, Some(report)) = (rune_common::timing::enabled(), &schedule) {
             let trace_path = self.config.fingerprint_dir.join("trace.json");
-            write_trace(&trace_path, &spans);
-            let busy: f64 = spans.iter().map(|s| s.dur).sum();
-            let wall = start_time.elapsed().as_secs_f64().max(f64::EPSILON);
-            spans.sort_by(|a, b| (b.start + b.dur).total_cmp(&(a.start + a.dur)));
+            crate::schedule::write_chrome_trace(&trace_path, &steps);
+            let html_path = self
+                .config
+                .rune_dir
+                .join("timings")
+                .join("rune-timing.html");
+            crate::schedule::write_html(&html_path, &steps, report);
+            eprint!("  [timing] {}", report.describe_chain());
             eprintln!(
-                "  [timing] schedule: {:.1}s of unit time in {:.1}s wall ({:.1} units running on average); \
-                 last to finish: {}; trace: {}",
-                busy,
-                wall,
-                busy / wall,
-                spans
-                    .iter()
-                    .take(3)
-                    .map(|s| format!("{} ({:.1}s)", s.name, s.dur))
-                    .collect::<Vec<_>>()
-                    .join(", "),
+                "  [timing] report: {} (Chrome trace: {})",
+                html_path.display(),
                 trace_path.display()
             );
         }
@@ -780,6 +907,7 @@ impl BuildExecutor {
             artifact_paths,
             cache_keys: unit_cas_keys,
             build_script_outputs,
+            schedule,
         })
     }
 
@@ -1106,6 +1234,7 @@ impl BuildExecutor {
             script_only: false,
             lock: None,
             lock_waited: false,
+            frontend_threads: None,
         }
     }
 }
@@ -1147,6 +1276,8 @@ struct UnitJob {
     lock: Option<rune_common::fsutil::FileLock>,
     /// Another process held the lock first: it may have built the unit.
     lock_waited: bool,
+    /// `-Z threads` for this unit's compilation.
+    frontend_threads: Option<usize>,
 }
 
 impl UnitJob {
@@ -1551,6 +1682,11 @@ impl UnitJob {
         }
         for (k, v) in &self.extra_env {
             cmd_builder = cmd_builder.env(k, v);
+        }
+        // How the compiler divides its work, not what it produces: not part
+        // of the key (like `-j`).
+        if let Some(n) = self.frontend_threads {
+            cmd_builder = cmd_builder.extra_flags(vec![format!("-Zthreads={n}")]);
         }
         for (k, v, force) in &self.config_env {
             if *force || std::env::var_os(k).is_none() {
@@ -2144,54 +2280,6 @@ fn rust_source_bytes(dir: &Path) -> u64 {
         }
     }
     total
-}
-
-/// Writes the schedule of a finished build as a Chrome trace
-/// (`chrome://tracing`, Perfetto): one lane per concurrently running unit.
-fn write_trace(path: &Path, spans: &[TraceSpan]) {
-    let mut spans: Vec<&TraceSpan> = spans.iter().collect();
-    spans.sort_by(|a, b| {
-        a.start
-            .partial_cmp(&b.start)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    let mut lane_free_at: Vec<f64> = Vec::new();
-    let mut events = Vec::with_capacity(spans.len());
-    for span in spans {
-        let lane = match lane_free_at.iter().position(|&t| t <= span.start) {
-            Some(l) => l,
-            None => {
-                lane_free_at.push(0.0);
-                lane_free_at.len() - 1
-            }
-        };
-        lane_free_at[lane] = span.start + span.dur;
-        events.push(serde_json::json!({
-            "name": span.name,
-            "cat": span.kind,
-            "ph": "X",
-            "ts": (span.start * 1e6) as u64,
-            "dur": (span.dur * 1e6) as u64,
-            "pid": 1,
-            "tid": lane,
-            "args": { "after": span.after },
-        }));
-    }
-    let doc = serde_json::json!({ "traceEvents": events });
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let _ = std::fs::write(path, doc.to_string());
-}
-
-/// One compiled unit's place in the schedule, in seconds since the build began.
-struct TraceSpan {
-    name: String,
-    kind: &'static str,
-    start: f64,
-    dur: f64,
-    /// Names of the units this one waited for.
-    after: Vec<String>,
 }
 
 /// `RUSTFLAGS` (or `CARGO_ENCODED_RUSTFLAGS`) as individual arguments.
@@ -2880,6 +2968,19 @@ mod tests {
         let before = key(&u, &Profile::dev());
         std::fs::write(dir.path().join("src/lib.rs"), "fn b() {}").unwrap();
         assert_ne!(before, key(&u, &Profile::dev()));
+    }
+
+    #[test]
+    fn auto_frontend_threads_use_only_idle_cores() {
+        use rune_common::settings::FrontendThreads::*;
+        // A busy machine: one thread, i.e. no flag.
+        assert_eq!(frontend_threads(Auto, 10, 10, 0), None);
+        assert_eq!(frontend_threads(Auto, 10, 4, 6), None);
+        // The last crate of a build on an otherwise idle machine.
+        assert_eq!(frontend_threads(Auto, 10, 1, 0), Some(8));
+        assert_eq!(frontend_threads(Auto, 4, 2, 0), Some(3));
+        assert_eq!(frontend_threads(Off, 16, 1, 0), None);
+        assert_eq!(frontend_threads(Fixed(4), 16, 16, 9), Some(4));
     }
 
     #[test]

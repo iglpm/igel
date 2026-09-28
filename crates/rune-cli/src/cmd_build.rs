@@ -94,6 +94,12 @@ pub fn summarize(sess: &Session, result: &rune_scheduler::executor::BuildResult)
     }
     parts.push(format!("{:.2}s", result.total_duration.as_secs_f64()));
     ui::summary(parts.join(" · "));
+    // A slow build that left most cores idle says why.
+    if !sess.json
+        && let Some(hint) = result.schedule.as_ref().and_then(|s| s.hint())
+    {
+        ui::hint(hint);
+    }
 }
 
 /// `rune clippy`: lints the workspace's crates with `clippy-driver`.
