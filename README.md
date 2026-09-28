@@ -39,7 +39,8 @@ rune test my_filter -- --nocapture
 rune bench
 rune doc --no-deps
 rune add serde -F derive       # lists the release's features, + for those turned on
-rune tree -i serde             # who depends on serde?
+rune tree -i serde             # who depends on serde? (what a build on this machine uses)
+rune tree -e features -i serde # which package turned on each of serde's features
 rune why serde
 rune update                    # only re-downloads changed index entries
 rune new my-app                # or: rune init  (add --manifest rune for a Rune.toml project)

@@ -1124,7 +1124,7 @@ fn pick_targets(member: &Member, req: &Request, active: &[String]) -> Result<Vec
         }
         let want_lib_tests = (test_mode && (!explicit || sel.lib || all) && !sel.doc_only)
             || (all && !test_mode && !bench_mode);
-        if want_lib_tests && lib.test && !lib.proc_macro_or_no_harness() {
+        if want_lib_tests && lib.tested(true) && !lib.proc_macro_or_no_harness() {
             out.push(Pick {
                 kind: TargetKind::Lib,
                 name,
@@ -1176,7 +1176,7 @@ fn pick_targets(member: &Member, req: &Request, active: &[String]) -> Result<Vec
                 spec: Some(bin.clone()),
             });
         }
-        if test_mode && bin.test && bin.harness {
+        if test_mode && bin.tested(true) && bin.harness {
             out.push(Pick {
                 kind: TargetKind::Bin,
                 name,
@@ -1197,8 +1197,14 @@ fn pick_targets(member: &Member, req: &Request, active: &[String]) -> Result<Vec
         }
     }
 
-    // Examples.
-    let want_all_examples = explicit && (sel.examples || all);
+    // Examples. `test` without a selection builds them all, as Cargo does
+    // (to check they compile; a test may also run one), and runs those that
+    // ask for it (`test = true`) as tests.
+    let want_all_examples = if explicit {
+        sel.examples || all
+    } else {
+        test_mode
+    };
     for ex in &m.example {
         let name = ex.name.clone().unwrap_or_default();
         if !(want_all_examples || named(&sel.example, &name)) || sel.doc_only {
@@ -1214,13 +1220,23 @@ fn pick_targets(member: &Member, req: &Request, active: &[String]) -> Result<Vec
             }
             continue;
         }
+        let path = ex.path.clone().unwrap_or_default();
         out.push(Pick {
             kind: TargetKind::Example,
-            name,
-            path: ex.path.clone().unwrap_or_default(),
+            name: name.clone(),
+            path: path.clone(),
             harness: false,
             spec: Some(ex.clone()),
         });
+        if test_mode && ex.harness && ex.tested(false) {
+            out.push(Pick {
+                kind: TargetKind::Example,
+                name,
+                path,
+                harness: true,
+                spec: Some(ex.clone()),
+            });
+        }
     }
 
     // Integration tests.
@@ -1244,7 +1260,7 @@ fn pick_targets(member: &Member, req: &Request, active: &[String]) -> Result<Vec
             }
             continue;
         }
-        if !t.test && !named(&sel.test, &name) && !all {
+        if !t.tested(true) && !named(&sel.test, &name) && !all {
             continue;
         }
         out.push(Pick {

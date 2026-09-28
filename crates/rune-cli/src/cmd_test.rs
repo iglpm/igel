@@ -515,6 +515,45 @@ pub fn run(args: TestArgs, mode: Mode) -> Result<()> {
             }
         };
 
+        // A package's examples and binaries are built before its tests run,
+        // as with Cargo, where everything is built first: a test may start
+        // one (`target/debug/examples/...`). Other packages' tests still start
+        // the moment they link.
+        let companions: std::cell::RefCell<HashMap<usize, std::collections::HashSet<NodeId>>> =
+            std::cell::RefCell::new(HashMap::new());
+        for r in &plan.requested {
+            if !is_runnable(r, bench)
+                && !r.harness
+                && matches!(r.kind, TargetKind::Example | TargetKind::Bin)
+            {
+                companions
+                    .borrow_mut()
+                    .entry(r.member)
+                    .or_default()
+                    .insert(r.node);
+            }
+        }
+        let held: std::cell::RefCell<Vec<(usize, Vec<PathBuf>)>> = Default::default();
+        let settle = |node: NodeId| {
+            let mut c = companions.borrow_mut();
+            for pending in c.values_mut() {
+                pending.remove(&node);
+            }
+            c.retain(|_, pending| !pending.is_empty());
+        };
+        let may_run = |idx: usize| !companions.borrow().contains_key(&runnables[idx].member);
+        let release_held = || {
+            let ready: Vec<(usize, Vec<PathBuf>)> = {
+                let mut h = held.borrow_mut();
+                let (ready, rest): (Vec<_>, Vec<_>) = h.drain(..).partition(|(i, _)| may_run(*i));
+                *h = rest;
+                ready
+            };
+            for (idx, artifacts) in ready {
+                dispatch(idx, &artifacts, &plan, &sess);
+            }
+        };
+
         let artifacts_seen: std::cell::RefCell<HashMap<NodeId, Vec<PathBuf>>> = Default::default();
         let scripts_seen: std::cell::RefCell<HashMap<NodeId, rune_common::BuildScriptOutput>> =
             Default::default();
@@ -590,12 +629,20 @@ pub fn run(args: TestArgs, mode: Mode) -> Result<()> {
                 artifacts_seen
                     .borrow_mut()
                     .insert(*node_id, artifacts.clone());
+                settle(*node_id);
                 if let Some(&idx) = by_node.get(node_id) {
-                    dispatch(idx, artifacts, &plan, &sess);
+                    if may_run(idx) {
+                        dispatch(idx, artifacts, &plan, &sess);
+                    } else {
+                        held.borrow_mut().push((idx, artifacts.clone()));
+                    }
                 }
+                release_held();
                 try_dispatch_docs();
             }
             PipelineEvent::BuildFailed { node_id, .. } => {
+                settle(*node_id);
+                release_held();
                 if let Some(&idx) = by_node.get(node_id)
                     && !std::mem::replace(&mut dispatched.borrow_mut()[idx], true)
                 {
@@ -611,6 +658,10 @@ pub fn run(args: TestArgs, mode: Mode) -> Result<()> {
             }
             _ => {}
         })?;
+
+        // Whatever still waited on a companion that never reported runs now.
+        companions.borrow_mut().clear();
+        release_held();
 
         // Anything never dispatched (a dependency failed first) is skipped.
         for (idx, done) in dispatched.borrow().iter().enumerate() {
@@ -739,7 +790,8 @@ fn is_runnable(r: &Requested, bench: bool) -> bool {
         TargetKind::Lib | TargetKind::Bin => r.harness,
         TargetKind::Test => !bench,
         TargetKind::Bench => bench,
-        TargetKind::Example => false,
+        // Only an example that asks for it (`test = true`) is run.
+        TargetKind::Example => r.harness && !bench,
     }
 }
 

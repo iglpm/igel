@@ -45,9 +45,10 @@ pub struct TargetSpec {
     /// Whether doctests are run for this target.
     #[serde(default = "default_true")]
     pub doctest: bool,
-    /// Whether this target is tested by default.
-    #[serde(default = "default_true")]
-    pub test: bool,
+    /// Whether this target is tested by default, when the manifest says;
+    /// see [`TargetSpec::tested`] for the default (which depends on the kind).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub test: Option<bool>,
     /// Whether this target is benchmarked by default.
     #[serde(default = "default_true")]
     pub bench: bool,
@@ -57,6 +58,15 @@ pub struct TargetSpec {
     /// Extra target fields.
     #[serde(flatten)]
     pub extra: std::collections::HashMap<String, toml::Value>,
+}
+
+impl TargetSpec {
+    /// Whether `cargo test` tests this target by default: what the manifest
+    /// says, else `default` — `true` for libraries, binaries and tests,
+    /// `false` for examples (they are only built).
+    pub fn tested(&self, default: bool) -> bool {
+        self.test.unwrap_or(default)
+    }
 }
 
 fn default_true() -> bool {
@@ -78,7 +88,7 @@ impl Default for TargetSpec {
             edition: None,
             doc: true,
             doctest: true,
-            test: true,
+            test: None,
             bench: true,
             proc_macro: false,
             extra: Default::default(),

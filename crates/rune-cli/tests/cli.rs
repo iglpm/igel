@@ -5272,3 +5272,47 @@ fn tree_shows_what_a_build_here_uses_like_cargo_tree() {
     assert!(lines[default + 1].starts_with("2app v0.1.0"), "{why}");
     assert!(lines.contains(&"1lib1 feature \"extra\""), "{why}");
 }
+
+#[test]
+fn test_builds_the_examples_first_and_runs_those_marked_test() {
+    let p = Project::new();
+    p.write(
+        "Cargo.toml",
+        "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
+         [[example]]\nname = \"checked\"\ntest = true\n",
+    );
+    p.write("src/lib.rs", "pub fn one() -> u32 { 1 }\n");
+    // A plain example: built, never run by `test`.
+    p.write(
+        "examples/tool.rs",
+        "fn main() { println!(\"tool ran\"); }\n",
+    );
+    // `test = true`: its #[test]s run.
+    p.write(
+        "examples/checked.rs",
+        "fn main() {}\n#[test]\nfn example_test() { assert_eq!(demo::one(), 1); }\n",
+    );
+    // An integration test that starts the example, as `once_cell`'s does:
+    // it must exist by the time the test runs.
+    p.write(
+        "tests/runs_example.rs",
+        r#"#[test]
+fn example_binary_is_there() {
+    let mut exe = std::env::current_exe().unwrap();
+    exe.pop();
+    exe.pop();
+    let tool = exe.join("examples").join("tool").with_extension(std::env::consts::EXE_EXTENSION);
+    let out = std::process::Command::new(&tool).output().expect("the example was built");
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "tool ran");
+}
+"#,
+    );
+    let out = p.ok(&["test"]);
+    assert!(out.contains("(example checked) · 1 passed"), "{out}");
+    assert!(out.contains("(test runs_example) · 1 passed"), "{out}");
+    assert!(
+        !out.contains("example tool)"),
+        "a plain example is not run: {out}"
+    );
+    assert!(out.contains("✓ 2 passed"), "{out}");
+}

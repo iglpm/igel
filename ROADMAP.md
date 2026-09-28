@@ -254,7 +254,8 @@ a test or benchmark before they are claimed in the README.
 | P12 upgrading | ✅ `rune outdated`, `rune upgrade [--incompatible]`; `rune add` lists the release's features (enabled ones marked, as Cargo does), its `rust-version` and publication date (§12). Licence and download trend ⬜ (not in the index). |
 | P15 build-time code | 🟡 `rune tree --exec-surface`, `resolve.min-release-age` ✅ (§12); the sandbox ⬜. |
 | P16 provenance | 🟡 `rune sbom` (CycloneDX/SPDX) ✅ (§12); attestation, reproducibility check ⬜. |
-| P10, P13, P14 | ⬜ |
+| P10 feature questions | 🟡 `rune tree -e features -i <crate>` says which package or feature turned each feature on (§12). Workspace-wide unification ⬜. |
+| P13, P14 | ⬜ |
 
 ### 4.1 Build speed and feedback loop
 
@@ -1008,6 +1009,15 @@ becoming the limit, and makes the remaining limit visible:
   219 entries, 739 MiB (231 MiB gzipped), export 0.9 s, import 1.4 s, then a
   clean checkout builds with 0 compiled. Build-script results travel too.
 - `rune affected --partition N/M` for sharding CI.
+- `rune tree` shows what a build on this machine uses, like `cargo tree`: the
+  build's feature resolver runs for the host (`--target`, `--target all`), so
+  other platforms' dependencies and optional dependencies nothing enables are
+  gone and features are the ones built with; `[build-dependencies]` /
+  `[dev-dependencies]` headings; `-e/--edges` including `-e features` (with
+  `-i`: which package or feature turned each feature on — P10's question),
+  `--prefix`, `name@version` specs; `-d` is `--duplicates` as in Cargo. On the
+  469-package corpus below it matches `cargo tree` line for line except where
+  Cargo draws a crate used at build time and at run time as two nodes.
 - `rune add` lists the added release's features with the enabled ones marked,
   as `cargo add` does (a crate with hundreds, like `windows-sys`, gets the
   enabled ones and a count), plus its `rust-version` and publication date.
