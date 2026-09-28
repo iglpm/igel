@@ -28,7 +28,7 @@ toml_edit = "0.25"
 bincode = "1.3"
 
 # Networking & Compression
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "blocking", "json", "gzip", "http2", "stream"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "rustls-tls-native-roots", "blocking", "json", "gzip", "http2", "stream"] }
 flate2 = "1.0"
 tar = "0.4"
 
@@ -44,7 +44,6 @@ crossbeam-channel = "0.5"
 # CLI & UI
 clap = { version = "4", features = ["derive"] }
 colored = "2"
-console = "0.15"
 
 # Logging & Diagnostics
 tracing = "0.1"
@@ -65,7 +64,6 @@ tempfile = "3"
 tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "fs", "io-util", "time"] }
 tokio-util = { version = "0.7", default-features = false, features = ["io"] }
 rustix = { version = "1", default-features = false, features = ["fs", "std"] }
-memmap2 = "0.9"
 walkdir = "2"
 libc = "0.2"
 same-file = "1.0"

@@ -1,5 +1,6 @@
 use crate::inputs::{self, DeclaredInputs, effective_key};
 use crate::pipeline::PipelineEvent;
+use crate::schedule::{Gate, ScheduleReport, Step, StepId};
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use rayon::prelude::*;
 use rune_cas::CasStore;
@@ -37,6 +38,10 @@ pub struct BuildResult {
     /// What each unit's build script reported (run or restored): the `cfg`s,
     /// environment and native search paths later steps (`rune doc`) need.
     pub build_script_outputs: HashMap<NodeId, BuildScriptOutput>,
+    /// How the build was scheduled, when anything was built.
+    pub schedule: Option<ScheduleReport>,
+    /// How long starting more compilers was held back for lack of memory.
+    pub memory_held: Duration,
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -67,6 +72,158 @@ enum WorkerMsg {
         node_id: NodeId,
         error: String,
     },
+    /// A unit's build script ran (or its result was restored); the unit's
+    /// compilation is scheduled separately, holding on to the unit's lock.
+    ScriptPhaseDone {
+        node_id: NodeId,
+        duration: Duration,
+        lock: Option<rune_common::fsutil::FileLock>,
+        lock_waited: bool,
+    },
+    /// A waiter thread obtained the lock of a unit another process held.
+    LockAcquired {
+        node_id: NodeId,
+        lock: rune_common::fsutil::FileLock,
+    },
+}
+
+/// See [`BuildExecutor::frontend_threads_for`].
+fn frontend_threads(
+    setting: rune_common::settings::FrontendThreads,
+    cpus: usize,
+    busy: usize,
+    waiting: usize,
+) -> Option<usize> {
+    use rune_common::settings::FrontendThreads;
+    let n = match setting {
+        FrontendThreads::Off => return None,
+        FrontendThreads::Fixed(n) => n,
+        FrontendThreads::Auto => (cpus.saturating_sub(busy + waiting) + 1).min(8),
+    };
+    (n > 1).then_some(n)
+}
+
+/// What a compiled build script was compiled from, kept beside it.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ScriptStamp {
+    /// The script's base key (configuration and build-dependencies).
+    base: String,
+    /// Its source files and their content hashes, from rustc's dep-info.
+    sources: Vec<(PathBuf, String)>,
+    /// What the compiler printed.
+    warnings: String,
+}
+
+impl ScriptStamp {
+    fn hash(p: &Path) -> String {
+        rune_common::hash::xxhash3_file(p)
+            .map(|h| format!("{h:016x}"))
+            .unwrap_or_default()
+    }
+
+    fn new(base: &str, sources: &[PathBuf], warnings: &str) -> Self {
+        Self {
+            base: base.to_string(),
+            sources: sources.iter().map(|p| (p.clone(), Self::hash(p))).collect(),
+            warnings: warnings.to_string(),
+        }
+    }
+
+    fn sources_unchanged(&self) -> bool {
+        !self.sources.is_empty() && self.sources.iter().all(|(p, h)| Self::hash(p) == *h)
+    }
+}
+
+/// Shows again what compiling a restored build script printed.
+fn replay_script_warnings(
+    events: &Sender<PipelineEvent>,
+    node_id: NodeId,
+    output: Option<&BuildScriptOutput>,
+) {
+    if let Some(out) = output.filter(|o| !o.compile_warnings.trim().is_empty()) {
+        let _ = events.send(PipelineEvent::ScriptWarnings {
+            node_id,
+            warnings: out.compile_warnings.clone(),
+        });
+    }
+}
+
+/// The name a unit has in `--timings` traces.
+fn span_name(unit: &CompilationUnit) -> String {
+    format!(
+        "{} {} ({})",
+        unit.crate_id.name,
+        unit.crate_id.version,
+        unit.kind.as_str()
+    )
+}
+
+fn step_id(node: NodeId, script: bool) -> StepId {
+    StepId {
+        node: node.0,
+        script,
+    }
+}
+
+/// What a step waited for, mirroring the readiness rules in
+/// [`BuildExecutor::execute`].
+fn step_gates(
+    graph: &BuildGraph,
+    id: NodeId,
+    script: bool,
+    transitive_deps: &HashMap<NodeId, HashSet<NodeId>>,
+    script_prereqs: &HashMap<NodeId, (Vec<NodeId>, Vec<NodeId>)>,
+) -> Vec<Gate> {
+    let end = |d: NodeId| Gate::End(step_id(d, false));
+    let node = graph.node(id);
+    if script {
+        let Some((built, links)) = script_prereqs.get(&id) else {
+            return Vec::new();
+        };
+        return built
+            .iter()
+            .map(|d| end(*d))
+            .chain(links.iter().map(|d| {
+                if script_prereqs.contains_key(d) {
+                    Gate::End(step_id(*d, true))
+                } else {
+                    end(*d)
+                }
+            }))
+            .collect();
+    }
+    let mut gates: Vec<Gate> = if node.unit.produces_real_artifact() {
+        transitive_deps[&id].iter().map(|d| end(*d)).collect()
+    } else {
+        node.dependencies
+            .iter()
+            .map(|d| {
+                if graph.node(*d).unit.crate_type == CrateType::ProcMacro {
+                    end(*d)
+                } else {
+                    Gate::Metadata(step_id(*d, false))
+                }
+            })
+            .collect()
+    };
+    if script_prereqs.contains_key(&id) {
+        gates.push(Gate::End(step_id(id, true)));
+    }
+    gates
+}
+
+/// The advisory lock file that makes concurrent `rune` processes take turns
+/// on one unit's outputs.
+fn unit_lock_path(
+    config: &RuneConfig,
+    profile: &Profile,
+    graph: &BuildGraph,
+    id: NodeId,
+) -> PathBuf {
+    config
+        .profile_target_dir(profile.output_dir_name())
+        .join(".rune-locks")
+        .join(script_key(&graph.node(id).unit))
 }
 
 /// Which artifact flavor a compilation needs from its dependencies.
@@ -104,6 +261,12 @@ pub struct BuildExecutor {
     /// internal codegen threads and C compilers draw from one pool of
     /// `max_jobs` tokens instead of each assuming it owns the machine.
     jobserver: Option<jobserver::Client>,
+    /// `build.frontend-threads`.
+    frontend_threads: rune_common::settings::FrontendThreads,
+    /// Cores on this machine.
+    cpus: usize,
+    /// Reads the machine's memory (replaceable in tests).
+    memory: fn() -> Option<rune_common::sysinfo::Memory>,
 }
 
 impl BuildExecutor {
@@ -121,7 +284,36 @@ impl BuildExecutor {
             config_env: Vec::new(),
             color: false,
             jobserver: jobserver::Client::new(max_jobs.max(1)).ok(),
+            frontend_threads: Default::default(),
+            cpus: std::thread::available_parallelism().map_or(1, |n| n.get()),
+            memory: rune_common::sysinfo::memory,
         }
+    }
+
+    /// Replaces how the machine's memory is read (tests).
+    pub fn with_memory_probe(
+        mut self,
+        probe: fn() -> Option<rune_common::sysinfo::Memory>,
+    ) -> Self {
+        self.memory = probe;
+        self
+    }
+
+    /// Threads for rustc's parallel front end (nightly compilers only; see
+    /// `build.frontend-threads`).
+    pub fn with_frontend_threads(mut self, t: rune_common::settings::FrontendThreads) -> Self {
+        self.frontend_threads = t;
+        self
+    }
+
+    /// `-Z threads` for a unit started now, with `busy` units running
+    /// (including it) and `waiting` more ready to start: under `auto`, the
+    /// cores nobody else will use, so the long single crates at the end of a
+    /// build type-check on several cores while a busy machine is not
+    /// oversubscribed.
+    fn frontend_threads_for(&self, busy: usize, waiting: usize) -> Option<usize> {
+        frontend_threads(self.frontend_threads, self.cpus, busy, waiting)
+            .filter(|_| toolchain::global().accepts_unstable_flags())
     }
 
     /// Sets the CAS store for artifact caching.
@@ -178,8 +370,13 @@ impl BuildExecutor {
         let timings_path = self.config.fingerprint_dir.join("timings.json");
         let global_timings_path = self.config.cas_dir.join("timings.json");
         let mut timings = Timings::load(&timings_path, &global_timings_path);
-        let mut spans: Vec<TraceSpan> = Vec::new();
-        let mut started: HashMap<NodeId, f64> = HashMap::new();
+        // The schedule as it happened (see `schedule`): when each step became
+        // ready, started, wrote metadata and finished.
+        let mut steps: HashMap<StepId, Step> = HashMap::new();
+        let mut started: HashMap<StepId, f64> = HashMap::new();
+        let mut first_ready: HashMap<StepId, f64> = HashMap::new();
+        let mut metadata_at: HashMap<NodeId, f64> = HashMap::new();
+        let now = || start_time.elapsed().as_secs_f64();
 
         // 1. Cache keys for every node, dependencies first. A unit's *base*
         // key covers its source, configuration and dependencies; the key it is
@@ -275,6 +472,7 @@ impl BuildExecutor {
                             node_id: id,
                             output: output.clone(),
                         });
+                        replay_script_warnings(&self.event_tx, id, Some(&output));
                         build_script_outputs.insert(id, output);
                     }
                     // The generated files too: the package's other units
@@ -339,9 +537,9 @@ impl BuildExecutor {
                     }
                 },
                 |dep, dependent, dep_cost| {
-                    let pipelined = !dependent.unit.needs_real_link()
+                    let pipelined = !dependent.unit.produces_real_artifact()
                         && dep.unit.crate_type != CrateType::ProcMacro
-                        && !dep.unit.needs_real_link();
+                        && !dep.unit.produces_real_artifact();
                     if pipelined {
                         dep_cost * METADATA_FRACTION
                     } else {
@@ -378,6 +576,54 @@ impl BuildExecutor {
             map
         };
 
+        // A package's build script is its own step, as in Cargo: it needs its
+        // build-dependencies fully built (it links them) and the scripts of
+        // the `links` crates it depends on (their `DEP_*` metadata), but not
+        // the package's ordinary dependencies. So it compiles and runs while
+        // those are still compiling, and the library itself then starts as
+        // soon as their `.rmeta` exists. (Running the script first and only
+        // then the library, both after *every* dependency was fully linked,
+        // put each such crate's whole script on the critical path.)
+        let own_script = |id: NodeId| {
+            let u = &graph.node(id).unit;
+            u.build_script.is_some() && u.ext.script_owner.is_none()
+        };
+        let script_prereqs: HashMap<NodeId, (Vec<NodeId>, Vec<NodeId>)> = topo
+            .iter()
+            .copied()
+            .filter(|&id| own_script(id))
+            .map(|id| {
+                let node = graph.node(id);
+                let mut built: HashSet<NodeId> = HashSet::new();
+                for bd in &node.build_dependencies {
+                    built.insert(*bd);
+                    built.extend(transitive_deps[bd].iter().copied());
+                }
+                let links: Vec<NodeId> = node
+                    .dependencies
+                    .iter()
+                    .copied()
+                    .filter(|d| graph.node(*d).unit.links.is_some())
+                    .collect();
+                (id, (built.into_iter().collect(), links))
+            })
+            .collect();
+        let mut script_done: HashSet<NodeId> = HashSet::new();
+        // Units whose script step is running (their key may still change as
+        // their dependencies learn about outside inputs).
+        let mut in_script_phase: HashSet<NodeId> = HashSet::new();
+        // A unit's lock is held from its script step through its compilation,
+        // so another process never re-runs the script (and rewrites `OUT_DIR`)
+        // under a compiler reading it. `bool`: whether we had to wait for it.
+        let mut held_locks: HashMap<NodeId, (rune_common::fsutil::FileLock, bool)> = HashMap::new();
+        // Units another process holds the lock of; a waiter thread (not a job
+        // slot) blocks on it and hands it over.
+        let mut lock_waiting: HashSet<NodeId> = HashSet::new();
+        let mut job_threads: Vec<std::thread::JoinHandle<()>> = Vec::new();
+        // How long new work was held back because memory was short.
+        let mut memory_held = Duration::ZERO;
+        let mut memory_held_since: Option<Instant> = None;
+
         // Nodes still to schedule, in stable graph order.
         let mut unscheduled: Vec<NodeId> = graph
             .nodes()
@@ -391,13 +637,25 @@ impl BuildExecutor {
                 break; // Nothing more can start once something failed.
             }
 
-            if failed.is_empty() && in_flight.len() < self.max_jobs {
-                let mut ready: Vec<NodeId> = unscheduled
+            // Readiness is checked even while every slot is taken, so that the
+            // schedule report knows how long a unit waited for one.
+            if failed.is_empty() {
+                let mut ready: Vec<(NodeId, bool)> = unscheduled
                     .iter()
                     .copied()
-                    .filter(|&id| {
+                    .filter(|id| !in_flight.contains(id) && !lock_waiting.contains(id))
+                    .filter_map(|id| {
                         let node = graph.node(id);
-                        if node.unit.needs_real_link() {
+                        if let Some((built, links)) = script_prereqs.get(&id)
+                            && !script_done.contains(&id)
+                        {
+                            let ready = built.iter().all(|d| completed.contains(d))
+                                && links.iter().all(|d| {
+                                    completed.contains(d) || build_script_outputs.contains_key(d)
+                                });
+                            return ready.then_some((id, true));
+                        }
+                        let ready = if node.unit.produces_real_artifact() {
                             transitive_deps[&id].iter().all(|d| completed.contains(d))
                         } else {
                             node.dependencies.iter().all(|dep_id| {
@@ -407,25 +665,74 @@ impl BuildExecutor {
                                     completed.contains(dep_id) || metadata_ready.contains(dep_id)
                                 }
                             })
-                        }
+                        };
+                        ready.then_some((id, false))
                     })
                     .collect();
 
+                for (id, script_only) in &ready {
+                    first_ready
+                        .entry(step_id(*id, *script_only))
+                        .or_insert_with(now);
+                }
                 // Longest remaining chain first.
-                ready.sort_by(|a, b| {
+                ready.sort_by(|(a, _), (b, _)| {
                     let wa = weights.get(a).copied().unwrap_or(0.0);
                     let wb = weights.get(b).copied().unwrap_or(0.0);
                     wb.partial_cmp(&wa).unwrap_or(std::cmp::Ordering::Equal)
                 });
 
-                for node_id in ready {
+                let ready_count = ready.len();
+                for (index, (node_id, script_only)) in ready.into_iter().enumerate() {
                     if in_flight.len() >= self.max_jobs {
                         break;
                     }
-                    unscheduled.retain(|id| *id != node_id);
+                    // Short of memory: let what runs finish (it frees memory)
+                    // before starting more — a slower build instead of a
+                    // swapping machine or a compiler killed for lack of it.
+                    if !in_flight.is_empty() && (self.memory)().is_some_and(|m| m.is_short()) {
+                        if memory_held_since.is_none() {
+                            memory_held_since = Some(Instant::now());
+                            debug!("memory is short: holding back new compilations");
+                        }
+                        break;
+                    }
+                    if let Some(since) = memory_held_since.take() {
+                        memory_held += since.elapsed();
+                    }
+                    // Another `rune` process may be building this very unit into
+                    // the same target directory (an editor's background check
+                    // next to a terminal build). Whoever holds the unit's lock
+                    // owns its output files; everyone else waits — without
+                    // tying up a job slot — and then usually finds the finished
+                    // result in the store instead of compiling it again.
+                    let (lock, lock_waited) = match held_locks.remove(&node_id) {
+                        Some(held) => held,
+                        None => {
+                            let path = unit_lock_path(&self.config, &self.profile, graph, node_id);
+                            match rune_common::fsutil::FileLock::try_exclusive(&path) {
+                                rune_common::fsutil::TryLock::Locked(lock) => (lock, false),
+                                rune_common::fsutil::TryLock::Busy => {
+                                    lock_waiting.insert(node_id);
+                                    let tx = worker_tx.clone();
+                                    std::thread::spawn(move || {
+                                        let (lock, _) =
+                                            rune_common::fsutil::FileLock::exclusive(&path);
+                                        let _ = tx.send(WorkerMsg::LockAcquired { node_id, lock });
+                                    });
+                                    continue;
+                                }
+                            }
+                        }
+                    };
+                    if !script_only {
+                        unscheduled.retain(|id| *id != node_id);
+                    } else {
+                        in_script_phase.insert(node_id);
+                    }
                     in_flight.insert(node_id);
-                    started.insert(node_id, start_time.elapsed().as_secs_f64());
-                    let job = self.prepare_job(
+                    started.insert(step_id(node_id, script_only), now());
+                    let mut job = self.prepare_job(
                         graph,
                         node_id,
                         &unit_base_keys[&node_id],
@@ -435,11 +742,30 @@ impl BuildExecutor {
                         &build_script_outputs,
                         worker_tx.clone(),
                     );
-                    std::thread::spawn(move || job.run());
+                    job.script_only = script_only;
+                    job.lock = Some(lock);
+                    job.lock_waited = lock_waited;
+                    if script_only {
+                        let (base, package_hash, key) = self.script_keys(
+                            graph,
+                            node_id,
+                            &unit_cas_keys,
+                            &job.dep_metadata,
+                            &mut source_cache,
+                        );
+                        job.package_hash = package_hash;
+                        job.script_cache_key = Some(key);
+                        job.script_base = Some(base);
+                    }
+                    if !script_only {
+                        job.frontend_threads =
+                            self.frontend_threads_for(in_flight.len(), ready_count - index - 1);
+                    }
+                    job_threads.push(std::thread::spawn(move || job.run()));
                 }
             }
 
-            if in_flight.is_empty() {
+            if in_flight.is_empty() && lock_waiting.is_empty() {
                 if completed.len() + failed.len() < total_nodes {
                     error!(
                         "Build stalled: no tasks in flight and remaining tasks cannot be scheduled."
@@ -458,6 +784,7 @@ impl BuildExecutor {
                         rmeta_path,
                     } => {
                         debug!("Metadata ready for node {:?}", node_id);
+                        metadata_at.entry(node_id).or_insert_with(now);
                         metadata_ready.insert(node_id);
                         metadata_paths.insert(node_id, rmeta_path);
                     }
@@ -468,11 +795,55 @@ impl BuildExecutor {
                         });
                         build_script_outputs.insert(node_id, output);
                     }
+                    WorkerMsg::LockAcquired { node_id, lock } => {
+                        lock_waiting.remove(&node_id);
+                        held_locks.insert(node_id, (lock, true));
+                    }
+                    WorkerMsg::ScriptPhaseDone {
+                        node_id,
+                        duration,
+                        lock,
+                        lock_waited,
+                    } => {
+                        in_flight.remove(&node_id);
+                        in_script_phase.remove(&node_id);
+                        script_done.insert(node_id);
+                        if let Some(lock) = lock {
+                            held_locks.insert(node_id, (lock, lock_waited));
+                        }
+                        let unit = &graph.node(node_id).unit;
+                        timings.record_script(unit, &self.profile, duration);
+                        let id = step_id(node_id, true);
+                        let begun = started.get(&id).copied().unwrap_or(0.0);
+                        steps.insert(
+                            id,
+                            Step {
+                                label: format!(
+                                    "{} {} (build script)",
+                                    unit.crate_id.name, unit.crate_id.version
+                                ),
+                                kind: "build-script",
+                                ready: first_ready.get(&id).copied().unwrap_or(begun),
+                                start: begun,
+                                metadata: None,
+                                end: now(),
+                                gates: step_gates(
+                                    graph,
+                                    node_id,
+                                    true,
+                                    &transitive_deps,
+                                    &script_prereqs,
+                                ),
+                            },
+                        );
+                    }
                     WorkerMsg::KeyUpdate { node_id, key } => {
                         // The unit's key changed; so do those of everything
-                        // above it that has not started yet (nothing above
-                        // it can have, apart from pipelined dependents, which
-                        // wait for the metadata that follows this message).
+                        // above it whose compilation has not started yet
+                        // (nothing above it can have, apart from pipelined
+                        // dependents, which wait for the metadata that follows
+                        // this message — and units running only their build
+                        // script, which are keyed again here too).
                         unit_cas_keys.insert(node_id, key);
                         // Only what transitively depends on this unit can have
                         // changed: one pass in dependency order, recomputing a
@@ -481,7 +852,7 @@ impl BuildExecutor {
                         for &id in &topo {
                             if id == node_id
                                 || completed.contains(&id)
-                                || in_flight.contains(&id)
+                                || (in_flight.contains(&id) && !in_script_phase.contains(&id))
                                 || !graph
                                     .node(id)
                                     .dependencies
@@ -513,6 +884,9 @@ impl BuildExecutor {
                     } => {
                         debug!("Finished compiling node {:?}", node_id);
                         in_flight.remove(&node_id);
+                        in_script_phase.remove(&node_id);
+                        unscheduled.retain(|id| *id != node_id);
+                        held_locks.remove(&node_id);
                         completed.insert(node_id);
                         metadata_ready.insert(node_id);
                         artifact_paths.insert(node_id, artifacts);
@@ -520,37 +894,30 @@ impl BuildExecutor {
                         if !restored {
                             timings.record(unit, &self.profile, duration);
                         }
-                        spans.push(TraceSpan {
-                            name: format!(
-                                "{} {} ({})",
-                                unit.crate_id.name,
-                                unit.crate_id.version,
-                                unit.kind.as_str()
-                            ),
-                            kind: if unit.crate_type == CrateType::ProcMacro {
-                                "proc-macro"
-                            } else if unit.build_script.is_some() {
-                                "build-script"
-                            } else {
-                                unit.kind.as_str()
+                        let id = step_id(node_id, false);
+                        let begun = started.get(&id).copied().unwrap_or(0.0);
+                        steps.insert(
+                            id,
+                            Step {
+                                label: span_name(unit),
+                                kind: if unit.crate_type == CrateType::ProcMacro {
+                                    "proc-macro"
+                                } else {
+                                    unit.kind.as_str()
+                                },
+                                ready: first_ready.get(&id).copied().unwrap_or(begun),
+                                start: begun,
+                                metadata: metadata_at.get(&node_id).copied(),
+                                end: now(),
+                                gates: step_gates(
+                                    graph,
+                                    node_id,
+                                    false,
+                                    &transitive_deps,
+                                    &script_prereqs,
+                                ),
                             },
-                            start: started.get(&node_id).copied().unwrap_or(0.0),
-                            dur: duration.as_secs_f64(),
-                            after: graph
-                                .node(node_id)
-                                .dependencies
-                                .iter()
-                                .map(|d| {
-                                    let u = &graph.node(*d).unit;
-                                    format!(
-                                        "{} {} ({})",
-                                        u.crate_id.name,
-                                        u.crate_id.version,
-                                        u.kind.as_str()
-                                    )
-                                })
-                                .collect(),
-                        });
+                        );
                         if restored {
                             cached += 1;
                         } else {
@@ -563,10 +930,21 @@ impl BuildExecutor {
                         // themselves, so this is just a trace breadcrumb.
                         debug!("Failed to compile node {:?}: {}", node_id, error);
                         in_flight.remove(&node_id);
+                        in_script_phase.remove(&node_id);
+                        held_locks.remove(&node_id);
                         failed.push(node_id);
                     }
                 }
             }
+        }
+        if let Some(since) = memory_held_since.take() {
+            memory_held += since.elapsed();
+        }
+        // Units report `Finished` before they are stored (so their dependents
+        // start sooner); the build is over once every store has landed.
+        drop(held_locks);
+        for t in job_threads {
+            let _ = t.join();
         }
 
         let failed_set: HashSet<NodeId> = failed.iter().copied().collect();
@@ -579,24 +957,21 @@ impl BuildExecutor {
         );
         let _ = source_cache.save_if_changed(&source_cache_path);
         timings.save(&timings_path, &global_timings_path);
-        if rune_common::timing::enabled() && !spans.is_empty() {
+        let schedule =
+            (!steps.is_empty()).then(|| ScheduleReport::analyze(&steps, self.cpus, self.max_jobs));
+        if let (true, Some(report)) = (rune_common::timing::enabled(), &schedule) {
             let trace_path = self.config.fingerprint_dir.join("trace.json");
-            write_trace(&trace_path, &spans);
-            let busy: f64 = spans.iter().map(|s| s.dur).sum();
-            let wall = start_time.elapsed().as_secs_f64().max(f64::EPSILON);
-            spans.sort_by(|a, b| (b.start + b.dur).total_cmp(&(a.start + a.dur)));
+            crate::schedule::write_chrome_trace(&trace_path, &steps);
+            let html_path = self
+                .config
+                .rune_dir
+                .join("timings")
+                .join("rune-timing.html");
+            crate::schedule::write_html(&html_path, &steps, report);
+            eprint!("  [timing] {}", report.describe_chain());
             eprintln!(
-                "  [timing] schedule: {:.1}s of unit time in {:.1}s wall ({:.1} units running on average); \
-                 last to finish: {}; trace: {}",
-                busy,
-                wall,
-                busy / wall,
-                spans
-                    .iter()
-                    .take(3)
-                    .map(|s| format!("{} ({:.1}s)", s.name, s.dur))
-                    .collect::<Vec<_>>()
-                    .join(", "),
+                "  [timing] report: {} (Chrome trace: {})",
+                html_path.display(),
                 trace_path.display()
             );
         }
@@ -623,6 +998,8 @@ impl BuildExecutor {
             artifact_paths,
             cache_keys: unit_cas_keys,
             build_script_outputs,
+            schedule,
+            memory_held,
         })
     }
 
@@ -673,7 +1050,11 @@ impl BuildExecutor {
             .cas
             .as_ref()
             .and_then(|c| c.get_value(&format!("{}-inputs", identity.key)));
-        let key = effective_key(&identity.key, recorded.as_ref(), unit.build_script.is_some());
+        let key = effective_key(
+            &identity.key,
+            recorded.as_ref(),
+            unit.build_script.is_some(),
+        );
         if key != identity.key {
             identity.parts.insert(
                 "outside inputs (environment variables and files it read)".into(),
@@ -699,9 +1080,116 @@ impl BuildExecutor {
         for id in topo {
             let identity = self.unit_identity(graph, id, &keys, &mut source_cache);
             keys.insert(id, identity.key.clone());
-            out.push((id, unit_label(&graph.node(id).unit, &self.profile), identity));
+            out.push((
+                id,
+                unit_label(&graph.node(id).unit, &self.profile),
+                identity,
+            ));
         }
         Ok(out)
+    }
+
+    /// Every store slot a build of `graph` reads, as it stands now: each
+    /// unit's artifacts, its build script's result, replayed warnings and
+    /// diagnostics, and the outside inputs recorded for it — what
+    /// `rune cas export` puts in a bundle.
+    pub fn store_keys(&self, graph: &BuildGraph) -> RuneResult<Vec<String>> {
+        let topo = graph.topological_sort()?;
+        let cache_path = self.config.fingerprint_dir.join("source-cache.json");
+        let mut source_cache =
+            rune_fingerprint::FingerprintCache::load(&cache_path).unwrap_or_default();
+        let mut keys: HashMap<NodeId, String> = HashMap::new();
+        // Build script results found so far, by script (for `DEP_*` values).
+        let mut script_outputs: HashMap<String, BuildScriptOutput> = HashMap::new();
+        let mut out = Vec::new();
+        for id in topo {
+            let (base, key) = self.compute_keys(graph, id, &keys, &mut source_cache, false);
+            out.extend([
+                key.clone(),
+                // The script output a cache hit of the unit restores (for its
+                // dependents' `DEP_*`, link paths and `OUT_DIR`).
+                format!("{key}-buildscript"),
+                format!("{key}-warnings"),
+                format!("{key}-diagnostics"),
+                format!("{base}-inputs"),
+            ]);
+            let unit = &graph.node(id).unit;
+            if unit.build_script.is_some() && unit.ext.script_owner.is_none() {
+                let mut dep_metadata = Vec::new();
+                for d in &graph.node(id).dependencies {
+                    let dep = &graph.node(*d).unit;
+                    let owner = dep
+                        .ext
+                        .script_owner
+                        .clone()
+                        .unwrap_or_else(|| script_key(dep));
+                    if let (Some(links), Some(output)) = (&dep.links, script_outputs.get(&owner)) {
+                        for (k, v) in &output.metadata {
+                            dep_metadata.push((links.clone(), k.clone(), v.clone()));
+                        }
+                    }
+                }
+                let (script_base, _, script) =
+                    self.script_keys(graph, id, &keys, &dep_metadata, &mut source_cache);
+                let result = format!("{script}-buildscript");
+                if let Some(output) = self.cas.as_ref().and_then(|c| c.get_value(&result)) {
+                    script_outputs.insert(script_key(unit), output);
+                }
+                out.extend([format!("{script_base}-script-record"), result]);
+            }
+            keys.insert(id, key);
+        }
+        Ok(out)
+    }
+
+    /// The keys of a unit's build script result: `(base, package hash, key
+    /// it is looked up under)` (see [`compute_script_base`] and
+    /// [`inputs::script_result_key`]), given its build-dependencies' final
+    /// keys and the `DEP_*` values the script receives.
+    fn script_keys(
+        &self,
+        graph: &BuildGraph,
+        id: NodeId,
+        keys: &HashMap<NodeId, String>,
+        dep_metadata: &[(String, String, String)],
+        source_cache: &mut rune_fingerprint::FingerprintCache,
+    ) -> (String, String, String) {
+        let node = graph.node(id);
+        let build_dep_keys: Vec<(String, String)> = node
+            .build_dependencies
+            .iter()
+            .filter_map(|d| {
+                let dep = &graph.node(*d).unit;
+                let alias = node
+                    .build_aliases
+                    .get(d)
+                    .cloned()
+                    .unwrap_or_else(|| dep.rustc_crate_name());
+                Some((
+                    format!("build-dep:{alias}:{}", dep.crate_id.name),
+                    keys.get(d)?.clone(),
+                ))
+            })
+            .collect();
+        let base = compute_script_base(
+            &node.unit,
+            &self.profile,
+            &build_dep_keys,
+            dep_metadata,
+            source_cache,
+        );
+        let package_hash = if node.unit.crate_id.source == CrateSource::Local {
+            rune_fingerprint::hasher::compute_package_hash(&node.unit.manifest_dir, source_cache)
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
+        let record: Option<inputs::ScriptRecord> = self
+            .cas
+            .as_ref()
+            .and_then(|c| c.get_value(&format!("{base}-script-record")));
+        let key = inputs::script_result_key(&base, record.as_ref(), || package_hash.clone());
+        (base, package_hash, key)
     }
 
     /// Whether the store has a result for `key`.
@@ -776,7 +1264,6 @@ fn dep_keys_of(
 }
 
 impl BuildExecutor {
-
     /// Gathers everything a worker thread needs, by value.
     #[allow(clippy::too_many_arguments)]
     fn prepare_job(
@@ -939,6 +1426,13 @@ impl BuildExecutor {
             extra_env,
             color: self.color,
             jobserver: self.jobserver.clone(),
+            script_only: false,
+            lock: None,
+            lock_waited: false,
+            frontend_threads: None,
+            script_base: None,
+            script_cache_key: None,
+            package_hash: String::new(),
         }
     }
 }
@@ -973,6 +1467,21 @@ struct UnitJob {
     extra_env: Vec<(String, String)>,
     color: bool,
     jobserver: Option<jobserver::Client>,
+    /// Only run (or restore) the unit's build script; its compilation is a
+    /// separate job, started once its dependencies' metadata exists.
+    script_only: bool,
+    /// The unit's lock, taken by the scheduler (see `execute`).
+    lock: Option<rune_common::fsutil::FileLock>,
+    /// Another process held the lock first: it may have built the unit.
+    lock_waited: bool,
+    /// `-Z threads` for this unit's compilation.
+    frontend_threads: Option<usize>,
+    /// For a script step: the script result's base key (see
+    /// [`compute_script_base`]) and the key it is looked up under now.
+    script_base: Option<String>,
+    script_cache_key: Option<String>,
+    /// The package's source hash (for a script that watches no files).
+    package_hash: String,
 }
 
 impl UnitJob {
@@ -1070,31 +1579,30 @@ impl UnitJob {
         true
     }
 
-    fn run(self) {
+    fn run(mut self) {
         // Hold one jobserver token for as long as this unit runs; the compiler
         // may borrow more for its own codegen threads while others are idle.
-        let _token = self.jobserver.as_ref().and_then(|js| js.acquire().ok());
+        let token = self.jobserver.as_ref().and_then(|js| js.acquire().ok());
         let start = Instant::now();
+        // Held until the unit is stored (or, for a script step, handed back to
+        // the scheduler for the compilation that follows).
+        let mut unit_lock = self.lock.take();
         let node_id = self.node_id;
         let unit = &self.unit;
         let profile = &self.profile;
         let config = &self.config;
-        let _ = self.event_tx.send(PipelineEvent::BuildStarted {
-            node_id,
-            unit: unit.clone(),
-        });
+        if !self.script_only {
+            let _ = self.event_tx.send(PipelineEvent::BuildStarted {
+                node_id,
+                unit: unit.clone(),
+            });
+        }
 
-        // Another `rune` process may be building this very unit into the same
-        // target directory (an editor's background check next to a terminal
-        // build). Whoever holds the unit's lock owns its output files; everyone
-        // else waits — and then usually finds the finished result in the store
-        // instead of compiling it again.
-        let lock_path = config
-            .profile_target_dir(profile.output_dir_name())
-            .join(".rune-locks")
-            .join(script_key(unit));
-        let (_unit_lock, acquired) = rune_common::fsutil::FileLock::exclusive(&lock_path);
-        if acquired == rune_common::fsutil::Acquired::AfterWaiting
+        // The process we waited for may have built this unit. (Not checked by
+        // a script step: its dependencies may not have their final keys yet,
+        // so neither has the unit.)
+        if self.lock_waited
+            && !self.script_only
             && !self.force_rebuild
             && self.restore_finished_elsewhere(start)
         {
@@ -1106,7 +1614,15 @@ impl UnitJob {
         // recompiling for any reason, a build script whose own inputs didn't
         // change can skip being recompiled and re-executed — the most
         // expensive part of crates like `openssl-sys` or `ring`.
-        let build_script_cache_key = format!("{}-buildscript", self.cas_key);
+        // A script step looks its result up by the script's own key (see
+        // `compute_script_base`): editing the package's other files does not
+        // run a script that declared which files it reads.
+        let build_script_cache_key = match &self.script_cache_key {
+            Some(k) => format!("{k}-buildscript"),
+            None => format!("{}-buildscript", self.cas_key),
+        };
+        // The files the script's own compilation read (for its record).
+        let mut script_sources: Vec<PathBuf> = Vec::new();
 
         // 1. Compile & execute the build script, unless a cached run already
         //    told us its output. Its output is two things that must be
@@ -1128,11 +1644,17 @@ impl UnitJob {
         let mut store_key = self.cas_key.clone();
         let mut script_ran: Option<BuildScriptOutput> = None;
         let has_script = unit.build_script.is_some();
+        // A script step does not announce keys: its dependencies may still
+        // change theirs, and the compilation that follows keys the unit again
+        // (with the same script output) once they are settled.
+        let script_only = self.script_only;
         let bump = |declared: &DeclaredInputs, store_key: &mut String| {
             let key = effective_key(&self.base_key, Some(declared), has_script);
             if key != *store_key {
                 *store_key = key.clone();
-                let _ = self.worker_tx.send(WorkerMsg::KeyUpdate { node_id, key });
+                if !script_only {
+                    let _ = self.worker_tx.send(WorkerMsg::KeyUpdate { node_id, key });
+                }
             }
         };
         if effective_build_output.is_none()
@@ -1145,6 +1667,7 @@ impl UnitJob {
                 .unwrap_or(false);
             if restored {
                 effective_build_output = cas_store.get_value(&build_script_cache_key);
+                replay_script_warnings(&self.event_tx, node_id, effective_build_output.as_ref());
             }
         }
 
@@ -1190,7 +1713,7 @@ impl UnitJob {
                 }
                 .to_string(),
                 num_jobs: self.max_jobs as u32,
-                rustc: tc.rustc.clone(),
+                rustc: tc.exec.clone(),
                 rustdoc: tc.rustdoc.clone(),
                 rustc_wrapper: tc.wrapper.clone(),
                 rustc_workspace_wrapper: tc.workspace_wrapper.clone(),
@@ -1222,17 +1745,26 @@ impl UnitJob {
                 .script_profile
                 .as_ref()
                 .map(|p| {
+                    // Build scripts ignore `panic`, as in Cargo.
+                    let p = Profile {
+                        panic: rune_common::PanicStrategy::Unwind,
+                        ..p.clone()
+                    };
                     with_profile_flags(
                         RustcCommandBuilder::new(PathBuf::new()),
-                        p,
+                        &p,
                         &self.toolchain.host,
                         true,
                     )
                     .into_args()
                 })
                 .unwrap_or_default();
+            let color = self.color;
             let configure = |cmd: &mut std::process::Command| {
                 cmd.args(&script_flags);
+                if color {
+                    cmd.arg("--color=always");
+                }
                 // A dependency's build script is not the user's code: its
                 // warnings are noise, exactly as for the crate itself.
                 if unit.crate_id.source != CrateSource::Local {
@@ -1242,18 +1774,63 @@ impl UnitJob {
                     js.configure(cmd);
                 }
             };
-            let compiled = BuildScriptRunner::compile_with(
-                tc.rustc_command(unit.ext.member),
-                &build_rs,
-                &script_out_dir,
-                &deps_dir,
-                unit.edition.as_str(),
-                &self.build_script_extern_deps,
-                Some(&compile_env),
-                &configure,
-            );
+            let script_bin_dir =
+                config.build_script_bin_dir_by_key(profile.output_dir_name(), &script_key(unit));
+            // The compiled script is kept beside `OUT_DIR` with a stamp of
+            // what it was compiled from; a script that must run again because
+            // a file it watches changed is not compiled again for that.
+            let stamp_path = script_bin_dir.join(".rune-stamp");
+            let reusable = self
+                .script_base
+                .as_ref()
+                .filter(|_| !self.force_rebuild)
+                .and_then(|base| {
+                    let stamp: ScriptStamp =
+                        serde_json::from_str(&std::fs::read_to_string(&stamp_path).ok()?).ok()?;
+                    let bin = script_bin_dir.join(if cfg!(windows) {
+                        "build_script_build.exe"
+                    } else {
+                        "build_script_build"
+                    });
+                    (stamp.base == *base && bin.is_file() && stamp.sources_unchanged())
+                        .then_some((bin, stamp))
+                });
+            let compiled = match reusable {
+                Some((bin, stamp)) => {
+                    script_sources = stamp.sources.iter().map(|(p, _)| p.clone()).collect();
+                    Ok((bin, stamp.warnings))
+                }
+                None => {
+                    let compiled = BuildScriptRunner::compile_reporting(
+                        tc.rustc_command(unit.ext.member),
+                        &build_rs,
+                        &script_bin_dir,
+                        &deps_dir,
+                        unit.edition.as_str(),
+                        &self.build_script_extern_deps,
+                        Some(&compile_env),
+                        &configure,
+                    );
+                    if let (Ok((_, printed)), Some(base)) = (&compiled, &self.script_base) {
+                        script_sources =
+                            inputs::dep_info_sources(&script_bin_dir.join("build_script_build.d"));
+                        let stamp = ScriptStamp::new(base, &script_sources, printed);
+                        if let Ok(text) = serde_json::to_string(&stamp) {
+                            let _ = rune_common::fsutil::write_atomic(&stamp_path, text.as_bytes());
+                        }
+                    }
+                    compiled
+                }
+            };
             match compiled {
-                Ok(bin_path) => {
+                Ok((bin_path, printed)) => {
+                    // Warnings about a dependency's `build.rs` are capped, as
+                    // for the crate itself; the workspace's own are kept.
+                    let compile_warnings = if unit.crate_id.source == CrateSource::Local {
+                        printed
+                    } else {
+                        String::new()
+                    };
                     let run_configure = |cmd: &mut std::process::Command| {
                         if let Some(js) = &self.jobserver {
                             js.configure(cmd);
@@ -1283,12 +1860,30 @@ impl UnitJob {
                         return;
                     }
                     match outcome {
-                        Ok(out) => {
+                        Ok(mut out) => {
                             let _ = self.event_tx.send(PipelineEvent::BuildScriptFinished {
                                 node_id,
                                 crate_name: unit.crate_id.name.clone(),
                                 duration: start.elapsed(),
                             });
+                            out.compile_warnings = compile_warnings;
+                            // Shown when the script runs (as Cargo does), for
+                            // the workspace's own packages.
+                            if unit.crate_id.source == CrateSource::Local {
+                                let mut text = out.compile_warnings.clone();
+                                for w in &out.warnings {
+                                    text.push_str(&format!(
+                                        "warning: {}@{}: {w}\n",
+                                        unit.crate_id.name, unit.crate_id.version
+                                    ));
+                                }
+                                if !text.trim().is_empty() {
+                                    let _ = self.event_tx.send(PipelineEvent::ScriptWarnings {
+                                        node_id,
+                                        warnings: text,
+                                    });
+                                }
+                            }
                             script_ran = Some(out.clone());
                             effective_build_output = Some(out);
                         }
@@ -1323,7 +1918,22 @@ impl UnitJob {
             bump(&declared, &mut store_key);
         }
         if let (Some(out), Some(cas_store)) = (&script_ran, &self.cas) {
-            let key = format!("{store_key}-buildscript");
+            let key = match &self.script_base {
+                // What the run showed it depends on keys its next lookup.
+                Some(base) => {
+                    let record = inputs::script_record(
+                        out,
+                        &unit.manifest_dir,
+                        &script_out_dir,
+                        &script_sources,
+                    );
+                    let _ = cas_store.put_value(&format!("{base}-script-record"), &record);
+                    let package_hash = self.package_hash.clone();
+                    let key = inputs::script_result_key(base, Some(&record), || package_hash);
+                    format!("{key}-buildscript")
+                }
+                None => format!("{store_key}-buildscript"),
+            };
             let _ = cas_store.put_dir_tree(&key, &script_out_dir);
             let _ = cas_store.put_value(&key, out);
         }
@@ -1333,6 +1943,15 @@ impl UnitJob {
                 node_id,
                 output: output.clone(),
             });
+        }
+        if self.script_only {
+            let _ = self.worker_tx.send(WorkerMsg::ScriptPhaseDone {
+                node_id,
+                duration: start.elapsed(),
+                lock: unit_lock.take(),
+                lock_waited: self.lock_waited,
+            });
+            return;
         }
 
         // 2. Build the rustc command. Any leftover output from an earlier
@@ -1363,6 +1982,11 @@ impl UnitJob {
         }
         for (k, v) in &self.extra_env {
             cmd_builder = cmd_builder.env(k, v);
+        }
+        // How the compiler divides its work, not what it produces: not part
+        // of the key (like `-j`).
+        if let Some(n) = self.frontend_threads {
+            cmd_builder = cmd_builder.extra_flags(vec![format!("-Zthreads={n}")]);
         }
         for (k, v, force) in &self.config_env {
             if *force || std::env::var_os(k).is_none() {
@@ -1446,9 +2070,29 @@ impl UnitJob {
                 };
                 let artifacts: Vec<PathBuf> =
                     comp_res.artifacts.into_iter().map(|a| a.artifact).collect();
+                uplift_artifacts(config, profile, unit, &artifacts);
+
+                // Dependents can start now; storing the result is not their
+                // concern (the files they use are the ones just written).
+                let _ = self.event_tx.send(PipelineEvent::BuildFinished {
+                    node_id,
+                    artifacts: artifacts.clone(),
+                    duration,
+                    warnings: warnings.clone(),
+                    diagnostics: diagnostics.clone(),
+                });
+                let _ = self.worker_tx.send(WorkerMsg::Finished {
+                    node_id,
+                    artifacts: artifacts.clone(),
+                    duration,
+                    restored: false,
+                });
+                // Storing is disk work, not compiler work: give the job slot's
+                // token back so another compiler can use the core meanwhile.
+                drop(token);
 
                 if let Some(cas_store) = &self.cas {
-                    let _ = cas_store.put(
+                    let _ = cas_store.put_adopted(
                         &store_key,
                         &unit.crate_id.name,
                         &unit.crate_id.version.to_string(),
@@ -1467,22 +2111,19 @@ impl UnitJob {
                         let _ =
                             cas_store.put_value(&format!("{}-inputs", self.base_key), &declared);
                     }
+                    // The script's result under the key the unit is finally
+                    // stored under, which is what a later cache hit restores
+                    // it by (the script step stored it under the key the unit
+                    // had then, which its dependencies may have changed since).
+                    if let (Some(out), false) = (&effective_build_output, shares_script) {
+                        let key = format!("{store_key}-buildscript");
+                        if !cas_store.contains_tree(&key) {
+                            let _ = cas_store.put_dir_tree(&key, &script_out_dir);
+                            let _ = cas_store.put_value(&key, out);
+                        }
+                    }
                 }
-                uplift_artifacts(config, profile, unit, &artifacts);
-
-                let _ = self.event_tx.send(PipelineEvent::BuildFinished {
-                    node_id,
-                    artifacts: artifacts.clone(),
-                    duration,
-                    warnings,
-                    diagnostics,
-                });
-                let _ = self.worker_tx.send(WorkerMsg::Finished {
-                    node_id,
-                    artifacts,
-                    duration,
-                    restored: false,
-                });
+                drop(unit_lock);
             }
             Ok(comp_res) => {
                 let err_msg = render_compile_error(&comp_res);
@@ -1823,6 +2464,31 @@ impl Timings {
     /// Seconds this unit is expected to take: measured if we have seen it
     /// before, otherwise guessed from the size of its package's sources.
     fn estimate(&self, unit: &CompilationUnit, profile: &Profile) -> f64 {
+        // A unit that runs its own build script also waits for that (measured
+        // separately, since it can overlap the unit's dependencies).
+        let script = if unit.build_script.is_some() && unit.ext.script_owner.is_none() {
+            self.secs
+                .get(&Self::script_key(unit, profile))
+                .copied()
+                .unwrap_or(1.0)
+        } else {
+            0.0
+        };
+        script + self.estimate_compile(unit, profile)
+    }
+
+    fn script_key(unit: &CompilationUnit, profile: &Profile) -> String {
+        format!("{} script", Self::key(unit, profile))
+    }
+
+    fn record_script(&mut self, unit: &CompilationUnit, profile: &Profile, took: Duration) {
+        self.secs
+            .insert(Self::script_key(unit, profile), took.as_secs_f64());
+        self.dirty = true;
+    }
+
+    /// Seconds the unit's own compilation is expected to take.
+    fn estimate_compile(&self, unit: &CompilationUnit, profile: &Profile) -> f64 {
         if let Some(&secs) = self.secs.get(&Self::key(unit, profile)) {
             return secs;
         }
@@ -1836,9 +2502,6 @@ impl Timings {
         // matters to the scheduler, not the absolute value).
         let mb = bytes / (1024.0 * 1024.0);
         let mut secs = 0.3 + 3.0 * mb.powf(0.6);
-        if unit.build_script.is_some() || unit.is_build_script {
-            secs += 1.0; // compile + run the script
-        }
         if unit.harness {
             secs *= 1.2;
         }
@@ -1917,54 +2580,6 @@ fn rust_source_bytes(dir: &Path) -> u64 {
         }
     }
     total
-}
-
-/// Writes the schedule of a finished build as a Chrome trace
-/// (`chrome://tracing`, Perfetto): one lane per concurrently running unit.
-fn write_trace(path: &Path, spans: &[TraceSpan]) {
-    let mut spans: Vec<&TraceSpan> = spans.iter().collect();
-    spans.sort_by(|a, b| {
-        a.start
-            .partial_cmp(&b.start)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    let mut lane_free_at: Vec<f64> = Vec::new();
-    let mut events = Vec::with_capacity(spans.len());
-    for span in spans {
-        let lane = match lane_free_at.iter().position(|&t| t <= span.start) {
-            Some(l) => l,
-            None => {
-                lane_free_at.push(0.0);
-                lane_free_at.len() - 1
-            }
-        };
-        lane_free_at[lane] = span.start + span.dur;
-        events.push(serde_json::json!({
-            "name": span.name,
-            "cat": span.kind,
-            "ph": "X",
-            "ts": (span.start * 1e6) as u64,
-            "dur": (span.dur * 1e6) as u64,
-            "pid": 1,
-            "tid": lane,
-            "args": { "after": span.after },
-        }));
-    }
-    let doc = serde_json::json!({ "traceEvents": events });
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let _ = std::fs::write(path, doc.to_string());
-}
-
-/// One compiled unit's place in the schedule, in seconds since the build began.
-struct TraceSpan {
-    name: String,
-    kind: &'static str,
-    start: f64,
-    dur: f64,
-    /// Names of the units this one waited for.
-    after: Vec<String>,
 }
 
 /// `RUSTFLAGS` (or `CARGO_ENCODED_RUSTFLAGS`) as individual arguments.
@@ -2200,13 +2815,32 @@ pub fn build_rustc_command(
         unit.all_crate_types()
             .fold(builder, |b, t| b.crate_type(t.rustc_crate_type()))
     };
-    let links_final_artifact = !unit.harness
-        && unit.all_crate_types().any(|t| {
+    // A test harness is a program too: `[profile.test] lto = "fat"` applies
+    // to it (some crates' tests depend on it, e.g. `no-panic` checks).
+    let links_final_artifact = if unit.harness {
+        !unit.check_only && unit.crate_type != CrateType::ProcMacro
+    } else {
+        unit.all_crate_types().any(|t| {
             matches!(
                 t,
                 CrateType::Bin | CrateType::Cdylib | CrateType::Dylib | CrateType::Staticlib
             )
-        });
+        })
+    };
+    // The test harness needs unwinding, and a panicking proc-macro must not
+    // take the compiler down: both ignore `panic = "abort"`, as in Cargo.
+    let unwinding;
+    let eff = if eff.panic != rune_common::PanicStrategy::Unwind
+        && (unit.harness || unit.crate_type == CrateType::ProcMacro)
+    {
+        unwinding = Profile {
+            panic: rune_common::PanicStrategy::Unwind,
+            ..eff.clone()
+        };
+        &unwinding
+    } else {
+        eff
+    };
     builder = with_profile_flags(builder, eff, compiled_for(unit), links_final_artifact);
     builder = with_cargo_env(builder, unit);
     if eff.trim_paths {
@@ -2238,9 +2872,11 @@ pub fn build_rustc_command(
         builder = builder.cap_lints("allow");
     }
 
-    // Declare which `feature = "..."` values exist, so `unexpected_cfgs`
-    // catches typos in this package's own `cfg(feature = ...)` (Cargo does).
-    if unit.crate_id.source == CrateSource::Local && !unit.ext.declared_features.is_empty() {
+    // Declare the cfgs Cargo declares for every package it lints: `docsrs`
+    // and `test`, and which `feature = "..."` values exist (none is a list
+    // too), so `unexpected_cfgs` catches typos but not `#[cfg(test)]` — a
+    // crate that denies warnings fails otherwise.
+    if unit.crate_id.source == CrateSource::Local {
         let values = unit
             .ext
             .declared_features
@@ -2248,7 +2884,9 @@ pub fn build_rustc_command(
             .map(|f| format!("\"{f}\""))
             .collect::<Vec<_>>()
             .join(", ");
-        builder = builder.check_cfg(&format!("cfg(feature, values({values}))"));
+        builder = builder
+            .check_cfg("cfg(docsrs,test)")
+            .check_cfg(&format!("cfg(feature, values({values}))"));
     }
 
     if unit.crate_type == CrateType::ProcMacro {
@@ -2414,7 +3052,7 @@ impl KeyRecorder {
         self.key.update(bytes);
         self.parts
             .entry(part.to_string())
-            .or_insert_with(rune_common::hash::HashBuilder::new)
+            .or_default()
             .update(bytes);
     }
 }
@@ -2425,6 +3063,42 @@ pub fn compute_unit_identity(
     profile: &Profile,
     dep_keys: &[(String, String)],
     source_cache: &mut rune_fingerprint::FingerprintCache,
+) -> UnitIdentity {
+    identity_with(unit, profile, dep_keys, source_cache, true)
+}
+
+/// The base key of a unit's *build script result*: the unit's configuration
+/// without its package's sources (which [`inputs::script_result_key`] adds
+/// back as the script declared them), with the script's build-dependencies
+/// and the `DEP_*` values it receives in place of the unit's dependencies.
+pub fn compute_script_base(
+    unit: &CompilationUnit,
+    profile: &Profile,
+    build_dep_keys: &[(String, String)],
+    dep_metadata: &[(String, String, String)],
+    source_cache: &mut rune_fingerprint::FingerprintCache,
+) -> String {
+    let mut deps: Vec<(String, String)> = build_dep_keys.to_vec();
+    for (links, k, v) in dep_metadata {
+        deps.push((format!("dep-metadata:{links}:{k}"), v.clone()));
+    }
+    let identity = identity_with(unit, profile, &deps, source_cache, false);
+    let mut hb = rune_common::hash::HashBuilder::new();
+    hb.update(b"build-script-result\0");
+    hb.update(identity.key.as_bytes());
+    if let Some(script) = &unit.build_script {
+        let rel = script.strip_prefix(&unit.manifest_dir).unwrap_or(script);
+        hb.update(rel.to_string_lossy().as_bytes());
+    }
+    hb.finish_blake3()
+}
+
+fn identity_with(
+    unit: &CompilationUnit,
+    profile: &Profile,
+    dep_keys: &[(String, String)],
+    source_cache: &mut rune_fingerprint::FingerprintCache,
+    include_sources: bool,
 ) -> UnitIdentity {
     let mut hb = KeyRecorder {
         key: rune_common::hash::HashBuilder::new(),
@@ -2460,6 +3134,14 @@ pub fn compute_unit_identity(
         hb.update("environment", k.as_bytes());
         hb.update("environment", b"=");
         hb.update("environment", v.as_bytes());
+    }
+    for (k, v) in inputs::apple_environment(compiled_for(unit)) {
+        if unit.ext.env.iter().all(|(set, _)| set != k) {
+            hb.update("environment", b"\0apple-env=");
+            hb.update("environment", k.as_bytes());
+            hb.update("environment", b"=");
+            hb.update("environment", v.as_bytes());
+        }
     }
     // How the build script is compiled and what it links against is part of
     // what the package produces.
@@ -2499,13 +3181,18 @@ pub fn compute_unit_identity(
         hb.update("lints", b"\0lint=");
         hb.update("lints", arg.as_bytes());
     }
+    // The cfgs declared for `unexpected_cfgs` (see `build_rustc_command`)
+    // decide which warnings a local crate's result replays.
+    if unit.crate_id.source == CrateSource::Local {
+        hb.update("lints", b"\0check-cfg=docsrs,test,features");
+    }
     for f in &unit.ext.declared_features {
         hb.update("declared features", b"\0declared=");
         hb.update("declared features", f.as_bytes());
     }
 
     let mut files = std::collections::BTreeMap::new();
-    if unit.crate_id.source == CrateSource::Local {
+    if unit.crate_id.source == CrateSource::Local && include_sources {
         // Where the crate root lives is an input too (`[lib] path = ...`).
         let rel_root = unit
             .source_root
@@ -2653,6 +3340,58 @@ mod tests {
         let before = key(&u, &Profile::dev());
         std::fs::write(dir.path().join("src/lib.rs"), "fn b() {}").unwrap();
         assert_ne!(before, key(&u, &Profile::dev()));
+    }
+
+    #[test]
+    fn a_machine_short_of_memory_builds_one_unit_at_a_time_and_finishes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut graph = BuildGraph::new();
+        for name in ["one", "two", "three", "four"] {
+            let pkg = dir.path().join(name);
+            std::fs::create_dir_all(pkg.join("src")).unwrap();
+            std::fs::write(pkg.join("Cargo.toml"), "").unwrap();
+            std::fs::write(
+                pkg.join("src/lib.rs"),
+                format!("pub fn {name}() -> u32 {{ 1 }}\n"),
+            )
+            .unwrap();
+            let mut u = unit(name, CrateSource::Local, &pkg);
+            u.target_name = name.into();
+            graph.add_node(u);
+        }
+        fn short() -> Option<rune_common::sysinfo::Memory> {
+            Some(rune_common::sysinfo::Memory {
+                total: 8 << 30,
+                available: 100 << 20,
+            })
+        }
+        let config = RuneConfig::new(dir.path().join("project"));
+        let result = BuildExecutor::new(config, Profile::dev(), 4)
+            .with_memory_probe(short)
+            .execute(&graph)
+            .unwrap();
+        assert!(result.success, "{:?}", result.failed);
+        assert_eq!(result.compiled, 4);
+        let schedule = result.schedule.unwrap();
+        assert!(
+            schedule.parallelism() <= 1.05,
+            "ran {:.2} units at once while memory was short",
+            schedule.parallelism()
+        );
+        assert!(result.memory_held > Duration::ZERO);
+    }
+
+    #[test]
+    fn auto_frontend_threads_use_only_idle_cores() {
+        use rune_common::settings::FrontendThreads::*;
+        // A busy machine: one thread, i.e. no flag.
+        assert_eq!(frontend_threads(Auto, 10, 10, 0), None);
+        assert_eq!(frontend_threads(Auto, 10, 4, 6), None);
+        // The last crate of a build on an otherwise idle machine.
+        assert_eq!(frontend_threads(Auto, 10, 1, 0), Some(8));
+        assert_eq!(frontend_threads(Auto, 4, 2, 0), Some(3));
+        assert_eq!(frontend_threads(Off, 16, 1, 0), None);
+        assert_eq!(frontend_threads(Fixed(4), 16, 16, 9), Some(4));
     }
 
     #[test]

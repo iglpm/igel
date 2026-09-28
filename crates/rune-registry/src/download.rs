@@ -11,7 +11,7 @@ use tracing::{debug, info};
 pub enum DownloadError {
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
-    #[error("Network download error: {0}")]
+    #[error("download failed: {}", crate::http::describe(.0))]
     Network(#[from] reqwest::Error),
     #[error(
         "Checksum mismatch for {crate_name} v{version}: expected {expected}, computed {computed}"
@@ -34,7 +34,7 @@ pub type Result<T> = std::result::Result<T, DownloadError>;
 pub struct CrateDownloader {
     crates_dir: PathBuf,
     src_dir: PathBuf,
-    client: reqwest::blocking::Client,
+    client: crate::http::LazyClient,
     offline: bool,
     backend: DlBackend,
 }
@@ -68,14 +68,12 @@ impl CrateDownloader {
         Self {
             crates_dir,
             src_dir,
-            client: reqwest::blocking::Client::builder()
-                .user_agent("rune (github.com/jonas/rune)")
-                .pool_max_idle_per_host(DOWNLOAD_CONCURRENCY)
-                .tcp_nodelay(true)
-                .connect_timeout(std::time::Duration::from_secs(15))
-                .timeout(std::time::Duration::from_secs(300))
-                .build()
-                .unwrap_or_else(|_| reqwest::blocking::Client::new()),
+            client: crate::http::LazyClient::new(|b| {
+                b.pool_max_idle_per_host(DOWNLOAD_CONCURRENCY)
+                    .tcp_nodelay(true)
+                    .connect_timeout(std::time::Duration::from_secs(15))
+                    .timeout(std::time::Duration::from_secs(300))
+            }),
             offline: false,
             backend: DlBackend::CratesIo,
         }
@@ -164,7 +162,9 @@ impl CrateDownloader {
                 if let Some(t) = token {
                     req = req.header(reqwest::header::AUTHORIZATION, t);
                 }
-                let text = req.send()?.error_for_status()?.text()?;
+                let text = crate::http::send_with_retry(|| req.try_clone().expect("GET"))?
+                    .error_for_status()?
+                    .text()?;
                 fs::create_dir_all(&self.crates_dir)?;
                 let _ = fs::write(&config_path, &text);
                 serde_json::from_str(&text).map_err(|e| {
@@ -293,34 +293,52 @@ impl CrateDownloader {
                 };
                 debug!("Downloading crate {} from {}", crate_folder_name, url);
 
-                let mut request = self.client.get(&url);
-                if let Some(token) = &token {
-                    request = request.header(reqwest::header::AUTHORIZATION, token.as_str());
-                }
-                let mut resp = request.send()?;
-                if !resp.status().is_success() {
-                    let hint = match (&self.backend, resp.status().as_u16()) {
-                        (DlBackend::Sparse { label, .. }, 401 | 403) => format!(
-                            " (the registry `{label}` requires authentication: set \
-                         `CARGO_REGISTRIES_<NAME>_TOKEN` or a token in .cargo/config.toml)"
-                        ),
-                        _ => String::new(),
-                    };
-                    return Err(DownloadError::Archive(format!(
-                        "Failed to download {}: HTTP {}{hint}",
-                        url,
-                        resp.status()
-                    )));
-                }
-
                 // Stream into a temp file and rename, so an interrupted download
-                // can never be mistaken for a complete tarball later.
+                // can never be mistaken for a complete tarball later. A
+                // connection that drops mid-body is retried like one that
+                // never connected.
                 let tmp_tarball = self
                     .crates_dir
                     .join(format!(".{crate_folder_name}.{}.part", std::process::id()));
-                {
-                    let mut out_file = File::create(&tmp_tarball)?;
-                    std::io::copy(&mut resp, &mut out_file)?;
+                let retries = rune_common::net::global().retries;
+                let mut attempt = 0;
+                loop {
+                    let mut resp = crate::http::send_with_retry(|| {
+                        let mut request = self.client.get(&url);
+                        if let Some(token) = &token {
+                            request =
+                                request.header(reqwest::header::AUTHORIZATION, token.as_str());
+                        }
+                        request
+                    })?;
+                    if !resp.status().is_success() {
+                        let hint = match (&self.backend, resp.status().as_u16()) {
+                            (DlBackend::Sparse { label, .. }, 401 | 403) => format!(
+                                " (the registry `{label}` requires authentication: set \
+                             `CARGO_REGISTRIES_<NAME>_TOKEN` or a token in .cargo/config.toml)"
+                            ),
+                            _ => String::new(),
+                        };
+                        return Err(DownloadError::Archive(format!(
+                            "Failed to download {}: HTTP {}{hint}",
+                            url,
+                            resp.status()
+                        )));
+                    }
+                    let copied = File::create(&tmp_tarball)
+                        .and_then(|mut out_file| std::io::copy(&mut resp, &mut out_file));
+                    match copied {
+                        Ok(_) => break,
+                        Err(e) if attempt < retries => {
+                            attempt += 1;
+                            debug!("download of {url} broke off ({e}); retry {attempt}/{retries}");
+                            std::thread::sleep(rune_common::net::retry_delay(attempt));
+                        }
+                        Err(e) => {
+                            let _ = fs::remove_file(&tmp_tarball);
+                            return Err(e.into());
+                        }
+                    }
                 }
                 fs::rename(&tmp_tarball, &tarball_path)?;
             }

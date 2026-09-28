@@ -14,7 +14,7 @@ pub enum ApiError {
     Config(String),
     #[error("the registry rejected the request: {0}")]
     Rejected(String),
-    #[error("could not reach the registry: {0}")]
+    #[error("could not reach the registry: {}", crate::http::describe(.0))]
     Http(#[from] reqwest::Error),
     #[error(transparent)]
     Index(#[from] crate::index::IndexError),
@@ -42,15 +42,11 @@ impl RegistryApi {
     /// The API of the registry with this index.
     pub fn for_index(index: &str) -> Result<Self> {
         let defs = defs();
-        let client = reqwest::blocking::Client::builder()
-            .user_agent(concat!(
-                "rune/",
-                env!("CARGO_PKG_VERSION"),
-                " (github.com/jonas/rune)"
-            ))
-            .connect_timeout(Duration::from_secs(15))
-            .timeout(Duration::from_secs(300))
-            .build()?;
+        let client = crate::http::client(
+            reqwest::blocking::Client::builder()
+                .connect_timeout(Duration::from_secs(15))
+                .timeout(Duration::from_secs(300)),
+        );
         let token = defs.api_token(index)?;
         let name = defs.name_of(index);
         let base = if index == CRATES_IO {

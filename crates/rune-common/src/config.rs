@@ -130,6 +130,16 @@ impl RuneConfig {
             .join("out")
     }
 
+    /// Where a package's build script is compiled: beside its `OUT_DIR`, not
+    /// in it, so that the directory the script fills (and the store keeps)
+    /// holds only what the script generated.
+    pub fn build_script_bin_dir_by_key(&self, profile_name: &str, key: &str) -> PathBuf {
+        self.profile_target_dir(profile_name)
+            .join("build")
+            .join(key)
+            .join("script")
+    }
+
     /// Ensure all necessary directories exist.
     pub fn ensure_dirs(&self, profile_name: &str) -> std::io::Result<()> {
         std::fs::create_dir_all(&self.fingerprint_dir)?;

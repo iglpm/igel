@@ -120,6 +120,9 @@ impl Workspace {
             anyhow::bail!(e);
         }
         apply_profile_config(&mut root_manifest.profile, &cargo_config, std::env::vars())?;
+        // `[http]`/`[net]`: CA bundles, proxy, timeouts and retries for every
+        // request this process makes.
+        rune_common::net::configure(rune_common::net::HttpConfig::from_config(&cargo_config));
         toolchain::set_global(Toolchain::discover(&cargo_config, &root_dir));
         // Alternative registries, mirrors and vendored sources.
         rune_registry::source::configure(rune_registry::source::RegistryDefs::from_config(

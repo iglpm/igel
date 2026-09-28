@@ -54,6 +54,8 @@ struct TestResult {
     counts: Counts,
     output: String,
     took: Duration,
+    /// Tests that failed and then passed when run again (`--retries`).
+    flaky: Vec<String>,
 }
 
 #[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
@@ -203,6 +205,8 @@ pub fn run(args: TestArgs, mode: Mode) -> Result<()> {
     let (res_tx, res_rx) = unbounded::<TestResult>();
 
     let mut counts_total = Counts::default();
+    let mut report_suites: Vec<crate::test_report::Suite> = Vec::new();
+    let mut flaky_tests: Vec<String> = Vec::new();
     let mut failed_labels: Vec<String> = Vec::new();
     let mut built_ok = true;
     let mut binaries_run = 0usize;
@@ -256,6 +260,7 @@ pub fn run(args: TestArgs, mode: Mode) -> Result<()> {
                             counts: Counts::default(),
                             output: String::new(),
                             took: Duration::ZERO,
+                            flaky: Vec::new(),
                         });
                         continue;
                     }
@@ -316,6 +321,7 @@ pub fn run(args: TestArgs, mode: Mode) -> Result<()> {
                                         },
                                         output: rec.output,
                                         took: Duration::ZERO,
+                                        flaky: Vec::new(),
                                     });
                                     continue;
                                 }
@@ -339,7 +345,7 @@ pub fn run(args: TestArgs, mode: Mode) -> Result<()> {
                                         String::from_utf8_lossy(&out.stdout).into_owned();
                                     text.push_str(&String::from_utf8_lossy(&out.stderr));
                                     let counts = parse_counts(&text);
-                                    TestResult {
+                                    let mut result = TestResult {
                                         order,
                                         outcome: if out.status.success() {
                                             Outcome::Passed
@@ -349,7 +355,30 @@ pub fn run(args: TestArgs, mode: Mode) -> Result<()> {
                                         counts,
                                         output: text,
                                         took: t.elapsed(),
+                                        flaky: Vec::new(),
+                                    };
+                                    if harness && args_ref.retries > 0 {
+                                        retry_failed(&mut result, args_ref.retries, |names| {
+                                            let mut again = sess.command_for(&exe);
+                                            again.arg("--exact").args(names);
+                                            if let Some(n) = args_ref.test_threads {
+                                                again.arg("--test-threads").arg(n.to_string());
+                                            }
+                                            again
+                                                .args(&args_ref.test_args)
+                                                .current_dir(&member.dir)
+                                                .env("CARGO_TARGET_TMPDIR", &tmp)
+                                                .stdin(Stdio::null());
+                                            apply_run_env(&mut again, member, sess);
+                                            let out = again.output().ok()?;
+                                            let mut text =
+                                                String::from_utf8_lossy(&out.stdout).into_owned();
+                                            text.push_str(&String::from_utf8_lossy(&out.stderr));
+                                            Some(text)
+                                        });
+                                        result.took = t.elapsed();
                                     }
+                                    result
                                 }
                                 Err(e) => TestResult {
                                     order,
@@ -357,6 +386,7 @@ pub fn run(args: TestArgs, mode: Mode) -> Result<()> {
                                     counts: Counts::default(),
                                     output: format!("failed to execute test binary: {e}"),
                                     took: t.elapsed(),
+                                    flaky: Vec::new(),
                                 },
                             }
                         }
@@ -387,28 +417,60 @@ pub fn run(args: TestArgs, mode: Mode) -> Result<()> {
         let printer = {
             let res_rx = res_rx.clone();
             let labels = &labels;
+            let json = sess.json;
             scope.spawn(move || {
                 let mut pending: BTreeMap<usize, TestResult> = BTreeMap::new();
                 let mut next = 0usize;
                 let mut counts = Counts::default();
                 let mut failed: Vec<String> = Vec::new();
                 let mut ran = 0usize;
+                let mut suites: Vec<crate::test_report::Suite> = Vec::new();
+                let mut flaky: Vec<String> = Vec::new();
                 while next < total_slots {
                     let Ok(r) = res_rx.recv() else { break };
                     pending.insert(r.order, r);
                     while let Some(r) = pending.remove(&next) {
-                        print_result(&labels[next], &r, verbose);
+                        if !json {
+                            print_result(&labels[next], &r, verbose);
+                        }
                         if !matches!(r.outcome, Outcome::Skipped) {
                             ran += 1;
+                            let suite = suite_of(&labels[next], &r);
+                            if json {
+                                // One line per binary, after the build's
+                                // compiler messages, for tools.
+                                println!(
+                                    "{}",
+                                    serde_json::json!({
+                                        "reason": "test-suite-finished",
+                                        "suite": suite.name,
+                                        "outcome": match r.outcome {
+                                            Outcome::Passed => "passed",
+                                            Outcome::Cached => "cached",
+                                            Outcome::Failed => "failed",
+                                            Outcome::CompileFailed => "not-built",
+                                            Outcome::Skipped => "skipped",
+                                        },
+                                        "seconds": suite.seconds,
+                                        "passed": r.counts.passed,
+                                        "failed": r.counts.failed,
+                                        "ignored": r.counts.ignored,
+                                        "tests": suite.cases,
+                                        "error": suite.error,
+                                    })
+                                );
+                            }
+                            suites.push(suite);
                         }
                         counts.add(r.counts);
                         if matches!(r.outcome, Outcome::Failed | Outcome::CompileFailed) {
                             failed.push(labels[next].clone());
                         }
+                        flaky.extend(r.flaky.iter().map(|t| format!("{t} ({})", labels[next])));
                         next += 1;
                     }
                 }
-                (counts, failed, ran)
+                (counts, failed, ran, suites, flaky)
             })
         };
 
@@ -437,6 +499,7 @@ pub fn run(args: TestArgs, mode: Mode) -> Result<()> {
                         counts: Counts::default(),
                         output: String::new(),
                         took: Duration::ZERO,
+                        flaky: Vec::new(),
                     });
                 }
                 None => {
@@ -446,8 +509,48 @@ pub fn run(args: TestArgs, mode: Mode) -> Result<()> {
                         counts: Counts::default(),
                         output: "the build produced no executable".into(),
                         took: Duration::ZERO,
+                        flaky: Vec::new(),
                     });
                 }
+            }
+        };
+
+        // A package's examples and binaries are built before its tests run,
+        // as with Cargo, where everything is built first: a test may start
+        // one (`target/debug/examples/...`). Other packages' tests still start
+        // the moment they link.
+        let companions: std::cell::RefCell<HashMap<usize, std::collections::HashSet<NodeId>>> =
+            std::cell::RefCell::new(HashMap::new());
+        for r in &plan.requested {
+            if !is_runnable(r, bench)
+                && !r.harness
+                && matches!(r.kind, TargetKind::Example | TargetKind::Bin)
+            {
+                companions
+                    .borrow_mut()
+                    .entry(r.member)
+                    .or_default()
+                    .insert(r.node);
+            }
+        }
+        let held: std::cell::RefCell<Vec<(usize, Vec<PathBuf>)>> = Default::default();
+        let settle = |node: NodeId| {
+            let mut c = companions.borrow_mut();
+            for pending in c.values_mut() {
+                pending.remove(&node);
+            }
+            c.retain(|_, pending| !pending.is_empty());
+        };
+        let may_run = |idx: usize| !companions.borrow().contains_key(&runnables[idx].member);
+        let release_held = || {
+            let ready: Vec<(usize, Vec<PathBuf>)> = {
+                let mut h = held.borrow_mut();
+                let (ready, rest): (Vec<_>, Vec<_>) = h.drain(..).partition(|(i, _)| may_run(*i));
+                *h = rest;
+                ready
+            };
+            for (idx, artifacts) in ready {
+                dispatch(idx, &artifacts, &plan, &sess);
             }
         };
 
@@ -458,7 +561,7 @@ pub fn run(args: TestArgs, mode: Mode) -> Result<()> {
         let doc_slots: Vec<bool> = plan
             .doc_tests
             .iter()
-            .map(|d| want_doctests && !args.no_run && has_doctests(&sess.ws.members[d.member].dir))
+            .map(|d| want_doctests && !args.no_run && has_doctests(&d.lib_source))
             .collect();
         // Doctests with nothing to run are settled immediately.
         for (i, wanted) in doc_slots.iter().enumerate() {
@@ -470,6 +573,7 @@ pub fn run(args: TestArgs, mode: Mode) -> Result<()> {
                     counts: Counts::default(),
                     output: String::new(),
                     took: Duration::ZERO,
+                    flaky: Vec::new(),
                 });
             }
         }
@@ -525,12 +629,20 @@ pub fn run(args: TestArgs, mode: Mode) -> Result<()> {
                 artifacts_seen
                     .borrow_mut()
                     .insert(*node_id, artifacts.clone());
+                settle(*node_id);
                 if let Some(&idx) = by_node.get(node_id) {
-                    dispatch(idx, artifacts, &plan, &sess);
+                    if may_run(idx) {
+                        dispatch(idx, artifacts, &plan, &sess);
+                    } else {
+                        held.borrow_mut().push((idx, artifacts.clone()));
+                    }
                 }
+                release_held();
                 try_dispatch_docs();
             }
             PipelineEvent::BuildFailed { node_id, .. } => {
+                settle(*node_id);
+                release_held();
                 if let Some(&idx) = by_node.get(node_id)
                     && !std::mem::replace(&mut dispatched.borrow_mut()[idx], true)
                 {
@@ -540,11 +652,16 @@ pub fn run(args: TestArgs, mode: Mode) -> Result<()> {
                         counts: Counts::default(),
                         output: "failed to compile (see the errors above)".into(),
                         took: Duration::ZERO,
+                        flaky: Vec::new(),
                     });
                 }
             }
             _ => {}
         })?;
+
+        // Whatever still waited on a companion that never reported runs now.
+        companions.borrow_mut().clear();
+        release_held();
 
         // Anything never dispatched (a dependency failed first) is skipped.
         for (idx, done) in dispatched.borrow().iter().enumerate() {
@@ -555,6 +672,7 @@ pub fn run(args: TestArgs, mode: Mode) -> Result<()> {
                     counts: Counts::default(),
                     output: "not built because a dependency failed to compile".into(),
                     took: Duration::ZERO,
+                    flaky: Vec::new(),
                 });
             }
         }
@@ -569,18 +687,21 @@ pub fn run(args: TestArgs, mode: Mode) -> Result<()> {
                     counts: Counts::default(),
                     output: String::new(),
                     took: Duration::ZERO,
+                    flaky: Vec::new(),
                 });
             }
         }
         drop(job_tx);
         drop(res_tx);
 
-        let (counts, failed, ran) = printer
+        let (counts, failed, ran, suites, flaky) = printer
             .join()
             .map_err(|_| anyhow::anyhow!("printer panicked"))?;
         counts_total = counts;
         failed_labels = failed;
         binaries_run = ran;
+        report_suites = suites;
+        flaky_tests = flaky;
         built_ok = build.success;
         Ok(build)
     })?;
@@ -591,6 +712,32 @@ pub fn run(args: TestArgs, mode: Mode) -> Result<()> {
     }
 
     let elapsed = start.elapsed().as_secs_f64();
+    if let Some(path) = &args.junit {
+        std::fs::write(path, crate::test_report::junit(&report_suites))
+            .map_err(|e| anyhow::anyhow!("cannot write {}: {e}", path.display()))?;
+    }
+    if !flaky_tests.is_empty() {
+        ui::warn(format!(
+            "{} flaky test(s) failed, then passed when run again: {}",
+            flaky_tests.len(),
+            flaky_tests.join(", ")
+        ));
+    }
+    // Where the time went, when there was time to spend.
+    let mut slowest: Vec<&crate::test_report::Suite> =
+        report_suites.iter().filter(|s| s.seconds > 0.0).collect();
+    slowest.sort_by(|a, b| b.seconds.total_cmp(&a.seconds));
+    if elapsed >= 5.0 && slowest.len() > 1 && !args.common.quiet {
+        ui::hint(format!(
+            "slowest: {}",
+            slowest
+                .iter()
+                .take(3)
+                .map(|s| format!("{} ({:.1}s)", s.name, s.seconds))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
     if !failed_labels.is_empty() {
         eprintln!();
         ui::error(format!(
@@ -643,7 +790,8 @@ fn is_runnable(r: &Requested, bench: bool) -> bool {
         TargetKind::Lib | TargetKind::Bin => r.harness,
         TargetKind::Test => !bench,
         TargetKind::Bench => bench,
-        TargetKind::Example => false,
+        // Only an example that asks for it (`test = true`) is run.
+        TargetKind::Example => r.harness && !bench,
     }
 }
 
@@ -703,6 +851,98 @@ fn find_executable(
     guess.exists().then_some(guess)
 }
 
+/// Runs the failed tests of a failed binary again, by exact name, up to
+/// `retries` times (`rerun` returns what a run printed). A test that passes
+/// on a later attempt is flaky; when every failure turns out flaky, the
+/// binary passed. A binary that failed without a failing test (a crash) is
+/// not retried.
+fn retry_failed(
+    result: &mut TestResult,
+    retries: u32,
+    rerun: impl Fn(&[String]) -> Option<String>,
+) {
+    use crate::test_report::{Status, parse_cases};
+    if !matches!(result.outcome, Outcome::Failed) {
+        return;
+    }
+    let mut failing: Vec<String> = parse_cases(&result.output)
+        .into_iter()
+        .filter(|c| c.status == Status::Failed)
+        .map(|c| c.name)
+        .collect();
+    if failing.is_empty() {
+        return;
+    }
+    let first_failures = failing.len() as u64;
+    for attempt in 1..=retries {
+        let Some(text) = rerun(&failing) else { break };
+        let cases = parse_cases(&text);
+        let still: Vec<String> = failing
+            .iter()
+            .filter(|n| {
+                !cases
+                    .iter()
+                    .any(|c| &c.name == *n && c.status == Status::Passed)
+            })
+            .cloned()
+            .collect();
+        result
+            .flaky
+            .extend(failing.iter().filter(|n| !still.contains(n)).cloned());
+        result.output.push_str(&format!(
+            "\n--- retry {attempt}: {} failed test(s) run again ---\n{text}",
+            failing.len()
+        ));
+        failing = still;
+        if failing.is_empty() {
+            break;
+        }
+    }
+    let recovered = first_failures - failing.len() as u64;
+    result.counts.failed = failing.len() as u64;
+    result.counts.passed += recovered;
+    if failing.is_empty() {
+        result.outcome = Outcome::Passed;
+    }
+}
+
+/// A binary's result for reports: its tests (the last run of each counts,
+/// so a flaky test shows as passed) or, when it could not run, an error.
+fn suite_of(label: &str, r: &TestResult) -> crate::test_report::Suite {
+    let mut cases: Vec<crate::test_report::Case> = Vec::new();
+    for c in crate::test_report::parse_cases(&r.output) {
+        match cases.iter_mut().find(|k| k.name == c.name) {
+            Some(k) => {
+                k.status = c.status;
+                if !c.output.is_empty() {
+                    k.output = c.output;
+                }
+            }
+            None => cases.push(c),
+        }
+    }
+    for c in cases.iter_mut() {
+        c.flaky = r.flaky.contains(&c.name);
+    }
+    let error = match r.outcome {
+        Outcome::CompileFailed => Some(r.output.clone()),
+        Outcome::Failed
+            if !cases
+                .iter()
+                .any(|c| c.status == crate::test_report::Status::Failed) =>
+        {
+            Some(r.output.clone())
+        }
+        _ => None,
+    };
+    crate::test_report::Suite {
+        name: label.to_string(),
+        seconds: r.took.as_secs_f64(),
+        error,
+        cases,
+    }
+}
+
 fn print_result(label: &str, r: &TestResult, verbose: bool) {
     let cached = matches!(r.outcome, Outcome::Cached);
     let took = if cached {
@@ -750,7 +990,25 @@ fn print_result(label: &str, r: &TestResult, verbose: bool) {
 /// a fenced code block inside a doc comment, or a doc attribute that pulls in
 /// a file (`#![doc = include_str!("../README.md")]`). Most crates have none,
 /// and starting `rustdoc` just to learn that costs tens of milliseconds each.
-fn has_doctests(dir: &std::path::Path) -> bool {
+/// Whether a source file may contain documentation tests. Only a filter
+/// that spares rustdoc runs with nothing to do, so it errs toward yes: a
+/// missed test is worse than a needless rustdoc.
+fn may_hold_doctests(text: &str) -> bool {
+    // Docs in attributes can span lines (`#![cfg_attr(feature = "std", doc =
+    // r#"...```rust ...```"#)]`, `#![doc = include_str!("../README.md")]`).
+    let doc_attribute = text.contains("doc =") || text.contains("doc=");
+    // Block doc comments (`/*! ... */`), whose lines need no leading `*`.
+    if (text.contains("/*!") || text.contains("/**")) && text.contains("```") {
+        return true;
+    }
+    text.lines().any(|line| {
+        let t = line.trim_start();
+        ((t.starts_with("///") || t.starts_with("//!") || t.starts_with('*')) && t.contains("```"))
+            || (doc_attribute && (t.contains("```") || t.contains("include_str!")))
+    })
+}
+
+fn has_doctests(lib_source: &std::path::Path) -> bool {
     fn scan(dir: &std::path::Path) -> bool {
         let Ok(entries) = std::fs::read_dir(dir) else {
             return false;
@@ -758,25 +1016,30 @@ fn has_doctests(dir: &std::path::Path) -> bool {
         for entry in entries.flatten() {
             let path = entry.path();
             if path.is_dir() {
+                // Where the library's root is the package directory itself
+                // (`[lib] path = "lib.rs"`), skip what is not its source.
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if name.starts_with('.')
+                    || matches!(name.as_ref(), "target" | "tests" | "examples" | "benches")
+                {
+                    continue;
+                }
                 if scan(&path) {
                     return true;
                 }
             } else if path.extension().and_then(|e| e.to_str()) == Some("rs")
                 && let Ok(text) = std::fs::read_to_string(&path)
-                && text.lines().any(|line| {
-                    let t = line.trim_start();
-                    ((t.starts_with("///") || t.starts_with("//!") || t.starts_with('*'))
-                        && t.contains("```"))
-                        || ((t.starts_with("#[doc") || t.starts_with("#![doc"))
-                            && (t.contains("include_str!") || t.contains("```")))
-                })
+                && may_hold_doctests(&text)
             {
                 return true;
             }
         }
         false
     }
-    scan(&dir.join("src"))
+    // The directory of the library's root file: `src/` usually, the package
+    // directory for crates like `fnv` whose `lib.rs` sits at the top.
+    lib_source.parent().is_some_and(scan)
 }
 
 /// What a library's build scripts give its doc tests, as they give the
@@ -860,13 +1123,25 @@ fn run_doctest(
 
     let mut cmd = Command::new(&rustdoc);
     cmd.args(sess.rustdoc_flags());
+    // Relative to the package, as Cargo passes it: doc tests are then named
+    // `src/lib.rs - Ident (line 937)`, what `--retries`, filters and CI
+    // reports expect.
     cmd.current_dir(&member.dir)
         .arg("--test")
-        .arg(&doc.lib_source)
+        .arg(
+            doc.lib_source
+                .strip_prefix(&member.dir)
+                .unwrap_or(&doc.lib_source),
+        )
         .arg("--crate-name")
         .arg(&doc.crate_name)
         .arg("--edition")
         .arg(doc.edition.as_str())
+        .args(if doc.proc_macro {
+            &["--crate-type", "proc-macro", "--extern", "proc_macro"][..]
+        } else {
+            &[][..]
+        })
         .arg("-L")
         .arg(format!("dependency={}", deps_dir.display()));
     if let Some(target) = &sess.target {
@@ -914,6 +1189,7 @@ fn run_doctest(
                 counts,
                 output: text,
                 took: start.elapsed(),
+                flaky: Vec::new(),
             }
         }
         Err(e) => TestResult {
@@ -922,6 +1198,7 @@ fn run_doctest(
             counts: Counts::default(),
             output: format!("failed to run `{}`: {e}", rustdoc.display()),
             took: start.elapsed(),
+            flaky: Vec::new(),
         },
     }
 }
@@ -958,14 +1235,14 @@ mod tests {
         let src = dir.path().join("src");
         std::fs::create_dir_all(&src).unwrap();
         std::fs::write(src.join("lib.rs"), "/// plain docs\npub fn f() {}\n").unwrap();
-        assert!(!has_doctests(dir.path()));
+        assert!(!has_doctests(&src.join("lib.rs")));
 
         std::fs::write(
             src.join("lib.rs"),
             "/// ```\n/// assert!(true);\n/// ```\npub fn f() {}\n",
         )
         .unwrap();
-        assert!(has_doctests(dir.path()));
+        assert!(has_doctests(&src.join("lib.rs")));
 
         std::fs::write(
             src.join("lib.rs"),
@@ -973,14 +1250,39 @@ mod tests {
         )
         .unwrap();
         assert!(
-            has_doctests(dir.path()),
+            has_doctests(&src.join("lib.rs")),
             "README-driven docs may contain tests"
         );
 
         std::fs::create_dir_all(src.join("nested")).unwrap();
         std::fs::write(src.join("lib.rs"), "mod nested;\n").unwrap();
         std::fs::write(src.join("nested/mod.rs"), "//! ```\n//! ```\n").unwrap();
-        assert!(has_doctests(dir.path()), "nested modules are scanned");
+        assert!(
+            has_doctests(&src.join("lib.rs")),
+            "nested modules are scanned"
+        );
+
+        // Docs in a `cfg_attr`, over several lines (`fnv`).
+        std::fs::write(
+            src.join("lib.rs"),
+            "#![cfg_attr(feature = \"std\", doc = r#\"\n```rust\nassert!(true);\n```\n\"#)]\n",
+        )
+        .unwrap();
+        assert!(has_doctests(&src.join("lib.rs")));
+
+        // A block doc comment whose lines have no leading `*` (grep-searcher).
+        std::fs::write(
+            src.join("lib.rs"),
+            "/*!\nDocs.\n\n```\nassert!(true);\n```\n*/\n",
+        )
+        .unwrap();
+        assert!(has_doctests(&src.join("lib.rs")));
+
+        // A library whose root is at the top of the package, as in `fnv`.
+        let top = tempfile::tempdir().unwrap();
+        std::fs::write(top.path().join("lib.rs"), "//! ```\n//! ```\n").unwrap();
+        std::fs::create_dir_all(top.path().join("target")).unwrap();
+        assert!(has_doctests(&top.path().join("lib.rs")));
     }
 
     #[test]

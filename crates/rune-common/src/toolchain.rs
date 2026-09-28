@@ -26,7 +26,16 @@ use std::sync::{Mutex, OnceLock};
 /// A discovered compiler installation plus its wrappers.
 #[derive(Debug, Clone)]
 pub struct Toolchain {
+    /// The compiler as configured (`RUSTC`, `build.rustc`, a toolchain file,
+    /// or plain `rustc` from `PATH`) — what the identity names.
     pub rustc: PathBuf,
+    /// The binary actually started: for a `rustc` found on `PATH`, the
+    /// toolchain's own `rustc` in its sysroot, not a `rustup` proxy. Cargo
+    /// does the same: a proxy costs ~7 ms per start, and resolves the
+    /// toolchain again each time — from the directory it is started in, so a
+    /// dependency shipping its own `rust-toolchain.toml` could get another
+    /// compiler, and a `rustup update` during a build would mix two.
+    pub exec: PathBuf,
     pub rustdoc: PathBuf,
     /// `RUSTC_WRAPPER` / `build.rustc-wrapper`.
     pub wrapper: Option<PathBuf>,
@@ -38,27 +47,50 @@ pub struct Toolchain {
     /// The host triple `rustc` reports.
     pub host: String,
     pub version: semver::Version,
+    /// The compiler's sysroot, when it could be determined.
+    pub sysroot: Option<PathBuf>,
+    /// Which entry of the probe cache describes this compiler.
+    probe_key: String,
     identity: String,
 }
 
 impl Toolchain {
     /// Discovers the toolchain for a project rooted at `project_root`.
     pub fn discover(cfg: &CargoConfig, project_root: &Path) -> Toolchain {
+        Self::discover_with_cache(cfg, project_root, &probe_cache_path())
+    }
+
+    /// [`Self::discover`], keeping compiler probes in `cache` (see
+    /// [`ProbeCache`]).
+    pub fn discover_with_cache(cfg: &CargoConfig, project_root: &Path, cache: &Path) -> Toolchain {
         let non_empty = |v: Option<std::ffi::OsString>| v.filter(|s| !s.is_empty());
 
-        let rustc: PathBuf = non_empty(std::env::var_os("RUSTC"))
+        let configured: Option<PathBuf> = non_empty(std::env::var_os("RUSTC"))
             .map(PathBuf::from)
-            .or_else(|| cfg.string(&["build", "rustc"]).map(PathBuf::from))
+            .or_else(|| cfg.string(&["build", "rustc"]).map(PathBuf::from));
+        let explicit = configured.is_some();
+        let rustc: PathBuf = configured
             .or_else(|| rustup_rustc(project_root))
             .unwrap_or_else(|| PathBuf::from("rustc"));
+
+        let probe = ProbeCache::open(cache).probe(&rustc);
+        let sysroot = (!probe.sysroot.is_empty()).then(|| PathBuf::from(&probe.sysroot));
+        // An explicitly configured compiler is started exactly as given (it
+        // may be a script); `rustc` from `PATH` is resolved to the real one.
+        let exec = sysroot
+            .as_ref()
+            .filter(|_| !explicit)
+            .map(|s| s.join("bin").join(exe_name("rustc")))
+            .filter(|p| p.is_file())
+            .unwrap_or_else(|| rustc.clone());
 
         let rustdoc: PathBuf = non_empty(std::env::var_os("RUSTDOC"))
             .map(PathBuf::from)
             .or_else(|| cfg.string(&["build", "rustdoc"]).map(PathBuf::from))
             .or_else(|| {
                 // `rustdoc` lives next to the `rustc` it belongs to.
-                let dir = rustc.parent().filter(|d| !d.as_os_str().is_empty())?;
-                let sibling = dir.join("rustdoc");
+                let dir = exec.parent().filter(|d| !d.as_os_str().is_empty())?;
+                let sibling = dir.join(exe_name("rustdoc"));
                 sibling.is_file().then_some(sibling)
             })
             .unwrap_or_else(|| PathBuf::from("rustdoc"));
@@ -81,13 +113,7 @@ impl Toolchain {
                 .map(PathBuf::from),
         };
 
-        let verbose_version = Command::new(&rustc)
-            .arg("-vV")
-            .output()
-            .ok()
-            .filter(|o| o.status.success())
-            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-            .unwrap_or_default();
+        let verbose_version = probe.verbose_version.clone();
         let host = verbose_version
             .lines()
             .find_map(|l| l.strip_prefix("host: "))
@@ -102,12 +128,15 @@ impl Toolchain {
 
         let mut tc = Toolchain {
             rustc,
+            exec,
             rustdoc,
             wrapper,
             workspace_wrapper,
             verbose_version,
             host,
             version,
+            sysroot,
+            probe_key: probe.key.clone(),
             identity: String::new(),
         };
         tc.identity = tc.compute_identity();
@@ -147,7 +176,13 @@ impl Toolchain {
         // compiler's actual implementation lives in `librustc_driver`, so
         // fingerprint that file too.
         out.push_str("driver=");
-        out.push_str(&driver_fingerprint(&self.rustc));
+        out.push_str(
+            &self
+                .sysroot
+                .as_deref()
+                .map(driver_fingerprint)
+                .unwrap_or_else(|| "unknown".into()),
+        );
         out.push('\n');
         for (label, tool) in [
             ("wrapper", &self.wrapper),
@@ -159,6 +194,19 @@ impl Toolchain {
             }
         }
         out
+    }
+
+    /// Whether the compiler accepts `-Z` flags: a nightly or locally built
+    /// one (or any, with `RUSTC_BOOTSTRAP=1` set by the user).
+    pub fn accepts_unstable_flags(&self) -> bool {
+        let release = self
+            .verbose_version
+            .lines()
+            .find_map(|l| l.strip_prefix("release: "))
+            .unwrap_or("");
+        release.contains("nightly")
+            || release.contains("-dev")
+            || std::env::var("RUSTC_BOOTSTRAP").is_ok_and(|v| v == "1")
     }
 
     /// Whether a `rust-version` requirement (`1.85`, `1.85.0`) is met.
@@ -189,7 +237,7 @@ impl Toolchain {
         if let (true, Some(w)) = (workspace_member, &self.workspace_wrapper) {
             chain.push(w);
         }
-        chain.push(&self.rustc);
+        chain.push(&self.exec);
         let mut cmd = Command::new(chain[0]);
         for extra in &chain[1..] {
             cmd.arg(extra);
@@ -281,16 +329,8 @@ pub fn program_fingerprint(program: &Path) -> String {
     }
 }
 
-fn driver_fingerprint(rustc: &Path) -> String {
-    let sysroot = Command::new(rustc)
-        .args(["--print", "sysroot"])
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| PathBuf::from(String::from_utf8_lossy(&o.stdout).trim()));
-    let Some(sysroot) = sysroot else {
-        return "unknown".into();
-    };
+/// Size and mtime of the compiler's implementation (`librustc_driver`).
+fn driver_fingerprint(sysroot: &Path) -> String {
     let mut parts = Vec::new();
     if let Ok(entries) = std::fs::read_dir(sysroot.join("lib")) {
         for e in entries.flatten() {
@@ -312,6 +352,241 @@ fn driver_fingerprint(rustc: &Path) -> String {
     }
     parts.sort();
     parts.join(",")
+}
+
+/// The first line of `program --version`, remembered by the program's path,
+/// size and mtime (`$RUNE_HOME/cache/tools.json`): the same binary gives the
+/// same answer, and starting a C compiler just to ask costs more than a whole
+/// no-op build.
+pub fn tool_version(program: &Path) -> String {
+    let fingerprint = program_fingerprint(program);
+    let path = crate::settings::rune_home()
+        .join("cache")
+        .join("tools.json");
+    let load = || -> HashMap<String, String> {
+        std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|t| serde_json::from_str(&t).ok())
+            .unwrap_or_default()
+    };
+    if !fingerprint.ends_with("|missing")
+        && let Some(v) = load().get(&fingerprint)
+    {
+        return v.clone();
+    }
+    let version = Command::new(program)
+        .arg("--version")
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .next()
+                .unwrap_or("")
+                .to_string()
+        })
+        .unwrap_or_default();
+    if !fingerprint.ends_with("|missing") {
+        let _guard = PROBE_LOCK.lock().unwrap();
+        let mut all = load();
+        all.insert(fingerprint, version.clone());
+        while all.len() > 256 {
+            let Some(k) = all.keys().next().cloned() else {
+                break;
+            };
+            all.remove(&k);
+        }
+        if let (Some(dir), Ok(text)) = (path.parent(), serde_json::to_string(&all)) {
+            let _ = std::fs::create_dir_all(dir);
+            let _ = crate::fsutil::write_atomic(&path, text.as_bytes());
+        }
+    }
+    version
+}
+
+/// `rustc` or `rustc.exe`.
+fn exe_name(name: &str) -> String {
+    format!("{name}{}", std::env::consts::EXE_SUFFIX)
+}
+
+/// Where compiler probes are kept.
+fn probe_cache_path() -> PathBuf {
+    crate::settings::rune_home()
+        .join("cache")
+        .join("toolchains.json")
+}
+
+/// What asking a compiler about itself found.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+struct Probe {
+    /// Which entry this is (see [`ProbeCache::resolution_key`]).
+    #[serde(skip)]
+    key: String,
+    /// `rustc -vV`.
+    verbose_version: String,
+    /// `rustc --print sysroot`.
+    sysroot: String,
+    /// Sizes and mtimes of the sysroot's `rustc` and `librustc_driver`: the
+    /// entry is only believed while these are unchanged.
+    files: String,
+    /// `rustc --print=cfg` output by target, specification and flags.
+    #[serde(default)]
+    cfg: std::collections::BTreeMap<String, String>,
+}
+
+/// Compiler probes (`rustc -vV`, `--print sysroot`, `--print=cfg`) kept across
+/// runs. Each one starts the compiler — through a `rustup` proxy about
+/// 15–20 ms — and every Rune command needs several, which used to be most of
+/// a no-op build's time. The answers change only when the compiler does, so
+/// an entry is keyed by what decides which compiler `rustc` is (its path,
+/// size and mtime; rustup's settings, `RUSTUP_TOOLCHAIN` and the working
+/// directory, which select a proxy's toolchain) and trusted only while the
+/// toolchain's own files are unchanged — `rustup update` misses and probes
+/// again.
+struct ProbeCache {
+    path: PathBuf,
+}
+
+static PROBE_LOCK: Mutex<()> = Mutex::new(());
+
+impl ProbeCache {
+    fn open(path: &Path) -> Self {
+        Self {
+            path: path.to_path_buf(),
+        }
+    }
+
+    fn load(&self) -> HashMap<String, Probe> {
+        std::fs::read_to_string(&self.path)
+            .ok()
+            .and_then(|t| serde_json::from_str(&t).ok())
+            .unwrap_or_default()
+    }
+
+    fn save(&self, entries: &HashMap<String, Probe>) {
+        if let (Some(dir), Ok(text)) = (self.path.parent(), serde_json::to_string(entries)) {
+            let _ = std::fs::create_dir_all(dir);
+            let _ = crate::fsutil::write_atomic(&self.path, text.as_bytes());
+        }
+    }
+
+    /// What selects the compiler a `rustc` invocation runs.
+    fn resolution_key(rustc: &Path) -> String {
+        let mut hb = crate::hash::HashBuilder::new();
+        hb.update(rustc.to_string_lossy().as_bytes());
+        hb.update(b"\0");
+        hb.update(program_fingerprint(rustc).as_bytes());
+        for var in ["RUSTUP_TOOLCHAIN", "RUSTUP_HOME", "RUSTC_BOOTSTRAP"] {
+            hb.update(b"\0");
+            hb.update(var.as_bytes());
+            hb.update(b"=");
+            if let Some(v) = std::env::var_os(var) {
+                hb.update(v.to_string_lossy().as_bytes());
+            }
+        }
+        let rustup_home = std::env::var_os("RUSTUP_HOME")
+            .map(PathBuf::from)
+            .or_else(|| home::home_dir().map(|h| h.join(".rustup")));
+        if let Some(settings) = rustup_home.map(|h| h.join("settings.toml"))
+            && let Ok(text) = std::fs::read(&settings)
+        {
+            hb.update(b"\0settings=");
+            hb.update(&text);
+        }
+        if let Ok(cwd) = std::env::current_dir() {
+            hb.update(b"\0cwd=");
+            hb.update(cwd.to_string_lossy().as_bytes());
+        }
+        hb.finish_blake3()
+    }
+
+    /// Fingerprint of the files that make up the compiler in `sysroot`.
+    fn sysroot_files(sysroot: &Path) -> String {
+        let rustc = sysroot.join("bin").join(exe_name("rustc"));
+        format!(
+            "{}|{}",
+            program_fingerprint(&rustc),
+            driver_fingerprint(sysroot)
+        )
+    }
+
+    /// The probe of `rustc`: remembered, or asked of the compiler (the two
+    /// questions in parallel).
+    fn probe(&self, rustc: &Path) -> Probe {
+        let key = Self::resolution_key(rustc);
+        if let Some(mut hit) = self.load().remove(&key)
+            && !hit.sysroot.is_empty()
+            && Self::sysroot_files(Path::new(&hit.sysroot)) == hit.files
+        {
+            hit.key = key;
+            return hit;
+        }
+        let ask = |args: &[&str]| -> String {
+            Command::new(rustc)
+                .args(args)
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                .unwrap_or_default()
+        };
+        let (verbose_version, sysroot) = std::thread::scope(|s| {
+            let sysroot = s.spawn(|| ask(&["--print", "sysroot"]));
+            let vv = ask(&["-vV"]);
+            (vv, sysroot.join().unwrap_or_default())
+        });
+        let mut probe = Probe {
+            key: key.clone(),
+            files: if sysroot.is_empty() {
+                String::new()
+            } else {
+                Self::sysroot_files(Path::new(&sysroot))
+            },
+            verbose_version,
+            sysroot,
+            cfg: Default::default(),
+        };
+        // Only a complete answer is worth remembering.
+        if !probe.sysroot.is_empty() && !probe.verbose_version.is_empty() {
+            let _guard = PROBE_LOCK.lock().unwrap();
+            let mut all = self.load();
+            if let Some(old) = all.get(&key)
+                && old.files == probe.files
+            {
+                probe.cfg = old.cfg.clone();
+            }
+            all.insert(key, probe.clone());
+            // Bounded: projects come and go, toolchains get updated.
+            while all.len() > 64 {
+                let Some(k) = all.keys().next().cloned() else {
+                    break;
+                };
+                all.remove(&k);
+            }
+            self.save(&all);
+        }
+        probe
+    }
+
+    fn cfg(&self, key: &str, cfg_key: &str) -> Option<String> {
+        if key.is_empty() {
+            return None;
+        }
+        self.load().get(key)?.cfg.get(cfg_key).cloned()
+    }
+
+    fn remember_cfg(&self, key: &str, cfg_key: &str, text: &str) {
+        if key.is_empty() {
+            return;
+        }
+        let _guard = PROBE_LOCK.lock().unwrap();
+        let mut all = self.load();
+        if let Some(entry) = all.get_mut(key) {
+            entry.cfg.insert(cfg_key.to_string(), text.to_string());
+            self.save(&all);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -340,7 +615,7 @@ impl TargetInfo {
         let arg = target
             .map(str::to_string)
             .unwrap_or_else(|| tc.host.clone());
-        let key = format!("{}|{arg}|{}", tc.rustc.display(), rustflags.join("\x1f"));
+        let key = format!("{}|{arg}|{}", tc.exec.display(), rustflags.join("\x1f"));
         let cache = TARGET_CACHE.get_or_init(Default::default);
         if let Some(hit) = cache.lock().unwrap().get(&key) {
             return hit.clone();
@@ -360,14 +635,31 @@ impl TargetInfo {
         };
 
         let run = |flags: &[String]| -> Option<String> {
-            let mut cmd = Command::new(&tc.rustc);
+            let mut cmd = Command::new(&tc.exec);
             cmd.arg("--print=cfg").arg("--target").arg(&arg).args(flags);
             let out = cmd.output().ok()?;
             out.status
                 .success()
                 .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
         };
-        let text = run(rustflags).or_else(|| run(&[])).unwrap_or_default();
+        // The answer depends on the compiler, the target (a custom one by its
+        // content) and the flags; the probe cache remembers it across runs.
+        let probe_cfg_key = format!(
+            "{arg}|{}|{}",
+            spec_hash.as_deref().unwrap_or(""),
+            rustflags.join("\x1f")
+        );
+        let probes = ProbeCache::open(&probe_cache_path());
+        let text = match probes.cfg(&tc.probe_key, &probe_cfg_key) {
+            Some(text) => text,
+            None => {
+                let text = run(rustflags).or_else(|| run(&[])).unwrap_or_default();
+                if !text.is_empty() {
+                    probes.remember_cfg(&tc.probe_key, &probe_cfg_key, &text);
+                }
+                text
+            }
+        };
         let info = TargetInfo {
             name,
             arg,
@@ -628,14 +920,80 @@ mod tests {
             .collect();
         assert_eq!(cmd.get_program().to_string_lossy(), "sccache");
         assert_eq!(args[0], "clippy-driver");
-        assert_eq!(args[1], tc.rustc.to_string_lossy());
+        assert_eq!(args[1], tc.exec.to_string_lossy());
         // Dependencies (not workspace members) skip the workspace wrapper.
         let cmd = tc.rustc_command(false);
         let args: Vec<_> = cmd
             .get_args()
             .map(|a| a.to_string_lossy().into_owned())
             .collect();
-        assert_eq!(args, [tc.rustc.to_string_lossy().into_owned()]);
+        assert_eq!(args, [tc.exec.to_string_lossy().into_owned()]);
+    }
+
+    /// A fake `rustc` that counts how often it is started.
+    #[cfg(unix)]
+    fn fake_rustc(dir: &Path) -> (PathBuf, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let sysroot = dir.join("sysroot");
+        std::fs::create_dir_all(sysroot.join("bin")).unwrap();
+        std::fs::create_dir_all(sysroot.join("lib")).unwrap();
+        std::fs::write(sysroot.join("lib/librustc_driver-abc.so"), "v1").unwrap();
+        let count = dir.join("count");
+        let rustc = sysroot.join("bin/rustc");
+        std::fs::write(
+            &rustc,
+            format!(
+                "#!/bin/sh\necho x >> {count}\ncase \"$1\" in\n\
+                 -vV) printf 'rustc 1.2.3\\nhost: x86_64-unknown-linux-gnu\\nrelease: 1.2.3\\n' ;;\n\
+                 --print) echo {sysroot} ;;\n\
+                 esac\n",
+                count = count.display(),
+                sysroot = sysroot.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&rustc, std::fs::Permissions::from_mode(0o755)).unwrap();
+        (rustc, count)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn compiler_probes_are_remembered_until_the_toolchain_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let (rustc, count) = fake_rustc(dir.path());
+        let cache = ProbeCache::open(&dir.path().join("probes.json"));
+        let starts = || {
+            std::fs::read_to_string(&count)
+                .map(|t| t.lines().count())
+                .unwrap_or(0)
+        };
+        let first = cache.probe(&rustc);
+        assert_eq!(first.verbose_version.lines().last(), Some("release: 1.2.3"));
+        assert!(first.sysroot.ends_with("sysroot"));
+        assert_eq!(starts(), 2, "-vV and --print sysroot");
+        let again = cache.probe(&rustc);
+        assert_eq!(again.verbose_version, first.verbose_version);
+        assert_eq!(starts(), 2, "a second probe must not start the compiler");
+        // The toolchain is updated in place (`rustup update`): probe again.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        std::fs::write(
+            dir.path().join("sysroot/lib/librustc_driver-abc.so"),
+            "v2 is longer",
+        )
+        .unwrap();
+        cache.probe(&rustc);
+        assert_eq!(starts(), 4);
+    }
+
+    #[test]
+    fn rustc_from_path_is_started_from_its_sysroot() {
+        let tc = global();
+        if std::env::var_os("RUSTC").is_some() {
+            return;
+        }
+        let sysroot = tc.sysroot.as_ref().expect("the sysroot is known");
+        assert_eq!(tc.exec, sysroot.join("bin").join(exe_name("rustc")));
+        assert!(tc.exec.is_file());
     }
 
     #[test]

@@ -16,7 +16,6 @@ tar.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 rayon.workspace = true
-semver.workspace = true
 home.workspace = true
 toml.workspace = true
 blake3.workspace = true

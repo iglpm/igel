@@ -2012,6 +2012,45 @@ fn update_precise_and_dry_run_move_one_package_like_cargo() {
 
 #[cfg(unix)]
 #[test]
+fn add_lists_the_features_it_turns_on_like_cargo() {
+    let reg = local_registry(&[("foo", "1.0.0", &[])]);
+    // Features, two optional dependencies (one hidden behind `dep:`), and
+    // what the index says about the release.
+    let optional = |name: &str| {
+        format!(
+            "{{\"name\":\"{name}\",\"req\":\"1\",\"features\":[],\"optional\":true,\"default_features\":true,\"target\":null,\"kind\":\"normal\"}}"
+        )
+    };
+    let file = reg.path().join("index/3/f/foo");
+    let record = std::fs::read_to_string(&file)
+        .unwrap()
+        .replace(
+            "\"deps\":[]",
+            &format!("\"deps\":[{},{}]", optional("foo_derive"), optional("bar")),
+        )
+        .replace(
+            "\"features\":{}",
+            "\"features\":{\"default\":[\"std\"],\"std\":[],\"derive\":[\"dep:foo_derive\"],\"extra\":[\"bar\"]},\"rust_version\":\"1.70\",\"pubtime\":\"2026-01-02T03:04:05Z\"",
+        );
+    std::fs::write(&file, record).unwrap();
+    let p = app_with(&reg, "");
+    let out = p.ok(&["add", "foo", "-F", "extra", "--dry-run"]);
+    let listed: Vec<&str> = out
+        .lines()
+        .map(str::trim)
+        .filter(|l| l.starts_with("+ ") || l.starts_with("- "))
+        .collect();
+    assert_eq!(listed, ["+ bar", "+ extra", "+ std", "- derive"], "{out}");
+    assert!(
+        out.contains("needs Rust 1.70, published 2026-01-02"),
+        "{out}"
+    );
+    let quiet = p.ok(&["add", "foo", "--no-default-features", "--dry-run"]);
+    assert!(quiet.contains("- std"), "{quiet}");
+}
+
+#[cfg(unix)]
+#[test]
 fn add_supports_renames_platforms_workspace_deps_and_replaced_sources() {
     let reg = local_registry(&[("foo", "1.0.0", &[]), ("foo", "1.4.2", &[])]);
     let p = app_with(&reg, "");
@@ -4105,4 +4144,1458 @@ fn doctor_warns_when_rune_toml_shadows_a_cargo_toml() {
     // A settings-only Rune.toml next to a Cargo.toml is the normal case: no warning.
     p.write("Rune.toml", "[build]\njobs = 2\n");
     assert!(!p.ok(&["doctor"]).contains("both `Rune.toml`"));
+}
+
+// ---------------------------------------------------------------------------
+// Build scripts as their own step
+// ---------------------------------------------------------------------------
+
+/// A build script that appends `<name> <event> <nanoseconds>` to the file
+/// named by `RUNE_T_STAMPS`, optionally sleeping in between.
+fn stamping_script(name: &str, sleep_ms: u64, extra: &str) -> String {
+    format!(
+        r#"use std::io::Write;
+fn stamp(event: &str) {{
+    let path = std::env::var("RUNE_T_STAMPS").unwrap();
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+    let mut f = std::fs::OpenOptions::new().create(true).append(true).open(path).unwrap();
+    writeln!(f, "{name} {{event}} {{now}}").unwrap();
+}}
+fn main() {{
+    stamp("start");
+    std::thread::sleep(std::time::Duration::from_millis({sleep_ms}));
+    stamp("end");
+    println!("cargo::rerun-if-changed=build.rs");
+    {extra}
+}}
+"#
+    )
+}
+
+fn stamps(path: &Path) -> std::collections::HashMap<String, u128> {
+    std::fs::read_to_string(path)
+        .unwrap()
+        .lines()
+        .map(|l| {
+            let mut it = l.split_whitespace();
+            let (who, what, at) = (it.next().unwrap(), it.next().unwrap(), it.next().unwrap());
+            (format!("{who} {what}"), at.parse().unwrap())
+        })
+        .collect()
+}
+
+#[test]
+fn a_build_script_runs_while_its_packages_dependencies_are_still_compiling() {
+    // `app`'s script needs nothing from `slow` (an ordinary dependency), so it
+    // must not wait for `slow` — whose own script takes 1.5 s — to finish.
+    let p = Project::new();
+    p.write(
+        "Cargo.toml",
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\
+         [dependencies]\nslow = { path = \"slow\" }\n",
+    );
+    p.write("build.rs", &stamping_script("app", 0, ""));
+    p.write("src/lib.rs", "pub fn v() -> u32 { slow::v() + 1 }\n");
+    p.write(
+        "slow/Cargo.toml",
+        "[package]\nname = \"slow\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    p.write("slow/build.rs", &stamping_script("slow", 1500, ""));
+    p.write("slow/src/lib.rs", "pub fn v() -> u32 { 1 }\n");
+    let log = p.home().join("stamps.txt");
+    let out = Command::new(env!("CARGO_BIN_EXE_rune"))
+        .args(["build", "-j", "4"])
+        .current_dir(p.path())
+        .env("RUNE_HOME", p.home())
+        .env("RUNE_T_STAMPS", &log)
+        .env("NO_COLOR", "1")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", text(&out));
+    let s = stamps(&log);
+    assert!(
+        s["app start"] < s["slow end"],
+        "app's build script waited for its dependency: {s:?}"
+    );
+}
+
+#[test]
+fn check_only_type_checks_the_ordinary_dependencies_of_a_crate_with_a_build_script() {
+    let p = Project::new();
+    p.write(
+        "Cargo.toml",
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\
+         [dependencies]\nplain = { path = \"plain\" }\n\
+         [build-dependencies]\nhelper = { path = \"helper\" }\n",
+    );
+    p.write(
+        "build.rs",
+        "fn main() { assert_eq!(helper::h(), 7); println!(\"cargo::rerun-if-changed=build.rs\"); }\n",
+    );
+    p.write("src/lib.rs", "pub fn v() -> u32 { plain::v() }\n");
+    for (name, body) in [
+        ("plain", "pub fn v() -> u32 { 1 }\n"),
+        ("helper", "pub fn h() -> u32 { 7 }\n"),
+    ] {
+        p.write(
+            &format!("{name}/Cargo.toml"),
+            &format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"),
+        );
+        p.write(&format!("{name}/src/lib.rs"), body);
+    }
+    p.ok(&["check"]);
+    let deps: Vec<String> = std::fs::read_dir(p.path().join(".rune/target/debug/deps"))
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    let has = |prefix: &str, ext: &str| {
+        deps.iter()
+            .any(|f| f.starts_with(prefix) && f.ends_with(ext))
+    };
+    assert!(has("libplain-", ".rmeta"), "{deps:?}");
+    assert!(
+        !has("libplain-", ".rlib"),
+        "an ordinary dependency was compiled to machine code by `check`: {deps:?}"
+    );
+    // The build script links `helper`, so that one is really built.
+    assert!(has("libhelper-", ".rlib"), "{deps:?}");
+}
+
+#[test]
+fn a_dependency_that_learns_an_outside_input_late_still_rekeys_its_dependents() {
+    // `base`'s script is slow and declares an environment variable; `app`'s
+    // script has long finished by then. `app` must still be stored under a
+    // key that includes `base`'s input: an identical second build is fully
+    // cached, and changing the variable rebuilds both.
+    let p = Project::new();
+    p.write(
+        "Cargo.toml",
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\
+         [dependencies]\nbase = { path = \"base\" }\n",
+    );
+    p.write("build.rs", &stamping_script("app", 0, ""));
+    p.write(
+        "src/main.rs",
+        "fn main() { println!(\"mode={}\", base::mode()); }\n",
+    );
+    p.write(
+        "base/Cargo.toml",
+        "[package]\nname = \"base\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    p.write(
+        "base/build.rs",
+        &stamping_script(
+            "base",
+            800,
+            r#"println!("cargo::rerun-if-env-changed=RUNE_T_MODE");
+    println!("cargo::rustc-env=MODE={}", std::env::var("RUNE_T_MODE").unwrap_or_default());"#,
+        ),
+    );
+    p.write(
+        "base/src/lib.rs",
+        "pub fn mode() -> &'static str { env!(\"MODE\") }\n",
+    );
+    let log = p.home().join("stamps.txt");
+    let run = |mode: &str, args: &[&str]| {
+        let out = Command::new(env!("CARGO_BIN_EXE_rune"))
+            .args(args)
+            .current_dir(p.path())
+            .env("RUNE_HOME", p.home())
+            .env("RUNE_T_STAMPS", &log)
+            .env("RUNE_T_MODE", mode)
+            .env("NO_COLOR", "1")
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{}", text(&out));
+        text(&out)
+    };
+    run("one", &["build", "-j", "4"]);
+    let s = stamps(&log);
+    assert!(
+        s["app end"] < s["base end"],
+        "the race did not happen: {s:?}"
+    );
+    let again = run("one", &["build", "-j", "4"]);
+    assert!(again.contains("0 compiled"), "{again}");
+    assert!(run("two", &["run", "-j", "4"]).contains("mode=two"));
+    let back = run("one", &["run", "-j", "4"]);
+    assert!(back.contains("mode=one"), "{back}");
+    assert!(back.contains("0 compiled"), "{back}");
+}
+
+// ---------------------------------------------------------------------------
+// outdated / upgrade
+// ---------------------------------------------------------------------------
+
+/// Adds `"rust_version":"<rv>"` to one release in a local registry's index.
+#[cfg(unix)]
+fn require_rust(reg: &tempfile::TempDir, name: &str, version: &str, rv: &str) {
+    let path = reg.path().join("index/1").join(name);
+    let text = std::fs::read_to_string(&path).unwrap().replace(
+        &format!("\"vers\":\"{version}\""),
+        &format!("\"vers\":\"{version}\",\"rust_version\":\"{rv}\""),
+    );
+    std::fs::write(path, text).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn outdated_lists_what_the_lockfile_and_the_manifest_hold_back() {
+    let reg = local_registry(&[
+        ("a", "1.0.0", &[]),
+        ("a", "1.2.0", &[]),
+        ("a", "2.0.0", &[]),
+        ("b", "0.3.0", &[]),
+    ]);
+    let p = app_with(&reg, "a = \"1.0\"\nb = \"0.3\"\n");
+    p.write("Cargo.lock", "");
+    std::fs::remove_file(p.path().join("Cargo.lock")).unwrap();
+    // Lock the old release on purpose.
+    p.ok(&["generate-lockfile"]);
+    p.ok(&["update", "-p", "a", "--precise", "1.0.0"]);
+
+    let out = p.rune(&["outdated", "--exit-code"]);
+    let table = text(&out);
+    assert_eq!(out.status.code(), Some(1), "{table}");
+    let row = table
+        .lines()
+        .find(|l| l.starts_with("a "))
+        .unwrap_or_else(|| panic!("no row for `a`:\n{table}"));
+    let cells: Vec<&str> = row.split_whitespace().collect();
+    assert_eq!(
+        &cells[..5],
+        ["a", "1.0", "1.0.0", "1.2.0", "2.0.0"],
+        "{row}"
+    );
+    assert!(
+        !table.lines().any(|l| l.starts_with("b ")),
+        "b is current:\n{table}"
+    );
+
+    let json = p.rune(&["outdated", "--format", "json"]);
+    let rows: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    assert_eq!(rows[0]["name"], "a");
+    assert_eq!(rows[0]["compatible"], "1.2.0");
+}
+
+#[cfg(unix)]
+#[test]
+fn upgrade_raises_requirements_keeping_the_manifests_formatting() {
+    let reg = local_registry(&[
+        ("a", "1.0.0", &[]),
+        ("a", "1.2.0", &[]),
+        ("a", "2.0.0", &[]),
+        ("bb", "0.3.0", &[]),
+        ("bb", "0.4.1", &[]),
+    ]);
+    let p = app_with(
+        &reg,
+        "a = \"1.0\" # keep this comment\nbb = { version = \"0.3\", default-features = false }\n",
+    );
+    p.ok(&["generate-lockfile"]);
+    p.ok(&["update", "-p", "a", "--precise", "1.0.0"]);
+
+    // Compatible: `a` to 1.2, `bb` stays (0.4 is a breaking release).
+    let out = p.ok(&["upgrade"]);
+    let manifest = p.read("Cargo.toml");
+    assert!(
+        manifest.contains("a = \"1.2\" # keep this comment"),
+        "{manifest}\n{out}"
+    );
+    assert!(
+        manifest.contains("bb = { version = \"0.3\", default-features = false }"),
+        "{manifest}"
+    );
+    assert!(
+        locked(&p).contains(&"a 1.2.0".to_string()),
+        "{:?}",
+        locked(&p)
+    );
+
+    // Incompatible, one dependency: only `bb`, table form kept.
+    p.ok(&["upgrade", "--incompatible", "bb"]);
+    let manifest = p.read("Cargo.toml");
+    assert!(
+        manifest.contains("bb = { version = \"0.4\", default-features = false }"),
+        "{manifest}"
+    );
+    assert!(manifest.contains("a = \"1.2\""), "{manifest}");
+    assert!(
+        locked(&p).contains(&"bb 0.4.1".to_string()),
+        "{:?}",
+        locked(&p)
+    );
+
+    // A dry run writes nothing.
+    let before = p.read("Cargo.toml");
+    p.ok(&["upgrade", "--incompatible", "--dry-run"]);
+    assert_eq!(p.read("Cargo.toml"), before);
+}
+
+#[cfg(unix)]
+#[test]
+fn upgrade_and_outdated_respect_the_packages_rust_version() {
+    let reg = local_registry(&[
+        ("a", "1.0.0", &[]),
+        ("a", "1.5.0", &[]),
+        ("a", "1.9.0", &[]),
+    ]);
+    require_rust(&reg, "a", "1.5.0", "1.50");
+    require_rust(&reg, "a", "1.9.0", "9.99");
+    let p = app_with(&reg, "a = \"1.0.0\"\n");
+    let manifest = p.read("Cargo.toml").replace(
+        "edition = \"2021\"",
+        "edition = \"2021\"\nrust-version = \"1.60\"",
+    );
+    p.write("Cargo.toml", &manifest);
+    p.ok(&["upgrade"]);
+    assert!(
+        p.read("Cargo.toml").contains("a = \"1.5.0\""),
+        "{}",
+        p.read("Cargo.toml")
+    );
+    let table = p.ok(&["outdated"]);
+    assert!(table.contains("1.9.0 needs a newer Rust"), "{table}");
+    p.ok(&["upgrade", "--ignore-rust-version"]);
+    assert!(
+        p.read("Cargo.toml").contains("a = \"1.9.0\""),
+        "{}",
+        p.read("Cargo.toml")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn upgrade_edits_workspace_dependencies_where_members_inherit_them() {
+    let reg = local_registry(&[("a", "1.0.0", &[]), ("a", "1.3.0", &[])]);
+    let p = Project::new();
+    p.write(
+        "Cargo.toml",
+        "[workspace]\nmembers = [\"app\"]\n\n[workspace.dependencies]\na = \"1.0\"\n",
+    );
+    p.write(
+        "app/Cargo.toml",
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\
+         [dependencies]\na = { workspace = true }\n",
+    );
+    p.write("app/src/main.rs", "fn main() {}\n");
+    p.write(
+        ".cargo/config.toml",
+        &format!(
+            "[source.crates-io]\nreplace-with = \"local\"\n[source.local]\nlocal-registry = {:?}\n",
+            reg.path()
+        ),
+    );
+    p.ok(&["upgrade"]);
+    assert!(
+        p.read("Cargo.toml").contains("a = \"1.3\""),
+        "{}",
+        p.read("Cargo.toml")
+    );
+    assert!(
+        p.read("app/Cargo.toml")
+            .contains("a = { workspace = true }")
+    );
+    // `-p app` only looks at the member's own manifest, which inherits.
+    assert!(p.ok(&["upgrade", "-p", "app"]).contains("already allows"));
+}
+
+#[test]
+fn out_dir_holds_only_what_the_script_generated_and_script_errors_are_shown() {
+    let p = build_script_project();
+    p.ok(&["build"]);
+    let build = p.path().join(".rune/target/debug/build");
+    let dirs: Vec<_> = std::fs::read_dir(&build).unwrap().flatten().collect();
+    assert_eq!(dirs.len(), 1, "{dirs:?}");
+    let out: Vec<String> = std::fs::read_dir(dirs[0].path().join("out"))
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(
+        out,
+        ["generated.rs"],
+        "the script binary does not belong in OUT_DIR"
+    );
+
+    p.write("build.rs", "fn main() { let x: u32 = \"not a number\"; }\n");
+    let failed = p.rune(&["build"]);
+    assert!(!failed.status.success());
+    let msg = text(&failed);
+    assert!(
+        msg.contains("mismatched types"),
+        "the compiler's error is shown:\n{msg}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// unused
+// ---------------------------------------------------------------------------
+
+#[test]
+fn unused_dependencies_are_found_by_asking_the_compiler() {
+    let p = Project::new();
+    p.write(
+        "Cargo.toml",
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\
+         [dependencies]\nused = { path = \"used\" }\nidle = { path = \"idle\" }\n\
+         tests-only = { path = \"tests-only\" }\n\
+         [dev-dependencies]\ndev-used = { path = \"dev-used\" }\ndev-idle = { path = \"dev-idle\" }\n\
+         [build-dependencies]\nbuild-used = { path = \"build-used\" }\nbuild-idle = { path = \"build-idle\" }\n",
+    );
+    for name in [
+        "used",
+        "idle",
+        "tests-only",
+        "dev-used",
+        "dev-idle",
+        "build-used",
+        "build-idle",
+    ] {
+        p.write(
+            &format!("{name}/Cargo.toml"),
+            &format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"),
+        );
+        p.write(&format!("{name}/src/lib.rs"), "pub fn f() -> u32 { 1 }\n");
+    }
+    p.write("src/lib.rs", "pub fn g() -> u32 { used::f() }\n");
+    p.write(
+        "tests/it.rs",
+        "#[test] fn t() { assert_eq!(dev_used::f() + tests_only::f() + app::g(), 3); }\n",
+    );
+    p.write(
+        "build.rs",
+        "fn main() { let _ = build_used::f(); println!(\"cargo::rerun-if-changed=build.rs\"); }\n",
+    );
+
+    for round in 0..2 {
+        let out = p.rune(&["unused"]);
+        let msg = text(&out);
+        assert_eq!(out.status.code(), Some(1), "round {round}:\n{msg}");
+        let unused_line = msg.lines().find(|l| l.contains("unused:")).unwrap_or("");
+        for name in ["idle", "dev-idle", "build-idle"] {
+            assert!(
+                unused_line.contains(&format!("{name} ")),
+                "round {round}: `{name}` is unused:\n{msg}"
+            );
+        }
+        for name in ["used [", "dev-used", "build-used"] {
+            assert!(
+                !unused_line.contains(name),
+                "round {round}: `{name}`:\n{msg}"
+            );
+        }
+        let dev_line = msg
+            .lines()
+            .find(|l| l.contains("could be dev-dependencies"))
+            .unwrap_or("");
+        assert!(dev_line.contains("tests-only"), "round {round}:\n{msg}");
+    }
+
+    p.ok(&["unused", "--fix"]);
+    let manifest = p.read("Cargo.toml");
+    for gone in ["idle = ", "dev-idle", "build-idle"] {
+        assert!(!manifest.contains(gone), "{manifest}");
+    }
+    assert!(
+        manifest.contains("used = { path = \"used\" }"),
+        "{manifest}"
+    );
+    let again = p.ok(&["unused"]);
+    assert!(again.contains("no unused dependencies"), "{again}");
+    p.ok(&["test"]);
+}
+
+#[test]
+fn a_dependency_used_only_under_another_cfg_is_reported_but_never_removed() {
+    let p = Project::new();
+    p.write(
+        "Cargo.toml",
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\
+         [dependencies]\nelsewhere = { path = \"elsewhere\" }\n",
+    );
+    p.write(
+        "elsewhere/Cargo.toml",
+        "[package]\nname = \"elsewhere\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    p.write("elsewhere/src/lib.rs", "pub fn f() {}\n");
+    p.write(
+        "src/lib.rs",
+        "#[cfg(target_os = \"plan9\")]\npub fn g() { elsewhere::f() }\n",
+    );
+    let out = p.ok(&["unused", "--fix"]);
+    assert!(out.contains("unused in this configuration"), "{out}");
+    assert!(
+        p.read("Cargo.toml").contains("elsewhere = { path"),
+        "must be kept"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// sbom
+// ---------------------------------------------------------------------------
+
+#[cfg(unix)]
+#[test]
+fn sbom_lists_what_ships_with_checksums_purls_and_edges() {
+    let reg = local_registry(&[
+        ("a", "1.0.0", &[("b", "1")]),
+        ("b", "1.1.0", &[]),
+        ("t", "0.5.0", &[]),
+    ]);
+    let p = app_with(
+        &reg,
+        "a = \"1\"\nhelper = { path = \"helper\" }\n[dev-dependencies]\nt = \"0.5\"\n",
+    );
+    p.write(
+        "helper/Cargo.toml",
+        "[package]\nname = \"helper\"\nversion = \"0.2.0\"\nedition = \"2021\"\nlicense = \"MIT\"\n",
+    );
+    p.write("helper/src/lib.rs", "");
+    let manifest = p.read("Cargo.toml").replace(
+        "edition = \"2021\"",
+        "edition = \"2021\"\nlicense = \"Apache-2.0\"\ndescription = \"demo\"",
+    );
+    p.write("Cargo.toml", &manifest);
+
+    let out = p.rune(&["sbom"]);
+    assert!(out.status.success(), "{}", text(&out));
+    let bom: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(bom["bomFormat"], "CycloneDX");
+    assert_eq!(bom["metadata"]["component"]["purl"], "pkg:cargo/app@0.1.0");
+    assert_eq!(
+        bom["metadata"]["component"]["licenses"][0]["expression"],
+        "Apache-2.0"
+    );
+    let names: Vec<&str> = bom["components"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names.len(), 3, "{names:?}");
+    for n in ["a", "b", "helper"] {
+        assert!(names.contains(&n), "{names:?}");
+    }
+    let a = bom["components"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["name"] == "a")
+        .unwrap();
+    assert_eq!(a["purl"], "pkg:cargo/a@1.0.0");
+    assert_eq!(a["hashes"][0]["alg"], "SHA-256");
+    let lock = p.read("Cargo.lock");
+    assert!(lock.contains(a["hashes"][0]["content"].as_str().unwrap()));
+    let edges_of_a = bom["dependencies"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["ref"] == "pkg:cargo/a@1.0.0")
+        .unwrap();
+    assert_eq!(edges_of_a["dependsOn"][0], "pkg:cargo/b@1.1.0");
+
+    // Development dependencies on request.
+    let with_dev: serde_json::Value =
+        serde_json::from_slice(&p.rune(&["sbom", "--dev"]).stdout).unwrap();
+    assert_eq!(with_dev["components"].as_array().unwrap().len(), 4);
+
+    // SPDX, to a file.
+    p.ok(&["sbom", "--format", "spdx", "-o", "bom.spdx.json"]);
+    let spdx: serde_json::Value = serde_json::from_str(&p.read("bom.spdx.json")).unwrap();
+    assert_eq!(spdx["spdxVersion"], "SPDX-2.3");
+    let rel = spdx["relationships"].as_array().unwrap();
+    assert!(rel.iter().any(|r| r["relationshipType"] == "DESCRIBES"
+        && r["relatedSpdxElement"] == "SPDXRef-Package-app-0.1.0"));
+    assert!(
+        rel.iter()
+            .any(|r| r["spdxElementId"] == "SPDXRef-Package-a-1.0.0"
+                && r["relatedSpdxElement"] == "SPDXRef-Package-b-1.1.0")
+    );
+}
+
+#[test]
+fn exec_surface_lists_build_scripts_and_proc_macros_with_their_chain() {
+    let p = Project::new();
+    p.write(
+        "Cargo.toml",
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\
+         [dependencies]\nmid = { path = \"mid\" }\n",
+    );
+    p.write("src/lib.rs", "pub use mid::*;\n");
+    p.write(
+        "mid/Cargo.toml",
+        "[package]\nname = \"mid\"\nversion = \"0.1.0\"\nedition = \"2021\"\nlinks = \"midnative\"\n\
+         [dependencies]\nmacros = { path = \"../macros\" }\n",
+    );
+    p.write("mid/build.rs", "fn main() {}\n");
+    p.write("mid/src/lib.rs", "pub use macros::*;\n");
+    p.write(
+        "macros/Cargo.toml",
+        "[package]\nname = \"macros\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[lib]\nproc-macro = true\n",
+    );
+    p.write("macros/src/lib.rs", "");
+    let human = p.ok(&["tree", "--exec-surface"]);
+    assert!(human.contains("2 of 3 packages run code"), "{human}");
+    let json = p.rune(&["tree", "--exec-surface", "--format", "json"]);
+    let items: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    let by_name = |n: &str| {
+        items
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["name"] == n)
+            .cloned()
+            .unwrap_or_else(|| panic!("{n} missing: {items}"))
+    };
+    let mid = by_name("mid");
+    assert_eq!(mid["runs"], serde_json::json!(["build-script", "links"]));
+    assert_eq!(mid["links"], "midnative");
+    assert_eq!(mid["via"], serde_json::json!(["app", "mid"]));
+    let macros = by_name("macros");
+    assert_eq!(macros["runs"], serde_json::json!(["proc-macro"]));
+    assert_eq!(macros["via"], serde_json::json!(["app", "mid", "macros"]));
+}
+
+/// Sets `pubtime` of one release in a local registry's index.
+#[cfg(unix)]
+fn published(reg: &tempfile::TempDir, name: &str, version: &str, when: &str) {
+    let path = reg.path().join("index/1").join(name);
+    let text = std::fs::read_to_string(&path).unwrap().replace(
+        &format!("\"vers\":\"{version}\""),
+        &format!("\"vers\":\"{version}\",\"pubtime\":\"{when}\""),
+    );
+    std::fs::write(path, text).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn a_minimum_release_age_keeps_brand_new_releases_out_until_they_mature() {
+    let reg = local_registry(&[
+        ("a", "1.0.0", &[]),
+        ("a", "1.1.0", &[]),
+        ("b", "2.0.0", &[]),
+    ]);
+    published(&reg, "a", "1.0.0", "2020-01-01T00:00:00Z");
+    published(&reg, "a", "1.1.0", "2099-01-01T00:00:00Z");
+    published(&reg, "b", "2.0.0", "2099-01-01T00:00:00Z");
+    let p = app_with(&reg, "a = \"1\"\nb = \"2\"\n");
+    let with_age = |args: &[&str]| {
+        let out = Command::new(env!("CARGO_BIN_EXE_rune"))
+            .args(args)
+            .current_dir(p.path())
+            .env("RUNE_HOME", p.home())
+            .env("RUNE_RESOLVE_MIN_RELEASE_AGE", "7d")
+            .env("NO_COLOR", "1")
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{}", text(&out));
+        text(&out)
+    };
+    let out = with_age(&["generate-lockfile"]);
+    // `a` has a mature release; `b` has none, so the young one is taken with
+    // a warning rather than failing the resolution.
+    assert_eq!(locked(&p), ["a 1.0.0", "app 0.1.0", "b 2.0.0"]);
+    assert!(
+        out.contains("younger than resolve.min-release-age"),
+        "{out}"
+    );
+    // Without the setting, the newest wins.
+    p.ok(&["update"]);
+    assert_eq!(locked(&p), ["a 1.1.0", "app 0.1.0", "b 2.0.0"]);
+    // A locked young version stays locked when the setting comes back.
+    with_age(&["build"]);
+    assert_eq!(locked(&p), ["a 1.1.0", "app 0.1.0", "b 2.0.0"]);
+}
+
+// ---------------------------------------------------------------------------
+// test runner: retries, flaky tests, JUnit
+// ---------------------------------------------------------------------------
+
+#[test]
+fn retries_mark_flaky_tests_and_junit_reports_every_test() {
+    let p = Project::new();
+    p.write("Cargo.toml", LIB_MANIFEST);
+    let lib = r#"pub fn one() -> u32 { 1 }
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn flaky() {
+        let marker = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("first-run-done");
+        if !marker.exists() {
+            std::fs::write(&marker, "").unwrap();
+            panic!("fails the first time only");
+        }
+    }
+    #[test]
+    fn solid() { assert_eq!(super::one(), 1); }
+    #[test]
+    fn broken() { assert_eq!(super::one(), 2, "never passes"); }
+    #[test]
+    #[ignore]
+    fn skipped() {}
+}
+"#;
+    p.write("src/lib.rs", lib);
+    let out = p.rune(&["test", "--retries", "2", "--junit", "report.xml"]);
+    let msg = text(&out);
+    assert_eq!(out.status.code(), Some(101), "`broken` still fails:\n{msg}");
+    assert!(
+        msg.contains("flaky test(s)") && msg.contains("tests::flaky"),
+        "{msg}"
+    );
+
+    let xml = p.read("report.xml");
+    assert!(xml.contains("tests=\"4\" failures=\"1\""), "{xml}");
+    assert!(
+        xml.contains("name=\"flaky\">\n      <system-out>flaky:"),
+        "{xml}"
+    );
+    assert!(xml.contains("name=\"broken\">\n      <failure"), "{xml}");
+    assert!(xml.contains("never passes"), "{xml}");
+    assert!(xml.contains("name=\"skipped\">\n      <skipped/>"), "{xml}");
+    assert!(xml.contains("name=\"solid\"/>"), "{xml}");
+
+    // With the real failure gone, a flaky failure alone does not fail the run.
+    std::fs::remove_file(p.path().join("first-run-done")).unwrap();
+    p.write(
+        "src/lib.rs",
+        &lib.replace("super::one(), 2", "super::one(), 1"),
+    );
+    let out = p.rune(&["test", "--retries", "1"]);
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(text(&out).contains("flaky test(s)"), "{}", text(&out));
+    // Without retries, it fails as before.
+    std::fs::remove_file(p.path().join("first-run-done")).unwrap();
+    assert_eq!(p.rune(&["test"]).status.code(), Some(101));
+}
+
+#[test]
+fn test_results_are_json_lines_with_message_format_json() {
+    let p = lib_project();
+    let out = p.rune(&["test", "--message-format", "json"]);
+    assert!(out.status.success(), "{}", text(&out));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let lines: Vec<serde_json::Value> = stdout
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap_or_else(|e| panic!("not JSON ({e}): {l}")))
+        .collect();
+    let suite = lines
+        .iter()
+        .find(|l| l["reason"] == "test-suite-finished")
+        .expect("a test-suite-finished line");
+    assert_eq!(suite["outcome"], "passed");
+    assert_eq!(suite["tests"][0]["name"], "tests::adds");
+    assert_eq!(suite["tests"][0]["status"], "passed");
+}
+
+// ---------------------------------------------------------------------------
+// cas export / import, affected --partition
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_store_bundle_carries_a_build_to_a_fresh_machine() {
+    let p = build_script_project();
+    p.ok(&["build"]);
+    p.ok(&["test", "--no-run"]);
+    let bundle = p.home().join("ci-cache.tar.gz");
+    let out = p.ok(&[
+        "cas",
+        "export",
+        "-o",
+        bundle.to_str().unwrap(),
+        "--for",
+        "build",
+        "--for",
+        "test",
+    ]);
+    assert!(out.contains("wrote"), "{out}");
+
+    // A fresh store and a clean checkout: everything comes from the bundle.
+    let fresh = tempfile::tempdir().unwrap();
+    std::fs::remove_dir_all(p.path().join(".rune")).unwrap();
+    let rune = |args: &[&str]| {
+        let out = Command::new(env!("CARGO_BIN_EXE_rune"))
+            .args(args)
+            .current_dir(p.path())
+            .env("RUNE_HOME", fresh.path())
+            .env("NO_COLOR", "1")
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{}", text(&out));
+        text(&out)
+    };
+    assert!(rune(&["cas", "import", bundle.to_str().unwrap()]).contains("imported"));
+    let build = rune(&["build"]);
+    assert!(build.contains(" 0 compiled"), "{build}");
+    // After an edit the package compiles again, but its build script's
+    // result comes from the bundle too: the script is not compiled.
+    let main = std::fs::read_to_string(p.path().join("src/main.rs")).unwrap();
+    std::fs::write(p.path().join("src/main.rs"), main.clone() + "\n// edited\n").unwrap();
+    let edited = rune(&["build"]);
+    assert!(!edited.contains(" 0 compiled"), "{edited}");
+    std::fs::write(p.path().join("src/main.rs"), main).unwrap();
+    let scripts: Vec<_> = std::fs::read_dir(p.path().join(".rune/target/debug/build"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| e.path().join("script").exists())
+        .collect();
+    assert!(scripts.is_empty(), "{scripts:?}");
+    let run = rune(&["run"]);
+    assert!(
+        run.contains("cfg=true env=ok"),
+        "the restored program runs:\n{run}"
+    );
+    let test = rune(&["test", "--no-run"]);
+    assert!(
+        test.contains(" 0 compiled") || !test.contains("compiled"),
+        "{test}"
+    );
+}
+
+#[test]
+fn affected_partitions_split_the_packages_between_machines() {
+    // app -> c2 -> c1 -> c0; an edit to c0 affects all four.
+    let p = chain_project(3);
+    git_in(p.path(), &["init", "-q", "-b", "main"]);
+    git_in(p.path(), &["add", "-A"]);
+    git_in(p.path(), &["commit", "-q", "-m", "base"]);
+    p.write("c0/src/extra.rs", "");
+    let shard = |n: &str| -> Vec<String> {
+        p.ok(&["affected", "--partition", n])
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(String::from)
+            .collect()
+    };
+    assert_eq!(shard("1/2"), ["app", "c1"]);
+    assert_eq!(shard("2/2"), ["c0", "c2"]);
+    let bad = p.rune(&["affected", "--partition", "3/2"]);
+    assert!(!bad.status.success());
+    assert!(text(&bad).contains("N/M"), "{}", text(&bad));
+}
+
+// ---------------------------------------------------------------------------
+// build scripts rerun only when what they watch changes
+// ---------------------------------------------------------------------------
+
+/// A package whose build script counts its runs in `runs.log` (outside the
+/// package) and reads `schema.txt` into a generated constant.
+fn watching_script_project(watch: bool) -> Project {
+    let p = Project::new();
+    p.write("Cargo.toml", LIB_MANIFEST);
+    let rerun = if watch {
+        "println!(\"cargo::rerun-if-changed=build.rs\");\n    println!(\"cargo::rerun-if-changed=schema.txt\");\n    println!(\"cargo::rerun-if-changed=build\");"
+    } else {
+        ""
+    };
+    p.write(
+        "build.rs",
+        &format!(
+            r#"#[path = "build/helper.rs"] mod helper;
+use std::io::Write;
+fn main() {{
+    let log = std::env::var("RUNE_T_RUNS").unwrap();
+    std::fs::OpenOptions::new().create(true).append(true).open(log).unwrap().write_all(b"run\n").unwrap();
+    let schema = std::fs::read_to_string("schema.txt").unwrap();
+    let out = std::path::PathBuf::from(std::env::var("OUT_DIR").unwrap());
+    std::fs::write(out.join("gen.rs"), format!("pub const SCHEMA: &str = {{:?}};", helper::decorate(schema.trim()))).unwrap();
+    {rerun}
+}}
+"#
+        ),
+    );
+    p.write(
+        "build/helper.rs",
+        "pub fn decorate(s: &str) -> String { format!(\"<{s}>\") }\n",
+    );
+    p.write("schema.txt", "v1\n");
+    p.write(
+        "src/lib.rs",
+        "include!(concat!(env!(\"OUT_DIR\"), \"/gen.rs\"));\npub fn schema() -> &'static str { SCHEMA }\n#[test] fn t() { assert!(SCHEMA.starts_with('<')); }\n",
+    );
+    p
+}
+
+fn build_counting_runs(p: &Project) -> usize {
+    let log = p.home().join("runs.log");
+    let out = Command::new(env!("CARGO_BIN_EXE_rune"))
+        .args(["build"])
+        .current_dir(p.path())
+        .env("RUNE_HOME", p.home())
+        .env("RUNE_T_RUNS", &log)
+        .env("NO_COLOR", "1")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", text(&out));
+    std::fs::read_to_string(&log).map_or(0, |t| t.lines().count())
+}
+
+#[test]
+fn a_build_script_reruns_only_when_a_file_it_watches_changes() {
+    let p = watching_script_project(true);
+    assert_eq!(build_counting_runs(&p), 1);
+    let bin = std::fs::read_dir(p.path().join(".rune/target/debug/build"))
+        .unwrap()
+        .flatten()
+        .next()
+        .unwrap()
+        .path()
+        .join("script/build_script_build");
+    let compiled_at = std::fs::metadata(&bin).unwrap().modified().unwrap();
+
+    // The crate's own sources are not something the script reads.
+    p.write("src/lib.rs", &(p.read("src/lib.rs") + "pub fn more() {}\n"));
+    assert_eq!(
+        build_counting_runs(&p),
+        1,
+        "an unwatched edit must not run the script"
+    );
+
+    // A watched input: the script runs again, but is not compiled again.
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    p.write("schema.txt", "v2\n");
+    assert_eq!(build_counting_runs(&p), 2);
+    assert_eq!(
+        std::fs::metadata(&bin).unwrap().modified().unwrap(),
+        compiled_at
+    );
+
+    // A module of the script: compiled and run again.
+    p.write(
+        "build/helper.rs",
+        "pub fn decorate(s: &str) -> String { format!(\"<<{s}>>\") }\n",
+    );
+    assert_eq!(build_counting_runs(&p), 3);
+    assert_ne!(
+        std::fs::metadata(&bin).unwrap().modified().unwrap(),
+        compiled_at
+    );
+
+    // Going back to an earlier state finds its result in the store.
+    p.write("schema.txt", "v1\n");
+    p.write(
+        "build/helper.rs",
+        "pub fn decorate(s: &str) -> String { format!(\"<{s}>\") }\n",
+    );
+    assert_eq!(build_counting_runs(&p), 3);
+}
+
+#[test]
+fn a_build_script_that_watches_nothing_reruns_on_any_change_like_cargo() {
+    let p = watching_script_project(false);
+    assert_eq!(build_counting_runs(&p), 1);
+    p.write("src/lib.rs", &(p.read("src/lib.rs") + "pub fn more() {}\n"));
+    assert_eq!(build_counting_runs(&p), 2);
+}
+
+// ---------------------------------------------------------------------------
+// rune graph
+// ---------------------------------------------------------------------------
+
+#[test]
+fn graph_draws_the_package_graph_as_dot_and_mermaid() {
+    let p = chain_project(2);
+    let dot = p.ok(&["graph"]);
+    assert!(dot.starts_with("digraph rune {"), "{dot}");
+    let id = |name: &str| {
+        let line = dot
+            .lines()
+            .find(|l| l.contains(&format!("label=\"{name} 0.1.0\"")))
+            .unwrap_or_else(|| panic!("no node {name}:\n{dot}"));
+        line.split_whitespace().next().unwrap().to_string()
+    };
+    let (app, c1, c0) = (id("app"), id("c1"), id("c0"));
+    assert!(dot.contains(&format!("{app} -> {c1};")), "{dot}");
+    assert!(dot.contains(&format!("{c1} -> {c0};")), "{dot}");
+    assert!(!dot.contains(&format!("{app} -> {c0};")), "{dot}");
+
+    let mermaid = p.ok(&["graph", "--format", "mermaid", "-p", "c1"]);
+    assert!(mermaid.starts_with("flowchart LR"), "{mermaid}");
+    assert!(mermaid.contains("[\"c1 0.1.0\"]:::member"), "{mermaid}");
+    assert!(!mermaid.contains("app"), "only what c1 reaches:\n{mermaid}");
+}
+
+#[test]
+fn graph_units_lists_the_build_plan_with_keys_and_cache_state() {
+    let p = chain_project(2);
+    let plan = |p: &Project| -> serde_json::Value {
+        let out = p.rune(&["graph", "--units", "--format", "json"]);
+        assert!(out.status.success(), "{}", text(&out));
+        serde_json::from_slice(&out.stdout).unwrap()
+    };
+    let before = plan(&p);
+    let units = before["units"].as_array().unwrap();
+    let packages: std::collections::BTreeSet<&str> = units
+        .iter()
+        .map(|u| u["package"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        packages.into_iter().collect::<Vec<_>>(),
+        ["app", "c0", "c1"]
+    );
+    assert!(units.iter().all(|u| u["cached"] == false), "{before:#}");
+    // Dependencies point at other units, by index.
+    let c1 = units.iter().find(|u| u["package"] == "c1").unwrap();
+    let to = c1["dependencies"][0]["index"].as_u64().unwrap() as usize;
+    assert_eq!(units[to]["package"], "c0");
+    assert_eq!(c1["dependencies"][0]["extern_crate_name"], "c0");
+
+    p.ok(&["build"]);
+    let after = plan(&p);
+    let units = after["units"].as_array().unwrap();
+    assert!(units.iter().all(|u| u["cached"] == true), "{after:#}");
+    // The keys are the ones the build used, so they are stable.
+    assert_eq!(plan(&p)["units"], after["units"]);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_dependencys_build_script_warnings_stay_quiet_but_the_workspaces_show() {
+    let reg = tempfile::tempdir().unwrap();
+    let (bytes, sum) = make_crate_with(
+        "noisy",
+        "1.0.0",
+        &[
+            ("src/lib.rs", "pub fn f() {}\n"),
+            (
+                "build.rs",
+                "fn main() { println!(\"cargo::warning=from the dependency\"); }\n",
+            ),
+        ],
+    );
+    std::fs::write(reg.path().join("noisy-1.0.0.crate"), bytes).unwrap();
+    let dir = reg.path().join("index/no/is");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("noisy"),
+        format!(
+            "{{\"name\":\"noisy\",\"vers\":\"1.0.0\",\"deps\":[],\"cksum\":\"{sum}\",\"features\":{{}},\"yanked\":false}}\n"
+        ),
+    )
+    .unwrap();
+    let p = app_with(&reg, "noisy = \"1\"\n");
+    p.write(
+        "build.rs",
+        "fn main() { println!(\"cargo::warning=from the workspace\"); }\n",
+    );
+    let out = p.ok(&["build"]);
+    assert!(out.contains("from the workspace"), "{out}");
+    // As with Cargo, a registry package's script warnings are not shown.
+    assert!(!out.contains("from the dependency"), "{out}");
+}
+
+// ---------------------------------------------------------------------------
+// rune tree: sections, platforms, edges, features
+// ---------------------------------------------------------------------------
+
+#[test]
+fn tree_shows_what_a_build_here_uses_like_cargo_tree() {
+    let p = Project::new();
+    p.write(
+        "Cargo.toml",
+        "[workspace]\nresolver = \"2\"\nmembers = [\"app\", \"lib1\", \"bld\", \"devd\", \"win\"]\n",
+    );
+    for (name, extra) in [
+        (
+            "lib1",
+            "[features]\ndefault = [\"std\"]\nstd = []\nextra = []\n",
+        ),
+        ("bld", ""),
+        ("devd", ""),
+        ("win", ""),
+    ] {
+        p.write(
+            &format!("{name}/Cargo.toml"),
+            &format!(
+                "[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n{extra}"
+            ),
+        );
+        p.write(&format!("{name}/src/lib.rs"), "");
+    }
+    p.write(
+        "app/Cargo.toml",
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
+         [dependencies]\nlib1 = { path = \"../lib1\", features = [\"extra\"] }\n\n\
+         [build-dependencies]\nbld = { path = \"../bld\" }\n\n\
+         [dev-dependencies]\ndevd = { path = \"../devd\" }\n\n\
+         [target.'cfg(windows)'.dependencies]\nwin = { path = \"../win\" }\n",
+    );
+    p.write("app/src/lib.rs", "");
+    p.write("app/build.rs", "fn main() {}\n");
+
+    let stdout = |args: &[&str]| {
+        let out = p.rune(args);
+        assert!(out.status.success(), "{}", text(&out));
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    let tree = stdout(&["tree", "-p", "app"]);
+    let lines: Vec<&str> = tree.lines().collect();
+    assert!(lines[0].starts_with("app v0.1.0 ("), "{tree}");
+    assert!(lines[1].starts_with("└── lib1 v0.1.0"), "{tree}");
+    assert_eq!(lines[2], "[build-dependencies]", "{tree}");
+    assert!(lines[3].starts_with("└── bld v0.1.0"), "{tree}");
+    assert_eq!(lines[4], "[dev-dependencies]", "{tree}");
+    assert!(lines[5].starts_with("└── devd v0.1.0"), "{tree}");
+    // Not a Windows machine (these tests run on Linux and macOS).
+    assert!(!tree.contains("win v0.1.0"), "{tree}");
+    assert!(stdout(&["tree", "-p", "app", "--target", "all"]).contains("win v0.1.0"));
+    assert!(
+        stdout(&["tree", "-p", "app", "--target", "x86_64-pc-windows-msvc"]).contains("win v0.1.0")
+    );
+
+    let normal = stdout(&["tree", "-p", "app", "-e", "normal", "--prefix", "none"]);
+    let names: Vec<&str> = normal
+        .lines()
+        .map(|l| l.split(' ').next().unwrap())
+        .collect();
+    assert_eq!(names, ["app", "lib1"], "{normal}");
+
+    // Why is lib1's `std` on? Its `default`, which app did not turn off.
+    let why = stdout(&["tree", "-e", "features", "-i", "lib1", "--prefix", "depth"]);
+    let lines: Vec<&str> = why.lines().collect();
+    let std = lines
+        .iter()
+        .position(|l| *l == "1lib1 feature \"std\"")
+        .unwrap();
+    assert!(
+        lines[std + 1].starts_with("2lib1 feature \"default\""),
+        "{why}"
+    );
+    let default = lines
+        .iter()
+        .position(|l| *l == "1lib1 feature \"default\"")
+        .unwrap();
+    assert!(lines[default + 1].starts_with("2app v0.1.0"), "{why}");
+    assert!(lines.contains(&"1lib1 feature \"extra\""), "{why}");
+}
+
+#[test]
+fn test_builds_the_examples_first_and_runs_those_marked_test() {
+    let p = Project::new();
+    p.write(
+        "Cargo.toml",
+        "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
+         [[example]]\nname = \"checked\"\ntest = true\n",
+    );
+    p.write("src/lib.rs", "pub fn one() -> u32 { 1 }\n");
+    // A plain example: built, never run by `test`.
+    p.write(
+        "examples/tool.rs",
+        "fn main() { println!(\"tool ran\"); }\n",
+    );
+    // `test = true`: its #[test]s run.
+    p.write(
+        "examples/checked.rs",
+        "fn main() {}\n#[test]\nfn example_test() { assert_eq!(demo::one(), 1); }\n",
+    );
+    // An integration test that starts the example, as `once_cell`'s does:
+    // it must exist by the time the test runs.
+    p.write(
+        "tests/runs_example.rs",
+        r#"#[test]
+fn example_binary_is_there() {
+    let mut exe = std::env::current_exe().unwrap();
+    exe.pop();
+    exe.pop();
+    let tool = exe.join("examples").join("tool").with_extension(std::env::consts::EXE_EXTENSION);
+    let out = std::process::Command::new(&tool).output().expect("the example was built");
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "tool ran");
+}
+"#,
+    );
+    let out = p.ok(&["test"]);
+    assert!(out.contains("(example checked) · 1 passed"), "{out}");
+    assert!(out.contains("(test runs_example) · 1 passed"), "{out}");
+    assert!(
+        !out.contains("example tool)"),
+        "a plain example is not run: {out}"
+    );
+    assert!(out.contains("✓ 2 passed"), "{out}");
+}
+
+#[cfg(unix)]
+#[test]
+fn panic_abort_profiles_still_test_with_unwinding_like_cargo() {
+    let p = Project::new();
+    p.write(
+        "Cargo.toml",
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
+         [profile.dev]\npanic = \"abort\"\n",
+    );
+    p.write(
+        "src/lib.rs",
+        "pub fn two() -> u32 { 2 }\n#[test]\nfn unit() { assert_eq!(two(), 2); }\n",
+    );
+    p.write(
+        "src/main.rs",
+        "fn main() { if std::env::args().count() > 1 { panic!(\"boom\") } }\n",
+    );
+    p.write(
+        "tests/it.rs",
+        "#[test]\n#[should_panic]\nfn unwinds() { panic!(\"caught by the harness\") }\n",
+    );
+    let out = p.ok(&["test"]);
+    assert!(out.contains("✓ 2 passed"), "{out}");
+
+    // An ordinary build keeps the profile's `panic = "abort"`.
+    p.ok(&["build"]);
+    use std::os::unix::process::ExitStatusExt;
+    let status = Command::new(p.path().join(".rune/target/debug/app"))
+        .arg("panic")
+        .stderr(std::process::Stdio::null())
+        .status()
+        .unwrap();
+    assert_eq!(status.signal(), Some(6), "aborted, not unwound: {status:?}");
+}
+
+#[test]
+fn store_entries_unused_for_a_month_are_removed_in_the_background() {
+    let p = Project::new();
+    p.write("Cargo.toml", LIB_MANIFEST);
+    let cas = p.home().join("cas");
+    let manifests = || -> std::collections::BTreeSet<PathBuf> {
+        walkdir::WalkDir::new(cas.join("objects"))
+            .into_iter()
+            .flatten()
+            .filter(|e| e.file_name() == "manifest.json")
+            .map(|e| e.into_path())
+            .collect()
+    };
+    // An old version of the code, then the current one.
+    p.write("src/lib.rs", "pub fn f() {}\n");
+    p.ok(&["build"]);
+    let old = manifests();
+    p.write("src/lib.rs", "pub fn f() {}\npub fn g() {}\n");
+    p.ok(&["build"]);
+    let current: Vec<PathBuf> = manifests().difference(&old).cloned().collect();
+    assert!(!old.is_empty() && !current.is_empty());
+    let stamp = cas.join("last-gc");
+    assert!(stamp.exists(), "a new store only gets its stamp");
+
+    // The old version's entries were stored and last used 40 days ago.
+    let days_ago =
+        |d: u64| std::time::SystemTime::now() - std::time::Duration::from_secs(d * 86_400);
+    for m in &old {
+        let mut json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(m).unwrap()).unwrap();
+        let then = days_ago(40)
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        json["stored_at"] = then.into();
+        let mut perms = std::fs::metadata(m).unwrap().permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        perms.set_readonly(false);
+        std::fs::set_permissions(m, perms).unwrap();
+        std::fs::write(m, json.to_string()).unwrap();
+        std::fs::File::open(m)
+            .unwrap()
+            .set_modified(days_ago(40))
+            .unwrap();
+    }
+    // Not due yet (the last run was today): nothing happens.
+    p.ok(&["build"]);
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    assert!(old.iter().all(|m| m.exists()));
+
+    // A day after the last run, the next build starts one in the background.
+    std::fs::File::open(&stamp)
+        .unwrap()
+        .set_modified(days_ago(2))
+        .unwrap();
+    p.ok(&["build"]);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while old.iter().any(|m| m.exists()) && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(old.iter().all(|m| !m.exists()), "unused entries removed");
+    assert!(current.iter().all(|m| m.exists()), "what builds use stays");
+}
+
+#[test]
+fn a_cached_dependencys_script_output_still_reaches_rebuilt_dependents() {
+    let p = Project::new();
+    p.write(
+        "Cargo.toml",
+        "[workspace]\nresolver = \"2\"\nmembers = [\"app\", \"sys\"]\n",
+    );
+    p.write(
+        "sys/Cargo.toml",
+        "[package]\nname = \"sys\"\nversion = \"0.1.0\"\nedition = \"2021\"\nlinks = \"sysx\"\n",
+    );
+    p.write(
+        "sys/build.rs",
+        "fn main() {\n    println!(\"cargo::rerun-if-changed=build.rs\");\n    println!(\"cargo::metadata=greeting=hello\");\n}\n",
+    );
+    p.write("sys/src/lib.rs", "");
+    p.write(
+        "app/Cargo.toml",
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\nsys = { path = \"../sys\" }\n",
+    );
+    // Reruns on any change of its package, and needs `sys`'s metadata.
+    p.write(
+        "app/build.rs",
+        "fn main() {\n    let g = std::env::var(\"DEP_SYSX_GREETING\").expect(\"DEP_SYSX_GREETING\");\n    println!(\"cargo::rustc-env=GREETING={g}\");\n}\n",
+    );
+    p.write(
+        "app/src/main.rs",
+        "fn main() { println!(\"{}\", env!(\"GREETING\")); }\n",
+    );
+    p.ok(&["build"]);
+    // Only `app` changes: `sys` comes from the store, its script does not
+    // run again, and `app`'s script must still see what it reported.
+    p.write(
+        "app/src/main.rs",
+        "fn main() { println!(\"{} again\", env!(\"GREETING\")); }\n",
+    );
+    let out = p.ok(&["run", "-p", "app"]);
+    assert!(out.contains("hello again"), "{out}");
+
+    // The same on a machine that got the store from a bundle.
+    let bundle = p.home().join("bundle.tar");
+    p.ok(&["cas", "export", "-o", bundle.to_str().unwrap()]);
+    let fresh = tempfile::tempdir().unwrap();
+    std::fs::remove_dir_all(p.path().join(".rune")).unwrap();
+    let rune = |args: &[&str]| {
+        let out = Command::new(env!("CARGO_BIN_EXE_rune"))
+            .args(args)
+            .current_dir(p.path())
+            .env("RUNE_HOME", fresh.path())
+            .env("NO_COLOR", "1")
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{}", text(&out));
+        text(&out)
+    };
+    rune(&["cas", "import", bundle.to_str().unwrap()]);
+    p.write(
+        "app/src/main.rs",
+        "fn main() { println!(\"{} once more\", env!(\"GREETING\")); }\n",
+    );
+    let out = rune(&["run", "-p", "app"]);
+    assert!(out.contains("hello once more"), "{out}");
+}
+
+#[test]
+fn json_messages_report_build_scripts_for_rust_analyzer() {
+    let p = build_script_project();
+    let executed = |p: &Project| -> Vec<serde_json::Value> {
+        let out = p.rune(&["check", "--message-format", "json"]);
+        assert!(out.status.success(), "{}", text(&out));
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter(|v| v["reason"] == "build-script-executed")
+            .collect()
+    };
+    // Fresh, and again when everything comes from the store: once each time.
+    for _ in 0..2 {
+        let lines = executed(&p);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        let m = &lines[0];
+        assert!(
+            m["package_id"]
+                .as_str()
+                .unwrap()
+                .contains("#demo@1.2.3-beta.1"),
+            "{m}"
+        );
+        assert_eq!(m["cfgs"], serde_json::json!(["from_script"]), "{m}");
+        assert_eq!(m["env"], serde_json::json!([["SCRIPT_VAR", "ok"]]), "{m}");
+        let out_dir = PathBuf::from(m["out_dir"].as_str().unwrap());
+        assert!(out_dir.join("generated.rs").is_file(), "{m}");
+    }
+}
+
+#[test]
+fn a_declared_target_without_its_file_is_reported_like_cargo() {
+    let p = Project::new();
+    p.write(
+        "Cargo.toml",
+        "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
+         [[example]]\nname = \"gone\"\npath = \"examples/gone.rs\"\n",
+    );
+    p.write("src/lib.rs", "");
+    // Not asked for: no error (plain `build` does not build examples).
+    p.ok(&["build"]);
+    let out = p.rune(&["test"]);
+    assert!(!out.status.success());
+    assert!(
+        text(&out).contains("can't find example `gone` at path"),
+        "{}",
+        text(&out)
+    );
+}
+
+#[test]
+fn a_links_package_with_integration_tests_is_not_its_own_conflict() {
+    let p = Project::new();
+    p.write(
+        "Cargo.toml",
+        "[package]\nname = \"natlib\"\nversion = \"0.1.0\"\nedition = \"2021\"\nlinks = \"natlib_0_1\"\n",
+    );
+    p.write("build.rs", "fn main() {}\n");
+    p.write("src/lib.rs", "pub fn one() -> u32 { 1 }\n");
+    p.write(
+        "tests/aead_tests.rs",
+        "#[test]\nfn works() { assert_eq!(natlib::one(), 1); }\n",
+    );
+    let out = p.ok(&["test"]);
+    assert!(out.contains("(test aead_tests) · 1 passed"), "{out}");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_workspace_crate_does_not_stand_in_for_its_published_release() {
+    // `helper` (a dev-dependency) depends on the published `core_lib 1.0.0`;
+    // the workspace develops `core_lib 1.1.0`. As with Cargo, `helper` gets
+    // the published release, not the local one.
+    let reg = local_registry(&[
+        ("core_lib", "1.0.0", &[]),
+        ("helper", "1.0.0", &[("core_lib", "^1.0")]),
+    ]);
+    let p = app_with(&reg, "");
+    p.write(
+        "Cargo.toml",
+        "[package]\nname = \"core_lib\"\nversion = \"1.1.0\"\nedition = \"2021\"\n\n\
+         [dev-dependencies]\nhelper = \"1\"\n",
+    );
+    p.write("src/lib.rs", "pub fn local() {}\n");
+    p.ok(&["generate-lockfile"]);
+    assert_eq!(
+        locked(&p),
+        ["core_lib 1.0.0", "core_lib 1.1.0", "helper 1.0.0"]
+    );
+    let lock = p.read("Cargo.lock");
+    assert!(lock.contains("\"core_lib 1.0.0\""), "{lock}");
+    p.ok(&["test"]);
+}
+
+#[test]
+fn a_proc_macro_crates_doc_tests_run_like_cargo() {
+    let p = Project::new();
+    p.write(
+        "Cargo.toml",
+        "[package]\nname = \"pm\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[lib]\nproc-macro = true\n",
+    );
+    p.write(
+        "src/lib.rs",
+        r#"//! ```
+//! pm::make_answer!();
+//! assert_eq!(answer(), 42);
+//! ```
+use proc_macro::TokenStream;
+
+#[proc_macro]
+pub fn make_answer(_: TokenStream) -> TokenStream {
+    "fn answer() -> u32 { 42 }".parse().unwrap()
+}
+"#,
+    );
+    let out = p.ok(&["test"]);
+    assert!(out.contains("(doc-tests) · 1 passed"), "{out}");
 }

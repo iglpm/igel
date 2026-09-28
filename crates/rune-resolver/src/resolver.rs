@@ -199,14 +199,21 @@ impl ResolvedGraph {
     ) -> Option<&ResolvedPackage> {
         let req =
             VersionReq::from_str(req_str).unwrap_or_else(|_| VersionReq::from_str("*").unwrap());
-        self.packages
-            .values()
-            .filter(|p| p.name == name && req.matches(&p.version))
-            .filter(|p| match &p.source {
-                PackageSource::Registry(r) => r == registry,
-                _ => true,
-            })
+        let candidates = || {
+            self.packages
+                .values()
+                .filter(|p| p.name == name && req.matches(&p.version))
+        };
+        // That registry's package first; a local or git one only when none
+        // is locked (a patch standing in for it).
+        candidates()
+            .filter(|p| matches!(&p.source, PackageSource::Registry(r) if r == registry))
             .max_by(|a, b| a.version.cmp(&b.version))
+            .or_else(|| {
+                candidates()
+                    .filter(|p| !matches!(p.source, PackageSource::Registry(_)))
+                    .max_by(|a, b| a.version.cmp(&b.version))
+            })
     }
 
     /// Finds a resolved package matching name and version requirement.
@@ -251,6 +258,9 @@ pub struct DependencyResolver {
     /// `(registry, name, version)` never to choose: backtracking away from a
     /// release whose requirements conflict with the rest of the graph.
     exclude: HashSet<(String, String, Version)>,
+    /// Newly chosen releases must have been published at least this long
+    /// ago (`resolve.min-release-age`); locked ones are kept regardless.
+    min_release_age: Option<std::time::Duration>,
 }
 
 impl Default for DependencyResolver {
@@ -272,7 +282,17 @@ impl DependencyResolver {
             hints: Vec::new(),
             prefer: HashMap::new(),
             exclude: HashSet::new(),
+            min_release_age: None,
         }
+    }
+
+    /// Only choose releases published at least `age` ago when nothing locks
+    /// a version: a malicious release is usually noticed and yanked within
+    /// days, before it would be picked up. When no release that old fits a
+    /// requirement, the newest that does is taken, with a warning.
+    pub fn with_min_release_age(mut self, age: Option<std::time::Duration>) -> Self {
+        self.min_release_age = age.filter(|a| !a.is_zero());
+        self
     }
 
     /// Versions to take whenever a requirement allows them (`(registry index,
@@ -1020,14 +1040,16 @@ fn resolve_one_queue_item(
         }
     }
 
-    // If already resolved with a version that matches req, reuse and request features
+    // If already resolved with a version that matches req, reuse and request
+    // features. Only a package from that registry: a workspace or path
+    // package of the same name does not stand in for a registry requirement
+    // (a `[patch]` does, and was handled above) — as in Cargo, where a crate
+    // under development and the published release its dev-dependencies use
+    // are two packages.
     if let Some((pkg_id, _existing)) = resolved_packages.iter().find(|(_, p)| {
         p.name == name
             && req.matches(&p.version)
-            && match &p.source {
-                PackageSource::Registry(r) => *r == registry,
-                _ => true,
-            }
+            && matches!(&p.source, PackageSource::Registry(r) if *r == registry)
     }) {
         feature_resolver.request_features(pkg_id, &features, default_features);
         return Ok(());
@@ -1079,6 +1101,7 @@ fn resolve_one_queue_item(
     // If not found in lockfile, query index for latest matching version
     if chosen_record.is_none() {
         let msrv = resolver.msrv.clone();
+        let min_release_age = resolver.min_release_age;
         let index = resolver.get_or_fetch_index(&registry, &name)?;
         let mut matches: Vec<&IndexRecord> = index
             .available_versions()
@@ -1098,6 +1121,30 @@ fn resolve_one_queue_item(
             let vb = Version::parse(&b.vers).unwrap_or_else(|_| Version::new(0, 0, 0));
             vb.cmp(&va)
         });
+
+        // Releases too young for `resolve.min-release-age` only when nothing
+        // older fits.
+        if let Some(age) = min_release_age {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs());
+            let cutoff = now.saturating_sub(age.as_secs());
+            let mature = |rec: &&IndexRecord| {
+                rec.pubtime
+                    .as_deref()
+                    .and_then(rune_common::time::parse_rfc3339)
+                    .is_none_or(|t| t <= cutoff)
+            };
+            if matches.iter().any(mature) {
+                matches.retain(mature);
+            } else if let Some(newest) = matches.first() {
+                tracing::warn!(
+                    "{name} {}: every release matching `{req}` is younger than \
+                     resolve.min-release-age; using it anyway",
+                    newest.vers
+                );
+            }
+        }
 
         // Prefer the newest release this compiler can build, when asked to.
         let compatible = msrv.as_ref().and_then(|m| {
@@ -1148,6 +1195,16 @@ fn resolve_one_queue_item(
         Version::parse(&record.vers).map_err(|e| ResolverError::Manifest(e.to_string()))?;
 
     let pkg_id = format!("{} {}", name, parsed_version);
+    // Packages are identified by name and version, so the release with the
+    // very version of a local package of that name cannot sit beside it:
+    // the local one serves (Cargo would lock both).
+    if resolved_packages
+        .get(&pkg_id)
+        .is_some_and(|p| !matches!(p.source, PackageSource::Registry(_)))
+    {
+        feature_resolver.request_features(&pkg_id, &features, default_features);
+        return Ok(());
+    }
     feature_resolver.register_package_features(&pkg_id, record.all_features());
     let aliases: HashMap<String, String> = record
         .deps

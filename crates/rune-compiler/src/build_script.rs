@@ -18,12 +18,20 @@ use tracing::{debug, warn};
 pub enum BuildScriptError {
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
-    #[error("Build script compilation failed with exit code: {0}")]
-    CompilationFailed(i32),
+    #[error("Build script compilation failed with exit code: {code}{}", fmt_output(.output))]
+    CompilationFailed { code: i32, output: String },
     #[error("Build script execution failed with exit code: {code}{}", fmt_stderr(.stderr))]
     ExecutionFailed { code: i32, stderr: String },
     #[error("Build script reported an error:\n{}", .0.join("\n"))]
     ReportedErrors(Vec<String>),
+}
+
+fn fmt_output(output: &str) -> String {
+    if output.trim().is_empty() {
+        String::new()
+    } else {
+        format!("\n{}", output.trim_end())
+    }
 }
 
 fn fmt_stderr(stderr: &str) -> String {
@@ -153,7 +161,7 @@ impl BuildScriptRunner {
     /// runs (e.g. to hand it a jobserver).
     #[allow(clippy::too_many_arguments)]
     pub fn compile_with(
-        mut cmd: Command,
+        cmd: Command,
         build_rs_path: &Path,
         out_dir: &Path,
         deps_dir: &Path,
@@ -162,11 +170,43 @@ impl BuildScriptRunner {
         env: Option<&BuildScriptEnv>,
         configure: &dyn Fn(&mut Command),
     ) -> Result<PathBuf> {
+        Self::compile_reporting(
+            cmd,
+            build_rs_path,
+            out_dir,
+            deps_dir,
+            edition,
+            extern_deps,
+            env,
+            configure,
+        )
+        .map(|(bin, _)| bin)
+    }
+
+    /// Like [`Self::compile_with`], also returning what the compiler printed
+    /// on success (warnings). Its output is captured, not passed through: on
+    /// failure it is part of the error, so it is shown once, with the failure,
+    /// rather than written into whatever else is on the terminal.
+    #[allow(clippy::too_many_arguments)]
+    pub fn compile_reporting(
+        mut cmd: Command,
+        build_rs_path: &Path,
+        out_dir: &Path,
+        deps_dir: &Path,
+        edition: &str,
+        extern_deps: &[(String, PathBuf)],
+        env: Option<&BuildScriptEnv>,
+        configure: &dyn Fn(&mut Command),
+    ) -> Result<(PathBuf, String)> {
+        let _ = std::fs::create_dir_all(out_dir);
         cmd.arg(build_rs_path);
         cmd.arg("--crate-name").arg("build_script_build");
         cmd.arg("--crate-type").arg("bin");
         cmd.arg("--edition").arg(edition);
         cmd.arg("--out-dir").arg(out_dir);
+        // The dep-info lists the files the script is compiled from, which is
+        // what decides whether the compiled script can be reused.
+        cmd.arg("--emit=dep-info,link");
 
         // Add dependency search path
         cmd.arg("-L")
@@ -199,12 +239,18 @@ impl BuildScriptRunner {
 
         configure(&mut cmd);
         debug!("Compiling build script: {:?}", cmd);
-        let status = cmd.status()?;
+        let out = cmd.output()?;
+        let printed = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
 
-        if !status.success() {
-            return Err(BuildScriptError::CompilationFailed(
-                status.code().unwrap_or(1),
-            ));
+        if !out.status.success() {
+            return Err(BuildScriptError::CompilationFailed {
+                code: out.status.code().unwrap_or(1),
+                output: printed,
+            });
         }
 
         let binary = out_dir.join(if cfg!(windows) {
@@ -213,7 +259,7 @@ impl BuildScriptRunner {
             "build_script_build"
         });
 
-        Ok(binary)
+        Ok((binary, printed))
     }
 
     /// Execute a compiled build script and parse its stdout.
@@ -415,7 +461,7 @@ impl BuildScriptRunner {
             "rerun-if-env-changed" => output.rerun_if_env_changed.push(value.to_string()),
             "warning" => {
                 output.warnings.push(value.to_string());
-                warn!("Build script warning: {}", value);
+                debug!("build script warning: {}", value);
             }
             "error" if modern => output.errors.push(value.to_string()),
             "metadata" if modern => {

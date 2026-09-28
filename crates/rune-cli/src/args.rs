@@ -68,8 +68,19 @@ pub enum Commands {
     Remove(RemoveArgs),
     /// Update dependencies in lockfiles to latest compatible versions
     Update(UpdateArgs),
+    /// List dependencies with newer releases than the lockfile or the
+    /// manifests allow
+    Outdated(OutdatedArgs),
+    /// Raise dependency requirements in the manifests to newer releases
+    Upgrade(UpgradeArgs),
+    /// Find dependencies the workspace's packages declare but never use
+    Unused(UnusedArgs),
+    /// Write a software bill of materials (CycloneDX or SPDX JSON)
+    Sbom(SbomArgs),
     /// Display the resolved dependency tree
     Tree(TreeArgs),
+    /// Draw the package graph (or a build's units) as Graphviz DOT, Mermaid or JSON
+    Graph(GraphArgs),
     /// Explain why a package is in the dependency graph
     Why(WhyArgs),
     /// Download every dependency without building
@@ -202,8 +213,10 @@ pub struct CommonArgs {
     #[arg(long)]
     pub frozen: bool,
 
-    /// Print how long each phase of the build takes (and write a Chrome
-    /// trace of the schedule to `.rune/fingerprints/trace.json`)
+    /// Print how long each phase of the build takes and the chain of crates
+    /// that determined its length; write an HTML timeline to
+    /// `.rune/timings/rune-timing.html` and a Chrome trace to
+    /// `.rune/fingerprints/trace.json`
     #[arg(long)]
     pub timings: bool,
 
@@ -320,6 +333,15 @@ pub struct TestArgs {
     /// Arguments passed to the test binaries (after `--`)
     #[arg(last = true, value_name = "ARGS")]
     pub test_args: Vec<String>,
+
+    /// Run a failed test binary's failed tests again, up to N times; a test
+    /// that then passes is reported as flaky instead of failing the run
+    #[arg(long, value_name = "N", default_value_t = 0)]
+    pub retries: u32,
+
+    /// Also write the results as JUnit XML (for CI test reports)
+    #[arg(long, value_name = "PATH")]
+    pub junit: Option<PathBuf>,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -594,6 +616,97 @@ pub struct UpdateArgs {
 }
 
 #[derive(Args, Debug, Clone)]
+pub struct OutdatedArgs {
+    #[command(flatten)]
+    pub manifest: ManifestArgs,
+    /// Only these workspace members (all of them when none are given)
+    #[arg(short = 'p', long = "package", value_name = "SPEC")]
+    pub package: Vec<String>,
+    /// Exit with status 1 when anything is outdated (for CI)
+    #[arg(long)]
+    pub exit_code: bool,
+    /// `human` (a table) or `json`
+    #[arg(long, default_value = "human", value_parser = ["human", "json"])]
+    pub format: String,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct GraphArgs {
+    #[command(flatten)]
+    pub common: CommonArgs,
+    #[command(flatten)]
+    pub targets: TargetArgs,
+    /// `dot` (Graphviz), `mermaid` (renders in GitHub/GitLab markdown) or `json`
+    #[arg(long, default_value = "dot", value_parser = ["dot", "mermaid", "json"])]
+    pub format: String,
+    /// The compilation units a build would use, with their keys and whether
+    /// the store has them, instead of packages
+    #[arg(long)]
+    pub units: bool,
+    /// Include the workspace packages' development dependencies
+    #[arg(long)]
+    pub dev: bool,
+    /// Only the workspace's own packages and the edges between them
+    #[arg(long)]
+    pub workspace_only: bool,
+    /// Write to this file instead of stdout
+    #[arg(short = 'o', long, value_name = "FILE")]
+    pub output: Option<PathBuf>,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct SbomArgs {
+    #[command(flatten)]
+    pub manifest: ManifestArgs,
+    /// Only these workspace members (all of them when none are given)
+    #[arg(short = 'p', long = "package", value_name = "SPEC")]
+    pub package: Vec<String>,
+    /// `cyclonedx` (1.5) or `spdx` (2.3), both JSON
+    #[arg(long, default_value = "cyclonedx", value_parser = ["cyclonedx", "spdx"])]
+    pub format: String,
+    /// Write to this file instead of stdout
+    #[arg(short = 'o', long, value_name = "FILE")]
+    pub output: Option<PathBuf>,
+    /// Include the members' development dependencies (not shipped)
+    #[arg(long)]
+    pub dev: bool,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct UnusedArgs {
+    #[command(flatten)]
+    pub common: CommonArgs,
+    /// Remove the unused dependencies from the manifests
+    #[arg(long)]
+    pub fix: bool,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct UpgradeArgs {
+    #[command(flatten)]
+    pub manifest: ManifestArgs,
+    /// Dependencies to upgrade (every registry dependency when none are given)
+    pub dependencies: Vec<String>,
+    /// Only the manifests of these workspace members
+    #[arg(short = 'p', long = "package", value_name = "SPEC")]
+    pub package: Vec<String>,
+    /// Also move to new major versions (0.x: new minor versions), which may
+    /// need code changes
+    #[arg(long)]
+    pub incompatible: bool,
+    /// Also rewrite `=` requirements
+    #[arg(long)]
+    pub pinned: bool,
+    /// Consider releases that need a newer Rust than the package's
+    /// `rust-version`
+    #[arg(long)]
+    pub ignore_rust_version: bool,
+    /// Show what would change without writing anything
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
+#[derive(Args, Debug, Clone)]
 pub struct TreeArgs {
     #[command(flatten)]
     pub manifest: ManifestArgs,
@@ -607,7 +720,7 @@ pub struct TreeArgs {
     pub workspace: bool,
 
     /// Maximum tree depth to display
-    #[arg(long, short = 'd')]
+    #[arg(long)]
     pub depth: Option<usize>,
 
     /// Show features enabled for each dependency
@@ -615,16 +728,66 @@ pub struct TreeArgs {
     pub show_features: bool,
 
     /// Show only packages present in more than one version
-    #[arg(long, short = 'D')]
+    #[arg(long, short = 'd', short_alias = 'D')]
     pub duplicates: bool,
 
-    /// Invert the tree: show what depends on this package
+    /// Invert the tree: show what depends on this package (with `-e features`:
+    /// which package turns on each of its features)
     #[arg(long, short = 'i', value_name = "SPEC")]
     pub invert: Option<String>,
 
-    /// Also show dev-dependencies
-    #[arg(long)]
+    /// Dependency kinds to follow: `normal`, `build`, `dev`, `all` (the
+    /// default), `no-normal`, `no-build`, `no-dev`, and `features` to show
+    /// features as nodes (comma-separated or repeated), as in Cargo
+    #[arg(long, short = 'e', value_name = "KINDS")]
+    pub edges: Vec<String>,
+
+    /// How lines start: `indent` (tree lines), `depth` (the depth as a
+    /// number) or `none`
+    #[arg(long, default_value = "indent", value_parser = ["indent", "depth", "none"])]
+    pub prefix: String,
+
+    /// Only dependencies that apply to this target triple (default: this
+    /// machine's), or `all`
+    #[arg(long, value_name = "TRIPLE")]
+    pub target: Option<String>,
+
+    /// Also show dev-dependencies (the default now, as in Cargo)
+    #[arg(long, hide = true)]
     pub dev: bool,
+
+    /// Instead of the tree, list every crate that runs code on this machine
+    /// while building (build scripts, proc-macros) or links native code
+    #[arg(long)]
+    pub exec_surface: bool,
+
+    /// With --exec-surface: `human` or `json`
+    #[arg(long, default_value = "human", value_parser = ["human", "json"])]
+    pub format: String,
+}
+
+impl CommonArgs {
+    /// Every option at its default, with the manifest and offline flags of
+    /// `m` — for commands that build a plan without taking build options.
+    pub fn defaults_for(m: &ManifestArgs) -> CommonArgs {
+        use clap::{FromArgMatches, Parser};
+        #[derive(Parser)]
+        struct Wrapper {
+            #[command(flatten)]
+            common: CommonArgs,
+        }
+        let mut argv = vec!["rune".to_string()];
+        if let Some(p) = &m.manifest_path {
+            argv.push("--manifest-path".into());
+            argv.push(p.display().to_string());
+        }
+        let matches = <Wrapper as clap::CommandFactory>::command().get_matches_from(argv);
+        let mut common = Wrapper::from_arg_matches(&matches)
+            .expect("the defaults parse")
+            .common;
+        common.offline = m.offline;
+        common
+    }
 }
 
 #[derive(Args, Debug, Clone)]
@@ -773,6 +936,27 @@ pub enum CasCommands {
     Gc(CasGcArgs),
     /// Show which packages take the space, and how much has gone unused
     Du(CasDuArgs),
+    /// Write the store entries a build of the workspace needs into one file
+    /// (a CI cache step saves it; `rune cas import` restores it)
+    Export(Box<CasExportArgs>),
+    /// Add the entries of a file written by `rune cas export` to the store
+    Import {
+        /// The file (`.tar` or `.tar.gz`)
+        path: PathBuf,
+    },
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct CasExportArgs {
+    #[command(flatten)]
+    pub build: BuildArgs,
+    /// The file to write: `.tar`, or `.tar.gz` to compress it
+    #[arg(short = 'o', long, value_name = "FILE")]
+    pub output: PathBuf,
+    /// Which commands' entries to include (repeatable): `build`, `check`,
+    /// `test`
+    #[arg(long = "for", value_name = "COMMAND", default_value = "build", value_parser = ["build", "check", "test"])]
+    pub for_commands: Vec<String>,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -788,9 +972,15 @@ pub struct CasGcArgs {
     #[arg(long)]
     pub max_size: Option<String>,
 
-    /// Maximum entry age in seconds
-    #[arg(long)]
+    /// Remove entries no build has used for this long (`30d`, `12h`, or
+    /// seconds)
+    #[arg(long, value_name = "DURATION", value_parser = parse_age)]
     pub max_age: Option<u64>,
+}
+
+fn parse_age(s: &str) -> Result<u64, String> {
+    rune_common::time::parse_duration(s)
+        .ok_or_else(|| format!("`{s}` is not a duration such as `30d`, `12h` or `3600`"))
 }
 
 #[derive(Subcommand, Debug)]
@@ -928,6 +1118,11 @@ pub struct AffectedArgs {
     /// Path to the manifest (Cargo.toml or Rune.toml), or a directory holding one
     #[arg(long, value_name = "PATH")]
     pub manifest_path: Option<PathBuf>,
+
+    /// Only shard N of M (`2/4`): split the affected packages between CI
+    /// machines, the same way on every one
+    #[arg(long, value_name = "N/M")]
+    pub partition: Option<String>,
 }
 
 #[derive(Args, Debug, Clone)]

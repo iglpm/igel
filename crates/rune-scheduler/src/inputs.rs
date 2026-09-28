@@ -85,6 +85,90 @@ impl DeclaredInputs {
     }
 }
 
+/// What a build script's result was found to depend on, recorded after it
+/// runs (`<script base>-script-record`) and used to key its next lookup.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ScriptRecord {
+    /// Declared files (inside the package too), environment variables, native
+    /// libraries, and the script's own source files.
+    pub inputs: DeclaredInputs,
+    /// It declared `rerun-if-changed`: then only those files matter, not every
+    /// file of the package.
+    pub watches_files: bool,
+}
+
+/// The record of a script run: what it declared (`rerun-if-*`), the native
+/// libraries it points the linker at, and `sources`, the files its own
+/// compilation read.
+pub fn script_record(
+    out: &BuildScriptOutput,
+    manifest_dir: &Path,
+    out_dir: &Path,
+    sources: &[PathBuf],
+) -> ScriptRecord {
+    let mut inputs = DeclaredInputs {
+        env: out.rerun_if_env_changed.clone(),
+        native: from_script_output(out, manifest_dir, out_dir).native,
+        ..Default::default()
+    };
+    for p in &out.rerun_if_changed {
+        let abs = if p.is_absolute() {
+            p.clone()
+        } else {
+            manifest_dir.join(p)
+        };
+        // What it writes itself is an output, not an input.
+        if !abs.starts_with(out_dir) {
+            inputs.files.push(abs);
+        }
+    }
+    inputs.files.extend(sources.iter().cloned());
+    inputs.merge(DeclaredInputs::default());
+    ScriptRecord {
+        inputs,
+        watches_files: !out.rerun_if_changed.is_empty(),
+    }
+}
+
+/// The key a build script's result is stored under. `base` covers everything
+/// the script can observe apart from files: the unit's configuration, its
+/// build-dependencies and the `DEP_*` values it receives. A script that
+/// declared `rerun-if-changed` is then keyed by the contents of exactly
+/// those files (and its own sources), so editing the rest of the package
+/// does not run it again; one that declared nothing is keyed by every file
+/// of the package, as Cargo reruns it on any change (`package_hash`).
+pub fn script_result_key(
+    base: &str,
+    record: Option<&ScriptRecord>,
+    package_hash: impl FnOnce() -> String,
+) -> String {
+    match record {
+        Some(r) if r.watches_files => {
+            effective_key(&format!("{base}\0watched"), Some(&r.inputs), true)
+        }
+        _ => {
+            let mut hb = HashBuilder::new();
+            hb.update(base.as_bytes());
+            hb.update(b"\0package=");
+            hb.update(package_hash().as_bytes());
+            effective_key(&hb.finish_blake3(), record.map(|r| &r.inputs), true)
+        }
+    }
+}
+
+/// The source files a rustc dep-info file lists (`path:` lines).
+pub fn dep_info_sources(dep_info: &Path) -> Vec<PathBuf> {
+    let Ok(text) = std::fs::read_to_string(dep_info) else {
+        return Vec::new();
+    };
+    text.lines()
+        .filter(|l| !l.starts_with('#'))
+        .filter_map(|l| l.strip_suffix(':'))
+        .filter(|l| !l.contains(": "))
+        .map(|l| PathBuf::from(l.replace("\\ ", " ")))
+        .collect()
+}
+
 /// The key a unit is stored and looked up under: its base key plus the
 /// current values of what it declared, plus — for a unit with a build script —
 /// the identity of the native toolchain the script may drive.
@@ -286,6 +370,34 @@ pub fn reads_manifest(dep_info: &Path, manifest: &Path) -> bool {
         })
 }
 
+/// Variables that change what rustc emits for an Apple target without rustc
+/// listing them in its dep-info: the minimum OS version written into every
+/// object file, and the SDK binaries are linked against.
+const APPLE_ENVIRONMENT: [&str; 6] = [
+    "MACOSX_DEPLOYMENT_TARGET",
+    "IPHONEOS_DEPLOYMENT_TARGET",
+    "TVOS_DEPLOYMENT_TARGET",
+    "WATCHOS_DEPLOYMENT_TARGET",
+    "XROS_DEPLOYMENT_TARGET",
+    "SDKROOT",
+];
+
+/// The [`APPLE_ENVIRONMENT`] variables that are set, for a unit compiled for
+/// `triple`; nothing for other targets, or when none is set (so keys do not
+/// change where they don't matter).
+pub fn apple_environment(triple: &str) -> &'static [(&'static str, String)] {
+    static SET: OnceLock<Vec<(&'static str, String)>> = OnceLock::new();
+    if !triple.contains("-apple-") {
+        return &[];
+    }
+    SET.get_or_init(|| {
+        APPLE_ENVIRONMENT
+            .iter()
+            .filter_map(|k| Some((*k, std::env::var(k).ok()?)))
+            .collect()
+    })
+}
+
 /// The C toolchain a build script may drive, as one string: the compiler
 /// (`$CC`, else `cc`) and archiver, by path, size, mtime and `--version`.
 /// Cached for the process. It only enters keys of units *with* build scripts;
@@ -308,29 +420,160 @@ pub fn native_tools_identity() -> &'static str {
                 program,
                 rune_common::toolchain::program_fingerprint(&path)
             ));
-            let version = std::process::Command::new(&program)
-                .arg("--version")
-                .output()
-                .ok()
-                .filter(|o| o.status.success())
-                .map(|o| {
-                    String::from_utf8_lossy(&o.stdout)
-                        .lines()
-                        .next()
-                        .unwrap_or("")
-                        .to_string()
-                })
-                .unwrap_or_default();
+            let version = rune_common::toolchain::tool_version(&path);
             out.push_str(&version);
             out.push('\n');
+        }
+        if cfg!(target_os = "macos") {
+            let developer_dir = std::env::var_os("DEVELOPER_DIR")
+                .map(PathBuf::from)
+                .or_else(|| std::fs::read_link("/var/db/xcode_select_link").ok())
+                .unwrap_or_else(|| PathBuf::from("/Library/Developer/CommandLineTools"));
+            let sdkroot = std::env::var_os("SDKROOT").map(PathBuf::from);
+            out.push_str(&apple_developer_identity(
+                &developer_dir,
+                sdkroot.as_deref(),
+            ));
         }
         out
     })
 }
 
+/// On macOS, `/usr/bin/cc` is a shim into the active developer directory
+/// (Command Line Tools or Xcode, `xcode-select`): updating those changes the
+/// compiler and the SDK without changing the shim. So the real `clang` and
+/// the SDK are fingerprinted too — by path, size and mtime, without starting
+/// `xcrun` (which would cost every build tens of milliseconds).
+fn apple_developer_identity(developer_dir: &Path, sdkroot: Option<&Path>) -> String {
+    let canonical = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let mut out = format!("DEVELOPER_DIR={}\n", canonical(developer_dir).display());
+    for clang in [
+        "usr/bin/clang",
+        "Toolchains/XcodeDefault.xctoolchain/usr/bin/clang",
+    ] {
+        let path = developer_dir.join(clang);
+        if path.is_file() {
+            out.push_str(&format!(
+                "clang={}\n",
+                rune_common::toolchain::program_fingerprint(&path)
+            ));
+        }
+    }
+    let sdks = match sdkroot {
+        Some(sdk) => vec![sdk.to_path_buf()],
+        None => vec![
+            developer_dir.join("SDKs/MacOSX.sdk"),
+            developer_dir.join("Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk"),
+        ],
+    };
+    for sdk in sdks.iter().filter(|s| s.exists()) {
+        // `MacOSX.sdk` is a link to the versioned SDK (`MacOSX26.1.sdk`).
+        let settings = sdk.join("SDKSettings.json");
+        out.push_str(&format!(
+            "sdk={}|{}\n",
+            canonical(sdk).display(),
+            rune_common::toolchain::program_fingerprint(&settings)
+        ));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_script_that_watches_files_is_keyed_by_them_not_the_package() {
+        let dir = tempfile::tempdir().unwrap();
+        let build_rs = dir.path().join("build.rs");
+        std::fs::write(&build_rs, "fn main() {}").unwrap();
+        let out = BuildScriptOutput {
+            rerun_if_changed: vec![PathBuf::from("build.rs")],
+            ..Default::default()
+        };
+        let record = script_record(&out, dir.path(), &dir.path().join("out"), &[]);
+        assert!(record.watches_files);
+        let a = script_result_key("base", Some(&record), || "package v1".into());
+        let b = script_result_key("base", Some(&record), || "package v2".into());
+        assert_eq!(a, b, "other files of the package do not matter");
+        std::fs::write(&build_rs, "fn main() { println!(); }").unwrap();
+        assert_ne!(
+            a,
+            script_result_key("base", Some(&record), || "package v2".into())
+        );
+
+        // Without `rerun-if-changed`, every file of the package counts.
+        let quiet = script_record(
+            &BuildScriptOutput::default(),
+            dir.path(),
+            &dir.path().join("out"),
+            &[],
+        );
+        assert!(!quiet.watches_files);
+        assert_ne!(
+            script_result_key("base", Some(&quiet), || "package v1".into()),
+            script_result_key("base", Some(&quiet), || "package v2".into())
+        );
+        assert_ne!(
+            script_result_key("base", None, || "package v1".into()),
+            script_result_key("base", None, || "package v2".into())
+        );
+    }
+
+    #[test]
+    fn apple_developer_tools_are_identified_by_the_real_compiler_and_sdk() {
+        let dev = tempfile::tempdir().unwrap();
+        let clang = dev.path().join("usr/bin/clang");
+        let sdk = dev.path().join("SDKs/MacOSX26.0.sdk");
+        std::fs::create_dir_all(clang.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&sdk).unwrap();
+        std::fs::write(&clang, "clang 17").unwrap();
+        std::fs::write(sdk.join("SDKSettings.json"), "{}").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&sdk, dev.path().join("SDKs/MacOSX.sdk")).unwrap();
+        #[cfg(not(unix))]
+        std::fs::create_dir_all(dev.path().join("SDKs/MacOSX.sdk")).unwrap();
+
+        let before = apple_developer_identity(dev.path(), None);
+        assert!(before.contains("clang="), "{before}");
+        assert!(before.contains("sdk="), "{before}");
+        // An update to the command line tools: a new compiler binary.
+        std::fs::write(&clang, "clang 18, a longer binary").unwrap();
+        let after = apple_developer_identity(dev.path(), None);
+        assert_ne!(before, after);
+        // An explicit SDKROOT replaces the default SDK.
+        let other = dev.path().join("Other.sdk");
+        std::fs::create_dir_all(&other).unwrap();
+        let chosen = apple_developer_identity(dev.path(), Some(&other));
+        assert!(
+            chosen.contains("Other.sdk") && !chosen.contains("MacOSX"),
+            "{chosen}"
+        );
+    }
+
+    #[test]
+    fn apple_environment_only_applies_to_apple_targets() {
+        assert!(apple_environment("x86_64-unknown-linux-gnu").is_empty());
+        assert!(apple_environment("wasm32-unknown-unknown").is_empty());
+    }
+
+    #[test]
+    fn dep_info_lists_the_sources() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path().join("x.d");
+        std::fs::write(
+            &d,
+            "/o/build_script_build: /p/build.rs /p/build/gen.rs\n\n/p/build.rs:\n/p/build/gen.rs:\n\n# env-dep:X=1\n",
+        )
+        .unwrap();
+        assert_eq!(
+            dep_info_sources(&d),
+            [
+                PathBuf::from("/p/build.rs"),
+                PathBuf::from("/p/build/gen.rs")
+            ]
+        );
+    }
 
     #[test]
     fn empty_inputs_leave_a_plain_key_alone() {

@@ -8,7 +8,6 @@ rust-version.workspace = true
 
 [dependencies]
 rune-common.workspace = true
-rune-fingerprint.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 serde = { workspace = true }
@@ -20,6 +19,8 @@ tokio-util.workspace = true
 filetime.workspace = true
 walkdir.workspace = true
 same-file.workspace = true
+tar.workspace = true
+flate2.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

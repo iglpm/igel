@@ -30,6 +30,9 @@ pub struct Session {
     pub selected: Vec<usize>,
     pub verbose: bool,
     pub quiet: bool,
+    /// Print the compiler's warnings as units finish (commands that report
+    /// on warnings themselves, like `rune unused`, turn this off).
+    pub show_warnings: bool,
     /// `--message-format json`: events go to stdout as JSON lines.
     pub json: bool,
     pub force_rebuild: bool,
@@ -119,6 +122,7 @@ impl Session {
             selected,
             verbose: common.verbose,
             quiet: common.quiet,
+            show_warnings: true,
             json,
             force_rebuild,
             ignore_rust_version: common.ignore_rust_version,
@@ -172,16 +176,23 @@ impl Session {
                         .map(|e| (e.name, e.value, e.force))
                         .collect(),
                 )
-                .with_color(colored::control::SHOULD_COLORIZE.should_colorize());
+                .with_color(colored::control::SHOULD_COLORIZE.should_colorize())
+                .with_frontend_threads(self.ws.config.settings.frontend_threads());
         if let Some(cas) = self.cas() {
             executor = executor.with_cas(cas);
         }
         executor
     }
 
-    /// Evicts old CAS entries if `cas.max-size` is set and exceeded.
+    /// Evicts old CAS entries if `cas.max-size` is set and exceeded, and —
+    /// at most once a day — starts `rune cas gc --max-age` in the background
+    /// for entries unused for `cas.max-age`.
     pub fn maybe_gc(&self) {
-        let (Some(max), Some(cas)) = (self.ws.config.settings.cas_max_size(), self.cas()) else {
+        let Some(cas) = self.cas() else { return };
+        if let Some(age) = self.ws.config.settings.cas_max_age() {
+            spawn_daily_gc(cas.root(), age);
+        }
+        let Some(max) = self.ws.config.settings.cas_max_size() else {
             return;
         };
         if cas.stats().map(|s| s.total_size_bytes).unwrap_or(0) > max {
@@ -199,6 +210,39 @@ impl Session {
     pub fn profile_label(&self) -> String {
         self.profile.name.clone()
     }
+}
+
+/// Starts `rune cas gc --max-age` for the store at `root` in the background
+/// when the last run was more than a day ago; the build does not wait for it.
+/// A store seen for the first time only gets its stamp: nothing in it can
+/// have gone unused for long, and short-lived stores (tests, CI) never pay.
+fn spawn_daily_gc(root: &std::path::Path, max_age_secs: u64) {
+    let stamp = root.join("last-gc");
+    let due = match std::fs::metadata(&stamp).and_then(|m| m.modified()) {
+        Ok(t) => t
+            .elapsed()
+            .is_ok_and(|e| e > std::time::Duration::from_secs(86_400)),
+        Err(_) => {
+            let _ = std::fs::write(&stamp, b"");
+            false
+        }
+    };
+    if !due {
+        return;
+    }
+    // Claim the day first, so concurrent builds do not all start one.
+    let _ = std::fs::write(&stamp, b"");
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let _ = std::process::Command::new(exe)
+        .args(["cas", "gc", "--max-age"])
+        .arg(max_age_secs.to_string())
+        .env("RUNE_CAS_DIR", root)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
 }
 
 impl Session {
@@ -264,6 +308,7 @@ pub fn drive(
 
         let mut progress = (!sess.quiet && !sess.json)
             .then(|| BuildProgress::new(ui::multi_progress(), graph.node_count() as u64));
+        let mut scripts_reported: std::collections::HashSet<String> = Default::default();
         while let Ok(event) = event_rx.recv() {
             let is_final = matches!(event, PipelineEvent::AllComplete { .. });
             if sess.json {
@@ -279,6 +324,25 @@ pub fn drive(
                         crate::messages::lines_for(unit, sess.config(), &sess.profile, &event)
                     {
                         println!("{line}");
+                    }
+                }
+                if let PipelineEvent::ScriptOutput { node_id, output } = &event {
+                    let unit = &graph.node(*node_id).unit;
+                    let owner = unit
+                        .ext
+                        .script_owner
+                        .clone()
+                        .unwrap_or_else(|| rune_scheduler::executor::script_key(unit));
+                    // Once per script, however many of its package's units
+                    // report it.
+                    if scripts_reported.insert(owner.clone()) {
+                        let out_dir = sess
+                            .config()
+                            .build_script_out_dir_by_key(sess.profile.output_dir_name(), &owner);
+                        println!(
+                            "{}",
+                            crate::messages::build_script_executed(unit, output, &out_dir)
+                        );
                     }
                 }
                 if let PipelineEvent::AllComplete { failed, .. } = &event {
@@ -304,7 +368,8 @@ pub fn drive(
                 }
                 PipelineEvent::BuildFinished { warnings, .. }
                 | PipelineEvent::CacheHit { warnings, .. }
-                    if !warnings.is_empty() && !sess.quiet && !sess.json =>
+                | PipelineEvent::ScriptWarnings { warnings, .. }
+                    if !warnings.is_empty() && sess.show_warnings && !sess.quiet && !sess.json =>
                 {
                     ui::print_above_progress(warnings);
                 }

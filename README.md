@@ -17,8 +17,14 @@ understands `.cargo/config.toml`.
 - **Content-addressable store** — immutable, verified artifacts shared across
   projects, profiles and targets
 - **Critical-path scheduling** — weighted by measured compile times from earlier builds
-- **Shared jobserver** — every `rustc` and build script draws from one job budget
-- **Pipelined test runner** — test binaries run the moment they link
+- **Build scripts as their own step** — a script runs while its package's other
+  dependencies still compile, and reruns only when a file it watches changes
+- **Uses the whole machine** — about 1.3 compilers per core sharing one GNU
+  jobserver (each `rustc` borrows idle slots for its codegen threads), no new
+  compilers while memory is short, and a build that left cores idle tells you
+  which chain of crates held it back
+- **Pipelined test runner** — test binaries run the moment they link; retries
+  with flaky-test detection, JUnit and JSON reports
 
 ## Usage
 
@@ -32,8 +38,9 @@ rune test                      # unit, integration and doc tests
 rune test my_filter -- --nocapture
 rune bench
 rune doc --no-deps
-rune add serde -F derive
-rune tree -i serde             # who depends on serde?
+rune add serde -F derive       # lists the release's features, + for those turned on
+rune tree -i serde             # who depends on serde? (what a build on this machine uses)
+rune tree -e features -i serde # which package turned on each of serde's features
 rune why serde
 rune update                    # only re-downloads changed index entries
 rune new my-app                # or: rune init  (add --manifest rune for a Rune.toml project)
@@ -44,7 +51,21 @@ rune watch -x check -x "test --lib"   # re-run on every change; going back to ol
 rune affected --since origin/main     # packages a change can influence, for selective CI
 rune script hello.rs           # single-file scripts with `---cargo` dependencies (or a shebang)
 rune doctor                    # what slows your builds down, with the fix
+rune build --timings           # HTML timeline with the chain of crates that set the build's length
+rune explain                   # which units the next build would compile, and what changed in each
 rune cas du                    # what takes the space in the store, and how much is idle
+rune graph --format mermaid    # the package graph (DOT, Mermaid or JSON); --units for the build plan
+
+rune outdated                  # newer releases than the lockfile or the manifests allow
+rune upgrade [--incompatible]  # raise requirements in the manifests, keeping their style
+rune unused [--fix]            # dependencies the compiler says a package never uses
+rune sbom -o bom.json          # CycloneDX 1.5 (or --format spdx) of what the workspace ships
+rune tree --exec-surface       # every crate that runs code at build time, and who brings it in
+
+rune test --retries 2 --junit report.xml   # flaky tests reported, not failed; CI test report
+rune cas export -o ci.tar.gz --for build --for test   # the store entries a CI run needs, as one file
+rune cas import ci.tar.gz      # (verified: nothing unchecked enters the store)
+rune affected --since origin/main --partition 2/4    # this machine's share of the affected packages
 
 rune install ripgrep           # from crates.io (also --git URL, --path DIR); rune install --list
 rune uninstall ripgrep
@@ -218,7 +239,8 @@ rune config unset build.release-rebuild-all
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `build.release-rebuild-all` | `false` | **Off:** release builds reuse the CAS like dev builds. **On:** every crate, dependencies included, is recompiled for release profiles (results are still stored). `--rebuild-all[=true\|false]` overrides it for one run. |
-| `build.jobs` | CPUs + ⅓ | Parallel compiler jobs. |
+| `build.jobs` | CPUs + ⅓ | Parallel compiler jobs (13 on a 10-core machine). Each `rustc` may borrow slots other jobs leave idle for its own codegen threads. |
+| `build.frontend-threads` | off | `-Z threads` for nightly compilers' parallel front end: `auto` gives a crate that starts while cores are idle (typically the last, largest ones) as many threads as there are idle cores; a number applies to every crate. Ignored on stable. |
 | `build.dependency-debuginfo` | `false` | **Off:** registry and git dependencies compile with `debug = "line-tables-only"` in the dev profile — backtraces and breakpoints work, local variables *inside dependency code* are not inspectable — which made a cold build of Rune itself about 10 % faster. **On:** Cargo's full debuginfo. A `debug` key in any profile (`[profile.dev]`, `[profile.dev.package."*"]`, …) always wins, and your own crates are never affected. |
 | `build.target-dir` | `.rune/target` | Build output directory. |
 | `cas.enabled` | `true` | Use the CAS at all. |
@@ -227,8 +249,10 @@ rune config unset build.release-rebuild-all
 | `cas.remote-token` | none | Bearer token for a Cairn server. Prefer `RUNE_CAS_REMOTE_TOKEN`: `Rune.toml` is readable by everyone who can read the project. |
 | `cas.remote-replicas` | `1` | With several Cairn URLs: how many servers hold each entry (`2` survives losing one). |
 | `cas.remote-write` | `true` | Publish to `cas.remote`. Set `false` where only CI should write (e.g. developers). |
+| `cas.max-age` | `30d` | Entries no build has used for this long are removed by a background `rune cas gc` that a build starts at most once a day (like Cargo's automatic cache cleanup). `0` keeps everything. |
 | `cas.max-size` | unlimited | Evict least-recently-used entries after a build when the CAS grows past this (`20GB`, `512MiB`). |
 | `cas.verify` | `false` | Re-hash every artifact restored from the CAS (entries are always checked against their key and recorded sizes). |
+| `resolve.min-release-age` | `0` | Only choose releases published at least this long ago (`14d`, `72h`) when resolving new versions; locked versions stay. Malicious releases are usually yanked within days. |
 | `resolve.write-cargo-lock` | `true` | Create/update `Cargo.lock` when the set of locked packages changes. An up-to-date lockfile is never touched. |
 | `net.offline` | `false` | Never touch the network. |
 | `test.doctests` | `true` | Run documentation tests in `rune test`. |
@@ -266,9 +290,17 @@ UnitKey = hash(
   its source: a build script's `rerun-if-env-changed`/`rerun-if-changed`, the
   native libraries it linked, `env!`/`option_env!` variables (from rustc's
   dep-info), the manifest if a crate includes it, and — for units with a build
-  script — the identity of the C toolchain. The key then follows the *current
-  values* of those, so an artifact is only found again when everything it read is
-  unchanged.
+  script — the identity of the C toolchain (on macOS including the active
+  Xcode/Command Line Tools and SDK). The key then follows the *current values*
+  of those, so an artifact is only found again when everything it read is
+  unchanged. For Apple targets, `MACOSX_DEPLOYMENT_TARGET` (and its iOS/tvOS/…
+  siblings) and `SDKROOT` are part of the key when set: rustc writes them into
+  the objects without listing them in its dep-info.
+* **Build scripts have their own key**: the script's configuration, its
+  build-dependencies and `DEP_*` values, plus — if it declared
+  `rerun-if-changed` — exactly the files it watches and its own sources. Editing
+  the rest of the package does not run it again (as in Cargo), and a script
+  that must run again because a watched file changed is not recompiled.
 * **Correctness beats hit rate.** A false rebuild is acceptable; reusing a wrong
   artifact is not. Objects in the store are immutable (first writer wins),
   read-only, published atomically, and verified on every hit.
@@ -286,6 +318,10 @@ Rune targets Cargo compatibility, so these are the things it does **not** do (ye
   A build script that reads the outside world without declaring it (no
   `rerun-if-*`) is treated like Cargo treats it, which cannot be detected
   without tracing or sandboxing — planned.
+- **Packages are identified by name and version.** A workspace crate whose
+  dev-dependencies use its *published release of exactly the same version*
+  gets the local crate there too; Cargo keeps the two apart. (With any other
+  version they are kept apart, as in Cargo.)
 - **The resolver is not a full SAT/PubGrub solver.** It picks the newest
   version that fits, then settles each semver-compatible range on one version,
   backtracking one requirer at a time. A conflict that needs several crates
@@ -296,8 +332,8 @@ Rune targets Cargo compatibility, so these are the things it does **not** do (ye
 - **Structured diagnostics.** Warnings are replayed as rendered text.
 - Linux is the platform this was developed on; the test suite also passes on
   macOS (Apple Silicon). Windows has not been exercised.
-- `audit`, `outdated` and `deny` are not built in; installed as the usual
-  `cargo-audit`/`cargo-outdated`/`cargo-deny`, they work as `rune audit` etc.
+- `audit` and `deny` are not built in; installed as the usual
+  `cargo-audit`/`cargo-deny`, they work as `rune audit` etc.
   (external subcommands get `CARGO` pointing at the real `cargo`, since plugins
   are written against it; `RUNE_PLUGIN_CARGO=rune` points them at Rune).
 
@@ -313,16 +349,53 @@ rune CLI
 ├── rune-registry     (sparse index, registries & source replacement, git dependencies, downloads)
 ├── rune-graph        (dependency DAG with normal/build edges, critical path, pruning)
 ├── rune-fingerprint  (content hashing, mtime+size cache)
-├── rune-scheduler    (parallel executor, jobserver, pipelining, declared inputs)
+├── rune-scheduler    (parallel executor, jobserver, pipelining, build-script steps, declared inputs, schedule analysis)
 ├── rune-compiler     (direct rustc invocation, build scripts)
 ├── rune-cas          (immutable content-addressable store, atomic writes, LRU GC)
 └── rune-common       (shared types, settings, toolchain, .cargo/config.toml, cfg evaluation)
 ```
 
-`rune build --timings` (or `RUNE_TIMINGS=1`) prints how long each phase takes and
-writes the schedule of the build — every unit, when it started and what it waited
-for — as a Chrome trace to `.rune/fingerprints/trace.json` (open it in
-`chrome://tracing` or <https://ui.perfetto.dev>).
+## Using the whole machine
+
+Rune runs about 1.3 compiler processes per core (`-j`, `build.jobs`) and hands
+every `rustc` and build script the same GNU jobserver, so a compiler that is
+alone at the end of a build can take the idle slots for its codegen threads
+while the total never exceeds the budget. A crate starts the moment the
+`.rmeta` of each dependency exists; a build script is its own step that starts
+once its build-dependencies are built, overlapping the rest of its package's
+dependencies. Before starting another compiler Rune checks available memory
+(Linux `MemAvailable`, macOS memory pressure) and, while it is short, lets
+running units finish first — a machine with many cores and little memory
+neither swaps nor loses a `rustc` to the OOM killer.
+
+What stable Rust cannot parallelize is a chain of crates that must be compiled
+one after another, and a single crate's front end. A build longer than 10 s that
+kept fewer than 60 % of the cores busy ends with one line naming that chain;
+`rune build --timings` (or `RUNE_TIMINGS=1`) prints it in full, with how long
+each phase of the command took, and writes
+`.rune/timings/rune-timing.html` — a timeline of every step with the chain
+highlighted and how many ran at once — plus a Chrome trace in
+`.rune/fingerprints/trace.json` (<https://ui.perfetto.dev>). Splitting the
+largest crate of that chain is usually what helps. On a nightly compiler,
+`build.frontend-threads = "auto"` gives crates that start while cores are idle
+a parallel front end.
+
+## CI
+
+```bash
+rune cas import ci.tar.gz || true                     # restore (a missing file is fine)
+rune build && rune test --retries 2 --junit report.xml
+rune cas export -o ci.tar.gz --for build --for test   # save exactly what this run needs
+```
+
+A bundle holds the store entries a build of the workspace needs — artifacts,
+build-script results, replayed warnings, recorded outside inputs — and nothing
+else, so it does not grow with every run the way a cached `target/` does
+(Rune's own: 219 entries, 231 MiB gzipped; a clean checkout with it builds with
+`0 compiled`). Import treats the file as untrusted: every artifact is checked
+against its recorded hash and an entry the store already has is kept.
+`rune affected --since origin/main --partition N/M` splits the packages a change
+can influence between M machines, the same way on each.
 
 ## Sharing the store
 
@@ -397,6 +470,24 @@ output and nothing else, and its exit code is Rune's. Because dependencies come
 from the store, a script whose dependencies any project has built before starts in
 about 0.15 s. Line numbers in errors match the file.
 
+## Dependencies and supply chain
+
+`rune outdated` lists the declared dependencies with newer releases (compatible,
+and newest overall, honouring each package's `rust-version`); `rune upgrade`
+raises the requirements in place, keeping comments and how each requirement is
+written (`1` stays `1`, `0.7` becomes `0.9`). `rune unused` runs `rustc`'s own
+`unused_crate_dependencies` lint over every target of the workspace's packages —
+no text search, so proc-macros, renamed crates and build-dependencies are
+judged correctly — and suggests moving a dependency only tests use to
+`[dev-dependencies]`; `--fix` removes the unused ones.
+
+`rune sbom` writes a CycloneDX 1.5 or SPDX 2.3 bill of materials with package
+URLs, checksums, licences and the locked dependency edges (`SOURCE_DATE_EPOCH`
+makes it reproducible). `rune tree --exec-surface` lists every crate that runs
+code on your machine while building — build scripts, proc-macros, native
+`links` crates — with the chain that brings each in. `resolve.min-release-age =
+"14d"` keeps resolution away from releases younger than that.
+
 ## Watching and selective CI
 
 `rune watch` re-runs commands (`-x check`, by default) when files change, killing
@@ -441,8 +532,21 @@ diagnostic because a crate was a cache hit. The output is tested against Cargo's
 message shape, not yet against a live rust-analyzer. To try it there:
 
 ```json
-{ "rust-analyzer.check.overrideCommand": ["rune", "check", "--message-format=json", "--workspace"] }
+{
+  "rust-analyzer.check.overrideCommand": ["rune", "check", "--message-format=json", "--workspace", "--all-targets"],
+  "rust-analyzer.cargo.buildScripts.overrideCommand": ["rune", "check", "--message-format=json", "--workspace", "--all-targets"]
+}
 ```
+
+The second line has rust-analyzer take build scripts' results from Rune too:
+the JSON includes Cargo's `build-script-executed` messages (each script's
+`OUT_DIR`, cfgs and environment, also when the result came from the store), so
+`include!(concat!(env!("OUT_DIR"), …))` and script-set cfgs resolve in the editor.
+
+`rune test --message-format json` adds one `test-suite-finished` line per test
+binary (outcome, counts, every test and its status). `rune graph --units
+--format json` is the build plan: every unit with its key, whether the store
+has it, its features and platform, and its dependencies.
 
 ## Building Rune
 

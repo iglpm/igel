@@ -104,6 +104,11 @@ pub struct CasEntry {
 /// Stored objects are never modified: taking away write permission makes a
 /// stray in-place write (through a hard link from a project directory) fail
 /// loudly instead of silently changing an object every project shares.
+#[cfg_attr(unix, allow(dead_code))]
+pub(crate) fn make_read_only_pub(path: &Path) {
+    make_read_only(path);
+}
+
 fn make_read_only(path: &Path) {
     if let Ok(meta) = fs::metadata(path) {
         let mut perms = meta.permissions();
@@ -115,13 +120,9 @@ fn make_read_only(path: &Path) {
 /// True if `dest` is already a hardlink to `src` (same inode on the same
 /// device), meaning there is nothing left to do to "link" it. (Elsewhere the
 /// link is simply made again, which is correct, only slower.)
-#[cfg(unix)]
 fn already_linked(src: &Path, dest: &Path) -> bool {
     same_file::is_same_file(src, dest).unwrap_or(false)
 }
-
-
-
 
 impl CasStore {
     /// Create a new CAS store, initializing directories if needed.
@@ -248,6 +249,13 @@ impl CasStore {
         self.object_dir(cache_key).join("manifest.json").is_file()
     }
 
+    /// Whether this store (not a remote one) has both a directory tree and a
+    /// value under `cache_key` — a build script's complete result.
+    pub fn contains_tree(&self, cache_key: &str) -> bool {
+        let dir = self.object_dir(cache_key);
+        dir.join("tree.json").is_file() && dir.join("value.json").is_file()
+    }
+
     /// Copy compiled artifacts into the CAS store.
     ///
     /// Every file is written to a temporary name and renamed into place, and
@@ -262,6 +270,33 @@ impl CasStore {
         crate_name: &str,
         crate_version: &str,
         source_files: &[PathBuf],
+    ) -> Result<()> {
+        self.put_files(cache_key, crate_name, crate_version, source_files, false)
+    }
+
+    /// Like [`Self::put`], but the store takes the files themselves (hard
+    /// links; a copy only across file systems) instead of copies of them, and
+    /// makes them read-only. For outputs the caller will never write again in
+    /// place — a compiler's fresh outputs, which a later compilation unlinks
+    /// before writing new ones, exactly as it does for restored outputs — this
+    /// saves writing every artifact twice (a debug binary can be 100+ MB).
+    pub fn put_adopted(
+        &self,
+        cache_key: &str,
+        crate_name: &str,
+        crate_version: &str,
+        source_files: &[PathBuf],
+    ) -> Result<()> {
+        self.put_files(cache_key, crate_name, crate_version, source_files, true)
+    }
+
+    fn put_files(
+        &self,
+        cache_key: &str,
+        crate_name: &str,
+        crate_version: &str,
+        source_files: &[PathBuf],
+        adopt: bool,
     ) -> Result<()> {
         let dir = self.object_dir(cache_key);
         // Objects are immutable: the first published result for a key stands,
@@ -293,7 +328,10 @@ impl CasStore {
 
             let dest = dir.join(&file_name);
             let tmp = dir.join(format!(".{file_name}.{}.tmp", std::process::id()));
-            fs::copy(src, &tmp)?;
+            let _ = fs::remove_file(&tmp);
+            if !adopt || fs::hard_link(src, &tmp).is_err() {
+                fs::copy(src, &tmp)?;
+            }
             let size = fs::metadata(&tmp)?.len();
             total_size += size;
             let hash = hash_file(&tmp)?;
@@ -478,7 +516,6 @@ impl CasStore {
             // worth the cost of hashing.
             rune_common::fsutil::replace_with_link(&src, &dest)?;
             let hard_linked = already_linked(&src, &dest);
-
             if hard_linked {
                 linked_files.push(dest);
                 continue;
@@ -613,7 +650,7 @@ fn touch_if_stale(manifest: &Path) {
 }
 
 /// Blake3 of a file's contents, hex encoded.
-fn hash_file(path: &Path) -> Result<String> {
+pub(crate) fn hash_file(path: &Path) -> Result<String> {
     let mut hasher = blake3::Hasher::new();
     hasher.update_reader(File::open(path)?)?;
     Ok(hasher.finalize().to_hex().to_string())
@@ -677,11 +714,40 @@ mod tests {
         assert_eq!(fs::read_to_string(&relinked[0]).unwrap(), "v1");
 
         // And a stray in-place write through a link fails instead of
-        // corrupting the shared object.
+        // corrupting the shared object. (A superuser may write read-only
+        // files anyway; then only the permission bits can be checked.)
         assert!(
-            fs::OpenOptions::new().write(true).open(&linked[0]).is_err(),
+            fs::metadata(&linked[0]).unwrap().permissions().readonly(),
             "stored objects must be read-only"
         );
+        let probe = src_dir.path().join("probe");
+        fs::write(&probe, "x").unwrap();
+        make_read_only(&probe);
+        if fs::OpenOptions::new().write(true).open(&probe).is_err() {
+            assert!(
+                fs::OpenOptions::new().write(true).open(&linked[0]).is_err(),
+                "stored objects must be read-only"
+            );
+        }
+    }
+
+    #[test]
+    fn adopted_files_become_the_object_without_a_copy() {
+        let dir = tempdir().unwrap();
+        let store = CasStore::new(dir.path().to_path_buf()).unwrap();
+        let build = tempdir().unwrap();
+        let out = build.path().join("libfoo-abc.rlib");
+        fs::write(&out, "compiled").unwrap();
+        store
+            .put_adopted("k", "foo", "1.0.0", std::slice::from_ref(&out))
+            .unwrap();
+        let obj = store.object_dir("k").join("libfoo-abc.rlib");
+        assert!(already_linked(&out, &obj), "the output itself is stored");
+        assert!(fs::metadata(&out).unwrap().permissions().readonly());
+        // It restores like any entry, and a restore into the same directory
+        // finds it already in place.
+        let linked = store.link_to("k", build.path()).unwrap();
+        assert_eq!(fs::read_to_string(&linked[0]).unwrap(), "compiled");
     }
 
     #[test]

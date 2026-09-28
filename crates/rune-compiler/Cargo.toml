@@ -7,13 +7,10 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-jobserver.workspace = true
 rune-common.workspace = true
-rune-manifest.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 serde = { workspace = true }
 serde_json.workspace = true
 
 [dev-dependencies]
-tempfile.workspace = true

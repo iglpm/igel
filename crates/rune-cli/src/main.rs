@@ -5,10 +5,15 @@ mod args;
 mod cmd_build;
 mod cmd_deps;
 mod cmd_explain;
+mod cmd_graph;
 mod cmd_install;
 mod cmd_misc;
 mod cmd_publish;
+mod cmd_sbom;
+mod cmd_surface;
 mod cmd_test;
+mod cmd_unused;
+mod cmd_upgrade;
 mod cmd_vendor;
 mod cmd_watch;
 mod doctor;
@@ -19,6 +24,7 @@ mod messages;
 mod script;
 mod session;
 mod test_cache;
+mod test_report;
 mod ui;
 mod workspace;
 
@@ -63,7 +69,12 @@ fn main() {
         Commands::Add(a) => cmd_deps::add(a),
         Commands::Remove(a) => cmd_deps::remove(a),
         Commands::Update(a) => cmd_deps::update(a),
+        Commands::Outdated(a) => cmd_upgrade::outdated(a),
+        Commands::Upgrade(a) => cmd_upgrade::upgrade(a),
+        Commands::Unused(a) => cmd_unused::unused(a),
+        Commands::Sbom(a) => cmd_sbom::sbom(a),
         Commands::Tree(a) => cmd_deps::tree(a),
+        Commands::Graph(a) => cmd_graph::graph(a),
         Commands::Why(a) => cmd_deps::why(a),
         Commands::Fetch(a) => cmd_deps::fetch(a),
         Commands::GenerateLockfile(a) => cmd_deps::generate_lockfile(a),
@@ -84,6 +95,7 @@ fn main() {
         Commands::VerifyProject(a) => cmd_deps::verify_project(a),
         Commands::Clean(a) => cmd_misc::clean(a),
         Commands::Config(c) => cmd_misc::config(c),
+        Commands::Cas(args::CasCommands::Export(a)) => cmd_build::cas_export(*a),
         Commands::Cas(c) => cmd_misc::cas(c),
         Commands::Doctor => cmd_misc::doctor(),
         Commands::Watch(a) => cmd_watch::watch(a),

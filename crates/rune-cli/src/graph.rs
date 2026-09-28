@@ -147,6 +147,9 @@ pub struct DocTest {
     pub externs: Vec<(String, NodeId)>,
     pub features: Vec<String>,
     pub edition: Edition,
+    /// The library is a proc-macro crate (its examples use it through its
+    /// compiled plugin, as Cargo's doc tests do).
+    pub proc_macro: bool,
 }
 
 /// The planned build.
@@ -579,6 +582,70 @@ fn prune_resolved(mut resolved: ResolvedGraph, refined: &Lockfile) -> ResolvedGr
     resolved
 }
 
+/// The resolved graph as a build of every workspace member (default
+/// features, development dependencies included) sees it on `target`
+/// (`None`: every platform) — what `rune tree` shows, as `cargo tree` does:
+/// only the packages and edges the feature resolver reaches, each package
+/// with the features it is built with (both roles' together).
+pub fn tree_view(ws: &Workspace, offline: bool, target: Option<&str>) -> Result<ResolvedGraph> {
+    let existing = LockfileManager::load_fast(ws.root());
+    let (resolved, lock) = resolve_fresh(ws, offline, existing.as_ref(), false)?;
+    let mut locals = Locals::load(ws)?;
+    locals.extend_from_lock(ws, &lock)?;
+    let uni = Universe::build(ws, &locals, &lock);
+    let roots: Vec<RootRequest> = ws
+        .members
+        .iter()
+        .enumerate()
+        .filter_map(|(mi, _)| locals.member_of.iter().position(|m| *m == Some(mi)))
+        .map(|li| RootRequest {
+            package: li,
+            features: Vec::new(),
+            default_features: true,
+            dev: true,
+        })
+        .collect();
+    let host = rune_common::toolchain::global().host.clone();
+    let applies = |platform: &str, for_host: bool| match target {
+        None => true,
+        Some(t) => rune_resolver::resolver::matches_target(
+            Some(platform),
+            if for_host { &host } else { t },
+        ),
+    };
+    let res = unit_features::resolve(
+        &uni.views,
+        &roots,
+        &FeatureOptions {
+            resolver: ws.root_manifest.resolver_version(),
+            platform_matches: &applies,
+            weak_activates: false,
+        },
+    );
+    let mut features: HashMap<String, BTreeSet<String>> = HashMap::new();
+    for ((pkg, _), feats) in &res.features {
+        features
+            .entry(uni.id[*pkg].clone())
+            .or_default()
+            .extend(feats.iter().cloned());
+    }
+    // (package id, dependency alias, kind) of every edge a build follows.
+    let mut edges: HashSet<(String, String, rune_manifest::dependency::DependencyKind)> =
+        HashSet::new();
+    for e in &res.edges {
+        let d = &uni.views[e.from.0].deps[e.dep];
+        edges.insert((uni.id[e.from.0].clone(), d.alias.clone(), d.kind));
+    }
+    let mut view = resolved;
+    view.packages.retain(|id, _| features.contains_key(id));
+    for (id, pkg) in view.packages.iter_mut() {
+        pkg.dependencies
+            .retain(|d| edges.contains(&(id.clone(), d.name.clone(), d.kind)));
+        pkg.features = features[id].iter().cloned().collect();
+    }
+    Ok(view)
+}
+
 /// Tightens a freshly resolved lockfile to exactly what Cargo would lock.
 ///
 /// The version resolver over-approximates which optional dependencies are
@@ -704,14 +771,28 @@ pub fn sync_cargo_lock(ws: &Workspace, lock: &Lockfile, locked: bool) -> Result<
         );
     }
     let mut out = lock.clone();
-    // An existing file keeps its format version; a new one gets the newest
-    // format the active toolchain reads (4 since Rust 1.83), like Cargo.
+    // An existing file keeps its format version. A new one gets the newest
+    // format the active toolchain reads (4 since Rust 1.83) — unless the
+    // workspace promises to build with an older Rust (`rust-version`), whose
+    // Cargo must be able to read it: then 3, as Cargo does. (Cargo would go
+    // down to 2 for a `rust-version` before 1.53; Rune writes 3 at least.)
     let newest = if toolchain::global().satisfies_msrv("1.83") {
         4
     } else {
         3
     };
-    out.version = existing.as_ref().map_or(newest, |e| e.version.max(1));
+    let lowest_rust = ws
+        .members
+        .iter()
+        .filter_map(|m| rune_common::toolchain::parse_rust_version(&m.meta.rust_version))
+        .min();
+    let for_msrv = match lowest_rust {
+        Some(v) if v < semver::Version::new(1, 83, 0) => 3,
+        _ => newest,
+    };
+    out.version = existing
+        .as_ref()
+        .map_or(newest.min(for_msrv), |e| e.version.max(1));
     LockfileManager::write_cargo(&out, &path).context("Failed to write Cargo.lock")?;
     ui::action(
         if existing.is_some() {
@@ -839,6 +920,7 @@ pub fn resolve_fresh_with(
     .offline(offline)
     .with_patches(ws.patches.clone())
     .with_msrv(msrv_for_resolution(ws))
+    .with_min_release_age(ws.config.settings.min_release_age())
     .with_prefetch_hint(on_disk.as_ref())
     .with_preferred(preferred);
     let resolved = resolver
@@ -950,7 +1032,8 @@ fn resolve(ws: &Workspace, locals: &Locals, req: &Request) -> Result<(ResolvedGr
     let mut resolver = DependencyResolver::default_resolver()
         .offline(req.offline)
         .with_patches(ws.patches.clone())
-        .with_msrv(msrv_for_resolution(ws));
+        .with_msrv(msrv_for_resolution(ws))
+        .with_min_release_age(ws.config.settings.min_release_age());
     let resolved = resolver
         .resolve_with_workspace(
             root,
@@ -1058,7 +1141,7 @@ fn pick_targets(member: &Member, req: &Request, active: &[String]) -> Result<Vec
         }
         let want_lib_tests = (test_mode && (!explicit || sel.lib || all) && !sel.doc_only)
             || (all && !test_mode && !bench_mode);
-        if want_lib_tests && lib.test && !lib.proc_macro_or_no_harness() {
+        if want_lib_tests && lib.tested(true) && !lib.proc_macro_or_no_harness() {
             out.push(Pick {
                 kind: TargetKind::Lib,
                 name,
@@ -1110,7 +1193,7 @@ fn pick_targets(member: &Member, req: &Request, active: &[String]) -> Result<Vec
                 spec: Some(bin.clone()),
             });
         }
-        if test_mode && bin.test && bin.harness {
+        if test_mode && bin.tested(true) && bin.harness {
             out.push(Pick {
                 kind: TargetKind::Bin,
                 name,
@@ -1131,8 +1214,14 @@ fn pick_targets(member: &Member, req: &Request, active: &[String]) -> Result<Vec
         }
     }
 
-    // Examples.
-    let want_all_examples = explicit && (sel.examples || all);
+    // Examples. `test` without a selection builds them all, as Cargo does
+    // (to check they compile; a test may also run one), and runs those that
+    // ask for it (`test = true`) as tests.
+    let want_all_examples = if explicit {
+        sel.examples || all
+    } else {
+        test_mode
+    };
     for ex in &m.example {
         let name = ex.name.clone().unwrap_or_default();
         if !(want_all_examples || named(&sel.example, &name)) || sel.doc_only {
@@ -1148,13 +1237,23 @@ fn pick_targets(member: &Member, req: &Request, active: &[String]) -> Result<Vec
             }
             continue;
         }
+        let path = ex.path.clone().unwrap_or_default();
         out.push(Pick {
             kind: TargetKind::Example,
-            name,
-            path: ex.path.clone().unwrap_or_default(),
+            name: name.clone(),
+            path: path.clone(),
             harness: false,
             spec: Some(ex.clone()),
         });
+        if test_mode && ex.harness && ex.tested(false) {
+            out.push(Pick {
+                kind: TargetKind::Example,
+                name,
+                path,
+                harness: true,
+                spec: Some(ex.clone()),
+            });
+        }
     }
 
     // Integration tests.
@@ -1178,7 +1277,7 @@ fn pick_targets(member: &Member, req: &Request, active: &[String]) -> Result<Vec
             }
             continue;
         }
-        if !t.test && !named(&sel.test, &name) && !all {
+        if !t.tested(true) && !named(&sel.test, &name) && !all {
             continue;
         }
         out.push(Pick {
@@ -1213,7 +1312,33 @@ fn pick_targets(member: &Member, req: &Request, active: &[String]) -> Result<Vec
         });
     }
 
+    ensure_target_exists(member, &out)?;
     Ok(out)
+}
+
+/// Cargo's error for a declared target whose source file is missing (a
+/// published crate whose examples were left out of the package, say),
+/// rather than rustc's "couldn't read" halfway through the build.
+fn ensure_target_exists(member: &Member, picks: &[Pick]) -> Result<()> {
+    for p in picks {
+        let path = member.dir.join(&p.path);
+        if !p.path.as_os_str().is_empty() && !path.exists() {
+            let kind = match p.kind {
+                TargetKind::Lib => "library",
+                TargetKind::Bin => "bin",
+                TargetKind::Example => "example",
+                TargetKind::Test => "test",
+                TargetKind::Bench => "bench",
+            };
+            bail!(
+                "can't find {kind} `{}` at path `{}` (declared in {})",
+                p.name,
+                path.display(),
+                member.manifest_path.display()
+            );
+        }
+    }
+    Ok(())
 }
 
 fn explicit_other_than_lib(sel: &TargetSelection) -> bool {
@@ -1590,7 +1715,12 @@ impl Planner<'_> {
             lean_debuginfo: matches!(self.uni.origin[pkg], Origin::Registry)
                 && !self.ws.config.settings.dependency_debuginfo(),
         };
-        let p = resolve_unit_profile(&self.req.profile.name, tables, role).ok()?;
+        let mut p = resolve_unit_profile(&self.req.profile.name, tables, role).ok()?;
+        // Everything a test or benchmark links unwinds, whatever the profile
+        // says: the harness needs it (Cargo does the same).
+        if matches!(self.req.mode, Mode::Test | Mode::Bench) {
+            p.panic = rune_common::PanicStrategy::Unwind;
+        }
         (p != *self.req.profile).then_some(p)
     }
 
@@ -1825,28 +1955,34 @@ impl Planner<'_> {
 /// The set of `links` values in a graph must be unique per package: two
 /// packages linking the same native library would collide at link time.
 fn check_links_conflicts(graph: &BuildGraph) -> Result<()> {
-    let mut seen: HashMap<String, (String, semver::Version)> = HashMap::new();
+    // A package is its directory: its test, example and binary units carry
+    // their target's name, not the package's (`ring`'s `aead_tests`).
+    let mut seen: HashMap<String, (PathBuf, String, semver::Version)> = HashMap::new();
     for node in graph.nodes() {
         let Some(links) = &node.unit.links else {
             continue;
         };
-        let pkg = (
-            node.unit.crate_id.name.clone(),
-            node.unit.crate_id.version.clone(),
-        );
-        if let Some(prev) = seen.get(links) {
-            if *prev != pkg {
+        let unit = &node.unit;
+        match seen.get(links) {
+            Some((dir, name, version)) if *dir != unit.manifest_dir => {
                 bail!(
                     "multiple packages link to the native library `{links}`, but a native library can be linked only once\n  \
-                     package `{} v{}` links to `{links}`\n  package `{} v{}` also links to `{links}`",
-                    prev.0,
-                    prev.1,
-                    pkg.0,
-                    pkg.1
+                     package `{name} v{version}` links to `{links}`\n  package `{} v{}` also links to `{links}`",
+                    unit.crate_id.name,
+                    unit.crate_id.version
                 );
             }
-        } else {
-            seen.insert(links.clone(), pkg);
+            Some(_) => {}
+            None => {
+                seen.insert(
+                    links.clone(),
+                    (
+                        unit.manifest_dir.clone(),
+                        unit.crate_id.name.clone(),
+                        unit.crate_id.version.clone(),
+                    ),
+                );
+            }
         }
     }
     Ok(())
@@ -2227,7 +2363,6 @@ pub fn plan(ws: &Workspace, req: &Request) -> Result<Plan> {
             && let (Some(lib), Some(&lib_node)) =
                 (&member.manifest.lib, planner.lib_node.get(&(li, false)))
             && lib.doctest
-            && !lib.proc_macro
         {
             let mut externs = match harness_lib_externs.take() {
                 Some(e) => e,
@@ -2252,6 +2387,7 @@ pub fn plan(ws: &Workspace, req: &Request) -> Result<Plan> {
                 externs,
                 features: active.clone(),
                 edition: member.edition,
+                proc_macro: lib.proc_macro,
             });
         }
     }
@@ -2395,18 +2531,32 @@ fn check_named_targets(req: &Request, locals: &Locals, _ws: &Workspace) -> Resul
 /// loaded into the compiler process — both need actual linked `.rlib`s (or a
 /// dylib) from their dependencies, not just `.rmeta`.
 ///
-/// This walks the graph once, seeded from every build-script-having or
-/// proc-macro node, and lifts `check_only` back to `false` across each one's
-/// *dependencies* (never the seed itself: a crate that merely *has* a build
-/// script still only needs its own code type-checked).
+/// This walks the graph once, seeded from every proc-macro's dependencies and
+/// every build script's build-dependencies, and lifts `check_only` back to
+/// `false` across them and everything below them (never the seed itself: a
+/// crate that merely *has* a build script still only needs its own code
+/// type-checked, and so do its ordinary dependencies).
 fn exempt_real_link_requirements_from_check(graph: &mut BuildGraph) {
     let mut must_be_real: HashSet<NodeId> = HashSet::new();
-    let mut stack: Vec<NodeId> = graph
-        .nodes()
-        .iter()
-        .filter(|n| n.unit.build_script.is_some() || n.unit.crate_type == CrateType::ProcMacro)
-        .map(|n| n.id)
-        .collect();
+    // What is linked into something that runs: a proc-macro's dependencies,
+    // and a build script's *build*-dependencies (its package's ordinary
+    // dependencies are only type-checked, like any other library's).
+    let mut stack: Vec<NodeId> = Vec::new();
+    for n in graph.nodes() {
+        if n.unit.crate_type == CrateType::ProcMacro {
+            stack.extend(n.dependencies.iter().copied());
+        } else if n.unit.build_script.is_some() {
+            stack.extend(
+                n.dependencies
+                    .iter()
+                    .copied()
+                    .filter(|d| n.build_dependencies.contains(d)),
+            );
+        }
+    }
+    for &id in &stack {
+        must_be_real.insert(id);
+    }
     while let Some(id) = stack.pop() {
         for &dep_id in &graph.node(id).dependencies {
             if must_be_real.insert(dep_id) {
@@ -2417,4 +2567,142 @@ fn exempt_real_link_requirements_from_check(graph: &mut BuildGraph) {
     for id in must_be_real {
         graph.node_mut(id).unit.check_only = false;
     }
+}
+
+// ---------------------------------------------------------------------------
+// Inventory: every package of the resolved graph, for reports (`rune sbom`)
+// ---------------------------------------------------------------------------
+
+/// How a package depends on another.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum EdgeKind {
+    Normal,
+    Build,
+    Dev,
+}
+
+/// A package of the resolved graph, with what its manifest says about it.
+#[derive(Debug, Clone)]
+pub struct InventoryPackage {
+    pub name: String,
+    pub version: semver::Version,
+    /// As `Cargo.lock` spells it; `None` for a path package.
+    pub source: Option<String>,
+    pub checksum: Option<String>,
+    pub meta: rune_common::PackageMeta,
+    /// A member of this workspace.
+    pub member: bool,
+    /// `(repository URL, commit)` of a git package.
+    pub git: Option<(String, String)>,
+    /// The registry's index URL, for a registry package.
+    pub registry: Option<String>,
+    /// Packages this one depends on as locked (only what is used, with
+    /// optional dependencies nothing enables left out), and how.
+    pub deps: Vec<(usize, EdgeKind)>,
+}
+
+/// Every package the lockfile holds, with metadata from its manifest and the
+/// locked dependency edges. Resolves (and downloads) first, like `build`.
+pub fn inventory(ws: &Workspace, offline: bool) -> Result<Vec<InventoryPackage>> {
+    let existing = LockfileManager::load_fast(ws.root());
+    let (resolved, lock) = resolve_fresh(ws, offline, existing.as_ref(), false)?;
+    store_resolution(ws, &lock)?;
+    download_all(&resolved, offline)?;
+    let mut locals = Locals::load(ws)?;
+    locals.extend_from_lock(ws, &lock)?;
+
+    let mut pkgs: Vec<&ResolvedPackage> = resolved.packages.values().collect();
+    pkgs.sort_by(|a, b| (&a.name, &a.version).cmp(&(&b.name, &b.version)));
+    let manifests: Vec<Option<rune_common::PackageMeta>> = pkgs
+        .par_iter()
+        .map(|p| match &p.source {
+            PackageSource::Registry(index) => {
+                let dl = rune_registry::CrateDownloader::for_registry(index)
+                    .ok()?
+                    .offline(true);
+                let dir = dl
+                    .download_and_extract(&p.name, &p.version.to_string(), p.checksum.as_deref())
+                    .ok()?;
+                let m = Manifest::from_path(&rune_common::manifest_file::manifest_in(&dir)).ok()?;
+                Some(m.package.as_ref()?.meta_in(None))
+            }
+            _ => None,
+        })
+        .collect();
+
+    let mut out: Vec<InventoryPackage> = Vec::with_capacity(pkgs.len());
+    for (p, registry_meta) in pkgs.iter().zip(manifests) {
+        let local = locals
+            .list
+            .iter()
+            .position(|m| m.name == p.name && m.version == p.version);
+        let meta = registry_meta
+            .or_else(|| local.map(|li| locals.list[li].meta.clone()))
+            .unwrap_or_default();
+        out.push(InventoryPackage {
+            name: p.name.clone(),
+            version: p.version.clone(),
+            source: p.source.lock_source(),
+            checksum: p.checksum.clone(),
+            meta,
+            member: local.is_some_and(|li| locals.member_of[li].is_some()),
+            git: match &p.source {
+                PackageSource::Git { url, commit, .. } => Some((url.clone(), commit.clone())),
+                _ => None,
+            },
+            registry: match &p.source {
+                PackageSource::Registry(index) => Some(index.clone()),
+                _ => None,
+            },
+            deps: Vec::new(),
+        });
+    }
+
+    // Edges as locked: `name`, `name version` or `name version (source)`.
+    let find = |spec: &str| -> Option<usize> {
+        let mut parts = spec.split_whitespace();
+        let name = parts.next()?;
+        let version = parts.next();
+        let source = spec.split_once(" (").map(|(_, s)| s.trim_end_matches(')'));
+        out.iter().position(|q| {
+            q.name == name
+                && version.is_none_or(|v| q.version.to_string() == v)
+                && source.is_none_or(|s| q.source.as_deref() == Some(s))
+        })
+    };
+    let mut edges: Vec<Vec<(usize, EdgeKind)>> = vec![Vec::new(); out.len()];
+    for (i, p) in pkgs.iter().enumerate() {
+        let Some(locked) = lock.packages.iter().find(|l| {
+            l.name == p.name
+                && l.version == p.version.to_string()
+                && l.source == p.source.lock_source()
+        }) else {
+            continue;
+        };
+        for spec in &locked.dependencies {
+            let Some(j) = find(spec) else { continue };
+            // The strongest way the manifest declares it: a dependency that
+            // is also a build- or dev-dependency is an ordinary one.
+            let kinds: Vec<DependencyKind> = p
+                .dependencies
+                .iter()
+                .filter(|d| d.package.as_deref().unwrap_or(&d.name) == out[j].name)
+                .map(|d| d.kind)
+                .collect();
+            let kind = if kinds.is_empty() || kinds.contains(&DependencyKind::Normal) {
+                EdgeKind::Normal
+            } else if kinds.contains(&DependencyKind::Build) {
+                EdgeKind::Build
+            } else {
+                EdgeKind::Dev
+            };
+            if !edges[i].iter().any(|(k, _)| *k == j) {
+                edges[i].push((j, kind));
+            }
+        }
+    }
+    for (p, e) in out.iter_mut().zip(edges) {
+        p.deps = e;
+    }
+    Ok(out)
 }

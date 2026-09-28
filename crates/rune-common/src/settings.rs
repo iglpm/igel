@@ -37,6 +37,10 @@ pub enum ValueKind {
     Size,
     /// Free text (a token, a list of URLs).
     Text,
+    /// `off`, `auto`, or a positive number (of threads).
+    Threads,
+    /// A length of time: `14d`, `72h`, `2w`, `0`.
+    Duration,
 }
 
 impl ValueKind {
@@ -47,8 +51,22 @@ impl ValueKind {
             ValueKind::Path => "a path",
             ValueKind::Text => "text",
             ValueKind::Size => "a size such as `20GB` or `512MiB`",
+            ValueKind::Threads => "`off`, `auto` or a number of threads",
+            ValueKind::Duration => "a duration such as `14d`, `72h` or `2w`",
         }
     }
+}
+
+/// How many threads rustc's parallel front end may use (`build.frontend-threads`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FrontendThreads {
+    /// One, as rustc does by default.
+    #[default]
+    Off,
+    /// As many as there are idle cores when a crate starts.
+    Auto,
+    /// Always this many.
+    Fixed(usize),
 }
 
 /// A typed setting value.
@@ -111,6 +129,18 @@ pub const KEYS: &[KeyDef] = &[
         description: "Default number of parallel compiler jobs (`-j`).",
     },
     KeyDef {
+        name: "build.frontend-threads",
+        kind: ValueKind::Threads,
+        default: "off",
+        description: "Threads for rustc's parallel front end (`-Z threads`), which only nightly \
+                      compilers accept; ignored on stable. `auto`: a crate that starts while \
+                      cores are idle — typically the last, largest crates of a build, which \
+                      otherwise type-check on one core — gets as many threads as there are idle \
+                      cores (at most 8); crates started while the machine is busy get one. A \
+                      number: that many for every crate. Whether it pays depends on the crate: \
+                      on Rune's own build (4 cores) it kept the cores busy but saved no time.",
+    },
+    KeyDef {
         name: "build.target-dir",
         kind: ValueKind::Path,
         default: ".rune/target",
@@ -168,12 +198,29 @@ pub const KEYS: &[KeyDef] = &[
                       beyond this size.",
     },
     KeyDef {
+        name: "cas.max-age",
+        kind: ValueKind::Duration,
+        default: "30d",
+        description: "Remove store entries no build has used for this long (`30d`, `2w`; `0` \
+                      keeps everything). Checked at most once a day, in the background after a \
+                      build, like Cargo's automatic cleanup of its caches.",
+    },
+    KeyDef {
         name: "cas.verify",
         kind: ValueKind::Bool,
         default: "false",
         description: "Re-hash every artifact restored from the content-addressable store \
                       (catches bit rot and tampering; costs a read of every restored file). \
                       Entries are always checked against their key and recorded sizes.",
+    },
+    KeyDef {
+        name: "resolve.min-release-age",
+        kind: ValueKind::Duration,
+        default: "0",
+        description: "Only choose releases published at least this long ago (`14d`, `72h`, `2w`) \
+                      when resolving new versions; locked versions are kept. A malicious release \
+                      is usually noticed and yanked within days. When nothing that old fits a \
+                      requirement, the newest release that does is used, with a warning.",
     },
     KeyDef {
         name: "net.offline",
@@ -429,6 +476,29 @@ impl Settings {
         self.bool("build.release-rebuild-all", false)
     }
 
+    /// `resolve.min-release-age`.
+    pub fn min_release_age(&self) -> Option<std::time::Duration> {
+        match self.values.get("resolve.min-release-age") {
+            Some((Value::Text(t), _)) => crate::time::parse_duration(t)
+                .filter(|s| *s > 0)
+                .map(std::time::Duration::from_secs),
+            _ => None,
+        }
+    }
+
+    /// `build.frontend-threads`.
+    pub fn frontend_threads(&self) -> FrontendThreads {
+        match self.values.get("build.frontend-threads") {
+            Some((Value::Text(t), _)) if t == "auto" => FrontendThreads::Auto,
+            Some((Value::Text(t), _)) => t
+                .parse::<usize>()
+                .ok()
+                .filter(|n| *n > 1)
+                .map_or(FrontendThreads::Off, FrontendThreads::Fixed),
+            _ => FrontendThreads::Off,
+        }
+    }
+
     /// `build.jobs`.
     pub fn jobs(&self) -> Option<usize> {
         self.uint("build.jobs")
@@ -454,6 +524,14 @@ impl Settings {
     /// `cas.max-size` in bytes.
     pub fn cas_max_size(&self) -> Option<u64> {
         self.uint("cas.max-size")
+    }
+
+    /// `cas.max-age` in seconds (30 days unless set; `None` when `0`).
+    pub fn cas_max_age(&self) -> Option<u64> {
+        match self.values.get("cas.max-age") {
+            Some((Value::Text(t), _)) => crate::time::parse_duration(t).filter(|s| *s > 0),
+            _ => Some(30 * 86_400),
+        }
     }
 
     /// `cas.verify`.
@@ -659,6 +737,34 @@ fn from_toml(def: &KeyDef, item: &Item) -> Result<Value, &'static str> {
             TomlValue::String(s) => parse_size(s.value()).map(Value::Size).ok_or(expected),
             _ => Err(expected),
         },
+        ValueKind::Threads => match value {
+            TomlValue::Integer(n) => parse_threads(&n.value().to_string()).ok_or(expected),
+            TomlValue::String(s) => parse_threads(s.value()).ok_or(expected),
+            _ => Err(expected),
+        },
+        ValueKind::Duration => match value {
+            TomlValue::Integer(n) => u64::try_from(*n.value())
+                .map(|n| Value::Text(n.to_string()))
+                .map_err(|_| expected),
+            TomlValue::String(s) => crate::time::parse_duration(s.value())
+                .map(|_| Value::Text(s.value().trim().to_string()))
+                .ok_or(expected),
+            _ => Err(expected),
+        },
+    }
+}
+
+/// `off`, `auto` or a positive count, normalized.
+fn parse_threads(raw: &str) -> Option<Value> {
+    let raw = raw.trim().to_ascii_lowercase();
+    match raw.as_str() {
+        "off" | "false" | "no" | "0" | "1" => Some(Value::Text("off".into())),
+        "auto" | "on" | "true" | "yes" => Some(Value::Text("auto".into())),
+        n => n
+            .parse::<u64>()
+            .ok()
+            .filter(|n| (2..=256).contains(n))
+            .map(|n| Value::Text(n.to_string())),
     }
 }
 
@@ -693,6 +799,10 @@ pub fn parse_value(def: &KeyDef, raw: &str) -> Result<Value, SettingsError> {
         ValueKind::Text if !raw.is_empty() => Ok(Value::Text(raw.to_string())),
         ValueKind::Text => Err(bad()),
         ValueKind::Size => parse_size(raw).map(Value::Size).ok_or_else(bad),
+        ValueKind::Threads => parse_threads(raw).ok_or_else(bad),
+        ValueKind::Duration => crate::time::parse_duration(raw)
+            .map(|_| Value::Text(raw.to_string()))
+            .ok_or_else(bad),
     }
 }
 
@@ -957,6 +1067,33 @@ mod tests {
             err.to_string().contains("build.release-rebuild-all"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn frontend_threads_accept_off_auto_or_a_count() {
+        let def = KEYS
+            .iter()
+            .find(|k| k.name == "build.frontend-threads")
+            .unwrap();
+        assert_eq!(
+            parse_value(def, "auto").unwrap(),
+            Value::Text("auto".into())
+        );
+        assert_eq!(parse_value(def, "off").unwrap(), Value::Text("off".into()));
+        assert_eq!(parse_value(def, "1").unwrap(), Value::Text("off".into()));
+        assert_eq!(parse_value(def, "8").unwrap(), Value::Text("8".into()));
+        assert!(parse_value(def, "lots").is_err());
+    }
+
+    #[test]
+    fn release_ages_must_be_durations() {
+        let def = KEYS
+            .iter()
+            .find(|k| k.name == "resolve.min-release-age")
+            .unwrap();
+        assert!(parse_value(def, "14d").is_ok());
+        assert!(parse_value(def, "0").is_ok());
+        assert!(parse_value(def, "14 days please").is_err());
     }
 
     #[test]

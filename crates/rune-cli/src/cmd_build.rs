@@ -29,7 +29,6 @@ pub fn selection(t: &TargetArgs) -> TargetSelection {
 
 /// Plans a build for a session.
 pub fn plan_for(sess: &Session, mode: Mode, targets: &TargetSelection) -> Result<Plan> {
-    warn_on_cross_compile(sess);
     graph::plan(
         &sess.ws,
         &Request {
@@ -45,18 +44,6 @@ pub fn plan_for(sess: &Session, mode: Mode, targets: &TargetSelection) -> Result
             doctests: false,
         },
     )
-}
-
-fn warn_on_cross_compile(sess: &Session) {
-    let host = rune_common::TargetTriple::host().map(|t| t.0);
-    if let (Some(target), Some(host)) = (&sess.target, host)
-        && *target != host
-    {
-        ui::warn(format!(
-            "cross-compiling for `{target}`: build scripts and proc-macros are still built \
-                 for the host, and their dependencies are not yet built separately for the host"
-        ));
-    }
 }
 
 pub fn build(args: BuildArgs, mode: Mode) -> Result<()> {
@@ -107,6 +94,18 @@ pub fn summarize(sess: &Session, result: &rune_scheduler::executor::BuildResult)
     }
     parts.push(format!("{:.2}s", result.total_duration.as_secs_f64()));
     ui::summary(parts.join(" · "));
+    if !sess.json && result.memory_held.as_secs_f64() >= 1.0 {
+        ui::hint(format!(
+            "memory ran short, so fewer compilers ran at once for {:.0} s",
+            result.memory_held.as_secs_f64()
+        ));
+    }
+    // A slow build that left most cores idle says why.
+    if !sess.json
+        && let Some(hint) = result.schedule.as_ref().and_then(|s| s.hint())
+    {
+        ui::hint(hint);
+    }
 }
 
 /// `rune clippy`: lints the workspace's crates with `clippy-driver`.
@@ -633,6 +632,38 @@ fn doc_with(args: DocArgs, extra: &[String]) -> Result<()> {
         };
         ui::action("opening", index.display());
         let _ = std::process::Command::new(opener).arg(index).spawn();
+    }
+    Ok(())
+}
+
+/// `rune cas export`: the store entries the requested builds need, in one
+/// file. Nothing is compiled: keys are computed from the sources, and only
+/// entries the store has go in (run the build first to fill it).
+pub fn cas_export(args: crate::args::CasExportArgs) -> Result<()> {
+    let sess = Session::new(&args.build.common, "dev")?;
+    let Some(cas) = sess.cas() else {
+        bail!("the store is disabled (cas.enabled = false)");
+    };
+    let mut keys: Vec<String> = Vec::new();
+    for command in &args.for_commands {
+        let (mode, profile) = match command.as_str() {
+            "check" => (Mode::Check, "dev"),
+            "test" => (Mode::Test, "test"),
+            _ => (Mode::Build, "dev"),
+        };
+        let s = Session::new(&args.build.common, profile)?;
+        let plan = plan_for(&s, mode, &selection(&args.build.targets))?;
+        keys.extend(s.executor().store_keys(&plan.graph)?);
+    }
+    let stats = cas.export_bundle(&keys, &args.output)?;
+    ui::summary(format!(
+        "wrote {} entries ({}) to {}",
+        stats.entries,
+        crate::cmd_misc::format_size_human(stats.bytes),
+        args.output.display()
+    ));
+    if stats.entries == 0 {
+        ui::hint("the store has none of them yet: build first, then export");
     }
     Ok(())
 }
