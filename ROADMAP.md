@@ -9,9 +9,10 @@ order in which to close the gaps.
 Legend: ✅ done and verified (by automated tests unless a note says otherwise) · 🟡 partial (what exists and what is
 missing is stated) · ⬜ not started.
 
-_Status as of the daily-driver update (2026-09-28, §11). Everything below was
-developed and verified on Linux x86_64 and macOS aarch64 (Apple M5). Windows has
-not been run._
+_Status as of the build-speed and tooling update (§12), which follows the
+daily-driver update (§11). §1–§11 were developed and verified on Linux x86_64
+and macOS aarch64 (Apple M5); §12 on Linux x86_64 (4 cores) — its notes say what
+to expect on a larger Mac. Windows has not been run._
 
 ---
 
@@ -20,21 +21,27 @@ not been run._
 **Build orchestration**
 - Direct `rustc` invocation, parallel critical-path scheduling weighted by
   measured compile times, `.rmeta` pipelining, a shared GNU jobserver for
-  `rustc`, build scripts and the C compilers they drive.
+  `rustc`, build scripts and the C compilers they drive. Build scripts run as
+  their own step, overlapping their package's dependencies, and rerun only when
+  what they watch changes; no new compiler starts while memory is short; a build
+  that left cores idle names the chain of crates responsible (§12).
 - `build`, `check`, `test` (unit, integration, bin, example, doc tests; test
   binaries run the moment they link), `run`, `bench`, `doc`, `clippy`, `fmt`,
   `install`, `clean`, `tree`, `why`, `add`, `remove`, `update`, `fetch`,
-  `generate-lockfile`, `metadata`, `locate-project`, `config`, `cas`, `lockfile`.
+  `generate-lockfile`, `metadata`, `locate-project`, `config`, `cas`, `lockfile`,
+  `explain`, `graph`, `outdated`, `upgrade`, `unused`, `sbom` (§12).
 - Cargo's selection flags, `--locked/--offline/--frozen`, `--target`,
   `--ignore-rust-version`, `--timings` (with a Chrome trace of the schedule),
   `--deps-only`, `--message-format json`.
 - Several `rune` processes on one project at once: no directory lock, atomic file
   replacement, per-unit locks, results shared through the store (§8).
 - `rune doctor` (toolchain/linker/profile/machine diagnosis), `rune cas du`,
-  `rune watch`, `rune affected --since`, `rune script` (single-file scripts), and
-  install advice when a build script fails on a missing system package, opt-in
-  cached test results, and a shared store (`cas.remote`, a directory or **Cairn**
-  servers — the companion project in `../cairn`) for CI and teams.
+  `rune watch`, `rune affected --since [--partition N/M]`, `rune script`
+  (single-file scripts), and install advice when a build script fails on a
+  missing system package, opt-in cached test results, test retries with flaky
+  detection and JUnit/JSON reports, `rune cas export/import` bundles for CI
+  caches, and a shared store (`cas.remote`, a directory or **Cairn** servers —
+  the companion project in `../cairn`) for CI and teams.
 
 **Manifests, workspaces, targets** — the full compilation-relevant manifest, from
 `Cargo.toml` or from a `Rune.toml` (a Rune-only project needs no `Cargo.toml`);
@@ -75,7 +82,7 @@ set, dependency edges, ordering and format (a regenerated lock differs only
 where crates.io has published newer releases than the ones pinned).
 
 **Proof points**
-- 353 automated tests (`cargo test --workspace` and `rune test` both pass),
+- 430 automated tests (`cargo test --workspace` and `rune test` both pass),
   including end-to-end tests for build scripts, host/target roles, features per
   selection, git (tag/branch/rev/submodules/foreign workspaces), patches,
   local/vendored/authenticated registries, wrappers, runners, config, CAS
@@ -88,9 +95,10 @@ where crates.io has published newer releases than the ones pinned).
   `bindgen`, `cxx`, bundled SQLite, `libz-sys` + CoreFoundation, `pyo3`
   extension module and embedded Python, `cbindgen` + staticlib/cdylib used from C,
   `libloading` plugins.
-- Rune builds and tests **itself** (182 units, 208 tests) from an empty CAS
+- Rune builds and tests **itself** (183 units, 430 tests) from an empty CAS
   against live crates.io, restores everything from the CAS after `rm -rf
-  .rune/target` (0 compiled), and a no-op build takes ~0.02 s.
+  .rune/target` (0 compiled, 76 ms), and a no-op build takes ~50 ms of wall
+  time (Cargo: 180–230 ms) — §12.
 
 ---
 
@@ -116,12 +124,12 @@ where crates.io has published newer releases than the ones pinned).
 | 16 | Host vs target | ✅ | Distinct host units (build scripts, proc-macros, their deps) with their own features/profile/flags. |
 | 17 | Target support | 🟡 | Any rustc target (delegated to rustc), exact `cfg`, target rustflags/linker/runner ✅. Custom JSON targets: identity implemented, end-to-end unverified (needs nightly `build-std`). |
 | 18 | `cfg` configuration | ✅ | From `rustc --print=cfg` for the target and flags; `rustc-cfg`/`rustc-check-cfg` supported. |
-| 19 | Build scripts | ✅ | All directives, environment, captured output, shared run, cached results. |
-| 20 | Build script outputs | ✅ | Generated files restored from the CAS; result identity via declared inputs. |
+| 19 | Build scripts | ✅ | All directives, environment, captured output, shared run, cached results; a separate step as in Cargo (§12). |
+| 20 | Build script outputs | ✅ | Generated files restored from the CAS; a result is keyed by the script's configuration, build-dependencies, `DEP_*` values and — with `rerun-if-changed` — exactly the watched files and its own sources (§12). |
 | 21 | Input tracking | 🟡 | `rerun-if-*`, native libs, tools ✅. **Undeclared reads are not detected** — needs tracing/sandbox (M1). |
 | 22 | Non-hermetic builds | 🟡 | Declared external state is keyed; there is no explicit "cannot prove ⇒ never share" class yet (M1). |
 | 23 | Proc macros | ✅ | Host artifacts with their own key. |
-| 24 | Native code | 🟡 | Works through build scripts (`cc`/`cmake`/`bindgen`/`pkg-config`). Identity covers `$CC` and `$AR` only. |
+| 24 | Native code | 🟡 | Works through build scripts (`cc`/`cmake`/`bindgen`/`pkg-config`). Identity covers `$CC`, `$AR` and on macOS the developer directory, its clang and the SDK (§12). |
 | 25 | Native libraries | ✅ | `links`, `rustc-link-*`, `DEP_*`; system library files fingerprinted. |
 | 26 | `DEP_*` metadata | ✅ | Reproduced; flows into dependents through the dependency's key. |
 | 27 | Compiler identity | ✅ | Path, `-vV`, `librustc_driver` fingerprint. |
@@ -163,7 +171,7 @@ where crates.io has published newer releases than the ones pinned).
 | 64 | MSRV | ✅ | `rust-version` enforced (`--ignore-rust-version` overrides); resolver 3 prefers compatible versions. |
 | 65 | Toolchain selection | ✅ | `rust-toolchain(.toml)` through `rustup which rustc`; toolchain identity in the key. |
 | 66 | Environment-dependent builds | ✅ | Only declared/read variables are keyed; the whole environment is not. |
-| 67 | Native tool identity | 🟡 | `cc`/`ar` (path, size, mtime, `--version`); `cmake`, `nasm`, `pkg-config`, `ld`/`lld`, SDKs ⬜ (M1). |
+| 67 | Native tool identity | 🟡 | `cc`/`ar` (path, size, mtime, `--version`); macOS developer directory, clang and SDK; Apple deployment targets and `SDKROOT` for Apple targets (§12). `cmake`, `nasm`, `pkg-config`, `ld`/`lld` ⬜ (M1). |
 | 68 | Environment vs identity | ✅ | |
 | 69 | Lookup algorithm | ✅ | A hit is an identity match. |
 | 70 | Correctness rule | ✅ | False rebuilds are accepted, false hits are not. |
@@ -204,15 +212,16 @@ projects like compiled artifacts.
 
 **G6 — Platforms.** *macOS (aarch64):* the full test suite passes, Rune builds
 and restores itself, and Cargo's `split-debuginfo = "unpacked"` default is applied
-(§10). Still to do: macOS SDK identity (`SDKROOT`, `xcrun`) in native tool
-identity, `rpath`/`.dylib` end-to-end tests, a CI job. *Windows:* path handling,
+(§10); the deployment target, SDK and developer tools are part of the identity
+(§12). Still to do: `rpath`/`.dylib` end-to-end tests, a CI job. *Windows:* path handling,
 `.exe`/`.dll` artifact names, CI matrix — not started.
 
 **G7 — Custom targets end to end (§17, §40).** A nightly CI job building a
 `no_std` project for a JSON target with `-Zbuild-std`.
 
-**G8 — Newer Cargo surface.** `rune vendor` ✅ (§11). Still: `trim-paths`
-(unstable in Cargo too), `hint-mostly-unused`, `-Z` unit-graph output,
+**G8 — Newer Cargo surface.** `rune vendor` ✅ (§11); the unit graph as JSON ✅
+(`rune graph --units --format json`, Rune's own schema, §12). Still: `trim-paths`
+(unstable in Cargo too), `hint-mostly-unused`, Cargo's `--unit-graph` schema,
 `--future-incompat-report`, `[hints]`.
 
 ---
@@ -234,14 +243,18 @@ a test or benchmark before they are claimed in the README.
 | P2 check ⇄ build sharing | ✅ `check` after `build` compiles nothing (Rune itself: 148 → 0 units, 6.1 s → 0.3 s); tested end to end (§10). `build` after `check` still compiles, as it must. |
 | P3 concurrent processes | ✅ fixed and tested (§8): it was a real bug — 3 of 4 concurrent builds failed. |
 | P4 debuginfo | ✅ dependencies default to `line-tables-only` (−10 % cold build); `split-debuginfo = "unpacked"` on macOS (−11 %, §10); `rune doctor` covers linkers. Link-step caching ⬜. |
-| P5 self-diagnosis | 🟡 `rune doctor`, `--timings` trace. The "slow build" hint ⬜. |
+| P5 self-diagnosis | ✅ `rune doctor`; a build that left cores idle names the chain of crates responsible; `--timings` writes an HTML timeline with that chain highlighted; `rune explain` (§12). |
 | P6 disk | 🟡 `rune cas du` ✅; gc by last use already existed; pinning, zstd ⬜. |
-| P7 CI/Docker | 🟡 `rune build --deps-only` ✅; `cas export/import` ⬜. |
+| P7 CI/Docker | ✅ `rune build --deps-only`; `rune cas export/import` bundles (§12). |
 | P8 path in keys | 🟡 verified: keys do **not** contain the checkout path (a shared store works across paths). Artifacts still embed absolute paths in debuginfo/panics; remapping is only needed for byte-identical builds. |
-| P17 machine interface | 🟡 `--message-format json` ✅; `rune unit-graph`, `rune-api` ⬜. |
+| P17 machine interface | 🟡 `--message-format json` for build/check/test ✅, `rune graph --units --format json` ✅ (§12); `rune-api` ⬜. |
 | P1 early cutoff | ⛔ not possible on stable (see P1): `.rmeta` changes on any edit. |
 | P9 cached tests | 🟡 opt-in `--cached` ✅ (285 tests: 8 s → 0.26 s); default-on needs G1. |
-| P15 sandbox, P10–P14, P16 | ⬜ |
+| P11 unused dependencies | ✅ `rune unused [--fix]` on rustc's own lint (§12). |
+| P12 upgrading | ✅ `rune outdated`, `rune upgrade [--incompatible]`; `rune add` lists the release's features (enabled ones marked, as Cargo does), its `rust-version` and publication date (§12). Licence and download trend ⬜ (not in the index). |
+| P15 build-time code | 🟡 `rune tree --exec-surface`, `resolve.min-release-age` ✅ (§12); the sandbox ⬜. |
+| P16 provenance | 🟡 `rune sbom` (CycloneDX/SPDX) ✅ (§12); attestation, reproducibility check ⬜. |
+| P10, P13, P14 | ⬜ |
 
 ### 4.1 Build speed and feedback loop
 
@@ -478,7 +491,7 @@ breakdown of the last stored key against the current one: "rebuilt because
 differs". Needs G4's recorded breakdown. This is the single feature that makes
 the cache trustworthy to users.
 
-**F3 — Remote / read-through CAS.** ✅ *(shared directory and HTTP; see §8 and the companion project **Cairn**, `../cairn`)* Done: a shared directory; an HTTP backend with bearer tokens (read/write roles), client-side sharding by rendezvous hashing with replicas, failover and a circuit breaker; and the Cairn server (integrity checks, LRU eviction, peers with read-through and replication, metrics). Still to do: TLS in Cairn itself (today: a reverse proxy), signed manifests, S3-compatible backends, cluster-wide eviction, `rune cas export/import`. A "trusted peer" mode lets a team share proc-macro and `-sys` builds, the most expensive units.
+**F3 — Remote / read-through CAS.** ✅ *(shared directory and HTTP; see §8 and the companion project **Cairn**, `../cairn`)* Done: a shared directory; an HTTP backend with bearer tokens (read/write roles), client-side sharding by rendezvous hashing with replicas, failover and a circuit breaker; and the Cairn server (integrity checks, LRU eviction, peers with read-through and replication, metrics). Still to do: TLS in Cairn itself (today: a reverse proxy), signed manifests, S3-compatible backends, cluster-wide eviction, `rune cas export/import` ✅ (§12). A "trusted peer" mode lets a team share proc-macro and `-sys` builds, the most expensive units.
 
 **F4 — `rune watch`.** ✅ *(polling; `-x` commands, restart on change, `--ignore`)* Rebuild/check/test on save using the same CAS, so
 reverting an edit or switching branches is instantaneous (a `bacon`/`cargo-watch`
@@ -489,12 +502,12 @@ block for dependencies (the format Cargo is stabilising), compiled through the
 normal pipeline and cached in the CAS; `#!/usr/bin/env rune` shebang. Runs in
 milliseconds after the first time.
 
-**F6 — `rune affected --since <git-ref>`.** ✅ *(package level: owner + transitive dependents; `--partition N/M` still to do)* Given a diff, print the packages
+**F6 — `rune affected --since <git-ref>`.** ✅ *(package level: owner + transitive dependents; `--partition N/M` ✅ §12)* Given a diff, print the packages
 whose unit keys change — exactly, not by path heuristics — so CI can build and
 test only what a PR can influence, and `--partition N/M` to shard tests over CI
 machines.
 
-**F7 — A better test runner.** Per-test parallelism, retries and flaky-test
+**F7 — A better test runner.** 🟡 *(retries with flaky marking, JUnit XML, JSON results, slowest binaries ✅ §12; scheduling single tests across binaries ⬜)* Per-test parallelism, retries and flaky-test
 marking, JUnit/JSON output, slowest-tests summary, `--fail-fast` iteration mode
 (all named in the Cargo vision post or done today by `cargo-nextest`). Runs
 inside the pipelined runner already in `rune test`.
@@ -508,7 +521,7 @@ a C compiler is missing, recognise the failure and say which package to install
 for the detected distro ("`openssl-sys` needs `libssl-dev` / `openssl-devel`").
 Among the commonest first-run failures for newcomers.
 
-**F10 — Timings and regression tracking.** Export Chrome-trace / OpenTelemetry
+**F10 — Timings and regression tracking.** 🟡 *(Chrome trace, HTML timeline with the critical chain ✅ §12; `--compare` ⬜)* Export Chrome-trace / OpenTelemetry
 spans; `rune timings --compare <ref>` to fail CI when the build gets slower by a
 threshold; feed the same data into the scheduler (already weighted by measured
 compile times).
@@ -518,7 +531,7 @@ compile times).
 yank`/`owner`/`login`. `audit`, `deny`, `outdated`, `coverage` run as the usual
 Cargo plugins through external subcommands; built-in versions are not planned.
 
-**F12 — Workspace ergonomics.** `rune graph` (DOT/Mermaid of packages and
+**F12 — Workspace ergonomics.** 🟡 *(`rune graph` ✅ §12)* `rune graph` (DOT/Mermaid of packages and
 units), `rune run -p x` from anywhere, `[workspace.metadata.rune]` for
 Rune-only settings so plain `cargo` users are unaffected, `rune new --template`
 (including the "mod-level templates" idea from the vision post).
@@ -541,10 +554,10 @@ and cache lookups for IDEs, Bazel-style wrappers and corporate tooling (see P17)
 | **M2** | Ecosystem confidence | G2 + a compatibility corpus: build the top ~500 crates (and their tests) with Rune vs Cargo in CI; fix every divergence; backtracking resolver. |
 | **M3** | Registry & tooling | *Done:* `install`/`uninstall`, `package`, `publish`, `login`/`logout`, `yank`, `owner`, `search`, `info`, `vendor`, `pkgid`, `verify-project`, external subcommands and aliases (§11). *Open:* the rest of G3. |
 | **M4** | Observability | G4 + `rune cas inspect`, `rune explain-miss` (F2), structured diagnostics. |
-| **M5** | Sharing | *Done:* shared-directory store ✅, HTTP backend ✅, **Cairn** server with peers/replication/sharding ✅, `--deps-only` ✅. *Open:* signed manifests, TLS in Cairn, S3 backend, `cas export/import` (P7); G5 shared documentation. |
-| **M6** | Platforms | *Started:* macOS aarch64 test suite passes, Apple debuginfo default ✅. *Open:* G6 (Windows, macOS SDK identity) + G7 + CI on Windows/macOS; `-Zbuild-std` in the CAS (F8). |
-| **M7** | Daily driver | *Started:* P3 concurrency ✅, P4–P6 `rune doctor`/`cas du`/dependency debuginfo ✅, `--message-format=json` ✅, `--deps-only` ✅. `rune watch` ✅, scripts ✅, `rune affected` ✅, build-script hints ✅, P2 check ⇄ build ✅, `fix`/`clippy --fix`/`clippy -- flags`/`fmt -- --check`/`rustc`/`rustdoc`, `update --precise`, `add --git/--rename/--target`, status on stderr (§11). *Open:* better test runner (F7), JSON for `test`. Start this before M4–M6: it is what users feel first. |
-| **M8** | Supply chain | P15/P16: sandbox as a security boundary, exec-surface report, `min-release-age`, SBOM/attestation, reproducibility check. Builds on M1. |
+| **M5** | Sharing | *Done:* shared-directory store ✅, HTTP backend ✅, **Cairn** server with peers/replication/sharding ✅, `--deps-only` ✅. `cas export/import` ✅ (§12). *Open:* signed manifests, TLS in Cairn, S3 backend; G5 shared documentation. |
+| **M6** | Platforms | *Started:* macOS aarch64 test suite passes, Apple debuginfo default ✅, Apple deployment target/SDK identity ✅ (§12). *Open:* G6 (Windows, macOS SDK identity) + G7 + CI on Windows/macOS; `-Zbuild-std` in the CAS (F8). |
+| **M7** | Daily driver | *Started:* P3 concurrency ✅, P4–P6 `rune doctor`/`cas du`/dependency debuginfo ✅, `--message-format=json` ✅, `--deps-only` ✅. `rune watch` ✅, scripts ✅, `rune affected` ✅, build-script hints ✅, P2 check ⇄ build ✅, `fix`/`clippy --fix`/`clippy -- flags`/`fmt -- --check`/`rustc`/`rustdoc`, `update --precise`, `add --git/--rename/--target`, status on stderr (§11). Test runner retries/flaky/JUnit/JSON, `outdated`/`upgrade`, `unused`, `graph`, `explain` ✅ (§12). *Open:* per-test scheduling, `rune features` (P10). |
+| **M8** | Supply chain | *Done (§12):* exec-surface report, `min-release-age`, SBOM. *Open:* sandbox as a security boundary, attestation, reproducibility check. Builds on M1. |
 | **M9** | Faster than Cargo on edits | P9 cached tests: opt-in ✅, default-on after M1. P1 early cutoff is blocked on compiler support, see P1. |
 
 ---
@@ -552,7 +565,7 @@ and cache lookups for IDEs, Bazel-style wrappers and corporate tooling (see P17)
 ## 7. How to verify the current state
 
 ```bash
-cargo test --workspace                       # 353 tests, no network needed
+cargo test --workspace                       # 430 tests, no network needed
 cargo clippy --workspace --all-targets
 
 # Rune builds and tests itself against live crates.io (use a scratch copy
@@ -888,3 +901,141 @@ error. `rune doc --open` used `xdg-open` everywhere.
 **Not done:** Windows, full PubGrub, P8 `trim-paths` (unstable in Cargo too),
 structured diagnostics (G4), JSON test output, `-Z` flags, config `include`,
 OS keychain credential providers.
+
+## 12. What changed in the build-speed and tooling update (2026-09-28)
+
+Asked for: use the whole machine (a 32 GB Apple M5 barely saw its CPU and
+memory used), make Rune faster, and close roadmap items. Developed and measured
+on Linux x86_64 with **4 cores** and 15 GB, rustc 1.98.1, on Rune's own
+workspace unless stated. The M5 was not available: numbers there will differ,
+and what to expect is said where it matters.
+
+**What limits a build is rarely the job count.** On 4 cores a cold build of
+Rune's own workspace keeps the machine ~86 % busy with Rune and with Cargo alike
+(55.3–55.7 s vs Cargo's 54.4–55.0 s,
+two runs each, empty store; 170 s vs 168 s of CPU, of which Rune's own process
+2.6 s and Cargo's 1.3 s). With more cores, what stops a build from using them is the chain
+of crates that must be compiled one after another and the one-core front end of
+each large crate — no job count changes that on stable Rust. So this update
+removes what made Rune's chains longer than they need to be, keeps memory from
+becoming the limit, and makes the remaining limit visible:
+- *Build scripts are their own step*, as in Cargo. A crate with a `build.rs`
+  used to start only once every transitive dependency was compiled and
+  linked, then compiled and ran its script, then itself — disabling `.rmeta`
+  pipelining for `serde`, `serde_json`, `proc-macro2`, `libc`, `anyhow`,
+  `rustix`, … and putting every script on the critical path. The script now
+  starts once its build-dependencies are built, overlapping the package's other
+  dependencies; the library starts when their metadata exists. The unit's lock
+  is held across both steps; lock waits no longer occupy job slots.
+- *Results are stored after dependents are released*, and the store hard-links
+  the compiler's fresh outputs instead of copying them.
+- *Memory*: before starting another compiler the scheduler checks available
+  memory (Linux `MemAvailable`, macOS memory pressure) and while it is below a
+  tenth of the machine (1–4 GiB) lets running units finish first. It never
+  holds back with nothing running. A test reports memory short and sees four
+  crates built one at a time (3.7 at once without the check).
+- *Seeing the limit*: every step's ready/start/metadata/finish times are
+  recorded, and the chain of steps that set the build's length is found. A
+  build over 10 s that kept fewer than 60 % of the cores busy says so in one
+  line with that chain; `--timings` prints it and writes
+  `.rune/timings/rune-timing.html`.
+- *Front-end threads* (`build.frontend-threads`, nightly only): `auto` gives a
+  crate that starts while cores are idle as many `-Z threads` as there are idle
+  cores. On 4 cores it kept the tail busy but saved nothing (47.4 s vs 47.9 s);
+  with 10 cores and a long single-crate tail it has more room. Off by default.
+- `build.jobs` stays CPUs + ⅓ (13 on a 10-core M5), and each `rustc` borrows
+  idle jobserver slots for its codegen threads, so a lone compiler at the end
+  of a build is not limited to one thread in its backend.
+
+**Less work per command.**
+- *No-op build 137 → 49 ms* (Cargo: 179 ms). Every command used to start
+  `rustc` four times through the rustup proxy before doing anything, and `cc`/
+  `ar` for their versions. Probes are now cached in
+  `RUNE_HOME/cache/toolchains.json`, trusted only while the sysroot's `rustc`
+  and `librustc_driver` are unchanged, and `rustc` is started from its sysroot
+  (no proxy per unit, one compiler for the whole build even if rustup updates
+  mid-build).
+- *Build scripts compile beside `OUT_DIR`*, not into it: the compiled script was
+  part of what the store kept for the script's result (106 MB of the 111 MB
+  under `build/`). CAS after a cold build: 830 → 724 MB.
+- *Build scripts rerun only when what they watch changes.* A script's result is
+  keyed by its configuration, build-dependencies and `DEP_*` values, plus — when
+  it declared `rerun-if-changed` — the watched files and its own sources (from
+  rustc's dep-info). Editing `src/` of a crate with a `build.rs` no longer
+  recompiles and reruns the script; a script that declared nothing still reruns
+  on any change of its package, as with Cargo; a script that must rerun because
+  a watched file changed is not recompiled. Edit-rebuild of a leaf crate with a
+  build script: **0.70 s → 0.19 s** (Cargo: 0.24 s).
+
+**Correctness.**
+- rustc writes `MACOSX_DEPLOYMENT_TARGET` (and the iOS/tvOS/watchOS/visionOS
+  equivalents) into every object and links against `SDKROOT` without listing
+  either in its dep-info (verified: the object bytes differ, the dep-info does
+  not), so an artifact built for one macOS version was reused for another. Units
+  compiled for Apple targets include those variables when set.
+- On macOS `/usr/bin/cc` is a shim into the active developer directory, so its
+  fingerprint did not change when the Command Line Tools or Xcode were updated.
+  The native tool identity now covers the developer directory, the real clang and
+  the SDK (by path, size and mtime — no `xcrun` per build).
+- HTTP: every client trusts the OS certificate store next to the bundled roots
+  and honours `http.cainfo`/`CARGO_HTTP_CAINFO`/`SSL_CERT_FILE`, `http.proxy`,
+  `http.timeout`, `http.user-agent` and `net.retry`; requests are retried on
+  connection errors, timeouts, 429 and 5xx. Behind a TLS-intercepting proxy
+  every index request used to fail and was reported as "crate not found".
+- The merge of the Windows branch had left the workspace uncompilable (three
+  stray braces); fixed.
+- `rune-common` lacked the `libc` dependency its macOS memory probe needs — found
+  by `rune unused`, invisible to Linux builds.
+
+**Commands.**
+- `rune outdated` / `rune upgrade [--incompatible] [--pinned] [--dry-run]`:
+  newer releases per declared dependency (honouring `rust-version`), and
+  requirements raised in place with their style and comments kept, then only
+  those crates re-resolved. Rune's 34 declared dependencies: 0.19 s.
+- `rune unused [--fix]`: rustc's `unused_crate_dependencies` lint over every
+  target of the workspace's packages; a dependency is unused when every
+  compilation given it reports it; one used only by tests is suggested as a
+  dev-dependency; a name still appearing in the sources is reported, never
+  removed. It found 23 in Rune's own crates, each confirmed by hand.
+- `rune sbom` (CycloneDX 1.5 / SPDX 2.3), `rune tree --exec-surface` (32 of 187
+  packages in Rune's graph run code at build time), `resolve.min-release-age`
+  (from the index's `pubtime`; locked versions stay).
+- `rune test --retries N` (flaky tests are warned about, not failed),
+  `--junit PATH`, `--message-format json` results per binary, the three slowest
+  binaries after a run of 5 s or more.
+- `rune cas export/import`: the store entries a build needs as one (gzip) tar,
+  imported as untrusted (paths, hashes, whole trees checked). Rune's workspace:
+  219 entries, 739 MiB (231 MiB gzipped), export 0.9 s, import 1.4 s, then a
+  clean checkout builds with 0 compiled. Build-script results travel too.
+- `rune affected --partition N/M` for sharding CI.
+- `rune add` lists the added release's features with the enabled ones marked,
+  as `cargo add` does (a crate with hundreds, like `windows-sys`, gets the
+  enabled ones and a count), plus its `rust-version` and publication date.
+- `rune graph`: the package graph (as locked; build/dev edges apart) or, with
+  `--units`, the units a build would run coloured by cache state, as DOT,
+  Mermaid or JSON — the JSON unit graph is a machine-readable build plan.
+- Build scripts' compiler output is captured (a failure shows it; warnings of a
+  workspace package's script are shown and replayed), and `cargo::warning=` of
+  workspace packages is shown.
+
+**Measured end to end (4 cores, Rune's own workspace, 183 units):**
+
+| | Rune | Cargo |
+| --- | --- | --- |
+| cold build, empty store | 55.3–55.7 s | 54.4–55.0 s |
+| no-op build | 53 ms | 231 ms |
+| after deleting the target directory | 76 ms (0 compiled) | a cold build |
+| `check` after `build` | 58 ms | compiles the workspace again |
+| edit a crate with a build script, rebuild | 0.19 s | 0.24 s |
+| `rune test` of the workspace | 429 passed, 52 s | |
+
+On a 10-core M5 a cold build is limited by the chain of crates rather than by
+the cores (the one-line hint and `--timings` show which); everything a store
+hit or a smaller rebuild saves above holds there as well.
+
+**Tests:** 430 (77 new), passing under `cargo test` and under `rune test` on
+Rune's own workspace; clippy clean.
+
+**Not done:** Windows; the sandbox (G1) and with it default-on cached tests;
+a PubGrub resolver; scheduling single tests across binaries; `rune features`
+(P10); zstd and pinning in the store (P6); measurements on the M5 itself.
