@@ -1106,6 +1106,9 @@ impl BuildExecutor {
             let (base, key) = self.compute_keys(graph, id, &keys, &mut source_cache, false);
             out.extend([
                 key.clone(),
+                // The script output a cache hit of the unit restores (for its
+                // dependents' `DEP_*`, link paths and `OUT_DIR`).
+                format!("{key}-buildscript"),
                 format!("{key}-warnings"),
                 format!("{key}-diagnostics"),
                 format!("{base}-inputs"),

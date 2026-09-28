@@ -5415,3 +5415,67 @@ fn store_entries_unused_for_a_month_are_removed_in_the_background() {
     assert!(old.iter().all(|m| !m.exists()), "unused entries removed");
     assert!(current.iter().all(|m| m.exists()), "what builds use stays");
 }
+
+#[test]
+fn a_cached_dependencys_script_output_still_reaches_rebuilt_dependents() {
+    let p = Project::new();
+    p.write(
+        "Cargo.toml",
+        "[workspace]\nresolver = \"2\"\nmembers = [\"app\", \"sys\"]\n",
+    );
+    p.write(
+        "sys/Cargo.toml",
+        "[package]\nname = \"sys\"\nversion = \"0.1.0\"\nedition = \"2021\"\nlinks = \"sysx\"\n",
+    );
+    p.write(
+        "sys/build.rs",
+        "fn main() {\n    println!(\"cargo::rerun-if-changed=build.rs\");\n    println!(\"cargo::metadata=greeting=hello\");\n}\n",
+    );
+    p.write("sys/src/lib.rs", "");
+    p.write(
+        "app/Cargo.toml",
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\nsys = { path = \"../sys\" }\n",
+    );
+    // Reruns on any change of its package, and needs `sys`'s metadata.
+    p.write(
+        "app/build.rs",
+        "fn main() {\n    let g = std::env::var(\"DEP_SYSX_GREETING\").expect(\"DEP_SYSX_GREETING\");\n    println!(\"cargo::rustc-env=GREETING={g}\");\n}\n",
+    );
+    p.write(
+        "app/src/main.rs",
+        "fn main() { println!(\"{}\", env!(\"GREETING\")); }\n",
+    );
+    p.ok(&["build"]);
+    // Only `app` changes: `sys` comes from the store, its script does not
+    // run again, and `app`'s script must still see what it reported.
+    p.write(
+        "app/src/main.rs",
+        "fn main() { println!(\"{} again\", env!(\"GREETING\")); }\n",
+    );
+    let out = p.ok(&["run", "-p", "app"]);
+    assert!(out.contains("hello again"), "{out}");
+
+    // The same on a machine that got the store from a bundle.
+    let bundle = p.home().join("bundle.tar");
+    p.ok(&["cas", "export", "-o", bundle.to_str().unwrap()]);
+    let fresh = tempfile::tempdir().unwrap();
+    std::fs::remove_dir_all(p.path().join(".rune")).unwrap();
+    let rune = |args: &[&str]| {
+        let out = Command::new(env!("CARGO_BIN_EXE_rune"))
+            .args(args)
+            .current_dir(p.path())
+            .env("RUNE_HOME", fresh.path())
+            .env("NO_COLOR", "1")
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{}", text(&out));
+        text(&out)
+    };
+    rune(&["cas", "import", bundle.to_str().unwrap()]);
+    p.write(
+        "app/src/main.rs",
+        "fn main() { println!(\"{} once more\", env!(\"GREETING\")); }\n",
+    );
+    let out = rune(&["run", "-p", "app"]);
+    assert!(out.contains("hello once more"), "{out}");
+}
