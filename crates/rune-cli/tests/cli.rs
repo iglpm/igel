@@ -5479,3 +5479,34 @@ fn a_cached_dependencys_script_output_still_reaches_rebuilt_dependents() {
     let out = rune(&["run", "-p", "app"]);
     assert!(out.contains("hello once more"), "{out}");
 }
+
+#[test]
+fn json_messages_report_build_scripts_for_rust_analyzer() {
+    let p = build_script_project();
+    let executed = |p: &Project| -> Vec<serde_json::Value> {
+        let out = p.rune(&["check", "--message-format", "json"]);
+        assert!(out.status.success(), "{}", text(&out));
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter(|v| v["reason"] == "build-script-executed")
+            .collect()
+    };
+    // Fresh, and again when everything comes from the store: once each time.
+    for _ in 0..2 {
+        let lines = executed(&p);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        let m = &lines[0];
+        assert!(
+            m["package_id"]
+                .as_str()
+                .unwrap()
+                .contains("#demo@1.2.3-beta.1"),
+            "{m}"
+        );
+        assert_eq!(m["cfgs"], serde_json::json!(["from_script"]), "{m}");
+        assert_eq!(m["env"], serde_json::json!([["SCRIPT_VAR", "ok"]]), "{m}");
+        let out_dir = PathBuf::from(m["out_dir"].as_str().unwrap());
+        assert!(out_dir.join("generated.rs").is_file(), "{m}");
+    }
+}

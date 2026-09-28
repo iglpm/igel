@@ -177,6 +177,38 @@ pub fn lines_for(
     }
 }
 
+/// Cargo's `build-script-executed` line: what a package's build script
+/// reported and where its `OUT_DIR` is — what rust-analyzer reads to resolve
+/// `include!(concat!(env!("OUT_DIR"), ...))` and script-set cfgs.
+pub fn build_script_executed(
+    unit: &CompilationUnit,
+    output: &rune_common::BuildScriptOutput,
+    out_dir: &std::path::Path,
+) -> String {
+    let spell = |kind: &Option<String>, value: String| match kind {
+        Some(k) => format!("{k}={value}"),
+        None => value,
+    };
+    json!({
+        "reason": "build-script-executed",
+        "package_id": package_id(unit),
+        "linked_libs": output
+            .link_libs
+            .iter()
+            .map(|l| spell(&l.kind, l.name.clone()))
+            .collect::<Vec<_>>(),
+        "linked_paths": output
+            .link_search
+            .iter()
+            .map(|l| spell(&l.kind, l.path.display().to_string()))
+            .collect::<Vec<_>>(),
+        "cfgs": output.cfgs,
+        "env": output.env_vars.iter().map(|(k, v)| [k, v]).collect::<Vec<_>>(),
+        "out_dir": out_dir,
+    })
+    .to_string()
+}
+
 /// The closing line of a build.
 pub fn build_finished(success: bool) -> String {
     json!({ "reason": "build-finished", "success": success }).to_string()

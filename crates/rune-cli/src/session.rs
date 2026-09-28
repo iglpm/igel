@@ -308,6 +308,7 @@ pub fn drive(
 
         let mut progress = (!sess.quiet && !sess.json)
             .then(|| BuildProgress::new(ui::multi_progress(), graph.node_count() as u64));
+        let mut scripts_reported: std::collections::HashSet<String> = Default::default();
         while let Ok(event) = event_rx.recv() {
             let is_final = matches!(event, PipelineEvent::AllComplete { .. });
             if sess.json {
@@ -323,6 +324,25 @@ pub fn drive(
                         crate::messages::lines_for(unit, sess.config(), &sess.profile, &event)
                     {
                         println!("{line}");
+                    }
+                }
+                if let PipelineEvent::ScriptOutput { node_id, output } = &event {
+                    let unit = &graph.node(*node_id).unit;
+                    let owner = unit
+                        .ext
+                        .script_owner
+                        .clone()
+                        .unwrap_or_else(|| rune_scheduler::executor::script_key(unit));
+                    // Once per script, however many of its package's units
+                    // report it.
+                    if scripts_reported.insert(owner.clone()) {
+                        let out_dir = sess
+                            .config()
+                            .build_script_out_dir_by_key(sess.profile.output_dir_name(), &owner);
+                        println!(
+                            "{}",
+                            crate::messages::build_script_executed(unit, output, &out_dir)
+                        );
                     }
                 }
                 if let PipelineEvent::AllComplete { failed, .. } = &event {
