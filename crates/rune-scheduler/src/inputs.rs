@@ -354,7 +354,9 @@ pub fn env_reads_from_dep_info(dep_info: &Path, provided: &dyn Fn(&str) -> bool)
 
 /// Whether a dep-info file lists the package manifest as something the
 /// compiler read (`include_str!("../Cargo.toml")`).
-pub fn reads_manifest(dep_info: &Path, manifest: &Path) -> bool {
+/// Relative paths in it are relative to `base`, the directory the compiler
+/// ran in.
+pub fn reads_manifest(dep_info: &Path, manifest: &Path, base: &Path) -> bool {
     let Ok(text) = std::fs::read_to_string(dep_info) else {
         return false;
     };
@@ -365,8 +367,8 @@ pub fn reads_manifest(dep_info: &Path, manifest: &Path) -> bool {
         .map(|t| t.trim_end_matches(':'))
         .filter(|t| t.ends_with("Cargo.toml") || t.ends_with("Rune.toml"))
         .any(|t| {
-            let p = Path::new(t);
-            std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf()) == wanted
+            let p = base.join(t);
+            std::fs::canonicalize(&p).unwrap_or(p) == wanted
         })
 }
 

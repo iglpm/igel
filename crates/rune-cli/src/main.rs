@@ -20,7 +20,9 @@ mod doctor;
 mod external;
 mod fix;
 mod graph;
+mod help;
 mod messages;
+mod pager;
 mod script;
 mod session;
 mod test_cache;
@@ -29,6 +31,7 @@ mod ui;
 mod workspace;
 
 use clap::Parser;
+use std::ffi::OsString;
 
 use args::{Cli, Commands};
 use graph::Mode;
@@ -43,13 +46,20 @@ fn main() {
     }
     ui::setup_logging();
 
-    let cli = Cli::parse_from(external::expand(std::env::args_os().collect()));
-    rune_common::cargo_config::set_cli_overrides(cli.config_overrides.clone());
-    match cli.color.as_str() {
-        "always" => colored::control::set_override(true),
-        "never" => colored::control::set_override(false),
-        _ => {}
+    let args = external::expand(std::env::args_os().collect());
+    apply_color_flag(&args);
+    if help::intercept(&args) {
+        return;
     }
+    let cli = match Cli::try_parse_from(&args) {
+        Ok(cli) => cli,
+        Err(e) if e.kind() == clap::error::ErrorKind::DisplayHelp => {
+            help::show_clap(&e);
+            return;
+        }
+        Err(e) => e.exit(),
+    };
+    rune_common::cargo_config::set_cli_overrides(cli.config_overrides.clone());
 
     let result = match cli.command {
         Commands::Build(a) => cmd_build::build(a, Mode::Build),
@@ -76,6 +86,7 @@ fn main() {
         Commands::Tree(a) => cmd_deps::tree(a),
         Commands::Graph(a) => cmd_graph::graph(a),
         Commands::Why(a) => cmd_deps::why(a),
+        Commands::Features(a) => cmd_deps::features(a),
         Commands::Fetch(a) => cmd_deps::fetch(a),
         Commands::GenerateLockfile(a) => cmd_deps::generate_lockfile(a),
         Commands::LocateProject(a) => cmd_deps::locate_project(a),
@@ -107,5 +118,34 @@ fn main() {
     if let Err(err) = result {
         ui::error(format!("{err:#}"));
         std::process::exit(1);
+    }
+}
+
+/// `--color` takes effect before anything is printed, help included.
+fn apply_color_flag(args: &[OsString]) {
+    let mut words = args.iter().filter_map(|a| a.to_str());
+    let mut choice = None;
+    while let Some(w) = words.next() {
+        if w == "--" {
+            break;
+        }
+        if let Some(v) = w.strip_prefix("--color=") {
+            choice = Some(v.to_string());
+        } else if w == "--color" {
+            choice = words.next().map(str::to_string);
+        }
+    }
+    match choice.as_deref() {
+        Some("always") => {
+            colored::control::set_override(true);
+            console::set_colors_enabled(true);
+            console::set_colors_enabled_stderr(true);
+        }
+        Some("never") => {
+            colored::control::set_override(false);
+            console::set_colors_enabled(false);
+            console::set_colors_enabled_stderr(false);
+        }
+        _ => {}
     }
 }

@@ -49,8 +49,14 @@ pub fn client(builder: ClientBuilder) -> Client {
 /// A client created on first use: building one loads trust stores and starts
 /// an I/O thread, which a build that never touches the network should not pay
 /// for.
+///
+/// Clients are shared by everything in the process with the same `setup`
+/// and never dropped: every index client or downloader created during one
+/// command reuses the same connections (no new TLS handshakes), and exiting
+/// does not wait for a blocking client's I/O thread to shut its HTTP/2
+/// connections down — which took a second at the end of some resolutions.
 pub struct LazyClient {
-    cell: std::sync::OnceLock<Client>,
+    cell: std::sync::OnceLock<&'static Client>,
     setup: fn(ClientBuilder) -> ClientBuilder,
 }
 
@@ -65,9 +71,22 @@ impl LazyClient {
     }
 
     pub fn client(&self) -> &Client {
-        self.cell
-            .get_or_init(|| client((self.setup)(Client::builder())))
+        self.cell.get_or_init(|| shared(self.setup))
     }
+}
+
+/// The process-wide client for `setup`.
+fn shared(setup: fn(ClientBuilder) -> ClientBuilder) -> &'static Client {
+    static CLIENTS: std::sync::Mutex<Vec<(usize, &'static Client)>> =
+        std::sync::Mutex::new(Vec::new());
+    let mut clients = CLIENTS.lock().unwrap_or_else(|e| e.into_inner());
+    let key = setup as usize;
+    if let Some((_, c)) = clients.iter().find(|(k, _)| *k == key) {
+        return c;
+    }
+    let c: &'static Client = Box::leak(Box::new(client(setup(Client::builder()))));
+    clients.push((key, c));
+    c
 }
 
 impl std::ops::Deref for LazyClient {
@@ -81,7 +100,7 @@ impl Clone for LazyClient {
     fn clone(&self) -> Self {
         let cell = std::sync::OnceLock::new();
         if let Some(c) = self.cell.get() {
-            let _ = cell.set(c.clone());
+            let _ = cell.set(*c);
         }
         Self {
             cell,

@@ -13,6 +13,7 @@ use crate::session::{Session, drive, ensure_success};
 use crate::ui;
 use crate::workspace::{Member, Workspace};
 use anyhow::{Context, Result, bail};
+use colored::Colorize;
 use rune_registry::api::RegistryApi;
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
@@ -1120,32 +1121,115 @@ pub fn search(args: SearchArgs) -> Result<()> {
     let api = api_for(args.registry.as_deref(), None)?;
     let query = args.query.join(" ");
     let limit = args.limit.clamp(1, 100);
+    let activity = ui::Activity::start("searching", format!("{} for `{query}`", api.name));
     let (hits, total) = api.search(&query, limit)?;
-    let width = hits
-        .iter()
-        .map(|h| h.name.len() + h.version.len() + 5)
-        .max()
-        .unwrap_or(0);
-    for h in &hits {
-        let left = format!("{} = \"{}\"", h.name, h.version);
-        match &h.description {
-            Some(d) => {
-                let d: String = d.chars().take(80).collect();
-                println!("{left:<width$}    # {d}");
-            }
-            None => println!("{left}"),
-        }
-    }
-    if total > hits.len() as u64 {
-        println!(
-            "... and {} crates more (use --limit N to see more)",
-            total - hits.len() as u64
-        );
-    }
+    activity.clear();
     if hits.is_empty() {
         ui::warn(format!("no crates match `{query}`"));
+        return Ok(());
     }
+
+    // Piped: Cargo's lines, ready to paste into a manifest.
+    if !ui::stdout_is_term() {
+        let width = hits
+            .iter()
+            .map(|h| h.name.len() + h.version.len() + 5)
+            .max()
+            .unwrap_or(0);
+        for h in &hits {
+            let left = format!("{} = \"{}\"", h.name, h.version);
+            match &h.description {
+                Some(d) => {
+                    let d: String = d.chars().take(80).collect();
+                    ui::out(format!("{left:<width$}    # {d}"));
+                }
+                None => ui::out(left),
+            }
+        }
+        if total > hits.len() as u64 {
+            ui::out(format!(
+                "... and {} crates more (use --limit N to see more)",
+                total - hits.len() as u64
+            ));
+        }
+        return Ok(());
+    }
+
+    let mut page = crate::pager::Page::new(format!("rune search {query}")).keep_on_exit();
+    page.line(format!(
+        "{} {}",
+        ui::brand(format!("{} of {}", hits.len(), thousands(total))),
+        format!("crates matching `{query}` on {}", api.name).dimmed()
+    ));
+    page.blank();
+    let left_width = hits
+        .iter()
+        .map(|h| h.name.len() + 1 + h.version.len())
+        .max()
+        .unwrap_or(0)
+        .clamp(12, 34);
+    let text_width = ui::term_width().saturating_sub(left_width + 12).max(24);
+    for h in &hits {
+        let label = format!("{} {}", ui::brand(&h.name), h.version.dimmed());
+        let label_width = h.name.len() + 1 + h.version.len();
+        let downloads = if h.downloads > 0 {
+            format!("{:>6}", downloads(h.downloads))
+                .dimmed()
+                .to_string()
+        } else {
+            "      ".to_string()
+        };
+        let desc = h.description.as_deref().unwrap_or("");
+        let lines = ui::wrap(desc, text_width);
+        // A long name gets a line of its own.
+        let (first_label, pad) = if label_width > left_width {
+            page.line(format!("  {label}"));
+            (String::new(), left_width)
+        } else {
+            (label, left_width - label_width)
+        };
+        for (i, l) in lines.iter().enumerate() {
+            if i == 0 {
+                page.line(format!("  {first_label}{:pad$}  {downloads}  {l}", ""));
+            } else {
+                page.line(format!("  {:w$}  {:6}  {l}", "", "", w = left_width));
+            }
+        }
+    }
+    page.blank();
+    let mut tips = vec![
+        format!("{} for details", "rune info <crate>".bold()),
+        format!("{} to use one", "rune add <crate>".bold()),
+    ];
+    if total > hits.len() as u64 {
+        tips.push(format!("{} for more", "--limit 50".bold()));
+    }
+    page.line(format!("  {}", tips.join(&" · ".dimmed().to_string())));
+    page.show();
     Ok(())
+}
+
+/// `22,412`.
+fn thousands(n: u64) -> String {
+    let digits = n.to_string();
+    let mut out = String::new();
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// `12.3M` / `850k` / `42`.
+fn downloads(n: u64) -> String {
+    match n {
+        0..=999 => format!("{n}"),
+        1_000..=999_999 => format!("{}k", n / 1_000),
+        1_000_000..=99_999_999 => format!("{:.1}M", n as f64 / 1e6),
+        _ => format!("{}M", n / 1_000_000),
+    }
 }
 
 /// `rune info`: a crate's description, links, features and dependencies —
@@ -1213,11 +1297,6 @@ pub fn info(args: InfoArgs) -> Result<()> {
                 .collect()
         })
         .unwrap_or_default();
-    println!("{} {}", name, keywords.join(" "));
-    if let Some(d) = krate.and_then(|k| k["description"].as_str()) {
-        println!("{}", d.trim());
-    }
-    println!("version: {}", record.vers);
     let version_page = page.as_ref().and_then(|p| {
         p["versions"]
             .as_array()?
@@ -1225,27 +1304,76 @@ pub fn info(args: InfoArgs) -> Result<()> {
             .find(|v| v["num"].as_str() == Some(&record.vers))
             .cloned()
     });
+
+    ui::out(format!(
+        "{} {}  {}",
+        ui::brand(&name),
+        record.vers.dimmed(),
+        keywords.join(" ").dimmed()
+    ));
+    if let Some(d) = krate.and_then(|k| k["description"].as_str()) {
+        for l in ui::wrap(d.trim(), ui::term_width().min(100)) {
+            ui::out(l);
+        }
+    }
+    ui::out("");
+    let mut facts: Vec<(&str, String)> = Vec::new();
     if let Some(l) = version_page.as_ref().and_then(|v| v["license"].as_str()) {
-        println!("license: {l}");
+        facts.push(("license", l.to_string()));
     }
     if let Some(rv) = &record.rust_version {
-        println!("rust-version: {rv}");
+        facts.push(("rust", format!("{rv} or newer")));
     }
+    if let Some(t) = record.pubtime.as_deref() {
+        facts.push(("published", t.split('T').next().unwrap_or(t).to_string()));
+    }
+    let newest = versions
+        .iter()
+        .rev()
+        .find(|r| semver::Version::parse(&r.vers).is_ok_and(|v| v.pre.is_empty()))
+        .map(|r| r.vers.clone());
+    facts.push((
+        "versions",
+        match &newest {
+            Some(n) if *n != record.vers => format!(
+                "{} published, newest {n}{}",
+                versions.len(),
+                if locked.is_some() {
+                    " (this project uses the one above)".dimmed().to_string()
+                } else {
+                    String::new()
+                }
+            ),
+            _ => format!("{} published", versions.len()),
+        },
+    ));
     for (label, key) in [
-        ("documentation", "documentation"),
+        ("docs", "documentation"),
         ("homepage", "homepage"),
         ("repository", "repository"),
     ] {
         if let Some(v) = krate.and_then(|k| k[key].as_str()) {
-            println!("{label}: {v}");
+            facts.push((label, v.to_string()));
         }
     }
     if index == rune_common::CRATES_IO_INDEX {
-        println!("crates.io: https://crates.io/crates/{name}/{}", record.vers);
+        facts.push((
+            "crates.io",
+            format!("https://crates.io/crates/{name}/{}", record.vers),
+        ));
     }
+    for l in ui::kv_lines(&facts, 2) {
+        ui::out(l);
+    }
+
     let features = record.all_features();
     if !features.is_empty() {
-        println!("features:");
+        ui::out("");
+        ui::out(format!(
+            "{} {}",
+            "features".bold(),
+            "(+ on by default)".dimmed()
+        ));
         let default: BTreeSet<String> = features
             .get("default")
             .map(|d| d.iter().cloned().collect())
@@ -1255,11 +1383,19 @@ pub fn info(args: InfoArgs) -> Result<()> {
         let w = names.iter().map(|n| n.len()).max().unwrap_or(0);
         for f in names {
             let on = f == "default" || default.contains(f);
-            println!(
-                " {}{f:<w$} = [{}]",
-                if on { "+" } else { " " },
-                features[f].join(", ")
+            let enables = features[f].join(", ");
+            let name = format!("{f:<w$}");
+            let line = format!(
+                "  {} {}  {}",
+                if on {
+                    "+".green().bold().to_string()
+                } else {
+                    " ".to_string()
+                },
+                if on { name.bold().to_string() } else { name },
+                enables.dimmed()
             );
+            ui::out(line.trim_end());
         }
     }
     let normal: Vec<&rune_registry::IndexDependency> = record
@@ -1268,15 +1404,33 @@ pub fn info(args: InfoArgs) -> Result<()> {
         .filter(|d| d.kind.as_deref().unwrap_or("normal") == "normal")
         .collect();
     if !normal.is_empty() {
-        println!("dependencies:");
+        ui::out("");
+        ui::out("dependencies".bold().to_string());
+        let w = normal
+            .iter()
+            .map(|d| d.package.as_deref().unwrap_or(&d.name).len())
+            .max()
+            .unwrap_or(0);
         for d in normal {
             let real = d.package.as_deref().unwrap_or(&d.name);
-            println!(
-                "  {real}@{}{}",
-                d.req,
-                if d.optional { " (optional)" } else { "" }
-            );
+            ui::out(format!(
+                "  {real:<w$}  {}{}",
+                d.req.dimmed(),
+                if d.optional {
+                    "  optional".dimmed().to_string()
+                } else {
+                    String::new()
+                }
+            ));
         }
+    }
+    if locked.is_none() {
+        ui::out("");
+        ui::out(format!(
+            "  {} {}",
+            format!("rune add {name}").bold(),
+            "to use it".dimmed()
+        ));
     }
     Ok(())
 }

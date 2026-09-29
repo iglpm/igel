@@ -439,26 +439,23 @@ pub fn run(args: TestArgs, mode: Mode) -> Result<()> {
                             if json {
                                 // One line per binary, after the build's
                                 // compiler messages, for tools.
-                                println!(
-                                    "{}",
-                                    serde_json::json!({
-                                        "reason": "test-suite-finished",
-                                        "suite": suite.name,
-                                        "outcome": match r.outcome {
-                                            Outcome::Passed => "passed",
-                                            Outcome::Cached => "cached",
-                                            Outcome::Failed => "failed",
-                                            Outcome::CompileFailed => "not-built",
-                                            Outcome::Skipped => "skipped",
-                                        },
-                                        "seconds": suite.seconds,
-                                        "passed": r.counts.passed,
-                                        "failed": r.counts.failed,
-                                        "ignored": r.counts.ignored,
-                                        "tests": suite.cases,
-                                        "error": suite.error,
-                                    })
-                                );
+                                ui::out(serde_json::json!({
+                                    "reason": "test-suite-finished",
+                                    "suite": suite.name,
+                                    "outcome": match r.outcome {
+                                        Outcome::Passed => "passed",
+                                        Outcome::Cached => "cached",
+                                        Outcome::Failed => "failed",
+                                        Outcome::CompileFailed => "not-built",
+                                        Outcome::Skipped => "skipped",
+                                    },
+                                    "seconds": suite.seconds,
+                                    "passed": r.counts.passed,
+                                    "failed": r.counts.failed,
+                                    "ignored": r.counts.ignored,
+                                    "tests": suite.cases,
+                                    "error": suite.error,
+                                }));
                             }
                             suites.push(suite);
                         }
@@ -739,7 +736,7 @@ pub fn run(args: TestArgs, mode: Mode) -> Result<()> {
         ));
     }
     if !failed_labels.is_empty() {
-        eprintln!();
+        ui::err("");
         ui::error(format!(
             "{} failed: {}",
             if failed_labels.len() == 1 {
@@ -968,12 +965,12 @@ fn print_result(label: &str, r: &TestResult, verbose: bool) {
                 ),
             );
             if verbose && !r.output.is_empty() {
-                println!("{}", r.output);
+                ui::out(&r.output);
             }
         }
         Outcome::Failed => {
             ui::error(format!("FAILED {} · {}", label.bold(), took));
-            println!("{}", r.output);
+            ui::out(&r.output);
         }
         Outcome::CompileFailed => {
             ui::error(format!("could not build {}: {}", label.bold(), r.output));

@@ -28,6 +28,8 @@ pub struct SearchHit {
     pub name: String,
     pub version: String,
     pub description: Option<String>,
+    /// All-time downloads (0 when the registry does not say).
+    pub downloads: u64,
 }
 
 pub struct RegistryApi {
@@ -163,6 +165,7 @@ impl RegistryApi {
                         description: c["description"]
                             .as_str()
                             .map(|d| d.split_whitespace().collect::<Vec<_>>().join(" ")),
+                        downloads: c["downloads"].as_u64().unwrap_or(0),
                     })
                     .collect()
             })

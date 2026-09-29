@@ -2147,11 +2147,51 @@ fn trim_paths_keeps_this_machines_paths_out_of_the_binary() {
         );
     }
 
-    // Without it, the absolute path is there, as with Cargo.
+    // Without it, the workspace's own paths are still relative to its root,
+    // as with Cargo (it compiles them from there), so panics name
+    // `src/main.rs` either way.
     p.write("Cargo.toml", LIB_MANIFEST);
     p.ok(&["build", "--release"]);
     let run = Command::new(&exe).output().unwrap();
-    assert!(String::from_utf8_lossy(&run.stderr).contains(root.to_str().unwrap()));
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert!(stderr.contains("src/main.rs:1"), "{stderr}");
+    assert!(!stderr.contains(root.to_str().unwrap()), "{stderr}");
+}
+
+#[test]
+fn compiler_messages_name_workspace_files_relative_to_the_root() {
+    let p = Project::new();
+    p.write(
+        "Cargo.toml",
+        "[workspace]\nresolver = \"2\"\nmembers = [\"app\"]\n",
+    );
+    p.write(
+        "app/Cargo.toml",
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    p.write("app/src/main.rs", "fn main() { let x: u32 = \"no\"; }\n");
+    let out = p.rune(&["build"]);
+    assert!(!out.status.success());
+    let text = text(&out);
+    assert!(text.contains("--> app/src/main.rs:1:26"), "{text}");
+    let root = p.path().canonicalize().unwrap();
+    assert!(!text.contains(root.to_str().unwrap()), "{text}");
+    // One verdict, after the compiler's message.
+    let verdict = text.find("could not compile app v0.1.0").expect(&text);
+    assert!(verdict > text.find("mismatched types").unwrap(), "{text}");
+    assert_eq!(text.matches("could not compile").count(), 1, "{text}");
+
+    // `rune fix` finds the files through those relative paths.
+    p.write(
+        "app/src/main.rs",
+        "#![warn(unused_parens)]\nfn main() { let x = (1); let _ = x; }\n",
+    );
+    p.ok(&["fix", "--allow-no-vcs"]);
+    assert!(
+        p.read("app/src/main.rs").contains("let x = 1;"),
+        "{}",
+        p.read("app/src/main.rs")
+    );
 }
 
 #[test]
@@ -5598,4 +5638,101 @@ pub fn make_answer(_: TokenStream) -> TokenStream {
     );
     let out = p.ok(&["test"]);
     assert!(out.contains("(doc-tests) · 1 passed"), "{out}");
+}
+
+#[test]
+fn a_target_that_is_not_installed_is_reported_before_building() {
+    let p = lib_project();
+    let out = p.rune(&["build", "--target", "x86_64-unknown-linux-gnux"]);
+    assert!(!out.status.success());
+    assert!(
+        text(&out).contains("unknown target `x86_64-unknown-linux-gnux`"),
+        "{}",
+        text(&out)
+    );
+
+    // A real target without its standard library: what to run, not
+    // rustc's "can't find crate for `core`" in every crate.
+    let sysroot = String::from_utf8(
+        Command::new("rustc")
+            .args(["--print", "sysroot"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    let missing = [
+        "riscv64gc-unknown-none-elf",
+        "thumbv7em-none-eabihf",
+        "wasm32v1-none",
+    ]
+    .into_iter()
+    .find(|t| {
+        !std::path::Path::new(sysroot.trim())
+            .join("lib/rustlib")
+            .join(t)
+            .exists()
+    });
+    if let Some(t) = missing {
+        let out = p.rune(&["build", "--target", t]);
+        assert!(!out.status.success());
+        let msg = text(&out);
+        assert!(
+            msg.contains(&format!("the standard library for `{t}` is not installed")),
+            "{msg}"
+        );
+        assert!(!msg.contains("can't find crate"), "{msg}");
+    }
+}
+
+#[test]
+fn features_says_which_are_on_and_who_turned_them_on() {
+    let p = Project::new();
+    p.write(
+        "Cargo.toml",
+        "[workspace]\nresolver = \"2\"\nmembers = [\"app\", \"lib\"]\n",
+    );
+    p.write(
+        "lib/Cargo.toml",
+        "[package]\nname = \"lib\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
+         [features]\ndefault = [\"std\"]\nstd = []\nfast = [\"simd\"]\nsimd = []\nunused = []\n",
+    );
+    p.write("lib/src/lib.rs", "");
+    p.write(
+        "app/Cargo.toml",
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
+         [dependencies]\nlib = { path = \"../lib\", features = [\"fast\"] }\n\n\
+         [features]\nturbo = [\"lib/simd\"]\n",
+    );
+    p.write("app/src/main.rs", "fn main() {}\n");
+
+    let out = p.ok(&["features", "lib"]);
+    let line = |f: &str| {
+        out.lines()
+            .find(|l| l.contains(&format!("+ {f} ")) || l.trim_end().ends_with(&format!("+ {f}")))
+            .unwrap_or_else(|| panic!("no `{f}` line in:\n{out}"))
+            .to_string()
+    };
+    assert!(
+        out.contains("lib 0.1.0") && out.contains("4 of 5 features on"),
+        "{out}"
+    );
+    assert!(line("fast").contains("app"), "{out}");
+    assert!(line("simd").contains("feature `fast`"), "{out}");
+    assert!(line("default").contains("default features of app"), "{out}");
+    assert!(line("std").contains("feature `default`"), "{out}");
+    assert!(!out.contains("unused"), "{out}");
+    assert!(p.ok(&["features", "lib", "--all"]).contains("- unused"));
+
+    // Without an argument: what the workspace's packages declare.
+    let out = p.ok(&["features"]);
+    assert!(out.contains("turbo") && out.contains("lib/simd"), "{out}");
+
+    let out = p.rune(&["features", "nope"]);
+    assert!(!out.status.success());
+    assert!(
+        text(&out).contains("`nope` is not in what a build"),
+        "{}",
+        text(&out)
+    );
 }

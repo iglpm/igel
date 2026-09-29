@@ -103,6 +103,10 @@ impl Session {
                     .and_then(|l| l.into_iter().next())
             })
             .filter(|t| !t.is_empty());
+        let target = common.target.clone().or(default_target);
+        if let Some(t) = &target {
+            check_target_installed(&ws, t)?;
+        }
         let selected = ws.select(&common.package, common.workspace, &common.exclude)?;
         let features = FeatureArgs::parse(
             &common.features,
@@ -117,7 +121,7 @@ impl Session {
             offline,
             locked,
             // `--target`, else `CARGO_BUILD_TARGET` / `build.target`.
-            target: common.target.clone().or(default_target),
+            target,
             features,
             selected,
             verbose: common.verbose,
@@ -306,8 +310,14 @@ pub fn drive(
     let result = std::thread::scope(|scope| -> Result<BuildResult> {
         let handle = scope.spawn(|| executor.execute(graph));
 
-        let mut progress = (!sess.quiet && !sess.json)
-            .then(|| BuildProgress::new(ui::multi_progress(), graph.node_count() as u64));
+        let checking = graph
+            .nodes()
+            .iter()
+            .all(|n| n.unit.check_only || n.unit.is_build_script || !n.unit.ext.member);
+        let verb = if checking { "checking" } else { "building" };
+        let mut progress = (!sess.quiet && !sess.json).then(|| {
+            BuildProgress::with_verb(ui::multi_progress(), graph.node_count() as u64, verb)
+        });
         let mut scripts_reported: std::collections::HashSet<String> = Default::default();
         while let Ok(event) = event_rx.recv() {
             let is_final = matches!(event, PipelineEvent::AllComplete { .. });
@@ -323,7 +333,7 @@ pub fn drive(
                     for line in
                         crate::messages::lines_for(unit, sess.config(), &sess.profile, &event)
                     {
-                        println!("{line}");
+                        ui::out(line);
                     }
                 }
                 if let PipelineEvent::ScriptOutput { node_id, output } = &event {
@@ -339,14 +349,13 @@ pub fn drive(
                         let out_dir = sess
                             .config()
                             .build_script_out_dir_by_key(sess.profile.output_dir_name(), &owner);
-                        println!(
-                            "{}",
-                            crate::messages::build_script_executed(unit, output, &out_dir)
-                        );
+                        ui::out(crate::messages::build_script_executed(
+                            unit, output, &out_dir,
+                        ));
                     }
                 }
                 if let PipelineEvent::AllComplete { failed, .. } = &event {
-                    println!("{}", crate::messages::build_finished(*failed == 0));
+                    ui::out(crate::messages::build_finished(*failed == 0));
                 }
             }
             match &event {
@@ -390,25 +399,107 @@ pub fn drive(
             .map_err(|e| anyhow::anyhow!(e.to_string()))
     })?;
 
-    for (crate_desc, error) in &failures {
-        ui::error(format!("failed to compile {}", crate_desc.bold()));
+    // The compiler's own messages; the one-line verdict naming the crates
+    // comes last, from `ensure_success`, like Cargo's.
+    for (_, error) in &failures {
         if !sess.json {
-            eprintln!("{error}");
+            ui::err(error.trim_end());
+            ui::err("");
         }
     }
+    *FAILED.lock().unwrap_or_else(|e| e.into_inner()) =
+        failures.iter().map(|(c, _)| c.clone()).collect();
     sess.maybe_gc();
     Ok((result, failures))
 }
 
-/// Bails with Cargo's message if a build had failures.
+/// A build for a target whose standard library is not installed fails in
+/// every crate with rustc's "can't find crate for `core`"; say what to do
+/// instead, before anything is compiled. Custom targets (a `.json` spec) and
+/// `-Zbuild-std`, which builds the standard library itself, are left alone.
+fn check_target_installed(ws: &Workspace, target: &str) -> Result<()> {
+    if target.ends_with(".json")
+        || ws
+            .cargo_config
+            .string_list(&["unstable", "build-std"])
+            .is_some()
+        || ws.cargo_config.string(&["unstable", "build-std"]).is_some()
+    {
+        return Ok(());
+    }
+    let tc = rune_common::toolchain::global();
+    let Some(sysroot) = &tc.sysroot else {
+        return Ok(());
+    };
+    if sysroot
+        .join("lib/rustlib")
+        .join(target)
+        .join("lib")
+        .is_dir()
+    {
+        return Ok(());
+    }
+    let known = std::process::Command::new(&tc.rustc)
+        .args(["--print", "target-list"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .any(|l| l.trim() == target)
+        });
+    match known {
+        Some(false) => bail!(
+            "unknown target `{target}` (`rustc --print target-list` lists the ones this compiler knows)"
+        ),
+        _ => {
+            let rustup = sysroot.components().any(|c| c.as_os_str() == ".rustup")
+                || std::env::var_os("RUSTUP_HOME").is_some();
+            if rustup {
+                bail!(
+                    "the standard library for `{target}` is not installed; add it with:\n\n    rustup target add {target}\n"
+                )
+            }
+            bail!(
+                "the standard library for `{target}` is not installed in {}",
+                sysroot.display()
+            )
+        }
+    }
+}
+
+/// The crates the last build could not compile (`name vX.Y.Z`).
+static FAILED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// Bails, naming the crates that did not compile, if a build had failures.
 pub fn ensure_success(result: &BuildResult) -> Result<()> {
     if result.success {
-        Ok(())
-    } else {
-        bail!(
-            "could not compile due to {} previous error(s)",
-            result.failed.len()
-        )
+        return Ok(());
+    }
+    let failed = FAILED.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    match failed.as_slice() {
+        [] => bail!(
+            "could not compile {}",
+            ui::plural(result.failed.len(), "crate")
+        ),
+        [one] => bail!("could not compile {}", one.bold()),
+        many => {
+            const SHOWN: usize = 3;
+            let mut names: Vec<String> = many
+                .iter()
+                .take(SHOWN)
+                .map(|c| c.bold().to_string())
+                .collect();
+            if many.len() > SHOWN {
+                names.push(format!("{} more", many.len() - SHOWN));
+            }
+            bail!(
+                "could not compile {}: {}",
+                ui::plural(many.len(), "crate"),
+                names.join(", ")
+            )
+        }
     }
 }
 

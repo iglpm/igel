@@ -216,7 +216,10 @@ pub fn unused(args: UnusedArgs) -> Result<()> {
     }
     ui::action(
         "checking",
-        format!("{} package(s) for unused dependencies", sess.selected.len()),
+        format!(
+            "{} for unused dependencies",
+            ui::plural(sess.selected.len(), "package")
+        ),
     );
 
     let mut diagnostics: HashMap<NodeId, Vec<String>> = HashMap::new();
@@ -358,22 +361,29 @@ pub fn unused(args: UnusedArgs) -> Result<()> {
         if f.unused.is_empty() && f.dev_only.is_empty() && f.unused_here.is_empty() {
             continue;
         }
-        println!("{}", name.bold());
+        ui::out(ui::brand(name));
         if !f.unused.is_empty() {
-            println!("  unused: {}", describe(&f.unused));
+            ui::out(format!(
+                "  {} {}",
+                "unused:".yellow().bold(),
+                describe(&f.unused)
+            ));
         }
         if !f.unused_here.is_empty() {
-            println!(
-                "  unused in this configuration, but named in the source (another platform or \
-                 feature?): {}",
+            ui::out(format!(
+                "  {} {}",
+                "unused in this configuration, but named in the source (another platform or \
+                 feature?):"
+                    .dimmed(),
                 describe(&f.unused_here)
-            );
+            ));
         }
         if !f.dev_only.is_empty() {
-            println!(
-                "  only used by tests, examples or benchmarks (could be dev-dependencies): {}",
+            ui::out(format!(
+                "  {} {}",
+                "only used by tests, examples or benchmarks (could be dev-dependencies):".dimmed(),
                 describe(&f.dev_only)
-            );
+            ));
         }
     }
     for name in &incomplete {

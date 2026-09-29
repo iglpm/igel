@@ -42,6 +42,7 @@ rune add serde -F derive       # lists the release's features, + for those turne
 rune tree -i serde             # who depends on serde? (what a build on this machine uses)
 rune tree -e features -i serde # which package turned on each of serde's features
 rune why serde
+rune features serde            # which of serde's features are on, and who turned each on
 rune update                    # only re-downloads changed index entries
 rune new my-app                # or: rune init  (add --manifest rune for a Rune.toml project)
 rune build --deps-only         # just the dependencies: a Docker layer / CI cache step
@@ -91,6 +92,37 @@ configuration and `CARGO_PROFILE_<NAME>_<KEY>` variables override the
 manifest's profiles, as with Cargo. Status lines go to stderr; stdout carries only
 what a command produces (`metadata`, `vendor`'s configuration, your program's
 output), so it can be piped.
+
+### Finding your way around
+
+`rune help` shows the everyday commands, grouped; `rune help --all` lists all of
+them, and `rune help <command>` (or `rune <command> --help`) a command's options,
+grouped like Cargo's, with examples for the common ones. Long output — help,
+`rune search`, `rune config list` — opens in a built-in pager on a terminal:
+
+| key | |
+|---|---|
+| `↑` `↓` `j` `k`, mouse wheel | scroll a line |
+| `space` `b`, `PgDn` `PgUp` | a page down / up |
+| `g` `G` | top / bottom |
+| `/` then text, `n` `N` | search (smart case, matches highlighted), next / previous match |
+| `q` `Esc` | quit (`rune search` leaves the page you were on in the terminal) |
+
+Piped or redirected output is printed as it is; `RUNE_PAGER=never` turns the
+pager off.
+
+While it works, Rune shows one status line that never wraps or piles up: the
+index files fetched while resolving, the crates being downloaded (count, bytes,
+names), and during a build the crates being compiled, oldest first:
+
+```text
+⠹ building ━━━━━╾────────────────── 47/197 regex-syntax, memchr, icu_locale_core +3
+```
+
+Each phase ends in one summary line (`▸ resolved 469 packages (0.84s)`,
+`▸ downloaded 468 crates (76.4 MiB, 2.12s)`), and anything printed meanwhile —
+warnings, test results arriving while crates still compile — lands above the
+status line instead of tearing it.
 
 ## What is supported
 
