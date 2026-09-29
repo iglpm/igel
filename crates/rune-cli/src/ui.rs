@@ -146,11 +146,6 @@ pub fn brand(s: impl Display) -> String {
     paint(s, true)
 }
 
-/// `s` in the brand accent, not bold.
-pub fn accent(s: impl Display) -> String {
-    paint(s, false)
-}
-
 fn paint(s: impl Display, bold: bool) -> String {
     if !colors() {
         return s.to_string();
@@ -328,13 +323,6 @@ impl Activity {
         Self {
             bar,
             started: Instant::now(),
-        }
-    }
-
-    /// Replaces the message after the verb.
-    pub fn set_message(&self, message: impl Display) {
-        if let Some(b) = &self.bar {
-            b.set_message(message.to_string());
         }
     }
 

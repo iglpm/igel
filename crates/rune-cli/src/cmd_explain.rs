@@ -7,6 +7,7 @@ use crate::args::BuildArgs;
 use crate::cmd_build::{plan_for, selection};
 use crate::graph::Mode;
 use crate::session::Session;
+use crate::ui;
 use anyhow::Result;
 use colored::Colorize;
 use rune_scheduler::executor::{UnitIdentity, load_identities};
@@ -49,14 +50,22 @@ pub fn explain(args: BuildArgs) -> Result<()> {
     let total = current.len();
     let compiled = roots.len() + downstream.len();
     if compiled == 0 {
-        println!("nothing would be compiled: all {total} units are in the store");
+        ui::summary(format!(
+            "nothing would be compiled: all {total} units are in the store"
+        ));
         return Ok(());
     }
-    println!("{compiled} of {total} units would be compiled ({restored} come from the store):\n");
+    ui::err(format!(
+        "{} {} {}",
+        ui::brand("▸"),
+        format!("{compiled} of {total} units would be compiled").bold(),
+        format!("({restored} come from the store)").dimmed()
+    ));
     for (label, reasons) in roots.iter().chain(&downstream) {
-        println!("{}", label.bold());
+        ui::out("");
+        ui::out(format!("  {}", label.bold()));
         for r in reasons {
-            println!("    {r}");
+            ui::out(format!("    {} {r}", "·".dimmed()));
         }
     }
     Ok(())

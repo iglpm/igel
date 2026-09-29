@@ -42,7 +42,7 @@ rayon = "1"
 crossbeam-channel = "0.5"
 
 # CLI & UI
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "wrap_help"] }
 colored = "2"
 
 # Logging & Diagnostics

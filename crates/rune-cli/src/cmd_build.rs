@@ -233,7 +233,10 @@ fn fix_loop(args: &BuildArgs, flags: &[String], vcs: &FixVcs, what: &str) -> Res
             break;
         }
     }
-    ui::summary(format!("applied {total} {what} suggestion(s)"));
+    ui::summary(format!(
+        "applied {}",
+        ui::plural(total, &format!("{what} suggestion"))
+    ));
     Ok(())
 }
 

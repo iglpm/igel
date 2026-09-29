@@ -398,18 +398,37 @@ pub fn config(cmd: ConfigCommands) -> Result<()> {
             }
             let rows = settings.effective();
             let width = rows.iter().map(|(d, ..)| d.name.len()).max().unwrap_or(0);
-            let vwidth = rows.iter().map(|(_, v, _)| v.len()).max().unwrap_or(0);
+            let text_width = crate::ui::term_width().clamp(40, 100) - 4;
+            let mut page = crate::pager::Page::new("rune config list");
+            page.line(format!(
+                "{}  {}",
+                crate::ui::brand("settings"),
+                "values you set are highlighted · change one with `rune config set <key> <value>`"
+                    .dimmed()
+            ));
+            let mut section = "";
             for (def, value, origin) in rows {
-                let set = origin != Origin::Default;
-                let line = format!("{:<width$} = {:<vwidth$}", def.name, value);
-                let line = if set { line.bold().to_string() } else { line };
-                if show_origin {
-                    println!("{line}  {}", format!("# {origin}").dimmed());
-                } else {
-                    println!("{line}");
+                let this = def.name.split('.').next().unwrap_or("");
+                if this != section {
+                    section = this;
+                    page.blank();
                 }
-                println!("    {}", def.description.dimmed());
+                let set = origin != Origin::Default;
+                let value = if set {
+                    crate::ui::brand(&value)
+                } else {
+                    value.clone()
+                };
+                let mut line = format!("{:<width$}  {value}", def.name.bold());
+                if show_origin || set {
+                    line.push_str(&format!("  {}", format!("# {origin}").dimmed()));
+                }
+                page.line(line);
+                for l in crate::ui::wrap(def.description, text_width) {
+                    page.line(format!("    {}", l.dimmed()));
+                }
             }
+            page.show();
         }
         ConfigCommands::Get {
             key,
@@ -539,26 +558,49 @@ pub fn cas(cmd: CasCommands) -> Result<()> {
             } else {
                 0.0
             };
-            ui::heading("content-addressable store");
-            println!("  location     {}", config.cas_dir.display());
-            println!("  entries      {}", stats.total_entries);
-            println!(
-                "  size         {}",
-                format_size_human(stats.total_size_bytes)
-            );
-            println!("  hits         {}", stats.hits.to_string().green());
-            println!("  misses       {}", stats.misses.to_string().yellow());
-            println!("  hit rate     {hit_rate:.1}%");
+            ui::heading("build cache");
+            let mut rows = vec![
+                ("location", config.cas_dir.display().to_string()),
+                ("entries", stats.total_entries.to_string()),
+                ("size", format_size_human(stats.total_size_bytes)),
+                (
+                    "hit rate",
+                    if total > 0 {
+                        format!(
+                            "{hit_rate:.1}%  {}",
+                            format!("({} reused, {} compiled)", stats.hits, stats.misses).dimmed()
+                        )
+                    } else {
+                        "no builds recorded yet".dimmed().to_string()
+                    },
+                ),
+            ];
             if let Some(max) = config.settings.cas_max_size() {
-                println!("  max size     {}", format_size(max));
+                rows.push(("max size", format_size(max)));
+            }
+            if let Some(age) = config.settings.cas_max_age() {
+                rows.push((
+                    "cleanup",
+                    format!("entries unused for {} days are removed", age / 86_400),
+                ));
+            }
+            for l in ui::kv_lines(&rows, 2) {
+                ui::out(l);
             }
         }
         CasCommands::Du(args) => {
             let u = rune_cas::usage::usage(&cas);
-            ui::heading("content-addressable store usage");
-            println!("  location     {}", config.cas_dir.display());
-            println!("  entries      {}", u.entries);
-            println!("  size         {}", format_size_human(u.bytes));
+            ui::heading("build cache usage");
+            for l in ui::kv_lines(
+                &[
+                    ("location", config.cas_dir.display().to_string()),
+                    ("entries", u.entries.to_string()),
+                    ("size", format_size_human(u.bytes)),
+                ],
+                2,
+            ) {
+                ui::out(l);
+            }
             if u.packages.is_empty() {
                 return Ok(());
             }
@@ -912,10 +954,22 @@ pub fn affected(args: crate::args::AffectedArgs) -> Result<()> {
             .output()
             .context("failed to run `git` (needed by `rune affected`)")?;
         if !out.status.success() {
+            let err = String::from_utf8_lossy(&out.stderr);
+            if err.contains("not a git repository") {
+                bail!(
+                    "`rune affected` compares git revisions, and this project is not in a git repository"
+                );
+            }
+            if err.contains("unknown revision") || err.contains("bad revision") {
+                bail!(
+                    "git knows no revision to compare with here (a repository without commits, \
+                     or a shallow clone missing the base): commit first, or pass --base <rev>"
+                );
+            }
             bail!(
                 "`git {}` failed: {}",
                 extra.join(" "),
-                String::from_utf8_lossy(&out.stderr).trim()
+                err.lines().next().unwrap_or("").trim()
             );
         }
         Ok(String::from_utf8_lossy(&out.stdout)

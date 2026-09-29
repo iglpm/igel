@@ -701,9 +701,36 @@ pub fn why(args: WhyArgs) -> Result<()> {
             args.package
         ));
     } else {
-        println!("{} is required by:", args.package.bold());
+        ui::out(format!(
+            "{} {}",
+            ui::brand(&args.package),
+            format!(
+                "is in the graph through {}:",
+                ui::plural(chains.len(), "path")
+            )
+            .dimmed()
+        ));
+        let arrow = " → ".dimmed().to_string();
         for chain in chains {
-            println!("  {}", chain.join(" -> ".dimmed().to_string().as_str()));
+            let last = chain.len().saturating_sub(1);
+            let steps: Vec<String> = chain
+                .iter()
+                .enumerate()
+                .map(|(i, step)| {
+                    let (name, version) = step.rsplit_once(' ').unwrap_or((step, ""));
+                    let name = if i == last {
+                        ui::brand(name)
+                    } else {
+                        name.to_string()
+                    };
+                    if version.is_empty() {
+                        name
+                    } else {
+                        format!("{name} {}", version.dimmed())
+                    }
+                })
+                .collect();
+            ui::out(format!("  {}", steps.join(&arrow)));
         }
     }
     Ok(())
