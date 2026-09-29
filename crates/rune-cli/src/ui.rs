@@ -232,11 +232,20 @@ pub fn hint(message: impl Display) {
     if quiet() {
         return;
     }
-    err(format!(
-        "  {} {}",
-        "note:".dimmed(),
-        message.to_string().dimmed()
-    ));
+    // Wrapped at word boundaries, continuation lines under the text.
+    let text = message.to_string();
+    let lines = if io::stderr().is_terminal() {
+        wrap(&text, term_width().saturating_sub(9).max(30))
+    } else {
+        vec![text]
+    };
+    for (i, l) in lines.iter().enumerate() {
+        if i == 0 {
+            err(format!("  {} {}", "note:".dimmed(), l.dimmed()));
+        } else {
+            err(format!("        {}", l.dimmed()));
+        }
+    }
 }
 
 /// An indented, dimmed line under a status line (on stderr).
