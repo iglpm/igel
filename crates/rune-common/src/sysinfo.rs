@@ -99,6 +99,40 @@ mod imp {
     }
 }
 
+/// Lowers this process's scheduling priority (and so its children's): they
+/// get the cores nothing else wants. Best effort.
+pub fn lower_priority() {
+    #[cfg(unix)]
+    // SAFETY: plain system call on this process.
+    unsafe {
+        libc::setpriority(libc::PRIO_PROCESS, 0, 10);
+    }
+}
+
+/// The size in bytes of the filesystem holding `path`.
+pub fn disk_size(path: &std::path::Path) -> Option<u64> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let mut probe = path.to_path_buf();
+        while !probe.exists() {
+            probe = probe.parent()?.to_path_buf();
+        }
+        let c = std::ffi::CString::new(probe.as_os_str().as_bytes()).ok()?;
+        // SAFETY: a zeroed `statvfs` is valid to be filled in; `c` is a valid path.
+        let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+        if unsafe { libc::statvfs(c.as_ptr(), &mut st) } != 0 {
+            return None;
+        }
+        Some(st.f_blocks as u64 * st.f_frsize as u64)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

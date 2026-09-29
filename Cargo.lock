@@ -1246,6 +1246,7 @@ dependencies = [
 name = "rune-compiler"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "rune-common",
  "serde",
  "serde_json",

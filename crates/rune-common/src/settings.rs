@@ -50,7 +50,7 @@ impl ValueKind {
             ValueKind::Uint => "a non-negative integer",
             ValueKind::Path => "a path",
             ValueKind::Text => "text",
-            ValueKind::Size => "a size such as `20GB` or `512MiB`",
+            ValueKind::Size => "a size such as `20GB` or `512MiB`, or `auto`",
             ValueKind::Threads => "`off`, `auto` or a number of threads",
             ValueKind::Duration => "a duration such as `14d`, `72h` or `2w`",
         }
@@ -111,6 +111,14 @@ pub const KEYS: &[KeyDef] = &[
         description: "Rebuild every crate (dependencies included) for release builds instead of \
                       restoring them from the content-addressable store. Off by default: release \
                       builds reuse cached artifacts just like dev builds do.",
+    },
+    KeyDef {
+        name: "build.low-priority",
+        kind: ValueKind::Bool,
+        default: "false",
+        description: "Run compilers and build scripts at low scheduling priority, so the rest of \
+                      the machine (editor, browser, a call) stays responsive during a big build; \
+                      the build takes the cores nothing else wants. `rune watch` always does.",
     },
     KeyDef {
         name: "build.dependency-debuginfo",
@@ -193,9 +201,10 @@ pub const KEYS: &[KeyDef] = &[
     KeyDef {
         name: "cas.max-size",
         kind: ValueKind::Size,
-        default: "unlimited",
-        description: "Evict the least recently stored entries after a build when the store grows \
-                      beyond this size.",
+        default: "auto",
+        description: "Evict the least recently used entries after a build when the store grows \
+                      beyond this size. `auto` (the default): a tenth of the disk it is on, at \
+                      least 5 GiB and at most 50 GiB; `0`: unlimited.",
     },
     KeyDef {
         name: "cas.max-age",
@@ -472,6 +481,11 @@ impl Settings {
 
     /// `build.release-rebuild-all`: rebuild every crate for release builds
     /// instead of using the content-addressable store.
+    /// `build.low-priority`.
+    pub fn low_priority(&self) -> bool {
+        self.bool("build.low-priority", false)
+    }
+
     pub fn release_rebuild_all(&self) -> bool {
         self.bool("build.release-rebuild-all", false)
     }
@@ -521,9 +535,24 @@ impl Settings {
         self.path("cas.dir")
     }
 
-    /// `cas.max-size` in bytes.
+    /// `cas.max-size` in bytes, as set (`None` when not set; `Some(0)` for
+    /// unlimited). See [`Self::cas_max_size_for`] for the value in force.
     pub fn cas_max_size(&self) -> Option<u64> {
         self.uint("cas.max-size")
+    }
+
+    /// The store size limit in force for a store at `store`: as set, or —
+    /// when not set — a tenth of the disk it is on, between 5 and 50 GiB.
+    /// `None`: unlimited.
+    pub fn cas_max_size_for(&self, store: &std::path::Path) -> Option<u64> {
+        match self.cas_max_size() {
+            Some(0) => None,
+            Some(n) => Some(n),
+            None => {
+                let disk = crate::sysinfo::disk_size(store)?;
+                Some((disk / 10).clamp(5 << 30, 50 << 30))
+            }
+        }
     }
 
     /// `cas.max-age` in seconds (30 days unless set; `None` when `0`).
@@ -734,6 +763,7 @@ fn from_toml(def: &KeyDef, item: &Item) -> Result<Value, &'static str> {
             TomlValue::Integer(n) => u64::try_from(*n.value())
                 .map(Value::Size)
                 .map_err(|_| expected),
+            TomlValue::String(s) if s.value() == "auto" => Ok(Value::Text("auto".into())),
             TomlValue::String(s) => parse_size(s.value()).map(Value::Size).ok_or(expected),
             _ => Err(expected),
         },
@@ -798,6 +828,7 @@ pub fn parse_value(def: &KeyDef, raw: &str) -> Result<Value, SettingsError> {
         ValueKind::Path => Err(bad()),
         ValueKind::Text if !raw.is_empty() => Ok(Value::Text(raw.to_string())),
         ValueKind::Text => Err(bad()),
+        ValueKind::Size if raw == "auto" => Ok(Value::Text("auto".into())),
         ValueKind::Size => parse_size(raw).map(Value::Size).ok_or_else(bad),
         ValueKind::Threads => parse_threads(raw).ok_or_else(bad),
         ValueKind::Duration => crate::time::parse_duration(raw)

@@ -54,6 +54,9 @@ impl Session {
         let json = crate::messages::wants_json(&common.message_format);
         crate::ui::set_quiet(common.quiet);
         let mut ws = Workspace::load(common.manifest_path.as_deref())?;
+        if ws.config.settings.low_priority() {
+            rune_common::sysinfo::lower_priority();
+        }
 
         if let Some(dir) = &common.target_dir {
             ws.config.target_dir = if dir.is_absolute() {
@@ -196,7 +199,7 @@ impl Session {
         if let Some(age) = self.ws.config.settings.cas_max_age() {
             spawn_daily_gc(cas.root(), age);
         }
-        let Some(max) = self.ws.config.settings.cas_max_size() else {
+        let Some(max) = self.ws.config.settings.cas_max_size_for(cas.root()) else {
             return;
         };
         if cas.stats().map(|s| s.total_size_bytes).unwrap_or(0) > max {

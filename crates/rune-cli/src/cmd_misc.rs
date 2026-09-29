@@ -588,7 +588,7 @@ pub fn cas(cmd: CasCommands) -> Result<()> {
                     },
                 ),
             ];
-            if let Some(max) = config.settings.cas_max_size() {
+            if let Some(max) = config.settings.cas_max_size_for(&config.cas_dir) {
                 rows.push(("max size", format_size(max)));
             }
             if let Some(age) = config.settings.cas_max_age() {
@@ -660,7 +660,7 @@ pub fn cas(cmd: CasCommands) -> Result<()> {
         CasCommands::Gc(args) => {
             let max_size = match &args.max_size {
                 Some(s) => Some(parse_size(s).with_context(|| format!("invalid size `{s}`"))?),
-                None => config.settings.cas_max_size(),
+                None => config.settings.cas_max_size_for(&config.cas_dir),
             };
             if max_size.is_none() && args.max_age.is_none() {
                 bail!(

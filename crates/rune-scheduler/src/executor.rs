@@ -64,6 +64,8 @@ enum WorkerMsg {
         node_id: NodeId,
         artifacts: Vec<PathBuf>,
         duration: Duration,
+        /// The compiler's peak memory, when this process compiled it.
+        peak_memory: Option<u64>,
         /// Taken from the store (another process built it while we waited)
         /// rather than compiled by this one.
         restored: bool,
@@ -626,6 +628,8 @@ impl BuildExecutor {
         let mut job_threads: Vec<std::thread::JoinHandle<()>> = Vec::new();
         // How long new work was held back because memory was short.
         let mut memory_held = Duration::ZERO;
+        // What each running compilation is expected to peak at.
+        let mut predicted_running: HashMap<NodeId, u64> = HashMap::new();
         let mut memory_held_since: Option<Instant> = None;
 
         // Nodes still to schedule, in stable graph order.
@@ -694,7 +698,24 @@ impl BuildExecutor {
                     // Short of memory: let what runs finish (it frees memory)
                     // before starting more — a slower build instead of a
                     // swapping machine or a compiler killed for lack of it.
-                    if !in_flight.is_empty() && (self.memory)().is_some_and(|m| m.is_short()) {
+                    // "Short" counts what this compiler is expected to need
+                    // (its peak the last time) and room for the running ones
+                    // to grow toward theirs, not only what is free right now.
+                    let need = if script_only {
+                        0
+                    } else {
+                        timings
+                            .memory(&graph.node(node_id).unit, &self.profile)
+                            .unwrap_or(DEFAULT_COMPILER_MEMORY)
+                    };
+                    let growth: u64 = predicted_running.values().sum::<u64>() / 2;
+                    if !in_flight.is_empty()
+                        && (self.memory)().is_some_and(|m| {
+                            m.is_short()
+                                || m.available
+                                    < m.reserve().saturating_add(need).saturating_add(growth)
+                        })
+                    {
                         if memory_held_since.is_none() {
                             memory_held_since = Some(Instant::now());
                             debug!("memory is short: holding back new compilations");
@@ -735,6 +756,14 @@ impl BuildExecutor {
                         in_script_phase.insert(node_id);
                     }
                     in_flight.insert(node_id);
+                    if !script_only {
+                        predicted_running.insert(
+                            node_id,
+                            timings
+                                .memory(&graph.node(node_id).unit, &self.profile)
+                                .unwrap_or(DEFAULT_COMPILER_MEMORY),
+                        );
+                    }
                     started.insert(step_id(node_id, script_only), now());
                     let mut job = self.prepare_job(
                         graph,
@@ -884,8 +913,10 @@ impl BuildExecutor {
                         node_id,
                         artifacts,
                         duration,
+                        peak_memory,
                         restored,
                     } => {
+                        predicted_running.remove(&node_id);
                         debug!("Finished compiling node {:?}", node_id);
                         in_flight.remove(&node_id);
                         in_script_phase.remove(&node_id);
@@ -897,6 +928,9 @@ impl BuildExecutor {
                         let unit = &graph.node(node_id).unit;
                         if !restored {
                             timings.record(unit, &self.profile, duration);
+                        }
+                        if let Some(bytes) = peak_memory {
+                            timings.record_memory(unit, &self.profile, bytes);
                         }
                         let id = step_id(node_id, false);
                         let begun = started.get(&id).copied().unwrap_or(0.0);
@@ -1580,6 +1614,7 @@ impl UnitJob {
             node_id: self.node_id,
             artifacts: linked,
             duration,
+            peak_memory: None,
             restored: true,
         });
         true
@@ -2096,6 +2131,7 @@ impl UnitJob {
                     node_id,
                     artifacts: artifacts.clone(),
                     duration,
+                    peak_memory: comp_res.peak_memory,
                     restored: false,
                 });
                 // Storing is disk work, not compiler work: give the job slot's
@@ -2417,6 +2453,9 @@ const METADATA_FRACTION: f64 = 0.4;
 /// start blind). For a unit nobody has timed yet the estimate comes from the
 /// size of its sources, which on a cold build is the difference between
 /// starting `syn` first and starting it last.
+/// What a compiler never measured before is assumed to need at its peak.
+const DEFAULT_COMPILER_MEMORY: u64 = 256 << 20;
+
 #[derive(Default)]
 struct Timings {
     secs: HashMap<String, f64>,
@@ -2523,6 +2562,20 @@ impl Timings {
             secs *= 2.5; // optimised builds spend far longer in codegen
         }
         secs
+    }
+
+    /// Records a compiler's peak memory for this unit.
+    fn record_memory(&mut self, unit: &CompilationUnit, profile: &Profile, bytes: u64) {
+        self.secs
+            .insert(format!("{} rss", Self::key(unit, profile)), bytes as f64);
+        self.dirty = true;
+    }
+
+    /// The unit's peak memory the last time it was compiled.
+    fn memory(&self, unit: &CompilationUnit, profile: &Profile) -> Option<u64> {
+        self.secs
+            .get(&format!("{} rss", Self::key(unit, profile)))
+            .map(|b| *b as u64)
     }
 
     fn record(&mut self, unit: &CompilationUnit, profile: &Profile, took: Duration) {
@@ -3404,6 +3457,66 @@ mod tests {
             schedule.parallelism()
         );
         assert!(result.memory_held > Duration::ZERO);
+    }
+
+    #[test]
+    fn compilers_expected_to_need_more_memory_than_is_free_run_one_at_a_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut graph = BuildGraph::new();
+        for name in ["one", "two", "three", "four"] {
+            let pkg = dir.path().join(name);
+            std::fs::create_dir_all(pkg.join("src")).unwrap();
+            std::fs::write(pkg.join("Cargo.toml"), "").unwrap();
+            std::fs::write(pkg.join("src/lib.rs"), format!("pub fn {name}() {{}}\n")).unwrap();
+            let mut u = unit(name, CrateSource::Local, &pkg);
+            u.target_name = name.into();
+            graph.add_node(u);
+        }
+        // 3 GiB free of 8: room for several ordinary compilers.
+        fn roomy() -> Option<rune_common::sysinfo::Memory> {
+            Some(rune_common::sysinfo::Memory {
+                total: 8 << 30,
+                available: 3 << 30,
+            })
+        }
+        let config = RuneConfig::new(dir.path().join("project"));
+        let first = BuildExecutor::new(config.clone(), Profile::dev(), 4)
+            .with_memory_probe(roomy)
+            .execute(&graph)
+            .unwrap();
+        assert!(first.success);
+        // Each compiler's peak was measured and kept.
+        let path = config.fingerprint_dir.join("timings.json");
+        let mut timings: HashMap<String, f64> =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let peaks: Vec<&String> = timings.keys().filter(|k| k.ends_with(" rss")).collect();
+        assert_eq!(peaks.len(), 4, "{timings:?}");
+        assert!(
+            timings
+                .iter()
+                .filter(|(k, _)| k.ends_with(" rss"))
+                .all(|(_, v)| *v > 0.0)
+        );
+        // Pretend each needed 2 GiB: two at once would not fit in 3.
+        for (k, v) in timings.iter_mut() {
+            if k.ends_with(" rss") {
+                *v = (2u64 << 30) as f64;
+            }
+        }
+        std::fs::write(&path, serde_json::to_string(&timings).unwrap()).unwrap();
+        let second = BuildExecutor::new(config, Profile::dev(), 4)
+            .with_memory_probe(roomy)
+            .with_force_rebuild(true)
+            .execute(&graph)
+            .unwrap();
+        assert!(second.success);
+        assert_eq!(second.compiled, 4);
+        let schedule = second.schedule.unwrap();
+        assert!(
+            schedule.parallelism() <= 1.05,
+            "ran {:.2} units at once",
+            schedule.parallelism()
+        );
     }
 
     #[test]
