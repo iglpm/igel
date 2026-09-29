@@ -226,7 +226,7 @@ fn fix_loop(args: &BuildArgs, flags: &[String], vcs: &FixVcs, what: &str) -> Res
             }
             _ => {}
         })?;
-        let applied = crate::fix::apply(&diagnostics.borrow(), &roots)?;
+        let applied = crate::fix::apply(&diagnostics.borrow(), &roots, sess.ws.root())?;
         total += applied;
         if applied == 0 {
             ensure_success(&result)?;
@@ -298,7 +298,7 @@ pub fn run(args: RunArgs) -> Result<()> {
     let exe = bin_dir_for(sess.config(), &sess.profile, unit).join(unit.executable_name(&name));
     let member = &sess.ws.members[node.member];
 
-    ui::action("running", exe.display());
+    ui::action("running", ui::rel(&exe));
     let mut cmd = sess.command_for(&exe);
     cmd.args(&args.args);
     apply_run_env(&mut cmd, member, &sess);

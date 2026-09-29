@@ -2147,11 +2147,51 @@ fn trim_paths_keeps_this_machines_paths_out_of_the_binary() {
         );
     }
 
-    // Without it, the absolute path is there, as with Cargo.
+    // Without it, the workspace's own paths are still relative to its root,
+    // as with Cargo (it compiles them from there), so panics name
+    // `src/main.rs` either way.
     p.write("Cargo.toml", LIB_MANIFEST);
     p.ok(&["build", "--release"]);
     let run = Command::new(&exe).output().unwrap();
-    assert!(String::from_utf8_lossy(&run.stderr).contains(root.to_str().unwrap()));
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert!(stderr.contains("src/main.rs:1"), "{stderr}");
+    assert!(!stderr.contains(root.to_str().unwrap()), "{stderr}");
+}
+
+#[test]
+fn compiler_messages_name_workspace_files_relative_to_the_root() {
+    let p = Project::new();
+    p.write(
+        "Cargo.toml",
+        "[workspace]\nresolver = \"2\"\nmembers = [\"app\"]\n",
+    );
+    p.write(
+        "app/Cargo.toml",
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    p.write("app/src/main.rs", "fn main() { let x: u32 = \"no\"; }\n");
+    let out = p.rune(&["build"]);
+    assert!(!out.status.success());
+    let text = text(&out);
+    assert!(text.contains("--> app/src/main.rs:1:26"), "{text}");
+    let root = p.path().canonicalize().unwrap();
+    assert!(!text.contains(root.to_str().unwrap()), "{text}");
+    // One verdict, after the compiler's message.
+    let verdict = text.find("could not compile app v0.1.0").expect(&text);
+    assert!(verdict > text.find("mismatched types").unwrap(), "{text}");
+    assert_eq!(text.matches("could not compile").count(), 1, "{text}");
+
+    // `rune fix` finds the files through those relative paths.
+    p.write(
+        "app/src/main.rs",
+        "#![warn(unused_parens)]\nfn main() { let x = (1); let _ = x; }\n",
+    );
+    p.ok(&["fix", "--allow-no-vcs"]);
+    assert!(
+        p.read("app/src/main.rs").contains("let x = 1;"),
+        "{}",
+        p.read("app/src/main.rs")
+    );
 }
 
 #[test]

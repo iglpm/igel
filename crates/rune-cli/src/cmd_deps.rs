@@ -229,13 +229,14 @@ pub fn add(args: AddArgs) -> Result<()> {
             inline.insert("workspace", Value::from(true));
             version_shown = "from the workspace".to_string();
         } else {
-            ui::action(
-                "updating",
-                format!("`{name}` from the {} index", defs.name_of(&index_url)),
+            let looking = ui::Activity::start(
+                "looking up",
+                format!("`{name}` in the {} index", defs.name_of(&index_url)),
             );
             let index = client
                 .refresh_crate(&name)
                 .with_context(|| format!("could not find `{name}` in the registry"))?;
+            looking.clear();
             let requirement = match ver_req {
                 Some(v) => v,
                 None => {
@@ -457,7 +458,6 @@ pub fn update(args: UpdateArgs) -> Result<()> {
         bail!("`rune update` needs the network to look for new releases (drop --offline)");
     }
     let before = LockfileManager::load_fast(ws.root());
-    ui::action("updating", "crates.io index");
 
     // `NAME` or `NAME@VERSION` (to pick one of several locked versions),
     // positional or with `-p` as in older Cargo.

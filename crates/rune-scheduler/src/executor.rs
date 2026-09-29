@@ -2020,7 +2020,11 @@ impl UnitJob {
             "dep-info" => {
                 let reads = inputs::env_reads_from_dep_info(&artifact.artifact, &provided);
                 let manifest = rune_common::manifest_file::manifest_in(&unit.manifest_dir);
-                let read_manifest = inputs::reads_manifest(&artifact.artifact, &manifest);
+                let read_manifest = inputs::reads_manifest(
+                    &artifact.artifact,
+                    &manifest,
+                    &self.config.project_root,
+                );
                 if !reads.is_empty() || read_manifest {
                     declared.merge(DeclaredInputs {
                         env: reads,
@@ -2801,7 +2805,21 @@ pub fn build_rustc_command(
     // The unit's own profile (`[profile.*.package.*]`, `build-override`);
     // the request's profile still names the output directory.
     let eff = unit.effective_profile(profile);
-    let mut builder = RustcCommandBuilder::new(unit.source_root.clone())
+    // A crate of the project is compiled from the project root with a
+    // relative path, as Cargo does: diagnostics and panic locations read
+    // `src/main.rs:3:5` instead of a long absolute path, and the paths baked
+    // into the artifact do not depend on where the checkout lives.
+    let (source, cwd) = match unit.source_root.strip_prefix(&config.project_root) {
+        Ok(rel) if unit.crate_id.source == CrateSource::Local && !rel.as_os_str().is_empty() => {
+            (rel.to_path_buf(), Some(config.project_root.clone()))
+        }
+        _ => (unit.source_root.clone(), None),
+    };
+    let mut builder = RustcCommandBuilder::new(source);
+    if let Some(dir) = cwd {
+        builder = builder.current_dir(dir);
+    }
+    let mut builder = builder
         .crate_name(&unit.rustc_crate_name())
         .edition(unit.edition.as_str())
         .metadata_hash(&unit.metadata_hash());

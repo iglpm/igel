@@ -8,6 +8,7 @@ pub struct RustcCommandBuilder {
     source_root: PathBuf,
     flags: Vec<OsString>,
     envs: Vec<(String, String)>,
+    current_dir: Option<PathBuf>,
 }
 
 impl RustcCommandBuilder {
@@ -17,6 +18,7 @@ impl RustcCommandBuilder {
             source_root,
             flags: Vec::new(),
             envs: Vec::new(),
+            current_dir: None,
         }
     }
 
@@ -256,6 +258,12 @@ impl RustcCommandBuilder {
         self
     }
 
+    /// Runs the compiler in `dir` (the source path is then relative to it).
+    pub fn current_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.current_dir = Some(dir.into());
+        self
+    }
+
     /// The accumulated compiler arguments (without the source file).
     pub fn into_args(self) -> Vec<OsString> {
         self.flags
@@ -270,6 +278,9 @@ impl RustcCommandBuilder {
     /// already names the compiler (and any wrappers in front of it), e.g. from
     /// `Toolchain::rustc_command`.
     pub fn build_with_command(self, mut cmd: Command) -> Command {
+        if let Some(dir) = &self.current_dir {
+            cmd.current_dir(dir);
+        }
         cmd.arg(&self.source_root);
         cmd.args(&self.flags);
         for (k, v) in self.envs {

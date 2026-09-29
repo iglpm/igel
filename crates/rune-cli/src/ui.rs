@@ -368,6 +368,16 @@ impl Drop for Activity {
     }
 }
 
+/// `path` relative to the working directory when it is below it
+/// (`.rune/target/debug/app`), as it was given otherwise.
+pub fn rel(path: &std::path::Path) -> String {
+    std::env::current_dir()
+        .ok()
+        .and_then(|cwd| path.strip_prefix(cwd).ok().map(|p| p.display().to_string()))
+        .filter(|p| !p.is_empty())
+        .unwrap_or_else(|| path.display().to_string())
+}
+
 /// `1.24s` / `380ms`.
 pub fn secs(d: Duration) -> String {
     if d < Duration::from_secs(1) {

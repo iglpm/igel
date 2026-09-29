@@ -24,7 +24,11 @@ struct Edit {
 /// The machine-applicable suggestions in `diagnostics` (rustc JSON, one
 /// diagnostic per string), grouped per file. Only files under one of `roots`
 /// are touched: never a dependency's sources.
-fn suggestions(diagnostics: &[String], roots: &[PathBuf]) -> BTreeMap<PathBuf, Vec<Vec<Edit>>> {
+fn suggestions(
+    diagnostics: &[String],
+    roots: &[PathBuf],
+    base: &std::path::Path,
+) -> BTreeMap<PathBuf, Vec<Vec<Edit>>> {
     let mut out: BTreeMap<PathBuf, Vec<Vec<Edit>>> = BTreeMap::new();
     let mut seen: BTreeSet<(PathBuf, Vec<Edit>)> = BTreeSet::new();
     for text in diagnostics {
@@ -56,7 +60,8 @@ fn suggestions(diagnostics: &[String], roots: &[PathBuf]) -> BTreeMap<PathBuf, V
             let mut edits = Vec::new();
             let mut ok = true;
             for s in &spans {
-                let path = PathBuf::from(s["file_name"].as_str().unwrap_or_default());
+                // Relative to the directory the compiler ran in.
+                let path = base.join(s["file_name"].as_str().unwrap_or_default());
                 if file.as_ref().is_some_and(|f| *f != path) {
                     ok = false;
                     break;
@@ -94,9 +99,9 @@ fn suggestions(diagnostics: &[String], roots: &[PathBuf]) -> BTreeMap<PathBuf, V
 }
 
 /// Applies the suggestions; returns how many were applied.
-pub fn apply(diagnostics: &[String], roots: &[PathBuf]) -> Result<usize> {
+pub fn apply(diagnostics: &[String], roots: &[PathBuf], base: &std::path::Path) -> Result<usize> {
     let mut applied = 0;
-    for (file, mut solutions) in suggestions(diagnostics, roots) {
+    for (file, mut solutions) in suggestions(diagnostics, roots, base) {
         let text = std::fs::read_to_string(&file)
             .with_context(|| format!("cannot read {}", file.display()))?;
         solutions.sort_by_key(|s| s.first().map(|e| e.start).unwrap_or(0));
@@ -235,7 +240,7 @@ mod tests {
             // Two edits of one suggestion.
             diag(f, &[(17, 18, "g"), (19, 19, "x: u8")], "MachineApplicable"),
         ];
-        let n = apply(&diags, &[dir.path().to_path_buf()]).unwrap();
+        let n = apply(&diags, &[dir.path().to_path_buf()], dir.path()).unwrap();
         assert_eq!(n, 2);
         assert_eq!(
             std::fs::read_to_string(&file).unwrap(),
@@ -253,7 +258,12 @@ mod tests {
             &[(0, 7, "")],
             "MachineApplicable",
         )];
-        let n = apply(&diags, &[PathBuf::from("/somewhere/else")]).unwrap();
+        let n = apply(
+            &diags,
+            &[PathBuf::from("/somewhere/else")],
+            std::path::Path::new("/"),
+        )
+        .unwrap();
         assert_eq!(n, 0);
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "use a;\n");
     }
@@ -268,7 +278,10 @@ mod tests {
             diag(f, &[(0, 3, "X")], "MachineApplicable"),
             diag(f, &[(2, 4, "Y")], "MachineApplicable"),
         ];
-        assert_eq!(apply(&diags, &[dir.path().to_path_buf()]).unwrap(), 1);
+        assert_eq!(
+            apply(&diags, &[dir.path().to_path_buf()], dir.path()).unwrap(),
+            1
+        );
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "Xdef");
     }
 }

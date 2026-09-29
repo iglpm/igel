@@ -395,25 +395,51 @@ pub fn drive(
             .map_err(|e| anyhow::anyhow!(e.to_string()))
     })?;
 
-    for (crate_desc, error) in &failures {
-        ui::error(format!("failed to compile {}", crate_desc.bold()));
+    // The compiler's own messages; the one-line verdict naming the crates
+    // comes last, from `ensure_success`, like Cargo's.
+    for (_, error) in &failures {
         if !sess.json {
-            ui::err(error);
+            ui::err(error.trim_end());
+            ui::err("");
         }
     }
+    *FAILED.lock().unwrap_or_else(|e| e.into_inner()) =
+        failures.iter().map(|(c, _)| c.clone()).collect();
     sess.maybe_gc();
     Ok((result, failures))
 }
 
-/// Bails with Cargo's message if a build had failures.
+/// The crates the last build could not compile (`name vX.Y.Z`).
+static FAILED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// Bails, naming the crates that did not compile, if a build had failures.
 pub fn ensure_success(result: &BuildResult) -> Result<()> {
     if result.success {
-        Ok(())
-    } else {
-        bail!(
-            "could not compile due to {} previous error(s)",
-            result.failed.len()
-        )
+        return Ok(());
+    }
+    let failed = FAILED.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    match failed.as_slice() {
+        [] => bail!(
+            "could not compile {}",
+            ui::plural(result.failed.len(), "crate")
+        ),
+        [one] => bail!("could not compile {}", one.bold()),
+        many => {
+            const SHOWN: usize = 3;
+            let mut names: Vec<String> = many
+                .iter()
+                .take(SHOWN)
+                .map(|c| c.bold().to_string())
+                .collect();
+            if many.len() > SHOWN {
+                names.push(format!("{} more", many.len() - SHOWN));
+            }
+            bail!(
+                "could not compile {}: {}",
+                ui::plural(many.len(), "crate"),
+                names.join(", ")
+            )
+        }
     }
 }
 

@@ -234,11 +234,24 @@ pub fn clean(args: CleanArgs) -> Result<()> {
     };
 
     if target.exists() {
+        let (files, size) = walkdir::WalkDir::new(&target)
+            .into_iter()
+            .flatten()
+            .filter(|e| e.file_type().is_file())
+            .filter_map(|e| e.metadata().ok())
+            .fold((0usize, 0u64), |(n, b), m| (n + 1, b + m.len()));
         fs::remove_dir_all(&target)
             .with_context(|| format!("failed to remove {}", target.display()))?;
-        ui::action("cleaned", target.display());
+        ui::action(
+            "cleaned",
+            format!(
+                "{} {}",
+                ui::rel(&target),
+                format!("({}, {})", ui::plural(files, "file"), ui::bytes(size)).dimmed()
+            ),
+        );
     } else {
-        println!("nothing to clean");
+        ui::summary("nothing to clean");
     }
     Ok(())
 }
