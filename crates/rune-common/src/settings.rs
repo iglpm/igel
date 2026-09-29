@@ -218,6 +218,13 @@ pub const KEYS: &[KeyDef] = &[
                       least 5 GiB and at most 50 GiB; `0`: unlimited.",
     },
     KeyDef {
+        name: "cas.compress-after",
+        kind: ValueKind::Duration,
+        default: "7d",
+        description: "Compress (zstd) store entries no build has used for this long; the next \
+                      build that needs one decompresses it. `0`: never compress.",
+    },
+    KeyDef {
         name: "cas.max-age",
         kind: ValueKind::Duration,
         default: "30d",
@@ -579,6 +586,14 @@ impl Settings {
         match self.values.get("cas.max-age") {
             Some((Value::Text(t), _)) => crate::time::parse_duration(t).filter(|s| *s > 0),
             _ => Some(30 * 86_400),
+        }
+    }
+
+    /// `cas.compress-after` in seconds (7 days unless set; `None` when `0`).
+    pub fn cas_compress_after(&self) -> Option<u64> {
+        match self.values.get("cas.compress-after") {
+            Some((Value::Text(t), _)) => crate::time::parse_duration(t).filter(|s| *s > 0),
+            _ => Some(7 * 86_400),
         }
     }
 

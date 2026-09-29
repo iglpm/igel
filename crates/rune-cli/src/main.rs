@@ -107,6 +107,7 @@ fn main() {
         Commands::Clean(a) => cmd_misc::clean(a),
         Commands::Config(c) => cmd_misc::config(c),
         Commands::Cas(args::CasCommands::Export(a)) => cmd_build::cas_export(*a),
+        Commands::Cas(args::CasCommands::Pin(a)) => cmd_build::cas_pin(*a),
         Commands::Cas(c) => cmd_misc::cas(c),
         Commands::Doctor => cmd_misc::doctor(),
         Commands::Watch(a) => cmd_watch::watch(a),

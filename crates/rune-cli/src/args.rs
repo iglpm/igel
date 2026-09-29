@@ -990,6 +990,12 @@ pub enum CasCommands {
     Stats,
     /// Garbage collect the CAS store by size or age
     Gc(CasGcArgs),
+    /// Keep what this workspace's builds need through every cleanup
+    Pin(Box<CasPinArgs>),
+    /// Stop keeping this workspace's entries
+    Unpin,
+    /// List pinned workspaces
+    Pins,
     /// Show which packages take the space, and how much has gone unused
     Du(CasDuArgs),
     /// Write the store entries a build of the workspace needs into one file
@@ -1032,6 +1038,19 @@ pub struct CasGcArgs {
     /// seconds)
     #[arg(long, value_name = "DURATION", value_parser = parse_age)]
     pub max_age: Option<u64>,
+
+    /// Compress (zstd) entries no build has used for this long
+    #[arg(long, value_name = "DURATION", value_parser = parse_age)]
+    pub compress_idle: Option<u64>,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct CasPinArgs {
+    #[command(flatten)]
+    pub build: BuildArgs,
+    /// Which commands' entries to keep (repeatable): `build`, `check`, `test`
+    #[arg(long = "for", value_name = "COMMAND", default_values_t = ["build".to_string(), "check".to_string(), "test".to_string()], value_parser = ["build", "check", "test"])]
+    pub for_commands: Vec<String>,
 }
 
 fn parse_age(s: &str) -> Result<u64, String> {

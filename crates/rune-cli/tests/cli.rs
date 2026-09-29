@@ -5840,3 +5840,73 @@ fn workspace_feature_unification_shares_dependency_builds_across_selections() {
         text(&bad)
     );
 }
+
+#[test]
+fn pinned_workspaces_survive_cleanup_and_idle_entries_are_compressed() {
+    let p = Project::new();
+    p.write("Cargo.toml", LIB_MANIFEST);
+    p.write(
+        "src/lib.rs",
+        &format!(
+            "pub fn f() -> &'static str {{ \"{}\" }}\n",
+            "x".repeat(20_000)
+        ),
+    );
+    p.ok(&["build"]);
+    let cas = p.home().join("cas");
+    let manifests: Vec<PathBuf> = walkdir::WalkDir::new(cas.join("objects"))
+        .into_iter()
+        .flatten()
+        .filter(|e| e.file_name() == "manifest.json")
+        .map(|e| e.into_path())
+        .collect();
+    assert!(!manifests.is_empty());
+    // Everything was stored and last used 40 days ago.
+    let then = std::time::SystemTime::now() - std::time::Duration::from_secs(40 * 86_400);
+    let age = || {
+        for m in &manifests {
+            let mut json: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(m).unwrap()).unwrap();
+            json["stored_at"] = then
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+                .into();
+            let mut perms = std::fs::metadata(m).unwrap().permissions();
+            #[allow(clippy::permissions_set_readonly_false)]
+            perms.set_readonly(false);
+            std::fs::set_permissions(m, perms).unwrap();
+            std::fs::write(m, json.to_string()).unwrap();
+            std::fs::File::open(m).unwrap().set_modified(then).unwrap();
+        }
+    };
+    age();
+
+    let out = p.ok(&["cas", "pin"]);
+    assert!(out.contains("pinned"), "{out}");
+    assert!(p.ok(&["cas", "pins"]).contains("entries"));
+
+    // Pinned: kept, but compressed.
+    let out = p.ok(&["cas", "gc", "--max-age", "30d", "--compress-idle", "7d"]);
+    assert!(out.contains("0 entries"), "{out}");
+    assert!(out.contains("kept for pinned"), "{out}");
+    assert!(manifests.iter().all(|m| m.exists()));
+    let compressed = |m: &PathBuf| {
+        std::fs::read_dir(m.parent().unwrap())
+            .unwrap()
+            .flatten()
+            .any(|e| e.file_name().to_string_lossy().ends_with(".zst"))
+    };
+    assert!(manifests.iter().any(compressed), "{out}");
+
+    // A fresh build restores from the compressed entries.
+    p.ok(&["clean"]);
+    assert!(p.ok(&["build"]).contains("0 compiled · 1 cached"));
+    assert!(!manifests.iter().any(compressed));
+
+    // Unpinned, old entries go.
+    age();
+    assert!(p.ok(&["cas", "unpin"]).contains("unpinned"));
+    p.ok(&["cas", "gc", "--max-age", "30d"]);
+    assert!(manifests.iter().all(|m| !m.exists()));
+}

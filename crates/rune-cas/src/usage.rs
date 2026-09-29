@@ -86,11 +86,11 @@ pub fn usage(store: &CasStore) -> Usage {
         let idle = now.saturating_sub(used);
 
         out.entries += 1;
-        out.bytes += manifest.total_size;
+        out.bytes += manifest.disk_size();
         for bucket in &mut out.idle {
             if idle >= bucket.min_idle_secs {
                 bucket.entries += 1;
-                bucket.bytes += manifest.total_size;
+                bucket.bytes += manifest.disk_size();
             }
         }
         let pkg = by_name
@@ -102,7 +102,7 @@ pub fn usage(store: &CasStore) -> Usage {
                 idle_secs: u64::MAX,
             });
         pkg.entries += 1;
-        pkg.bytes += manifest.total_size;
+        pkg.bytes += manifest.disk_size();
         pkg.idle_secs = pkg.idle_secs.min(idle);
     }
 

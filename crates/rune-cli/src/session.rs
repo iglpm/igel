@@ -196,8 +196,10 @@ impl Session {
     /// for entries unused for `cas.max-age`.
     pub fn maybe_gc(&self) {
         let Some(cas) = self.cas() else { return };
-        if let Some(age) = self.ws.config.settings.cas_max_age() {
-            spawn_daily_gc(cas.root(), age);
+        let settings = &self.ws.config.settings;
+        let (age, compress) = (settings.cas_max_age(), settings.cas_compress_after());
+        if age.is_some() || compress.is_some() {
+            spawn_daily_gc(cas.root(), age, compress);
         }
         let Some(max) = self.ws.config.settings.cas_max_size_for(cas.root()) else {
             return;
@@ -208,6 +210,7 @@ impl Session {
                 &GcConfig {
                     max_size_bytes: Some(max),
                     max_age_secs: None,
+                    compress_idle_secs: None,
                 },
             );
         }
@@ -219,11 +222,11 @@ impl Session {
     }
 }
 
-/// Starts `rune cas gc --max-age` for the store at `root` in the background
+/// Starts `rune cas gc --max-age --compress-idle` for the store at `root` in the background
 /// when the last run was more than a day ago; the build does not wait for it.
 /// A store seen for the first time only gets its stamp: nothing in it can
 /// have gone unused for long, and short-lived stores (tests, CI) never pay.
-fn spawn_daily_gc(root: &std::path::Path, max_age_secs: u64) {
+fn spawn_daily_gc(root: &std::path::Path, max_age_secs: Option<u64>, compress: Option<u64>) {
     let stamp = root.join("last-gc");
     let due = match std::fs::metadata(&stamp).and_then(|m| m.modified()) {
         Ok(t) => t
@@ -242,10 +245,18 @@ fn spawn_daily_gc(root: &std::path::Path, max_age_secs: u64) {
     let Ok(exe) = std::env::current_exe() else {
         return;
     };
-    let _ = std::process::Command::new(exe)
-        .args(["cas", "gc", "--max-age"])
-        .arg(max_age_secs.to_string())
+    let mut cmd = std::process::Command::new(exe);
+    cmd.args(["cas", "gc"]);
+    if let Some(age) = max_age_secs {
+        cmd.arg("--max-age").arg(age.to_string());
+    }
+    if let Some(idle) = compress {
+        cmd.arg("--compress-idle").arg(idle.to_string());
+    }
+    // Compressing is background work: never at the expense of the user's.
+    let _ = cmd
         .env("RUNE_CAS_DIR", root)
+        .env("RUNE_BACKGROUND", "1")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())

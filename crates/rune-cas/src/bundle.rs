@@ -47,6 +47,8 @@ impl CasStore {
             if !seen.insert(key.as_str()) {
                 continue;
             }
+            // A compressed entry travels decompressed, as it is used.
+            let _ = self.get(key);
             let dir = self.object_dir(key);
             if !dir.is_dir() {
                 stats.skipped += 1;
