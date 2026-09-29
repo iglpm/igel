@@ -30,6 +30,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+      # .cargo/config.toml links aarch64-apple-darwin with lld.
+      - if: runner.os == 'macOS'
+        run: brew install lld
       - name: Build
         env:
           RUNE_BUILD_COMMIT: ${{ github.sha }}
