@@ -45,9 +45,8 @@ flate2.workspace = true
 glob.workspace = true
 walkdir.workspace = true
 blake3.workspace = true
+reqwest.workspace = true
+tempfile.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
-
-[dev-dependencies]
-tempfile.workspace = true

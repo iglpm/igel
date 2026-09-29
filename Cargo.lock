@@ -1248,6 +1248,7 @@ dependencies = [
  "indicatif",
  "libc",
  "rayon",
+ "reqwest",
  "rune-cas",
  "rune-common",
  "rune-fingerprint",

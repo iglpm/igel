@@ -31,14 +31,33 @@ understands `.cargo/config.toml`.
 
 ## Install
 
+**Linux and macOS:**
 ```bash
-curl -fsSL https://raw.githubusercontent.com/runepm/rune/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/runepm/rune/main/installers/install.sh | sh
 ```
 
-The script downloads the release for your machine (Linux or macOS, x86_64 or
-aarch64), checks its SHA-256 and installs `rune` to `~/.rune/bin`
+**Windows (PowerShell):**
+```powershell
+irm https://raw.githubusercontent.com/runepm/rune/main/installers/install.ps1 | iex
+```
+
+The script downloads the release for your machine (Linux, macOS, or Windows;
+x86_64 or aarch64), checks its SHA-256 and installs `rune` to `~/.rune/bin`
 (`--to DIR`, `--version v0.1.0`). From source: `cargo install --git
-https://github.com/runepm/rune rune-cli`. Then:
+https://github.com/runepm/rune rune-cli`.
+
+To update Rune later:
+```bash
+rune self update             # or: rune self update --check
+```
+
+To uninstall:
+```bash
+curl -fsSL https://raw.githubusercontent.com/runepm/rune/main/installers/uninstall.sh | sh
+# Or from Rune directly: rune self uninstall --purge
+```
+
+Then:
 
 ```bash
 rune version -v                                   # what you have
