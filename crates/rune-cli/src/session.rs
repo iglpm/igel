@@ -306,8 +306,14 @@ pub fn drive(
     let result = std::thread::scope(|scope| -> Result<BuildResult> {
         let handle = scope.spawn(|| executor.execute(graph));
 
-        let mut progress = (!sess.quiet && !sess.json)
-            .then(|| BuildProgress::new(ui::multi_progress(), graph.node_count() as u64));
+        let checking = graph
+            .nodes()
+            .iter()
+            .all(|n| n.unit.check_only || n.unit.is_build_script || !n.unit.ext.member);
+        let verb = if checking { "checking" } else { "building" };
+        let mut progress = (!sess.quiet && !sess.json).then(|| {
+            BuildProgress::with_verb(ui::multi_progress(), graph.node_count() as u64, verb)
+        });
         let mut scripts_reported: std::collections::HashSet<String> = Default::default();
         while let Ok(event) = event_rx.recv() {
             let is_final = matches!(event, PipelineEvent::AllComplete { .. });
@@ -323,7 +329,7 @@ pub fn drive(
                     for line in
                         crate::messages::lines_for(unit, sess.config(), &sess.profile, &event)
                     {
-                        println!("{line}");
+                        ui::out(line);
                     }
                 }
                 if let PipelineEvent::ScriptOutput { node_id, output } = &event {
@@ -339,14 +345,13 @@ pub fn drive(
                         let out_dir = sess
                             .config()
                             .build_script_out_dir_by_key(sess.profile.output_dir_name(), &owner);
-                        println!(
-                            "{}",
-                            crate::messages::build_script_executed(unit, output, &out_dir)
-                        );
+                        ui::out(crate::messages::build_script_executed(
+                            unit, output, &out_dir,
+                        ));
                     }
                 }
                 if let PipelineEvent::AllComplete { failed, .. } = &event {
-                    println!("{}", crate::messages::build_finished(*failed == 0));
+                    ui::out(crate::messages::build_finished(*failed == 0));
                 }
             }
             match &event {
@@ -393,7 +398,7 @@ pub fn drive(
     for (crate_desc, error) in &failures {
         ui::error(format!("failed to compile {}", crate_desc.bold()));
         if !sess.json {
-            eprintln!("{error}");
+            ui::err(error);
         }
     }
     sess.maybe_gc();

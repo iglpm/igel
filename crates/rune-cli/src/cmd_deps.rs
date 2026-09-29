@@ -595,7 +595,10 @@ pub fn fetch(args: ManifestArgs) -> Result<()> {
     let (resolved, lock) = graph::resolve_fresh(&ws, offline, existing.as_ref(), false)?;
     graph::store_resolution(&ws, &lock)?;
     let n = graph::download_all(&resolved, offline)?;
-    ui::action("fetched", format!("{n} crates"));
+    ui::summary(format!(
+        "{} available offline",
+        ui::plural(n, "registry crate")
+    ));
     Ok(())
 }
 

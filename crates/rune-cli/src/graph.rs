@@ -17,6 +17,7 @@
 //! 4. Drop everything not reachable from the requested targets.
 
 use anyhow::{Context, Result, bail};
+use colored::Colorize;
 use rayon::prelude::*;
 use rune_common::timing::phase;
 use rune_common::toolchain::{self, Role, TargetInfo};
@@ -897,6 +898,16 @@ pub fn resolve_fresh_with(
     preferred: &[(String, String, semver::Version)],
 ) -> Result<(ResolvedGraph, Lockfile)> {
     let _timer = phase("resolve (fresh)");
+    // Callers report the outcome (a lockfile written, a tree printed); the
+    // line only shows what is going on meanwhile.
+    let _activity = ui::Activity::start(
+        "resolving",
+        if refresh {
+            "checking the index for new releases"
+        } else {
+            "dependency graph"
+        },
+    );
     configure_git(ws, offline, refresh, existing);
     let locals = Locals::load(ws)?;
     let profile = Profile::dev();
@@ -1027,7 +1038,7 @@ fn resolve(ws: &Workspace, locals: &Locals, req: &Request) -> Result<(ResolvedGr
     let existing_lock = LockfileManager::load_fast(root);
     let roots = resolution_roots(ws, locals, req)?;
 
-    ui::action("resolving", "dependency graph");
+    let activity = ui::Activity::start("resolving", "dependency graph");
     let _timer = phase("resolve");
     let mut resolver = DependencyResolver::default_resolver()
         .offline(req.offline)
@@ -1045,6 +1056,25 @@ fn resolve(ws: &Workspace, locals: &Locals, req: &Request) -> Result<(ResolvedGr
 
     let lockfile = refine_lock(ws, locals, &resolved.to_lockfile());
     let resolved = prune_resolved(resolved, &lockfile);
+    let fetched = activity.fetched();
+    let took = activity.elapsed();
+    activity.finish(
+        "resolved",
+        format!(
+            "{} {}",
+            ui::plural(lockfile.packages.len(), "package"),
+            if fetched > 0 {
+                format!(
+                    "({}, {})",
+                    ui::plural(fetched, "index file") + " fetched",
+                    ui::secs(took)
+                )
+            } else {
+                format!("({})", ui::secs(took))
+            }
+            .dimmed()
+        ),
+    );
     warn_unused_patches(ws, &resolved);
     if req.locked
         && existing_lock.as_ref().map(locked_registry_packages)

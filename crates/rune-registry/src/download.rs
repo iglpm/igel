@@ -292,6 +292,18 @@ impl CrateDownloader {
                     ),
                 };
                 debug!("Downloading crate {} from {}", crate_folder_name, url);
+                use rune_common::progress::{CountingReader, Event, emit};
+                emit(Event::DownloadStarted { name, version });
+                struct Finished<'a>(&'a str, &'a str);
+                impl Drop for Finished<'_> {
+                    fn drop(&mut self) {
+                        emit(Event::DownloadFinished {
+                            name: self.0,
+                            version: self.1,
+                        });
+                    }
+                }
+                let _finished = Finished(name, version);
 
                 // Stream into a temp file and rename, so an interrupted download
                 // can never be mistaken for a complete tarball later. A
@@ -325,8 +337,9 @@ impl CrateDownloader {
                             resp.status()
                         )));
                     }
-                    let copied = File::create(&tmp_tarball)
-                        .and_then(|mut out_file| std::io::copy(&mut resp, &mut out_file));
+                    let copied = File::create(&tmp_tarball).and_then(|mut out_file| {
+                        std::io::copy(&mut CountingReader(&mut resp), &mut out_file)
+                    });
                     match copied {
                         Ok(_) => break,
                         Err(e) if attempt < retries => {
@@ -434,6 +447,22 @@ impl CrateDownloader {
 
         let mut results: Vec<Option<Result<PathBuf>>> = (0..packages.len()).map(|_| None).collect();
         if !missing.is_empty() {
+            // Archives already in the cache only need unpacking.
+            let to_fetch = missing
+                .iter()
+                .filter(|&&i| {
+                    let (name, version, _) = &packages[i];
+                    !self
+                        .crates_dir
+                        .join(format!("{name}-{version}.crate"))
+                        .is_file()
+                })
+                .count();
+            if to_fetch > 0 && !self.offline {
+                rune_common::progress::emit(rune_common::progress::Event::DownloadsQueued {
+                    count: to_fetch,
+                });
+            }
             let run = || -> Vec<(usize, Result<PathBuf>)> {
                 missing
                     .par_iter()
