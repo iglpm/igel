@@ -525,7 +525,7 @@ pub fn run(args: TestArgs, mode: Mode) -> Result<()> {
             match exe {
                 Some(exe) if !args.no_run => {
                     let batches = if split && r.harness {
-                        split_into_batches(&sess, &exe, r.member, &args, runner_count)
+                        split_into_batches(sess, &exe, r.member, &args, runner_count)
                     } else {
                         Vec::new()
                     };
