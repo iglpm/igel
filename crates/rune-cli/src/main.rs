@@ -44,6 +44,13 @@ fn main() {
     unsafe {
         libc::signal(libc::SIGPIPE, libc::SIG_DFL);
     }
+    // The sandbox helper (`build.sandbox`): confine, then run the program.
+    if std::env::args_os().nth(1).as_deref()
+        == Some(std::ffi::OsStr::new(rune_common::sandbox::HELPER_ARG))
+    {
+        let rest: Vec<OsString> = std::env::args_os().skip(2).collect();
+        rune_common::sandbox::helper_main(&rest);
+    }
     ui::setup_logging();
 
     let args = external::expand(std::env::args_os().collect());

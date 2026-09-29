@@ -18,6 +18,7 @@ pub mod hash;
 pub mod manifest_file;
 pub mod net;
 pub mod progress;
+pub mod sandbox;
 pub mod settings;
 pub mod sysinfo;
 pub mod time;

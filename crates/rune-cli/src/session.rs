@@ -41,6 +41,8 @@ pub struct Session {
     /// build directory (`cargo::rustc-link-search=…/out`): a program run by
     /// `rune run`/`rune test` finds its dynamic libraries there, as with Cargo.
     pub native_dirs: std::sync::Mutex<Vec<std::path::PathBuf>>,
+    /// `build.sandbox`, checked to work here.
+    pub sandbox: Option<rune_scheduler::executor::SandboxPolicy>,
 }
 
 impl Session {
@@ -57,6 +59,23 @@ impl Session {
         if ws.config.settings.low_priority() {
             rune_common::sysinfo::lower_priority();
         }
+        let sandbox = if ws.config.settings.sandbox() {
+            let helper =
+                anyhow::Context::context(std::env::current_exe(), "locating the rune executable")?;
+            let sandbox =
+                rune_common::sandbox::Sandbox::new(helper, ws.config.target_dir.join("tmp"));
+            sandbox.probe().map_err(|why| {
+                anyhow::anyhow!(
+                    "build.sandbox is on, but build-time code cannot be confined here: {why}"
+                )
+            })?;
+            Some(rune_scheduler::executor::SandboxPolicy {
+                sandbox,
+                network: ws.config.settings.sandbox_network().into_iter().collect(),
+            })
+        } else {
+            None
+        };
 
         if let Some(dir) = &common.target_dir {
             ws.config.target_dir = if dir.is_absolute() {
@@ -134,6 +153,7 @@ impl Session {
             force_rebuild,
             ignore_rust_version: common.ignore_rust_version,
             native_dirs: Default::default(),
+            sandbox,
         })
     }
 
@@ -187,6 +207,9 @@ impl Session {
                 .with_frontend_threads(self.ws.config.settings.frontend_threads());
         if let Some(cas) = self.cas() {
             executor = executor.with_cas(cas);
+        }
+        if let Some(policy) = &self.sandbox {
+            executor = executor.with_sandbox(policy.clone());
         }
         executor
     }

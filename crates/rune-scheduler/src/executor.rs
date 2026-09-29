@@ -270,6 +270,16 @@ pub struct BuildExecutor {
     cpus: usize,
     /// Reads the machine's memory (replaceable in tests).
     memory: fn() -> Option<rune_common::sysinfo::Memory>,
+    /// `build.sandbox`: compilers and build scripts run confined.
+    sandbox: Option<std::sync::Arc<SandboxPolicy>>,
+}
+
+/// How build-time code is confined (see `rune_common::sandbox`).
+#[derive(Debug, Clone)]
+pub struct SandboxPolicy {
+    pub sandbox: rune_common::sandbox::Sandbox,
+    /// Packages whose build scripts may use the network.
+    pub network: HashSet<String>,
 }
 
 impl BuildExecutor {
@@ -291,6 +301,7 @@ impl BuildExecutor {
             jobserver,
             tokens,
             frontend_threads: Default::default(),
+            sandbox: None,
             cpus: std::thread::available_parallelism().map_or(1, |n| n.get()),
             memory: rune_common::sysinfo::memory,
         }
@@ -307,6 +318,12 @@ impl BuildExecutor {
 
     /// Threads for rustc's parallel front end (nightly compilers only; see
     /// `build.frontend-threads`).
+    /// Runs every compiler and build script confined.
+    pub fn with_sandbox(mut self, policy: SandboxPolicy) -> Self {
+        self.sandbox = Some(std::sync::Arc::new(policy));
+        self
+    }
+
     pub fn with_frontend_threads(mut self, t: rune_common::settings::FrontendThreads) -> Self {
         self.frontend_threads = t;
         self
@@ -1465,6 +1482,7 @@ impl BuildExecutor {
             color: self.color,
             jobserver: self.jobserver.clone(),
             tokens: self.tokens.clone(),
+            sandbox: self.sandbox.clone(),
             script_only: false,
             lock: None,
             lock_waited: false,
@@ -1507,6 +1525,7 @@ struct UnitJob {
     color: bool,
     jobserver: Option<jobserver::Client>,
     tokens: Option<crate::tokens::JobTokens>,
+    sandbox: Option<std::sync::Arc<SandboxPolicy>>,
     /// Only run (or restore) the unit's build script; its compilation is a
     /// separate job, started once its dependencies' metadata exists.
     script_only: bool,
@@ -1525,6 +1544,16 @@ struct UnitJob {
 }
 
 impl UnitJob {
+    /// The compiler command, confined when `build.sandbox` is on: it writes
+    /// only into the build directory, and proc-macros get no network.
+    fn compiler_command(&self, member: bool) -> std::process::Command {
+        let cmd = self.toolchain.rustc_command(member);
+        match &self.sandbox {
+            Some(p) => p.sandbox.wrap(&cmd, &[&self.config.target_dir], false),
+            None => cmd,
+        }
+    }
+
     fn fail(&self, error: String, event_error: String) {
         self.fail_with(error, event_error, Vec::new());
     }
@@ -1844,7 +1873,7 @@ impl UnitJob {
                 }
                 None => {
                     let compiled = BuildScriptRunner::compile_reporting(
-                        tc.rustc_command(unit.ext.member),
+                        self.compiler_command(unit.ext.member),
                         &build_rs,
                         &script_bin_dir,
                         &deps_dir,
@@ -1883,7 +1912,18 @@ impl UnitJob {
                     // and nowhere near its own source.
                     let immutable_before = (unit.crate_id.source != CrateSource::Local)
                         .then(|| tree_stamp(&unit.manifest_dir));
-                    let outcome = BuildScriptRunner::execute_with(&bin_path, &env, &run_configure);
+                    let script_cmd = match &self.sandbox {
+                        // Writes go to `OUT_DIR` only; the network is off
+                        // unless the package is allowed it.
+                        Some(p) => p.sandbox.command(
+                            bin_path.as_os_str(),
+                            &[&env.out_dir],
+                            p.network.contains(&unit.crate_id.name),
+                        ),
+                        None => std::process::Command::new(&bin_path),
+                    };
+                    let outcome =
+                        BuildScriptRunner::execute_command(script_cmd, &env, &run_configure);
                     if let Some(before) = immutable_before
                         && outcome.is_ok()
                         && tree_stamp(&unit.manifest_dir) != before
@@ -2035,7 +2075,7 @@ impl UnitJob {
                 cmd_builder = cmd_builder.env(k, v);
             }
         }
-        let mut cmd = cmd_builder.build_with_command(self.toolchain.rustc_command(unit.ext.member));
+        let mut cmd = cmd_builder.build_with_command(self.compiler_command(unit.ext.member));
         if let Some(js) = &self.jobserver {
             js.configure(&mut cmd);
         }

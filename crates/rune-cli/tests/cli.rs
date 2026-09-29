@@ -5978,3 +5978,44 @@ fn an_impossible_version_choice_is_explained() {
     assert!(t.contains("side by side"), "{t}");
     assert!(out.status.success(), "{t}");
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn the_sandbox_confines_build_scripts() {
+    let p = lib_project();
+    let outside = p.home().join("planted");
+    p.write(
+        "build.rs",
+        &format!(
+            r#"
+fn main() {{
+    let out = std::env::var("OUT_DIR").unwrap();
+    std::fs::write(format!("{{out}}/generated.rs"), "pub const OK: u8 = 1;").unwrap();
+    let planted = std::fs::write({outside:?}, "x").is_ok();
+    let net = std::net::TcpStream::connect_timeout(
+        &"1.1.1.1:80".parse().unwrap(),
+        std::time::Duration::from_millis(500),
+    )
+    .map_err(|e| e.kind());
+    println!("cargo::warning=planted={{planted}} net_unreachable={{}}",
+        net.as_ref().err() == Some(&std::io::ErrorKind::NetworkUnreachable));
+}}
+"#
+        ),
+    );
+    p.write(
+        "src/lib.rs",
+        "include!(concat!(env!(\"OUT_DIR\"), \"/generated.rs\"));\n",
+    );
+    // Without the sandbox a build script can write anywhere.
+    let out = p.ok(&["build"]);
+    assert!(out.contains("planted=true"), "{out}");
+    std::fs::remove_file(&outside).unwrap();
+
+    p.write("Rune.toml", "[build]\nsandbox = true\n");
+    let out = p.ok(&["build", "--rebuild-all"]);
+    // OUT_DIR works; nothing else is writable, and there is no network.
+    assert!(out.contains("planted=false"), "{out}");
+    assert!(out.contains("net_unreachable=true"), "{out}");
+    assert!(!outside.exists());
+}

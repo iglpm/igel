@@ -124,6 +124,22 @@ pub const KEYS: &[KeyDef] = &[
                       Cargo's `resolver.feature-unification` config is honored too.",
     },
     KeyDef {
+        name: "build.sandbox",
+        kind: ValueKind::Bool,
+        default: "false",
+        description: "Run build scripts and the compiler (which runs proc-macros) confined: no \
+                      network, and no writes outside the build directory (a build script: its \
+                      OUT_DIR) and the temporary directory. Linux: user namespaces; macOS: \
+                      sandbox-exec.",
+    },
+    KeyDef {
+        name: "build.sandbox-network",
+        kind: ValueKind::Text,
+        default: "",
+        description: "Packages whose build scripts may use the network in the sandbox \
+                      (comma-separated names), for those that download what they build.",
+    },
+    KeyDef {
         name: "build.low-priority",
         kind: ValueKind::Bool,
         default: "false",
@@ -515,6 +531,22 @@ impl Settings {
         match self.values.get("build.feature-unification") {
             Some((Value::Text(t), _)) => Some(t.clone()),
             _ => None,
+        }
+    }
+
+    pub fn sandbox(&self) -> bool {
+        self.bool("build.sandbox", false)
+    }
+
+    /// `build.sandbox-network`: package names.
+    pub fn sandbox_network(&self) -> Vec<String> {
+        match self.values.get("build.sandbox-network") {
+            Some((Value::Text(t), _)) => t
+                .split([',', ' '])
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect(),
+            _ => Vec::new(),
         }
     }
 
