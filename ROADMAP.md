@@ -1103,3 +1103,62 @@ Rune's own workspace; clippy clean.
 **Not done:** Windows; the sandbox (G1) and with it default-on cached tests;
 a PubGrub resolver; scheduling single tests across binaries; `rune features`
 (P10); zstd and pinning in the store (P6); measurements on the M5 itself.
+
+## 13. What changed in the CLI and network update (2026-09-29)
+
+**The progress bar glitch.** `rune test` runs each test binary as soon as it
+links, while other crates still compile, and its result lines (`▸ ok …`) were
+written straight to the terminal in the middle of the progress redraw: the text
+landed on the spinner row, the next redraw moved the cursor up too few rows, and
+the old frame stayed behind — the bar seemed to stop, then continued on a new
+line. Reproduced in a pseudo-terminal and checked frame by frame with a terminal
+emulator. Now every line the CLI prints (status, warnings, logs, test results,
+JSON, from any thread) goes through one lock that suspends the progress display,
+and the display is a single line — `⠹ building ━━━━╾──── 47/197 regex-syntax,
+memchr +3`, the crates in flight fitted to the width, the bar narrower on narrow
+terminals — which cannot wrap or outgrow the screen as the stack of one spinner
+per crate could. Across 400 sampled frames of `rune test` on Rune's workspace:
+one progress line at a time, nothing written into it, nothing left behind.
+
+**Progress for the network.** Resolution shows the index files fetched so far,
+then `▸ resolved 469 packages (0.84s)`; downloads a bar with crates, bytes and
+names, then `▸ downloaded 468 crates (76.4 MiB, 2.12s)`. The registry and
+resolver report through a small event sink in `rune-common`.
+
+**Faster resolution** (469-package corpus, same machine and network, runs
+interleaved with the previous binary):
+
+| | before | after | Cargo |
+| --- | --- | --- | --- |
+| resolve, index cached, online (revalidates every file) | 0.93–2.13 s, mostly 2.09 | 0.91–1.52 s | 1.27–1.37 s |
+| resolve with the lockfile present (`update`) | 2.09–2.11 s | 0.75–0.95 s | 1.24–1.47 s |
+| resolve from an empty home | 2.11–4.14 s | 1.23–1.59 s | 1.40–4.59 s |
+
+- A second at the end of most resolutions was the blocking HTTP client joining
+  its I/O thread while HTTP/2 connections shut down. Clients are now shared by
+  the whole process and never dropped: no wait, and every index client and
+  downloader of one command reuses the same connections.
+- The index is fetched in one pipelined wave instead of one BFS generation at a
+  time (13 for this graph, each waiting for its slowest request): as each file
+  arrives, the version resolution will probably pick (the locked one, else the
+  newest matching one) is looked up and its dependencies — the optional ones its
+  default features enable included — are requested at once, 96 in flight. A
+  wrong guess costs a spare request, never correctness; the lockfile is still
+  byte-identical to Cargo's.
+
+**Help and output.**
+- `rune help` shows 21 everyday commands in five groups (it listed 50);
+  `rune help --all` lists every command, grouped; `rune help <command>` equals
+  `rune <command> --help`, whose options are grouped like Cargo's (Package
+  Selection, Feature Selection, Compilation Options, …), wrap to the terminal
+  and come with examples for build, test, run, add, watch, tree and search.
+- A built-in pager for long output (help, `rune search`, `rune config list`):
+  scroll with keys or the mouse wheel, `/` to search with highlighted matches.
+- `search` (downloads, wrapped descriptions, next steps), `info` (a card:
+  facts, features and what they enable, dependencies), `why` (paths drawn with
+  arrows), `explain`, `unused`, `config list`, `cas stats`/`du` restyled;
+  `affected` explains a missing repository or revision; Cargo's plain formats
+  stay where scripts read them (piped `search`, `pkgid`, `locate-project`,
+  `verify-project`, `metadata`).
+- The brand violet falls back to its 256-colour neighbour where the terminal
+  has no truecolor (it was rounded to blue).

@@ -908,8 +908,12 @@ pub fn resolve_fresh_with(
             "dependency graph"
         },
     );
+    let t = phase("configure git");
     configure_git(ws, offline, refresh, existing);
+    drop(t);
+    let t = phase("load locals");
     let locals = Locals::load(ws)?;
+    drop(t);
     let profile = Profile::dev();
     let features = FeatureArgs::default();
     let targets = TargetSelection::default();
@@ -934,11 +938,17 @@ pub fn resolve_fresh_with(
     .with_min_release_age(ws.config.settings.min_release_age())
     .with_prefetch_hint(on_disk.as_ref())
     .with_preferred(preferred);
+    let t = phase("resolve walk");
     let resolved = resolver
         .resolve_with_workspace(ws.root(), &roots, existing, ws.workspace_manifest())
         .context("Dependency resolution failed")?;
+    drop(t);
+    let t = phase("refine lock");
     let lock = refine_lock(ws, &locals, &resolved.to_lockfile());
+    drop(t);
+    let t = phase("prune");
     let resolved = prune_resolved(resolved, &lock);
+    drop(t);
     warn_unused_patches(ws, &resolved);
     Ok((resolved, lock))
 }

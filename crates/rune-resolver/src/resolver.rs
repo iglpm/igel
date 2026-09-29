@@ -407,6 +407,149 @@ impl DependencyResolver {
         }
     }
 
+    /// Fetches the index of every registry crate the resolution will probably
+    /// need, starting from `seeds` (`(registry, name, requirement)`), with
+    /// many requests in flight and no waiting between levels: as each index
+    /// file arrives, the version resolution is likely to choose (the locked
+    /// one, else the newest that matches) is looked up and its dependencies —
+    /// the optional ones its default features turn on included — are
+    /// requested at once.
+    ///
+    /// Waiting for a whole BFS generation before starting the next paid the
+    /// slowest request of every level (13 levels for a 469-package graph).
+    /// A wrong guess costs a spare request, never correctness: the walk
+    /// that follows decides, and fetches whatever is still missing.
+    fn prefetch_closure(
+        &mut self,
+        seeds: Vec<(String, String, VersionReq)>,
+        existing_lock: Option<&Lockfile>,
+    ) {
+        use std::sync::{Condvar, Mutex};
+        if self.offline || seeds.is_empty() {
+            return;
+        }
+        let _timer = rune_common::timing::phase("index prefetch");
+        let mut registries: Vec<String> = seeds.iter().map(|(r, ..)| r.clone()).collect();
+        registries.sort();
+        registries.dedup();
+        for r in &registries {
+            let _ = self.client(r);
+        }
+        let locked: HashMap<&str, Vec<Version>> = existing_lock.map_or_else(HashMap::new, |lock| {
+            let mut m: HashMap<&str, Vec<Version>> = HashMap::new();
+            for p in lock.packages.iter().filter(|p| p.source.is_some()) {
+                if let Ok(v) = Version::parse(&p.version) {
+                    m.entry(p.name.as_str()).or_default().push(v);
+                }
+            }
+            m
+        });
+
+        struct State {
+            queue: VecDeque<(String, String, VersionReq)>,
+            seen: HashSet<(String, String)>,
+            in_flight: usize,
+            fetched: Vec<((String, String), CrateIndex)>,
+        }
+        let mut seen = HashSet::new();
+        let mut queue = VecDeque::new();
+        for (r, n, req) in seeds {
+            if seen.insert((r.clone(), n.clone())) {
+                queue.push_back((r, n, req));
+            }
+        }
+        let state = Mutex::new(State {
+            queue,
+            seen,
+            in_flight: 0,
+            fetched: Vec::new(),
+        });
+        let wake = Condvar::new();
+        let clients = &self.clients;
+        let cached = &self.cached_indices;
+        let refresh = self.refresh;
+        std::thread::scope(|scope| {
+            for _ in 0..PREFETCH_WORKERS {
+                scope.spawn(|| {
+                    loop {
+                        let (registry, name, req) = {
+                            let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
+                            loop {
+                                if let Some(item) = st.queue.pop_front() {
+                                    st.in_flight += 1;
+                                    break item;
+                                }
+                                if st.in_flight == 0 {
+                                    wake.notify_all();
+                                    return;
+                                }
+                                st = wake.wait(st).unwrap_or_else(|e| e.into_inner());
+                            }
+                        };
+                        let key = (registry.clone(), name.clone());
+                        // Already in memory: its dependencies are needed now
+                        // (it is a seed), but it costs no request.
+                        let (index, fresh) = match cached.get(&key) {
+                            Some(i) => (Some(i.clone()), false),
+                            None => (
+                                clients.get(&registry).and_then(|c| {
+                                    if refresh {
+                                        c.refresh_crate(&name).ok()
+                                    } else {
+                                        c.fetch_crate(&name).ok()
+                                    }
+                                }),
+                                true,
+                            ),
+                        };
+                        let children = index
+                            .as_ref()
+                            .map(|i| {
+                                likely_dependencies(
+                                    i,
+                                    &req,
+                                    locked.get(name.as_str()).map(Vec::as_slice),
+                                )
+                            })
+                            .unwrap_or_default();
+                        let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
+                        for (dep_registry, dep_name, dep_req) in children {
+                            let dep_registry = dep_registry.unwrap_or_else(|| registry.clone());
+                            // Only registries with a client ready (the
+                            // walk handles anything else).
+                            if !clients.contains_key(&dep_registry) {
+                                continue;
+                            }
+                            // A crate already in memory was expanded when
+                            // it was fetched.
+                            let dep_key = (dep_registry.clone(), dep_name.clone());
+                            if cached.contains_key(&dep_key) {
+                                continue;
+                            }
+                            if st.seen.insert(dep_key) {
+                                st.queue.push_back((dep_registry, dep_name, dep_req));
+                            }
+                        }
+                        if fresh && let Some(index) = index {
+                            st.fetched.push((key, index));
+                        }
+                        st.in_flight -= 1;
+                        wake.notify_all();
+                    }
+                });
+            }
+        });
+        let fetched = std::mem::take(
+            &mut state
+                .into_inner()
+                .unwrap_or_else(|e| e.into_inner())
+                .fetched,
+        );
+        for (key, index) in fetched {
+            self.cached_indices.insert(key, index);
+        }
+    }
+
     /// Resolves dependencies for a set of root manifests and optional existing lockfile.
     pub fn resolve(
         &mut self,
@@ -639,7 +782,27 @@ impl DependencyResolver {
             }));
         }
         if !self.offline {
-            self.prefetch(hints.iter().map(|(r, n)| (r.as_str(), n.as_str())));
+            // Everything reachable from the roots (and whatever the lockfile
+            // names), in one pipelined wave.
+            let mut seeds: Vec<(String, String, VersionReq)> = hints
+                .iter()
+                .map(|(r, n)| (r.clone(), n.clone(), VersionReq::STAR))
+                .collect();
+            for (name, spec) in root_dependencies {
+                if spec.path.is_some() || spec.git.is_some() {
+                    continue;
+                }
+                if let Ok(registry) =
+                    rune_registry::source::defs().index_for_name(spec.registry.as_deref())
+                {
+                    seeds.push((
+                        registry,
+                        spec.package.clone().unwrap_or_else(|| name.clone()),
+                        spec.version.clone().unwrap_or(VersionReq::STAR),
+                    ));
+                }
+            }
+            self.prefetch_closure(seeds, existing_lock);
         }
 
         let mut resolved_packages: HashMap<String, ResolvedPackage> = HashMap::new();
@@ -691,12 +854,25 @@ impl DependencyResolver {
             // lookups it needs can be issued concurrently up front.
             while !queue.is_empty() {
                 let generation: Vec<_> = queue.drain(..).collect();
-                self.prefetch(
-                    generation
-                        .iter()
-                        .filter(|(_, _, _, _, local_dir, _)| local_dir.is_none())
-                        .map(|(name, _, _, _, _, registry)| (registry.as_str(), name.as_str())),
-                );
+                // Whatever this generation needs that is not in memory yet
+                // (and what that needs, and so on), pipelined.
+                let missing: Vec<(String, String, VersionReq)> = generation
+                    .iter()
+                    .filter(|(name, _, _, _, local_dir, registry)| {
+                        local_dir.is_none()
+                            && !self
+                                .cached_indices
+                                .contains_key(&(registry.clone(), name.clone()))
+                    })
+                    .map(|(name, req, _, _, _, registry)| {
+                        (registry.clone(), name.clone(), req.clone())
+                    })
+                    .collect();
+                if self.offline {
+                    self.prefetch(missing.iter().map(|(r, n, _)| (r.as_str(), n.as_str())));
+                } else {
+                    self.prefetch_closure(missing, existing_lock);
+                }
                 for (name, req, features, default_features, local_dir, registry) in generation {
                     resolve_one_queue_item(
                         name,
@@ -812,6 +988,93 @@ impl DependencyResolver {
         }
         Ok(&self.cached_indices[&key])
     }
+}
+
+/// Index requests the pipelined prefetch keeps in flight. Index files are
+/// tiny: the cost is round-trip latency, so far more than the CPU count.
+const PREFETCH_WORKERS: usize = 96;
+
+/// What the resolution will probably need after choosing a version of
+/// `index` for `req`: the locked version if one matches, else the newest
+/// matching one; its normal and build dependencies, the optional ones its
+/// default features switch on included. `(registry if another, name,
+/// requirement)`.
+fn likely_dependencies(
+    index: &CrateIndex,
+    req: &VersionReq,
+    locked: Option<&[Version]>,
+) -> Vec<(Option<String>, String, VersionReq)> {
+    let versions: Vec<(&IndexRecord, Version)> = index
+        .versions
+        .iter()
+        .filter_map(|r| Some((r, Version::parse(&r.vers).ok()?)))
+        .filter(|(_, v)| req.matches(v))
+        .collect();
+    let chosen = locked
+        .and_then(|l| {
+            versions
+                .iter()
+                .filter(|(_, v)| l.contains(v))
+                .max_by(|a, b| a.1.cmp(&b.1))
+        })
+        .or_else(|| {
+            versions
+                .iter()
+                .filter(|(r, _)| !r.yanked)
+                .max_by(|a, b| a.1.cmp(&b.1))
+        });
+    let Some((record, _)) = chosen else {
+        return Vec::new();
+    };
+    let on = default_enabled_dependencies(record);
+    record
+        .deps
+        .iter()
+        .filter(|d| d.kind.as_deref() != Some("dev"))
+        .filter(|d| !d.optional || on.contains(d.name.as_str()))
+        .map(|d| {
+            (
+                d.registry.as_deref().map(normalize_registry),
+                d.package.clone().unwrap_or_else(|| d.name.clone()),
+                VersionReq::from_str(&d.req).unwrap_or(VersionReq::STAR),
+            )
+        })
+        .collect()
+}
+
+/// The optional dependencies (by the name the package uses) that `record`'s
+/// `default` feature turns on, directly or through other features.
+fn default_enabled_dependencies(record: &IndexRecord) -> HashSet<String> {
+    let features = record.all_features();
+    let optional: HashSet<&str> = record
+        .deps
+        .iter()
+        .filter(|d| d.optional)
+        .map(|d| d.name.as_str())
+        .collect();
+    let mut on = HashSet::new();
+    let mut seen = HashSet::new();
+    let mut stack = vec!["default".to_string()];
+    while let Some(f) = stack.pop() {
+        if !seen.insert(f.clone()) {
+            continue;
+        }
+        for entry in features.get(&f).into_iter().flatten() {
+            if let Some(dep) = entry.strip_prefix("dep:") {
+                on.insert(dep.to_string());
+            } else if let Some((dep, _)) = entry.split_once('/') {
+                // `dep?/feat` only adds to a dependency that is on anyway.
+                if !dep.ends_with('?') && optional.contains(dep) {
+                    on.insert(dep.to_string());
+                }
+            } else if features.contains_key(entry) {
+                stack.push(entry.clone());
+            } else if optional.contains(entry.as_str()) {
+                on.insert(entry.clone());
+            }
+        }
+    }
+    on
 }
 
 /// A requirement in force: `from` (a package id, `None` for a root) needs
@@ -1456,4 +1719,92 @@ pub fn matches_target(target_str: Option<&str>, target_triple: &str) -> bool {
         // treat them as inapplicable rather than guessing.
         _ => false,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rune_registry::IndexDependency;
+
+    fn dep(name: &str, req: &str, optional: bool, kind: Option<&str>) -> IndexDependency {
+        IndexDependency {
+            name: name.into(),
+            req: req.into(),
+            features: vec![],
+            optional,
+            default_features: true,
+            target: None,
+            kind: kind.map(str::to_string),
+            package: None,
+            registry: None,
+        }
+    }
+
+    fn record(vers: &str, deps: Vec<IndexDependency>, features: &[(&str, &[&str])]) -> IndexRecord {
+        IndexRecord {
+            name: "pkg".into(),
+            vers: vers.into(),
+            deps,
+            cksum: String::new(),
+            features: features
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.iter().map(|s| s.to_string()).collect()))
+                .collect(),
+            features2: None,
+            yanked: false,
+            rust_version: None,
+            pubtime: None,
+        }
+    }
+
+    #[test]
+    fn the_prefetch_follows_the_version_resolution_would_pick() {
+        let index = CrateIndex {
+            name: "pkg".into(),
+            versions: vec![
+                record("1.0.0", vec![dep("old", "1", false, None)], &[]),
+                record(
+                    "1.2.0",
+                    vec![
+                        dep("always", "^2", false, None),
+                        dep("builder", "1", false, Some("build")),
+                        dep("tests_only", "1", false, Some("dev")),
+                        dep("by_default", "1", true, None),
+                        dep("via_feature", "1", true, None),
+                        dep("weak", "1", true, None),
+                        dep("never", "1", true, None),
+                    ],
+                    &[
+                        ("default", &["std", "dep:by_default"]),
+                        ("std", &["via_feature/std", "weak?/std"]),
+                        ("extra", &["never"]),
+                    ],
+                ),
+            ],
+        };
+        let names = |deps: Vec<(Option<String>, String, VersionReq)>| {
+            let mut n: Vec<String> = deps.into_iter().map(|(_, n, _)| n).collect();
+            n.sort();
+            n
+        };
+        // The newest matching release, its normal and build dependencies and
+        // the optional ones `default` turns on (not through `weak?/…`).
+        assert_eq!(
+            names(likely_dependencies(&index, &VersionReq::STAR, None)),
+            ["always", "builder", "by_default", "via_feature"]
+        );
+        // A locked version wins over the newest.
+        let locked = [Version::parse("1.0.0").unwrap()];
+        assert_eq!(
+            names(likely_dependencies(
+                &index,
+                &VersionReq::STAR,
+                Some(&locked)
+            )),
+            ["old"]
+        );
+        // Nothing matches: nothing to follow.
+        let req = VersionReq::parse("^3").unwrap();
+        assert!(likely_dependencies(&index, &req, None).is_empty());
+    }
 }
