@@ -5778,3 +5778,65 @@ fn a_lockfile_from_another_resolution_is_never_trusted() {
     p.write("src/main.rs", "fn main() { foo::f(); }\n");
     p.ok(&["build"]);
 }
+
+#[test]
+fn workspace_feature_unification_shares_dependency_builds_across_selections() {
+    let p = Project::new();
+    p.write(
+        "Cargo.toml",
+        "[workspace]\nmembers = [\"crates/*\"]\nresolver = \"2\"\n",
+    );
+    p.write(
+        "crates/shared/Cargo.toml",
+        "[package]\nname = \"shared\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[features]\nextra = []\n",
+    );
+    p.write(
+        "crates/shared/src/lib.rs",
+        "pub fn extra() -> bool { cfg!(feature = \"extra\") }\n",
+    );
+    p.write(
+        "crates/a/Cargo.toml",
+        "[package]\nname = \"a\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[dependencies]\nshared = { path = \"../shared\" }\n",
+    );
+    p.write(
+        "crates/a/src/main.rs",
+        "fn main() { println!(\"extra={}\", shared::extra()); }\n",
+    );
+    // `b` asks for the feature — and does not compile, so it must never be
+    // built when only `a` is selected.
+    p.write(
+        "crates/b/Cargo.toml",
+        "[package]\nname = \"b\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[dependencies]\nshared = { path = \"../shared\", features = [\"extra\"] }\n",
+    );
+    p.write("crates/b/src/lib.rs", "this does not compile\n");
+
+    // By default only the selected package's requests count.
+    assert!(p.ok(&["run", "-p", "a"]).contains("extra=false"));
+
+    // Rune's setting: `b`'s request counts, `b` itself is not built.
+    p.write(
+        "Rune.toml",
+        "[build]\nfeature-unification = \"workspace\"\n",
+    );
+    assert!(p.ok(&["run", "-p", "a"]).contains("extra=true"));
+
+    // Cargo's config key does the same.
+    p.write("Rune.toml", "");
+    p.write(
+        ".cargo/config.toml",
+        "[resolver]\nfeature-unification = \"workspace\"\n",
+    );
+    assert!(p.ok(&["run", "-p", "a"]).contains("extra=true"));
+
+    p.write(
+        ".cargo/config.toml",
+        "[resolver]\nfeature-unification = \"everything\"\n",
+    );
+    let bad = p.rune(&["build", "-p", "a"]);
+    assert!(!bad.status.success());
+    assert!(
+        text(&bad).contains("unknown feature unification"),
+        "{}",
+        text(&bad)
+    );
+}

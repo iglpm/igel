@@ -113,6 +113,17 @@ pub const KEYS: &[KeyDef] = &[
                       builds reuse cached artifacts just like dev builds do.",
     },
     KeyDef {
+        name: "build.feature-unification",
+        kind: ValueKind::Text,
+        default: "selected",
+        description: "Which packages' feature requests a build honors. `selected` (the \
+                      default): only the packages being built, so `-p a` compiles its \
+                      dependencies with just the features `a` needs. `workspace`: every \
+                      member's, so building any subset of the workspace reuses the same \
+                      dependency builds (what `cargo hakari` does, without a generated crate). \
+                      Cargo's `resolver.feature-unification` config is honored too.",
+    },
+    KeyDef {
         name: "build.low-priority",
         kind: ValueKind::Bool,
         default: "false",
@@ -482,6 +493,14 @@ impl Settings {
     /// `build.release-rebuild-all`: rebuild every crate for release builds
     /// instead of using the content-addressable store.
     /// `build.low-priority`.
+    /// `build.feature-unification`, when set: `selected` or `workspace`.
+    pub fn feature_unification(&self) -> Option<String> {
+        match self.values.get("build.feature-unification") {
+            Some((Value::Text(t), _)) => Some(t.clone()),
+            _ => None,
+        }
+    }
+
     pub fn low_priority(&self) -> bool {
         self.bool("build.low-priority", false)
     }
