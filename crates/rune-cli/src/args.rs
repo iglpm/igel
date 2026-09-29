@@ -384,6 +384,12 @@ pub struct TestArgs {
     /// Also write the results as JUnit XML (for CI test reports)
     #[arg(long, value_name = "PATH")]
     pub junit: Option<PathBuf>,
+
+    /// `tests`: split test binaries into batches of tests scheduled across
+    /// all cores, each batch its own process; `binaries`: one process per
+    /// binary (default: `test.schedule`, else `binaries`)
+    #[arg(long, value_name = "HOW", value_parser = ["binaries", "tests"])]
+    pub schedule: Option<String>,
 }
 
 #[derive(Args, Debug, Clone)]

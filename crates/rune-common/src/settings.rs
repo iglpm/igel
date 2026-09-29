@@ -273,6 +273,16 @@ pub const KEYS: &[KeyDef] = &[
                       files outside the package.",
     },
     KeyDef {
+        name: "test.schedule",
+        kind: ValueKind::Text,
+        default: "binaries",
+        description: "How `rune test` spreads tests over the cores. `binaries`: each test \
+                      binary runs as one process, as with Cargo. `tests`: each binary's tests \
+                      are split into small batches, each its own process, scheduled across \
+                      every binary at once (like cargo-nextest) — faster when a few binaries \
+                      hold most tests, but tests no longer share a process.",
+    },
+    KeyDef {
         name: "test.doctests",
         kind: ValueKind::Bool,
         default: "true",
@@ -594,6 +604,14 @@ impl Settings {
         match self.values.get("cas.compress-after") {
             Some((Value::Text(t), _)) => crate::time::parse_duration(t).filter(|s| *s > 0),
             _ => Some(7 * 86_400),
+        }
+    }
+
+    /// `test.schedule`, when set.
+    pub fn test_schedule(&self) -> Option<String> {
+        match self.values.get("test.schedule") {
+            Some((Value::Text(t), _)) => Some(t.clone()),
+            _ => None,
         }
     }
 

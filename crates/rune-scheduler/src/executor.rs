@@ -3489,17 +3489,24 @@ mod tests {
         let path = config.fingerprint_dir.join("timings.json");
         let mut timings: HashMap<String, f64> =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        let peaks: Vec<&String> = timings.keys().filter(|k| k.ends_with(" rss")).collect();
+        // (The timings file may be shared with real builds, under RUNE_HOME.)
+        let ours = |k: &str| {
+            k.ends_with(" rss")
+                && ["one ", "two ", "three ", "four "]
+                    .iter()
+                    .any(|n| k.starts_with(n))
+        };
+        let peaks: Vec<&String> = timings.keys().filter(|k| ours(k)).collect();
         assert_eq!(peaks.len(), 4, "{timings:?}");
         assert!(
             timings
                 .iter()
-                .filter(|(k, _)| k.ends_with(" rss"))
+                .filter(|(k, _)| ours(k))
                 .all(|(_, v)| *v > 0.0)
         );
         // Pretend each needed 2 GiB: two at once would not fit in 3.
         for (k, v) in timings.iter_mut() {
-            if k.ends_with(" rss") {
+            if ours(k) {
                 *v = (2u64 << 30) as f64;
             }
         }

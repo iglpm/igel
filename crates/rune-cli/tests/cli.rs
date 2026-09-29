@@ -5910,3 +5910,39 @@ fn pinned_workspaces_survive_cleanup_and_idle_entries_are_compressed() {
     p.ok(&["cas", "gc", "--max-age", "30d"]);
     assert!(manifests.iter().all(|m| !m.exists()));
 }
+
+#[test]
+fn tests_can_be_scheduled_one_batch_at_a_time_across_binaries() {
+    let p = lib_project();
+    let mut tests = String::new();
+    for i in 0..12 {
+        tests.push_str(&format!(
+            "#[test] fn t{i}() {{ std::thread::sleep(std::time::Duration::from_millis(50)); }}\n"
+        ));
+    }
+    tests.push_str("#[test] #[ignore] fn slow() {}\n");
+    p.write("tests/many.rs", &tests);
+    p.write("tests/other.rs", "#[test] fn alone() {}\n");
+
+    let whole = p.ok(&["test", "--no-doc"]);
+    let split = p.ok(&["test", "--no-doc", "--schedule", "tests"]);
+    // The same totals either way: every test ran exactly once.
+    assert!(split.contains("12 passed, 1 ignored"), "{split}");
+    assert!(split.contains("14 passed · 1 ignored"), "{split}");
+    assert!(whole.contains("14 passed · 1 ignored"), "{whole}");
+
+    // A filter: the rest counts as filtered out, once.
+    let out = p.ok(&["test", "--no-doc", "--schedule", "tests", "t1"]);
+    assert!(out.contains("3 passed"), "{out}"); // t1, t10, t11
+
+    // A failure in one batch fails the binary, and the setting works too.
+    p.write("Rune.toml", "[test]\nschedule = \"tests\"\n");
+    p.write(
+        "tests/other.rs",
+        "#[test] fn alone() {}\n#[test] fn broken() { panic!(\"nope\") }\n",
+    );
+    let out = p.rune(&["test", "--no-doc", "--no-fail-fast"]);
+    assert!(!out.status.success());
+    let t = text(&out);
+    assert!(t.contains("nope") && t.contains("1 failed"), "{t}");
+}
