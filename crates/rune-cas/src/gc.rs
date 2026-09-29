@@ -9,6 +9,9 @@ pub struct GcConfig {
     pub max_size_bytes: Option<u64>,
     /// Maximum age in seconds. Entries older than this are evicted.
     pub max_age_secs: Option<u64>,
+    /// Compress (zstd) the artifacts of entries kept but unused for this
+    /// many seconds.
+    pub compress_idle_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -17,6 +20,10 @@ pub struct GcReport {
     pub bytes_freed: u64,
     pub entries_remaining: u64,
     pub bytes_remaining: u64,
+    /// Entries kept because a pinned project needs them.
+    pub entries_pinned: u64,
+    pub entries_compressed: u64,
+    pub bytes_compressed_away: u64,
 }
 
 /// Run garbage collection on the CAS store.
@@ -66,8 +73,14 @@ pub fn run_gc(store: &CasStore, config: &GcConfig) -> crate::store::Result<GcRep
     // Sort entries by stored_at ascending (oldest first) for LRU eviction
     entries.sort_by_key(|(_, m)| m.stored_at);
 
+    // Entries a pinned project needs are never removed.
+    crate::pins::prune(store);
+    let pinned = crate::pins::pinned_keys(store);
+    let is_pinned = |m: &ArtifactManifest| pinned.contains(&m.cache_key);
+    report.entries_pinned = entries.iter().filter(|(_, m)| is_pinned(m)).count() as u64;
+
     // 2. Remove entries older than max_age_secs
-    let mut current_total_size: u64 = entries.iter().map(|(_, m)| m.total_size).sum();
+    let mut current_total_size: u64 = entries.iter().map(|(_, m)| m.disk_size()).sum();
     let mut remaining_entries = Vec::new();
 
     for (path, manifest) in entries {
@@ -76,6 +89,7 @@ pub fn run_gc(store: &CasStore, config: &GcConfig) -> crate::store::Result<GcRep
 
         if let Some(max_age) = config.max_age_secs
             && age > max_age
+            && !is_pinned(&manifest)
         {
             remove = true;
             debug!(
@@ -87,8 +101,8 @@ pub fn run_gc(store: &CasStore, config: &GcConfig) -> crate::store::Result<GcRep
         if remove {
             if fs::remove_dir_all(&path).is_ok() {
                 report.entries_removed += 1;
-                report.bytes_freed += manifest.total_size;
-                current_total_size = current_total_size.saturating_sub(manifest.total_size);
+                report.bytes_freed += manifest.disk_size();
+                current_total_size = current_total_size.saturating_sub(manifest.disk_size());
             }
         } else {
             remaining_entries.push((path, manifest));
@@ -101,23 +115,45 @@ pub fn run_gc(store: &CasStore, config: &GcConfig) -> crate::store::Result<GcRep
             if current_total_size <= max_size {
                 break;
             }
+            if is_pinned(manifest) {
+                continue;
+            }
             if fs::remove_dir_all(path).is_ok() {
                 report.entries_removed += 1;
-                report.bytes_freed += manifest.total_size;
-                current_total_size = current_total_size.saturating_sub(manifest.total_size);
+                report.bytes_freed += manifest.disk_size();
+                current_total_size = current_total_size.saturating_sub(manifest.disk_size());
                 debug!("Evicting {} due to size constraint", manifest.cache_key);
             }
         }
     }
 
     // Recalculate remaining
-    let final_remaining: Vec<_> = remaining_entries
+    let mut final_remaining: Vec<_> = remaining_entries
         .into_iter()
         .filter(|(p, _)| p.exists())
         .collect();
 
+    // 4. Compress what has gone unused for a while.
+    if let Some(idle) = config.compress_idle_secs {
+        for (path, manifest) in final_remaining.iter_mut() {
+            if manifest.compressed || now.saturating_sub(manifest.stored_at) <= idle {
+                continue;
+            }
+            match store.compress(path) {
+                Ok(0) => {}
+                Ok(saved) => {
+                    report.entries_compressed += 1;
+                    report.bytes_compressed_away += saved;
+                    manifest.compressed = true;
+                    manifest.stored_size = Some(manifest.total_size - saved);
+                }
+                Err(e) => debug!("could not compress {}: {e}", manifest.cache_key),
+            }
+        }
+    }
+
     report.entries_remaining = final_remaining.len() as u64;
-    report.bytes_remaining = final_remaining.iter().map(|(_, m)| m.total_size).sum();
+    report.bytes_remaining = final_remaining.iter().map(|(_, m)| m.disk_size()).sum();
 
     // Update stats
     store.flush_stats();
@@ -163,6 +199,7 @@ mod tests {
         let config = GcConfig {
             max_size_bytes: None,
             max_age_secs: Some(1), // Evict older than 1s
+            compress_idle_secs: None,
         };
 
         let report = run_gc(&store, &config).unwrap();
@@ -171,5 +208,73 @@ mod tests {
 
         assert!(store.get("key1").is_none());
         assert!(store.get("key2").is_some());
+    }
+
+    fn age(store: &CasStore, key: &str, secs: u64) {
+        let manifest_path = store.object_dir(key).join("manifest.json");
+        let used = fs::metadata(&manifest_path).unwrap().modified().unwrap();
+        let past =
+            filetime::FileTime::from_system_time(used - std::time::Duration::from_secs(secs));
+        filetime::set_file_mtime(&manifest_path, past).unwrap();
+        let mut m: ArtifactManifest =
+            serde_json::from_str(&fs::read_to_string(&manifest_path).unwrap()).unwrap();
+        m.stored_at -= secs;
+        fs::write(&manifest_path, serde_json::to_string(&m).unwrap()).unwrap();
+        filetime::set_file_mtime(&manifest_path, past).unwrap();
+    }
+
+    #[test]
+    fn pinned_entries_survive_and_idle_ones_are_compressed_then_restored() {
+        let dir = tempdir().unwrap();
+        let store = CasStore::new(dir.path().join("store")).unwrap();
+        let src = dir.path().join("libfoo.rlib");
+        let data = "compressible rlib contents ".repeat(4_000);
+        fs::write(&src, &data).unwrap();
+        for k in ["pinned", "idle", "fresh"] {
+            store.put(k, k, "1.0", std::slice::from_ref(&src)).unwrap();
+        }
+        age(&store, "pinned", 100 * 86_400);
+        age(&store, "idle", 10 * 86_400);
+        let project = dir.path().join("proj");
+        fs::create_dir_all(&project).unwrap();
+        crate::pins::pin(&store, &project, vec!["pinned".into()]).unwrap();
+
+        let report = run_gc(
+            &store,
+            &GcConfig {
+                max_size_bytes: None,
+                max_age_secs: Some(30 * 86_400),
+                compress_idle_secs: Some(7 * 86_400),
+            },
+        )
+        .unwrap();
+        assert_eq!(report.entries_removed, 0);
+        assert_eq!(report.entries_pinned, 1);
+        // Both old entries compressed; the fresh one is left alone.
+        assert_eq!(report.entries_compressed, 2);
+        let idle = store.object_dir("idle");
+        assert!(!idle.join("libfoo.rlib").exists());
+        assert!(idle.join("libfoo.rlib.zst").exists());
+        assert!(report.bytes_remaining < 2 * data.len() as u64);
+
+        // The next use decompresses it and links the original bytes.
+        let out = dir.path().join("target");
+        store.link_to("idle", &out).unwrap();
+        assert_eq!(fs::read_to_string(out.join("libfoo.rlib")).unwrap(), data);
+        assert!(!idle.join("libfoo.rlib.zst").exists());
+
+        // Without the pin, the old entry goes.
+        crate::pins::unpin(&store, &project);
+        let report = run_gc(
+            &store,
+            &GcConfig {
+                max_size_bytes: None,
+                max_age_secs: Some(30 * 86_400),
+                compress_idle_secs: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(report.entries_removed, 1);
+        assert!(store.get("pinned").is_none());
     }
 }

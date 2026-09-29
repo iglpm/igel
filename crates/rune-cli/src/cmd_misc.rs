@@ -5,7 +5,7 @@ use colored::Colorize;
 use rune_cas::CasStore;
 use rune_cas::gc::{GcConfig, run_gc};
 use rune_common::settings::{
-    self, KEYS, Origin, Scope, Settings, config_path, format_size, key_def, parse_size,
+    self, KEYS, Origin, Scope, Settings, config_path, key_def, parse_size,
 };
 use rune_common::{Edition, RuneConfig};
 use rune_resolver::lockfile::LockfileManager;
@@ -563,6 +563,38 @@ pub fn cas(cmd: CasCommands) -> Result<()> {
             ));
         }
         CasCommands::Export(_) => unreachable!("handled by cmd_build::cas_export"),
+        CasCommands::Pin(_) => unreachable!("handled by cmd_build::cas_pin"),
+        CasCommands::Unpin => {
+            let root = crate::workspace::find_project_root(None)
+                .context("could not find `Cargo.toml` in this directory or any parent")?;
+            if rune_cas::pins::unpin(&cas, &root) {
+                ui::summary(format!("unpinned {}", root.display()));
+            } else {
+                ui::detail(format!("{} was not pinned", root.display()));
+            }
+        }
+        CasCommands::Pins => {
+            let pins = rune_cas::pins::list(&cas);
+            if pins.is_empty() {
+                ui::detail("no workspace is pinned (`rune cas pin` pins the current one)");
+            }
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            for p in pins {
+                let present = p.keys.iter().filter(|k| cas.contains(k)).count();
+                ui::out(format!(
+                    "  {}  {}",
+                    p.project.display(),
+                    format!(
+                        "{present} entries, pinned {}",
+                        format_idle(now.saturating_sub(p.pinned_at))
+                    )
+                    .dimmed()
+                ));
+            }
+        }
         CasCommands::Stats => {
             let stats = cas.stats().unwrap_or_default();
             let total = stats.hits + stats.misses;
@@ -588,14 +620,27 @@ pub fn cas(cmd: CasCommands) -> Result<()> {
                     },
                 ),
             ];
-            if let Some(max) = config.settings.cas_max_size() {
-                rows.push(("max size", format_size(max)));
+            if let Some(max) = config.settings.cas_max_size_for(&config.cas_dir) {
+                rows.push(("max size", format_size_human(max)));
             }
             if let Some(age) = config.settings.cas_max_age() {
                 rows.push((
                     "cleanup",
                     format!("entries unused for {} days are removed", age / 86_400),
                 ));
+            }
+            if let Some(idle) = config.settings.cas_compress_after() {
+                rows.push((
+                    "compression",
+                    format!(
+                        "entries unused for {} are compressed",
+                        format_idle_threshold(idle)
+                    ),
+                ));
+            }
+            let pins = rune_cas::pins::list(&cas);
+            if !pins.is_empty() {
+                rows.push(("pinned", ui::plural(pins.len(), "workspace")));
             }
             for l in ui::kv_lines(&rows, 2) {
                 ui::out(l);
@@ -658,11 +703,15 @@ pub fn cas(cmd: CasCommands) -> Result<()> {
             }
         }
         CasCommands::Gc(args) => {
+            // Started by a build to tidy up: stay out of the way.
+            if std::env::var_os("RUNE_BACKGROUND").is_some() {
+                rune_common::sysinfo::lower_priority();
+            }
             let max_size = match &args.max_size {
                 Some(s) => Some(parse_size(s).with_context(|| format!("invalid size `{s}`"))?),
-                None => config.settings.cas_max_size(),
+                None => config.settings.cas_max_size_for(&config.cas_dir),
             };
-            if max_size.is_none() && args.max_age.is_none() {
+            if max_size.is_none() && args.max_age.is_none() && args.compress_idle.is_none() {
                 bail!(
                     "nothing to do: pass --max-size / --max-age, or set `cas.max-size` with `rune config set`"
                 );
@@ -672,6 +721,7 @@ pub fn cas(cmd: CasCommands) -> Result<()> {
                 &GcConfig {
                     max_size_bytes: max_size,
                     max_age_secs: args.max_age,
+                    compress_idle_secs: args.compress_idle,
                 },
             )
             .map_err(|e| anyhow::anyhow!("CAS GC failed: {e}"))?;
@@ -683,11 +733,27 @@ pub fn cas(cmd: CasCommands) -> Result<()> {
                     format_size_human(report.bytes_freed)
                 ),
             );
+            if report.entries_compressed > 0 {
+                ui::action(
+                    "compressed",
+                    format!(
+                        "{} idle entries, {} saved",
+                        report.entries_compressed,
+                        format_size_human(report.bytes_compressed_away)
+                    ),
+                );
+            }
             ui::detail(format!(
                 "{} entries remaining, {}",
                 report.entries_remaining,
                 format_size_human(report.bytes_remaining)
             ));
+            if report.entries_pinned > 0 {
+                ui::detail(format!(
+                    "{} entries kept for pinned workspaces",
+                    report.entries_pinned
+                ));
+            }
         }
     }
     Ok(())
@@ -1076,4 +1142,38 @@ fn write_if_changed(path: &Path, content: &str) -> Result<()> {
         return Ok(());
     }
     std::fs::write(path, content).with_context(|| format!("cannot write {}", path.display()))
+}
+
+/// `rune version [-v]`.
+pub fn version(verbose: bool) -> Result<()> {
+    println!("rune {}", env!("RUNE_VERSION"));
+    if !verbose {
+        return Ok(());
+    }
+    let tc = rune_common::toolchain::global();
+    let mut rows = vec![
+        ("release", env!("CARGO_PKG_VERSION").to_string()),
+        ("commit-hash", env!("RUNE_COMMIT_HASH").to_string()),
+        ("commit-date", env!("RUNE_COMMIT_DATE").to_string()),
+        ("host", env!("RUNE_BUILD_TARGET").to_string()),
+        (
+            "os",
+            format!("{} {}", std::env::consts::OS, std::env::consts::ARCH),
+        ),
+        ("rustc", format!("{} ({})", tc.version, tc.host)),
+    ];
+    rows.retain(|(_, v)| !v.is_empty());
+    let width = rows.iter().map(|(k, _)| k.len()).max().unwrap_or(0);
+    for (k, v) in rows {
+        println!("{k:<width$}  {v}");
+    }
+    Ok(())
+}
+
+/// `rune completions <shell>`.
+pub fn completions(shell: clap_complete::Shell) -> Result<()> {
+    use clap::CommandFactory;
+    let mut cmd = crate::args::Cli::command();
+    clap_complete::generate(shell, &mut cmd, "rune", &mut std::io::stdout());
+    Ok(())
 }

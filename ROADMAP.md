@@ -192,9 +192,10 @@ non-hermetic (never stored globally). Extend native tool identity to `cmake`,
 
 **G2 — Resolver fidelity (§14).** *Done (§11):* one version per compatible range,
 settled by preference or by backtracking one requirer at a time; a fresh lock of
-Rune's own graph is byte-identical to Cargo's. *Still to do:* a full PubGrub
-solver for conflicts that need several crates moved at once (today: a warning and
-two versions side by side), and a differential test over the top-N crates.
+Rune's own graph is byte-identical to Cargo's. *Done (§14):* PubGrub for conflicts
+that need several crates moved at once, with an explanation when none exists;
+backtracking from releases whose dependencies were never published. *Still to
+do:* a differential test over the top-N crates.
 
 **G3 — Registry breadth (§41–43).** *Done (§11):* `[profile]` in config,
 `publish`, `yank`, `owner`, `login`/`logout`, `search`, `info`, `install` from a
@@ -244,7 +245,7 @@ a test or benchmark before they are claimed in the README.
 | P3 concurrent processes | ✅ fixed and tested (§8): it was a real bug — 3 of 4 concurrent builds failed. |
 | P4 debuginfo | ✅ dependencies default to `line-tables-only` (−10 % cold build); `split-debuginfo = "unpacked"` on macOS (−11 %, §10); `rune doctor` covers linkers. Link-step caching ⬜. |
 | P5 self-diagnosis | ✅ `rune doctor`; a build that left cores idle names the chain of crates responsible; `--timings` writes an HTML timeline with that chain highlighted; `rune explain` (§12). |
-| P6 disk | 🟡 `rune cas du` ✅; automatic cleanup of entries unused for 30 days (`cas.max-age`, §12) ✅; pinning, zstd ⬜. |
+| P6 disk | ✅ `rune cas du`; cleanup after 30 days unused (§12); automatic size cap, `rune cas pin`, zstd for idle entries (§14). |
 | P7 CI/Docker | ✅ `rune build --deps-only`; `rune cas export/import` bundles (§12). |
 | P8 path in keys | 🟡 verified: keys do **not** contain the checkout path (a shared store works across paths). Artifacts still embed absolute paths in debuginfo/panics; remapping is only needed for byte-identical builds. |
 | P17 machine interface | 🟡 `--message-format json` for build/check/test ✅, `rune graph --units --format json` ✅ (§12); `rune-api` ⬜. |
@@ -252,9 +253,9 @@ a test or benchmark before they are claimed in the README.
 | P9 cached tests | 🟡 opt-in `--cached` ✅ (285 tests: 8 s → 0.26 s); default-on needs G1. |
 | P11 unused dependencies | ✅ `rune unused [--fix]` on rustc's own lint (§12). |
 | P12 upgrading | ✅ `rune outdated`, `rune upgrade [--incompatible]`; `rune add` lists the release's features (enabled ones marked, as Cargo does), its `rust-version` and publication date (§12). Licence and download trend ⬜ (not in the index). |
-| P15 build-time code | 🟡 `rune tree --exec-surface`, `resolve.min-release-age` ✅ (§12); the sandbox ⬜. |
+| P15 build-time code | ✅ `rune tree --exec-surface`, `resolve.min-release-age` (§12); `build.sandbox` (§14). |
 | P16 provenance | 🟡 `rune sbom` (CycloneDX/SPDX) ✅ (§12); attestation, reproducibility check ⬜. |
-| P10 feature questions | 🟡 `rune features <crate>` lists which features are on and who turned each on (§13); `rune tree -e features -i <crate>` draws it as a tree (§12). Workspace-wide unification ⬜. |
+| P10 feature questions | 🟡 `rune features <crate>` lists which features are on and who turned each on (§13); `rune tree -e features -i <crate>` draws it as a tree (§12). Workspace-wide unification ✅ (`build.feature-unification`, §14). |
 | P13, P14 | ⬜ |
 
 ### 4.1 Build speed and feedback loop
@@ -508,7 +509,7 @@ whose unit keys change — exactly, not by path heuristics — so CI can build a
 test only what a PR can influence, and `--partition N/M` to shard tests over CI
 machines.
 
-**F7 — A better test runner.** 🟡 *(retries with flaky marking, JUnit XML, JSON results, slowest binaries ✅ §12; scheduling single tests across binaries ⬜)* Per-test parallelism, retries and flaky-test
+**F7 — A better test runner.** 🟡 *(retries with flaky marking, JUnit XML, JSON results, slowest binaries ✅ §12; scheduling batches of tests across binaries ✅ §14)* Per-test parallelism, retries and flaky-test
 marking, JUnit/JSON output, slowest-tests summary, `--fail-fast` iteration mode
 (all named in the Cargo vision post or done today by `cargo-nextest`). Runs
 inside the pipelined runner already in `rune test`.
@@ -557,7 +558,7 @@ and cache lookups for IDEs, Bazel-style wrappers and corporate tooling (see P17)
 | **M4** | Observability | G4 + `rune cas inspect`, `rune explain-miss` (F2), structured diagnostics. |
 | **M5** | Sharing | *Done:* shared-directory store ✅, HTTP backend ✅, **Cairn** server with peers/replication/sharding ✅, `--deps-only` ✅. `cas export/import` ✅ (§12). *Open:* signed manifests, TLS in Cairn, S3 backend; G5 shared documentation. |
 | **M6** | Platforms | *Started:* macOS aarch64 test suite passes, Apple debuginfo default ✅, Apple deployment target/SDK identity ✅ (§12). *Open:* G6 (Windows, macOS SDK identity) + G7 + CI on Windows/macOS; `-Zbuild-std` in the CAS (F8). |
-| **M7** | Daily driver | *Started:* P3 concurrency ✅, P4–P6 `rune doctor`/`cas du`/dependency debuginfo ✅, `--message-format=json` ✅, `--deps-only` ✅. `rune watch` ✅, scripts ✅, `rune affected` ✅, build-script hints ✅, P2 check ⇄ build ✅, `fix`/`clippy --fix`/`clippy -- flags`/`fmt -- --check`/`rustc`/`rustdoc`, `update --precise`, `add --git/--rename/--target`, status on stderr (§11). Test runner retries/flaky/JUnit/JSON, `outdated`/`upgrade`, `unused`, `graph`, `explain` ✅ (§12). `rune features` (§13). *Open:* per-test scheduling, workspace feature unification (P10). |
+| **M7** | Daily driver | *Started:* P3 concurrency ✅, P4–P6 `rune doctor`/`cas du`/dependency debuginfo ✅, `--message-format=json` ✅, `--deps-only` ✅. `rune watch` ✅, scripts ✅, `rune affected` ✅, build-script hints ✅, P2 check ⇄ build ✅, `fix`/`clippy --fix`/`clippy -- flags`/`fmt -- --check`/`rustc`/`rustdoc`, `update --precise`, `add --git/--rename/--target`, status on stderr (§11). Test runner retries/flaky/JUnit/JSON, `outdated`/`upgrade`, `unused`, `graph`, `explain` ✅ (§12). `rune features` (§13). Per-test scheduling, workspace feature unification (§14). |
 | **M8** | Supply chain | *Done (§12):* exec-surface report, `min-release-age`, SBOM. *Open:* sandbox as a security boundary, attestation, reproducibility check. Builds on M1. |
 | **M9** | Faster than Cargo on edits | P9 cached tests: opt-in ✅, default-on after M1. P1 early cutoff is blocked on compiler support, see P1. |
 
@@ -566,7 +567,7 @@ and cache lookups for IDEs, Bazel-style wrappers and corporate tooling (see P17)
 ## 7. How to verify the current state
 
 ```bash
-cargo test --workspace                       # 452 tests, no network needed
+cargo test --workspace                       # 465 tests, no network needed
 cargo clippy --workspace --all-targets
 
 # Rune builds and tests itself against live crates.io (use a scratch copy
@@ -1178,3 +1179,57 @@ interleaved with the previous binary):
   for `core`" in every crate; `rune add` of a crate that does not exist suggests
   the ones it probably meant (`serdee` → `serde`); outside a project, the error
   says how to create one.
+
+## 14. What changed in the release-readiness update (2026-09-29)
+
+**"undeclared crate" after a lockfile from another resolution.** `Rune.lock.bin`
+and the fingerprint of the inputs it was resolved from were two files; two
+`rune` processes at once, or a manifest saved during a resolution, could pair
+the lockfile of one resolution with the fingerprint of another, and the next
+build trusted a lockfile without the new dependency. The fingerprint now lives
+inside the lockfile (format v3), taken from the inputs *before* resolving, and
+the file is written atomically; a build also checks that every declared
+dependency is in the resolution and resolves again if not. Reproduced (spliced
+and truncated lockfiles) in a test.
+
+**Faster.** Inspection commands (`tree`, `metadata`, `features`, `why`) rebuild
+the graph from the lockfile: ~215 ms → 17–20 ms (Cargo: 139–158 ms). The first
+edit after a build went from 10.7 s to ~2.2 s: jobs no longer wait on the
+jobserver pipe behind other crates' codegen threads (they start owing a token,
+repaid as tokens return).
+
+**Resources.** Each compiler's peak memory is measured (`wait4`) and kept with
+its timings; a unit waits until what it is expected to need is free.
+`build.low-priority` (always on for `rune watch` and the background cleanup)
+lowers the scheduling priority.
+
+**Store (P6).** `cas.max-size` defaults to a tenth of the disk (5–50 GiB);
+entries unused for 7 days are zstd-compressed by the daily cleanup and
+decompressed on their next use; `rune cas pin` keeps a workspace's build, check
+and test entries through every cleanup.
+
+**Workspace feature unification (P10).** `build.feature-unification =
+"workspace"` or Cargo's `resolver.feature-unification`.
+
+**Per-test scheduling (F7).** `rune test --schedule tests`: batches of tests,
+each its own process, from one queue across all binaries. On Rune's own suite
+(4 cores, CPU-bound) it takes as long as per-binary scheduling (≈21 s both); it
+helps when a few binaries hold most tests on a machine with idle cores. Opt-in,
+since tests no longer share a process.
+
+**Resolver (G2).** PubGrub (virtual packages for requirements spanning several
+compatible ranges) when the walk's repairs run out; its explanation when no
+choice exists. A release whose dependency has no matching version is
+backtracked from. The corpus lock stays byte-identical.
+
+**Sandbox (G1 in part, P15).** `build.sandbox`: build scripts and rustc run
+through `rune __sandbox` — Linux user/mount/network namespaces with every mount
+read-only except the output directory and a private `TMPDIR`; macOS
+`sandbox-exec`. A full rebuild of Rune works confined at no measurable cost.
+Recording undeclared *reads* (hermeticity) is still open.
+
+**Release.** `rune version -v` (commit, date, host, toolchain),
+`rune completions`, `install.sh` (checksummed), `CHANGELOG.md`, CI (fmt, clippy,
+tests on Linux and macOS, MSRV 1.89, self-host) and a release workflow for four
+targets. `Rune.lock.bin` is no longer committed (it is machine-specific).
+

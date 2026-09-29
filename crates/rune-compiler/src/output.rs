@@ -8,6 +8,9 @@ pub struct CompilationResult {
     pub artifacts: Vec<ArtifactEvent>,
     pub diagnostics: Vec<Diagnostic>,
     pub stderr_raw: String,
+    /// The compiler's peak memory (resident set) in bytes, where the
+    /// platform reports it.
+    pub peak_memory: Option<u64>,
 }
 
 /// An artifact emitted by rustc (from --json=artifacts).

@@ -7,7 +7,7 @@ use std::path::PathBuf;
 #[command(
     name = "rune",
     about = "A fast, next-generation build system & package manager for Rust",
-    version,
+    version = env!("RUNE_VERSION"),
     styles = crate::help::styles(),
     disable_help_subcommand = true,
     long_about = "Rune is an alternative build system and package manager for Rust that is \
@@ -36,6 +36,19 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Commands {
+    /// Show version information
+    #[command(after_help = crate::help::examples(&[("rune version", "the version and commit"), ("rune version -v", "also the host, toolchain and settings in effect")]))]
+    Version {
+        /// Also show the commit, host and toolchain
+        #[arg(short, long)]
+        verbose: bool,
+    },
+    /// Print a shell completion script
+    #[command(after_help = crate::help::examples(&[("rune completions bash > ~/.local/share/bash-completion/completions/rune", "bash"), ("rune completions zsh > ~/.zfunc/_rune", "zsh (with ~/.zfunc in $fpath)"), ("rune completions fish > ~/.config/fish/completions/rune.fish", "fish")]))]
+    Completions {
+        /// bash, zsh, fish, elvish or powershell
+        shell: clap_complete::Shell,
+    },
     /// Compile the current package (and its dependencies)
     #[command(visible_alias = "b")]
     #[command(after_help = crate::help::examples(&[("rune build", "debug build of the current package"), ("rune build -r", "optimized (release) build"), ("rune build -p app --bin cli", "one binary of one workspace package"), ("rune build --timings", "show what the build waited on")]))]
@@ -384,6 +397,12 @@ pub struct TestArgs {
     /// Also write the results as JUnit XML (for CI test reports)
     #[arg(long, value_name = "PATH")]
     pub junit: Option<PathBuf>,
+
+    /// `tests`: split test binaries into batches of tests scheduled across
+    /// all cores, each batch its own process; `binaries`: one process per
+    /// binary (default: `test.schedule`, else `binaries`)
+    #[arg(long, value_name = "HOW", value_parser = ["binaries", "tests"])]
+    pub schedule: Option<String>,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -990,6 +1009,12 @@ pub enum CasCommands {
     Stats,
     /// Garbage collect the CAS store by size or age
     Gc(CasGcArgs),
+    /// Keep what this workspace's builds need through every cleanup
+    Pin(Box<CasPinArgs>),
+    /// Stop keeping this workspace's entries
+    Unpin,
+    /// List pinned workspaces
+    Pins,
     /// Show which packages take the space, and how much has gone unused
     Du(CasDuArgs),
     /// Write the store entries a build of the workspace needs into one file
@@ -1032,6 +1057,19 @@ pub struct CasGcArgs {
     /// seconds)
     #[arg(long, value_name = "DURATION", value_parser = parse_age)]
     pub max_age: Option<u64>,
+
+    /// Compress (zstd) entries no build has used for this long
+    #[arg(long, value_name = "DURATION", value_parser = parse_age)]
+    pub compress_idle: Option<u64>,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct CasPinArgs {
+    #[command(flatten)]
+    pub build: BuildArgs,
+    /// Which commands' entries to keep (repeatable): `build`, `check`, `test`
+    #[arg(long = "for", value_name = "COMMAND", default_values_t = ["build".to_string(), "check".to_string(), "test".to_string()], value_parser = ["build", "check", "test"])]
+    pub for_commands: Vec<String>,
 }
 
 fn parse_age(s: &str) -> Result<u64, String> {

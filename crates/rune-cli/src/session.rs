@@ -41,6 +41,8 @@ pub struct Session {
     /// build directory (`cargo::rustc-link-search=…/out`): a program run by
     /// `rune run`/`rune test` finds its dynamic libraries there, as with Cargo.
     pub native_dirs: std::sync::Mutex<Vec<std::path::PathBuf>>,
+    /// `build.sandbox`, checked to work here.
+    pub sandbox: Option<rune_scheduler::executor::SandboxPolicy>,
 }
 
 impl Session {
@@ -54,6 +56,26 @@ impl Session {
         let json = crate::messages::wants_json(&common.message_format);
         crate::ui::set_quiet(common.quiet);
         let mut ws = Workspace::load(common.manifest_path.as_deref())?;
+        if ws.config.settings.low_priority() {
+            rune_common::sysinfo::lower_priority();
+        }
+        let sandbox = if ws.config.settings.sandbox() {
+            let helper =
+                anyhow::Context::context(std::env::current_exe(), "locating the rune executable")?;
+            let sandbox =
+                rune_common::sandbox::Sandbox::new(helper, ws.config.target_dir.join("tmp"));
+            sandbox.probe().map_err(|why| {
+                anyhow::anyhow!(
+                    "build.sandbox is on, but build-time code cannot be confined here: {why}"
+                )
+            })?;
+            Some(rune_scheduler::executor::SandboxPolicy {
+                sandbox,
+                network: ws.config.settings.sandbox_network().into_iter().collect(),
+            })
+        } else {
+            None
+        };
 
         if let Some(dir) = &common.target_dir {
             ws.config.target_dir = if dir.is_absolute() {
@@ -131,6 +153,7 @@ impl Session {
             force_rebuild,
             ignore_rust_version: common.ignore_rust_version,
             native_dirs: Default::default(),
+            sandbox,
         })
     }
 
@@ -185,6 +208,9 @@ impl Session {
         if let Some(cas) = self.cas() {
             executor = executor.with_cas(cas);
         }
+        if let Some(policy) = &self.sandbox {
+            executor = executor.with_sandbox(policy.clone());
+        }
         executor
     }
 
@@ -193,10 +219,12 @@ impl Session {
     /// for entries unused for `cas.max-age`.
     pub fn maybe_gc(&self) {
         let Some(cas) = self.cas() else { return };
-        if let Some(age) = self.ws.config.settings.cas_max_age() {
-            spawn_daily_gc(cas.root(), age);
+        let settings = &self.ws.config.settings;
+        let (age, compress) = (settings.cas_max_age(), settings.cas_compress_after());
+        if age.is_some() || compress.is_some() {
+            spawn_daily_gc(cas.root(), age, compress);
         }
-        let Some(max) = self.ws.config.settings.cas_max_size() else {
+        let Some(max) = self.ws.config.settings.cas_max_size_for(cas.root()) else {
             return;
         };
         if cas.stats().map(|s| s.total_size_bytes).unwrap_or(0) > max {
@@ -205,6 +233,7 @@ impl Session {
                 &GcConfig {
                     max_size_bytes: Some(max),
                     max_age_secs: None,
+                    compress_idle_secs: None,
                 },
             );
         }
@@ -216,11 +245,11 @@ impl Session {
     }
 }
 
-/// Starts `rune cas gc --max-age` for the store at `root` in the background
+/// Starts `rune cas gc --max-age --compress-idle` for the store at `root` in the background
 /// when the last run was more than a day ago; the build does not wait for it.
 /// A store seen for the first time only gets its stamp: nothing in it can
 /// have gone unused for long, and short-lived stores (tests, CI) never pay.
-fn spawn_daily_gc(root: &std::path::Path, max_age_secs: u64) {
+fn spawn_daily_gc(root: &std::path::Path, max_age_secs: Option<u64>, compress: Option<u64>) {
     let stamp = root.join("last-gc");
     let due = match std::fs::metadata(&stamp).and_then(|m| m.modified()) {
         Ok(t) => t
@@ -239,10 +268,18 @@ fn spawn_daily_gc(root: &std::path::Path, max_age_secs: u64) {
     let Ok(exe) = std::env::current_exe() else {
         return;
     };
-    let _ = std::process::Command::new(exe)
-        .args(["cas", "gc", "--max-age"])
-        .arg(max_age_secs.to_string())
+    let mut cmd = std::process::Command::new(exe);
+    cmd.args(["cas", "gc"]);
+    if let Some(age) = max_age_secs {
+        cmd.arg("--max-age").arg(age.to_string());
+    }
+    if let Some(idle) = compress {
+        cmd.arg("--compress-idle").arg(idle.to_string());
+    }
+    // Compressing is background work: never at the expense of the user's.
+    let _ = cmd
         .env("RUNE_CAS_DIR", root)
+        .env("RUNE_BACKGROUND", "1")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())

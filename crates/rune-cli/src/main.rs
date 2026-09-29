@@ -44,6 +44,13 @@ fn main() {
     unsafe {
         libc::signal(libc::SIGPIPE, libc::SIG_DFL);
     }
+    // The sandbox helper (`build.sandbox`): confine, then run the program.
+    if std::env::args_os().nth(1).as_deref()
+        == Some(std::ffi::OsStr::new(rune_common::sandbox::HELPER_ARG))
+    {
+        let rest: Vec<OsString> = std::env::args_os().skip(2).collect();
+        rune_common::sandbox::helper_main(&rest);
+    }
     ui::setup_logging();
 
     let args = external::expand(std::env::args_os().collect());
@@ -107,7 +114,10 @@ fn main() {
         Commands::Clean(a) => cmd_misc::clean(a),
         Commands::Config(c) => cmd_misc::config(c),
         Commands::Cas(args::CasCommands::Export(a)) => cmd_build::cas_export(*a),
+        Commands::Cas(args::CasCommands::Pin(a)) => cmd_build::cas_pin(*a),
         Commands::Cas(c) => cmd_misc::cas(c),
+        Commands::Version { verbose } => cmd_misc::version(verbose),
+        Commands::Completions { shell } => cmd_misc::completions(shell),
         Commands::Doctor => cmd_misc::doctor(),
         Commands::Watch(a) => cmd_watch::watch(a),
         Commands::Affected(a) => cmd_misc::affected(a),

@@ -261,6 +261,9 @@ pub struct DependencyResolver {
     /// Newly chosen releases must have been published at least this long
     /// ago (`resolve.min-release-age`); locked ones are kept regardless.
     min_release_age: Option<std::time::Duration>,
+    /// The registry releases a failed round had chosen (`(registry, name,
+    /// version)`): where to look for the requirement nothing satisfies.
+    partial: Vec<(String, String, Version)>,
 }
 
 impl Default for DependencyResolver {
@@ -283,6 +286,7 @@ impl DependencyResolver {
             prefer: HashMap::new(),
             exclude: HashSet::new(),
             min_release_age: None,
+            partial: Vec::new(),
         }
     }
 
@@ -585,26 +589,37 @@ impl DependencyResolver {
         // version every requirement accepts, or, when there is none, by
         // backtracking away from the release that brought the odd requirement
         // in — and the walk re-run. Almost every graph needs one round.
-        let mut last: Option<ResolvedGraph> = None;
+        let mut last: Option<(ResolvedGraph, Vec<Edge>)> = None;
+        // The complete solver runs at most once, when the walk's own repairs
+        // run out.
+        let mut solved = false;
         for _ in 0..64 {
             let round =
                 self.resolve_round(project_root, root_dependencies, existing_lock, workspace);
             let (graph, edges) = match round {
                 Ok(r) => r,
-                // A backtracking step left nothing to choose: keep the last
-                // complete resolution.
+                // A release needs something that does not exist: move away
+                // from every release that asked for it, as Cargo would.
+                Err(ResolverError::NoMatchingVersion { name, req })
+                    if self.backtrack_from_missing(&name, &req) =>
+                {
+                    continue;
+                }
+                // A backtracking step left nothing to choose: solve the
+                // version choice as a whole, or keep the last complete
+                // resolution.
                 Err(e) => {
-                    let Some(graph) = last else { return Err(e) };
-                    for (_, name, versions) in compatible_duplicates(&graph) {
-                        tracing::warn!(
-                            "could not settle on one version of `{name}` ({}); using them side by side",
-                            versions
-                                .iter()
-                                .map(|v| v.to_string())
-                                .collect::<Vec<_>>()
-                                .join(" and ")
-                        );
+                    let Some((graph, edges)) = last else {
+                        return Err(e);
+                    };
+                    if !solved {
+                        solved = true;
+                        if self.solve_whole(&graph, &edges) {
+                            last = Some((graph, edges));
+                            continue;
+                        }
                     }
+                    warn_side_by_side(&graph);
                     return Ok(graph);
                 }
             };
@@ -618,22 +633,84 @@ impl DependencyResolver {
                 progressed |= self.settle(&registry, &name, &versions, &edges, &graph);
             }
             if !progressed {
-                for (_, name, versions) in compatible_duplicates(&graph) {
-                    tracing::warn!(
-                        "no single version of `{name}` satisfies every requirement in the \
-                         graph; using {} side by side (Cargo would refuse)",
-                        versions
-                            .iter()
-                            .map(|v| v.to_string())
-                            .collect::<Vec<_>>()
-                            .join(" and ")
-                    );
+                if !solved {
+                    solved = true;
+                    if self.solve_whole(&graph, &edges) {
+                        last = Some((graph, edges));
+                        continue;
+                    }
                 }
+                warn_side_by_side(&graph);
                 return Ok(graph);
             }
-            last = Some(graph);
+            last = Some((graph, edges));
         }
-        last.ok_or_else(|| ResolverError::Manifest("version resolution did not settle".into()))
+        last.map(|(g, _)| g)
+            .ok_or_else(|| ResolverError::Manifest("version resolution did not settle".into()))
+    }
+
+    /// Runs the complete solver over the graph's version choice. On success
+    /// its choice becomes the walk's preference (and earlier backtracking is
+    /// forgotten); otherwise its explanation is shown. Returns whether the
+    /// walk should run again.
+    fn solve_whole(&mut self, graph: &ResolvedGraph, edges: &[Edge]) -> bool {
+        let _timer = rune_common::timing::phase("version solving");
+        let requirements: Vec<crate::solver::Requirement<'_>> = edges
+            .iter()
+            .map(|e| crate::solver::Requirement {
+                from: e.from.as_deref(),
+                registry: &e.registry,
+                name: &e.name,
+                req: &e.req,
+            })
+            .collect();
+        match crate::solver::solve(self, graph, &requirements) {
+            crate::solver::Solution::Found(chosen) => {
+                for (registry, name, v) in chosen {
+                    let list = self.prefer.entry((registry, name)).or_default();
+                    list.retain(|p| compat_class(p) != compat_class(&v));
+                    list.push(v);
+                }
+                self.exclude.clear();
+                true
+            }
+            crate::solver::Solution::Impossible(why) => {
+                tracing::warn!("no set of versions satisfies every requirement:\n{why}");
+                false
+            }
+        }
+    }
+
+    /// Excludes the releases of the failed round that require `name` as
+    /// `req` (which no version satisfies). Returns whether there were any.
+    fn backtrack_from_missing(&mut self, name: &str, req: &str) -> bool {
+        let Ok(wanted) = VersionReq::from_str(req) else {
+            return false;
+        };
+        let mut progressed = false;
+        for (registry, pkg, version) in std::mem::take(&mut self.partial) {
+            let requires = self
+                .get_or_fetch_index(&registry, &pkg)
+                .ok()
+                .and_then(|i| i.get_version(&version.to_string()))
+                .is_some_and(|rec| {
+                    rec.deps.iter().any(|d| {
+                        d.kind.as_deref() != Some("dev")
+                            && d.package.as_deref().unwrap_or(&d.name) == name
+                            && VersionReq::from_str(&d.req).is_ok_and(|r| r == wanted)
+                    })
+                });
+            if requires {
+                tracing::debug!("{pkg} {version} needs {name} {req}, which does not exist");
+                progressed |= self.exclude.insert((registry, pkg, version));
+            }
+        }
+        progressed
+    }
+
+    /// The index of a crate, fetched if needed (for the solver).
+    pub(crate) fn index_for(&mut self, registry: &str, name: &str) -> Result<&CrateIndex> {
+        self.get_or_fetch_index(registry, name)
     }
 
     /// One conflict: `versions` of `name` share a compatible range. Returns
@@ -874,7 +951,7 @@ impl DependencyResolver {
                     self.prefetch_closure(missing, existing_lock);
                 }
                 for (name, req, features, default_features, local_dir, registry) in generation {
-                    resolve_one_queue_item(
+                    let step = resolve_one_queue_item(
                         name,
                         req,
                         features,
@@ -889,7 +966,19 @@ impl DependencyResolver {
                         workspace,
                         existing_lock,
                         self,
-                    )?;
+                    );
+                    if let Err(e) = step {
+                        self.partial = resolved_packages
+                            .values()
+                            .filter_map(|p| match &p.source {
+                                PackageSource::Registry(r) => {
+                                    Some((r.clone(), p.name.clone(), p.version.clone()))
+                                }
+                                _ => None,
+                            })
+                            .collect();
+                        return Err(e);
+                    }
                 }
             }
 
@@ -1088,12 +1177,25 @@ struct Edge {
 
 /// Which versions Cargo counts as compatible (one allowed per class):
 /// the same major, the same minor for `0.x`, the same patch for `0.0.x`.
-fn compat_class(v: &Version) -> (u64, u64, u64) {
-    match (v.major, v.minor) {
-        (0, 0) => (0, 0, v.patch),
-        (0, m) => (0, m, 0),
-        (m, _) => (m, 0, 0),
+use crate::solver::compat_class;
+
+/// Says which crates end up in several versions of one compatible range.
+fn warn_side_by_side(graph: &ResolvedGraph) {
+    for (_, name, versions) in compatible_duplicates(graph) {
+        tracing::warn!(
+            "no single version of `{name}` satisfies every requirement in the \
+             graph; using {} side by side (Cargo would refuse)",
+            versions
+                .iter()
+                .map(|v| v.to_string())
+                .collect::<Vec<_>>()
+                .join(" and ")
+        );
     }
+}
+
+pub(crate) fn normalize_registry_pub(url: &str) -> String {
+    normalize_registry(url)
 }
 
 /// Registry crates present in more than one version of one compatible class.
@@ -1754,6 +1856,91 @@ mod tests {
             yanked: false,
             rust_version: None,
             pubtime: None,
+        }
+    }
+
+    #[test]
+    fn the_solver_moves_several_crates_at_once_or_explains_why_it_cannot() {
+        let mut resolver = DependencyResolver::new().offline(true);
+        let reg = CRATES_IO.to_string();
+        let mut add = |name: &str, versions: Vec<IndexRecord>| {
+            let versions = versions
+                .into_iter()
+                .map(|mut r| {
+                    r.name = name.into();
+                    r
+                })
+                .collect();
+            resolver.cached_indices.insert(
+                (reg.clone(), name.into()),
+                CrateIndex {
+                    name: name.into(),
+                    versions,
+                },
+            );
+        };
+        // The newest `x` and the newest `y` pin different `z`s: one of them
+        // has to move back, and then everything fits.
+        add(
+            "x",
+            vec![
+                record("1.0.0", vec![dep("z", "^1", false, None)], &[]),
+                record("2.0.0", vec![dep("z", "=1.1.0", false, None)], &[]),
+            ],
+        );
+        add(
+            "y",
+            vec![
+                record("1.0.0", vec![dep("z", "^1", false, None)], &[]),
+                record("2.0.0", vec![dep("z", "=1.0.0", false, None)], &[]),
+            ],
+        );
+        add(
+            "z",
+            vec![record("1.0.0", vec![], &[]), record("1.1.0", vec![], &[])],
+        );
+        let star = VersionReq::STAR;
+        let pinned = VersionReq::from_str("=2.0.0").unwrap();
+        let reqs = |x: &'static VersionReq, y: &'static VersionReq| {
+            vec![
+                crate::solver::Requirement {
+                    from: None,
+                    registry: CRATES_IO,
+                    name: "x",
+                    req: x,
+                },
+                crate::solver::Requirement {
+                    from: None,
+                    registry: CRATES_IO,
+                    name: "y",
+                    req: y,
+                },
+            ]
+        };
+        let star: &'static VersionReq = Box::leak(Box::new(star));
+        let pinned: &'static VersionReq = Box::leak(Box::new(pinned));
+        let graph = ResolvedGraph::default();
+        let v = |s: &str| Version::parse(s).unwrap();
+        match crate::solver::solve(&mut resolver, &graph, &reqs(star, star)) {
+            crate::solver::Solution::Found(mut chosen) => {
+                chosen.sort();
+                let z = chosen.iter().find(|(_, n, _)| n == "z").unwrap().2.clone();
+                let x = chosen.iter().find(|(_, n, _)| n == "x").unwrap().2.clone();
+                let y = chosen.iter().find(|(_, n, _)| n == "y").unwrap().2.clone();
+                // Exactly one `z`, and whatever pinned it got it.
+                assert!(x != v("2.0.0") || z == v("1.1.0"));
+                assert!(y != v("2.0.0") || z == v("1.0.0"));
+                assert!(x == v("2.0.0") || y == v("2.0.0"), "keeps one newest");
+            }
+            crate::solver::Solution::Impossible(why) => panic!("{why}"),
+        }
+        // Both pinned to their newest: impossible, and the reason names them.
+        match crate::solver::solve(&mut resolver, &graph, &reqs(pinned, pinned)) {
+            crate::solver::Solution::Impossible(why) => {
+                assert!(why.contains("x 2.0.0 depends on z 1.1.0"), "{why}");
+                assert!(why.contains("y 2.0.0 depends on z 1.0.0"), "{why}");
+            }
+            crate::solver::Solution::Found(c) => panic!("{c:?}"),
         }
     }
 

@@ -642,22 +642,49 @@ fn doc_with(args: DocArgs, extra: &[String]) -> Result<()> {
 /// `rune cas export`: the store entries the requested builds need, in one
 /// file. Nothing is compiled: keys are computed from the sources, and only
 /// entries the store has go in (run the build first to fill it).
-pub fn cas_export(args: crate::args::CasExportArgs) -> Result<()> {
-    let sess = Session::new(&args.build.common, "dev")?;
-    let Some(cas) = sess.cas() else {
-        bail!("the store is disabled (cas.enabled = false)");
-    };
+/// The store keys a build of the workspace needs for each of `commands`.
+fn workspace_store_keys(
+    build: &crate::args::BuildArgs,
+    commands: &[String],
+) -> Result<Vec<String>> {
     let mut keys: Vec<String> = Vec::new();
-    for command in &args.for_commands {
+    for command in commands {
         let (mode, profile) = match command.as_str() {
             "check" => (Mode::Check, "dev"),
             "test" => (Mode::Test, "test"),
             _ => (Mode::Build, "dev"),
         };
-        let s = Session::new(&args.build.common, profile)?;
-        let plan = plan_for(&s, mode, &selection(&args.build.targets))?;
+        let s = Session::new(&build.common, profile)?;
+        let plan = plan_for(&s, mode, &selection(&build.targets))?;
         keys.extend(s.executor().store_keys(&plan.graph)?);
     }
+    Ok(keys)
+}
+
+/// `rune cas pin`: the entries this workspace's builds need survive every
+/// cleanup, however long they go unused and however full the store gets.
+pub fn cas_pin(args: crate::args::CasPinArgs) -> Result<()> {
+    let sess = Session::new(&args.build.common, "dev")?;
+    let Some(cas) = sess.cas() else {
+        bail!("the store is disabled (cas.enabled = false)");
+    };
+    let keys = workspace_store_keys(&args.build, &args.for_commands)?;
+    let present = keys.iter().filter(|k| cas.contains(k)).count();
+    rune_cas::pins::pin(&cas, sess.ws.root(), keys).context("could not write the pin")?;
+    ui::summary(format!(
+        "pinned {} ({present} entries in the store)",
+        sess.ws.root().display()
+    ));
+    ui::hint("pin again after dependency changes; `rune cas unpin` releases them");
+    Ok(())
+}
+
+pub fn cas_export(args: crate::args::CasExportArgs) -> Result<()> {
+    let sess = Session::new(&args.build.common, "dev")?;
+    let Some(cas) = sess.cas() else {
+        bail!("the store is disabled (cas.enabled = false)");
+    };
+    let keys = workspace_store_keys(&args.build, &args.for_commands)?;
     let stats = cas.export_bundle(&keys, &args.output)?;
     ui::summary(format!(
         "wrote {} entries ({}) to {}",

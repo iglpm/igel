@@ -14,6 +14,7 @@ serde.workspace = true
 toml.workspace = true
 bincode.workspace = true
 semver.workspace = true
+pubgrub = "0.3"
 thiserror.workspace = true
 tracing.workspace = true
 colored.workspace = true

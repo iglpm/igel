@@ -895,7 +895,9 @@ fn who_enables(
     let mut defaults: Vec<String> = Vec::new();
     let mut via_feature: Vec<String> = Vec::new();
     // Inside the package: another feature that lists this one.
-    for (g, values) in &pkg.declared_features {
+    let mut own: Vec<(&String, &Vec<String>)> = pkg.declared_features.iter().collect();
+    own.sort();
+    for (g, values) in own {
         if g != f && pkg_on.contains(g.as_str()) && values.iter().any(|v| v == f) {
             internal.push(format!("feature `{g}`"));
         }
@@ -932,7 +934,10 @@ fn who_enables(
             if f == "default" && dep.default_features {
                 defaults.push(who.clone());
             }
-            for (g, vals) in &parent.declared_features {
+            let mut parent_features: Vec<(&String, &Vec<String>)> =
+                parent.declared_features.iter().collect();
+            parent_features.sort();
+            for (g, vals) in parent_features {
                 if !parent_on.contains(g.as_str()) {
                     continue;
                 }

@@ -24,7 +24,26 @@ understands `.cargo/config.toml`.
   compilers while memory is short, and a build that left cores idle tells you
   which chain of crates held it back
 - **Pipelined test runner** — test binaries run the moment they link; retries
-  with flaky-test detection, JUnit and JSON reports
+  with flaky-test detection, JUnit and JSON reports; optionally batches of
+  tests scheduled across every binary at once
+- **Confined build-time code** — `build.sandbox` runs build scripts and
+  proc-macros with no network and nothing writable outside the build
+
+## Install
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/runepm/rune/main/install.sh | sh
+```
+
+The script downloads the release for your machine (Linux or macOS, x86_64 or
+aarch64), checks its SHA-256 and installs `rune` to `~/.rune/bin`
+(`--to DIR`, `--version v0.1.0`). From source: `cargo install --git
+https://github.com/runepm/rune rune-cli`. Then:
+
+```bash
+rune version -v                                   # what you have
+rune completions zsh > ~/.zfunc/_rune             # or bash, fish, elvish, powershell
+```
 
 ## Usage
 
@@ -274,6 +293,10 @@ rune config unset build.release-rebuild-all
 | `build.jobs` | CPUs + ⅓ | Parallel compiler jobs (13 on a 10-core machine). Each `rustc` may borrow slots other jobs leave idle for its own codegen threads. |
 | `build.frontend-threads` | off | `-Z threads` for nightly compilers' parallel front end: `auto` gives a crate that starts while cores are idle (typically the last, largest ones) as many threads as there are idle cores; a number applies to every crate. Ignored on stable. |
 | `build.dependency-debuginfo` | `false` | **Off:** registry and git dependencies compile with `debug = "line-tables-only"` in the dev profile — backtraces and breakpoints work, local variables *inside dependency code* are not inspectable — which made a cold build of Rune itself about 10 % faster. **On:** Cargo's full debuginfo. A `debug` key in any profile (`[profile.dev]`, `[profile.dev.package."*"]`, …) always wins, and your own crates are never affected. |
+| `build.low-priority` | `false` | Run compilers and build scripts at a lower scheduling priority, so the rest of the machine stays responsive. `rune watch` always does. |
+| `build.sandbox` | `false` | Run build scripts and the compiler (proc-macros) with no network and nothing writable outside the build — see *Dependencies and supply chain*. |
+| `build.sandbox-network` | none | Packages whose build scripts may use the network in the sandbox (comma-separated). |
+| `build.feature-unification` | `selected` | `workspace`: every member's feature requests count, so any subset of the workspace shares dependency builds (see *Workspace feature unification*). |
 | `build.target-dir` | `.rune/target` | Build output directory. |
 | `cas.enabled` | `true` | Use the CAS at all. |
 | `cas.dir` | `~/.rune/cas` | CAS location. |
@@ -282,13 +305,15 @@ rune config unset build.release-rebuild-all
 | `cas.remote-replicas` | `1` | With several Cairn URLs: how many servers hold each entry (`2` survives losing one). |
 | `cas.remote-write` | `true` | Publish to `cas.remote`. Set `false` where only CI should write (e.g. developers). |
 | `cas.max-age` | `30d` | Entries no build has used for this long are removed by a background `rune cas gc` that a build starts at most once a day (like Cargo's automatic cache cleanup). `0` keeps everything. |
-| `cas.max-size` | unlimited | Evict least-recently-used entries after a build when the CAS grows past this (`20GB`, `512MiB`). |
+| `cas.max-size` | `auto` | Evict least-recently-used entries after a build when the CAS grows past this (`20GB`, `512MiB`). `auto`: a tenth of its disk, 5–50 GiB; `0`: unlimited. Entries of pinned workspaces (`rune cas pin`) stay. |
+| `cas.compress-after` | `7d` | Compress (zstd) entries no build has used for this long, in the daily background cleanup; the next build that needs one decompresses it. `0`: never. |
 | `cas.verify` | `false` | Re-hash every artifact restored from the CAS (entries are always checked against their key and recorded sizes). |
 | `resolve.min-release-age` | `0` | Only choose releases published at least this long ago (`14d`, `72h`) when resolving new versions; locked versions stay. Malicious releases are usually yanked within days. |
 | `resolve.write-cargo-lock` | `true` | Create/update `Cargo.lock` when the set of locked packages changes. An up-to-date lockfile is never touched. |
 | `net.offline` | `false` | Never touch the network. |
 | `test.doctests` | `true` | Run documentation tests in `rune test`. |
 | `test.cache` | `false` | Same as `rune test --cached`: remember passing test binaries (see below). |
+| `test.schedule` | `binaries` | `tests` (or `rune test --schedule tests`): each test binary's tests are split into batches, each its own process, scheduled across all binaries at once (like cargo-nextest). Tests then no longer share a process. |
 
 Each key maps to an environment variable, e.g. `RUNE_BUILD_RELEASE_REBUILD_ALL=1`.
 `RUNE_HOME` moves everything Rune keeps outside your project (settings, CAS,
@@ -398,7 +423,15 @@ once its build-dependencies are built, overlapping the rest of its package's
 dependencies. Before starting another compiler Rune checks available memory
 (Linux `MemAvailable`, macOS memory pressure) and, while it is short, lets
 running units finish first — a machine with many cores and little memory
-neither swaps nor loses a `rustc` to the OOM killer.
+neither swaps nor loses a `rustc` to the OOM killer. Each compiler's peak
+memory is measured (`wait4`) and remembered, so a crate known to need 2 GiB
+waits until 2 GiB are free instead of starting next to three others like it.
+Starting a job never waits on the jobserver pipe either: rustc's codegen
+threads borrow idle tokens, and a job that starts while they hold them all
+simply owes one, repaid as they return — the critical path never waits behind
+another crate's code generation. `build.low-priority = true` runs every
+compiler at a lower scheduling priority so the rest of the machine stays
+responsive (`rune watch` always does).
 
 What stable Rust cannot parallelize is a chain of crates that must be compiled
 one after another, and a single crate's front end. A build longer than 10 s that
@@ -504,6 +537,32 @@ about 0.15 s. Line numbers in errors match the file.
 
 ## Dependencies and supply chain
 
+`build.sandbox = true` (or `RUNE_BUILD_SANDBOX=1`) runs every build script and
+compiler — and with it every proc-macro — confined: no network, and a
+read-only file system except the build's output (a build script: its
+`OUT_DIR`) and a private temporary directory. A build script that tries to
+plant something in `~/.bashrc` or another crate's sources, or to phone home,
+fails instead. On Linux this uses unprivileged user, mount and network
+namespaces (on Ubuntu 23.10+ AppArmor may have to allow them); on macOS,
+`sandbox-exec`. `build.sandbox-network = "openssl-src, foo"` lets the build
+scripts of those packages use the network. It costs nothing measurable: a full
+sandboxed rebuild of Rune's own 194 units (ring, zstd-sys, proc-macros) takes
+as long as an unconfined one.
+
+Version resolution takes the newest release each requirement allows and
+settles the rare conflict (two versions in one compatible range) by
+preferring or backtracking; when that is not enough it solves the choice as a
+whole with PubGrub, and when no choice exists it says why:
+
+```
+! no set of versions satisfies every requirement:
+  Because b 1.0.0 depends on a 1.1.0 and the workspace depends on b 1.0.0, the workspace depends on a 1.1.0.
+  And because the workspace depends on a 1.0.0, the workspace cannot be resolved.
+```
+
+A release that needs a version of something that was never published is
+skipped for an older one, as Cargo does.
+
 `rune outdated` lists the declared dependencies with newer releases (compatible,
 and newest overall, honouring each package's `rust-version`); `rune upgrade`
 raises the requirements in place, keeping comments and how each requirement is
@@ -519,6 +578,24 @@ makes it reproducible). `rune tree --exec-surface` lists every crate that runs
 code on your machine while building — build scripts, proc-macros, native
 `links` crates — with the chain that brings each in. `resolve.min-release-age =
 "14d"` keeps resolution away from releases younger than that.
+
+## Workspace feature unification
+
+By default `rune build -p a` compiles `a`'s dependencies with the features `a`
+needs — so building different members can build the same dependency with
+different features. `build.feature-unification = "workspace"` (or Cargo's
+`resolver.feature-unification = "workspace"` in `.cargo/config.toml`) counts
+every member's feature requests, so every subset of the workspace reuses the
+same dependency builds — what `cargo hakari` achieves with a generated crate,
+here without one. Only what the selected packages reach is built.
+
+## Keeping the store small
+
+The store caps itself at a tenth of its disk (5–50 GiB; `cas.max-size`),
+removes entries no build has used for 30 days (`cas.max-age`) and compresses
+those unused for 7 (`cas.compress-after`, zstd; the next build that needs one
+decompresses it). `rune cas pin` keeps everything this workspace's build,
+check and test need through every cleanup (`rune cas pins`, `rune cas unpin`).
 
 ## Watching and selective CI
 

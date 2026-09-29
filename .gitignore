@@ -1,2 +1,3 @@
 target/
-.rune/
+/.rune/
+/Rune.lock.bin

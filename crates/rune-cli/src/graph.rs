@@ -539,10 +539,34 @@ fn msrv_for_resolution(ws: &Workspace) -> Option<semver::Version> {
 /// The command line does not — version resolution is independent of the
 /// selected packages and features.
 fn resolution_fingerprint(ws: &Workspace, locals: &Locals, _req: &Request) -> String {
+    with_cargo_lock(&resolution_inputs(ws, locals), ws.root())
+}
+
+/// A hash of everything a resolution is made from except `Cargo.lock`: the
+/// manifests (read now — take it *before* resolving, so a manifest saved
+/// while the resolution runs makes the next build resolve again instead of
+/// trusting a lockfile made from the old one), the configuration files
+/// (`[patch]`, source replacement, registries) and settings, and the exact
+/// `rune` binary (a newer one may resolve differently; the version number
+/// alone does not change between development builds).
+fn resolution_inputs(ws: &Workspace, locals: &Locals) -> String {
     let mut hasher = rune_common::hash::HashBuilder::new();
     hasher.update(env!("CARGO_PKG_VERSION").as_bytes());
+    if let Some(meta) = std::env::current_exe()
+        .ok()
+        .and_then(|e| fs::metadata(e).ok())
+    {
+        hasher.update(&meta.len().to_le_bytes());
+        if let Ok(t) = meta.modified()
+            && let Ok(d) = t.duration_since(std::time::UNIX_EPOCH)
+        {
+            hasher.update(&d.as_nanos().to_le_bytes());
+        }
+    }
     let mut paths: Vec<PathBuf> = vec![ws.manifest_path()];
     paths.extend(locals.list.iter().map(|m| m.manifest_path.clone()));
+    paths.extend(ws.cargo_config.files.iter().cloned());
+    paths.push(ws.root().join(rune_common::settings::PROJECT_FILE));
     paths.sort();
     paths.dedup();
     for path in paths {
@@ -551,9 +575,17 @@ fn resolution_fingerprint(ws: &Workspace, locals: &Locals, _req: &Request) -> St
             hasher.update(&contents);
         }
     }
-    // `Cargo.lock` seeds the versions chosen, so a `cargo update` (or a
-    // teammate's change) is picked up rather than shadowed by our binary lock.
-    if let Ok(contents) = fs::read(ws.root().join("Cargo.lock")) {
+    hasher.update(format!("{:?}", ws.config.settings.min_release_age()).as_bytes());
+    hasher.finish_blake3()
+}
+
+/// `inputs` plus the current `Cargo.lock`, which seeds the versions chosen:
+/// a `cargo update` or a teammate's change is picked up rather than shadowed
+/// by the binary lockfile.
+fn with_cargo_lock(inputs: &str, root: &Path) -> String {
+    let mut hasher = rune_common::hash::HashBuilder::new();
+    hasher.update(inputs.as_bytes());
+    if let Ok(contents) = fs::read(root.join("Cargo.lock")) {
         hasher.update(b"\0Cargo.lock\0");
         hasher.update(&contents);
     }
@@ -853,6 +885,139 @@ fn resolved_from_lock(lock: &Lockfile) -> ResolvedGraph {
     }
 }
 
+/// The resolution recorded in `Rune.lock.bin`, when it was made from the
+/// current manifests, configuration and `Cargo.lock` (its fingerprint says
+/// so) and covers every dependency they declare: the whole graph, edges and
+/// feature tables included, rebuilt from the lockfile and the manifests.
+fn cached_resolution(ws: &Workspace) -> Option<(ResolvedGraph, Lockfile)> {
+    let _timer = phase("resolve (cached)");
+    let (lock, Some(stored)) =
+        LockfileManager::read_binary_with_fingerprint(&ws.root().join("Rune.lock.bin")).ok()?
+    else {
+        return None;
+    };
+    if lock.packages.is_empty() {
+        return None;
+    }
+    let mut locals = Locals::load(ws).ok()?;
+    if stored != with_cargo_lock(&resolution_inputs(ws, &locals), ws.root()) {
+        return None;
+    }
+    locals.extend_from_lock(ws, &lock).ok()?;
+    let uni = Universe::build(ws, &locals, &lock);
+    if !incomplete(&uni, &locals, &lock, &|_| true).is_empty() {
+        return None;
+    }
+    let mut packages = HashMap::new();
+    for idx in 0..uni.views.len() {
+        let view = &uni.views[idx];
+        let (source, checksum, features) = match uni.origin[idx] {
+            Origin::Registry => {
+                let lp = &lock.packages[uni.lock_pkg[idx]?];
+                (
+                    PackageSource::Registry(index_of_lock_source(lp.source.as_deref())),
+                    lp.checksum.clone(),
+                    lp.features.clone(),
+                )
+            }
+            Origin::Local(li) => {
+                let m = &locals.list[li];
+                let lp = lock.packages.iter().find(|p| {
+                    p.name == m.name
+                        && p.version == m.version.to_string()
+                        && !is_registry_source(p.source.as_deref())
+                });
+                let source = match &locals.git_of[li] {
+                    Some(co) => {
+                        // `git+URL?branch=x#commit`, as locked.
+                        let reference = lp
+                            .and_then(|p| p.source.as_deref())
+                            .and_then(|s| s.split_once('?'))
+                            .and_then(|(_, rest)| rest.split('#').next())
+                            .map(str::to_string);
+                        PackageSource::Git {
+                            url: co.url.clone(),
+                            reference,
+                            commit: co.commit.clone(),
+                        }
+                    }
+                    None => PackageSource::Path(m.dir.clone()),
+                };
+                (
+                    source,
+                    None,
+                    lp.map(|p| p.features.clone()).unwrap_or_default(),
+                )
+            }
+        };
+        // Only the edges the lockfile records: an optional dependency nothing
+        // turns on resolves to a package another one pulls in, but is no edge.
+        let recorded: Option<HashSet<&String>> = match uni.origin[idx] {
+            Origin::Registry => Some(
+                lock.packages[uni.lock_pkg[idx]?]
+                    .dependencies
+                    .iter()
+                    .collect(),
+            ),
+            Origin::Local(li) => {
+                let m = &locals.list[li];
+                lock.packages
+                    .iter()
+                    .find(|p| {
+                        p.name == m.name
+                            && p.version == m.version.to_string()
+                            && !is_registry_source(p.source.as_deref())
+                    })
+                    .map(|p| p.dependencies.iter().collect())
+            }
+        };
+        let dependencies = view
+            .deps
+            .iter()
+            .filter_map(|d| {
+                let t = d.resolved?;
+                if recorded.as_ref().is_some_and(|r| !r.contains(&uni.id[t])) {
+                    return None;
+                }
+                Some(rune_resolver::resolver::ResolvedDependencyRef {
+                    name: d.alias.clone(),
+                    req: format!("={}", uni.version[t]),
+                    kind: d.kind,
+                    optional: d.optional,
+                    features: d.features.clone(),
+                    default_features: d.default_features,
+                    package: d.renamed.then(|| uni.name[t].clone()),
+                    target: d.target.clone(),
+                    registry: None,
+                })
+            })
+            .collect();
+        packages.insert(
+            uni.id[idx].clone(),
+            ResolvedPackage {
+                name: uni.name[idx].clone(),
+                version: uni.version[idx].clone(),
+                source,
+                checksum,
+                dependencies,
+                features,
+                declared_features: view
+                    .features
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect(),
+            },
+        );
+    }
+    Some((
+        ResolvedGraph {
+            root_packages: ws.members.iter().map(|m| m.name.clone()).collect(),
+            packages,
+        },
+        lock,
+    ))
+}
+
 /// A request with no feature flags that selects every member — what
 /// commands like `update`, `fetch` and `tree` resolve against.
 pub fn whole_workspace_request<'a>(
@@ -891,6 +1056,35 @@ pub fn resolve_fresh(
 /// [`resolve_fresh`], preferring the given `(registry index, name, version)`s
 /// wherever a requirement allows them.
 pub fn resolve_fresh_with(
+    ws: &Workspace,
+    offline: bool,
+    existing: Option<&Lockfile>,
+    refresh: bool,
+    preferred: &[(String, String, semver::Version)],
+) -> Result<(ResolvedGraph, Lockfile)> {
+    // Nothing to refresh or prefer, and the lockfile on disk was made from
+    // exactly these manifests: it *is* the resolution (`tree`, `why`,
+    // `metadata`, `features` … need no resolver run).
+    // Only when seeded by exactly the lockfile on disk: a trimmed seed
+    // (`update -p foo`) or none (`generate-lockfile`) asks for a real
+    // resolution.
+    let from_disk = !refresh
+        && preferred.is_empty()
+        && LockfileManager::load_fast(ws.root()).as_ref() == existing;
+    if from_disk && let Some(cached) = cached_resolution(ws) {
+        return Ok(cached);
+    }
+    let (resolved, lock) = resolve_uncached(ws, offline, existing, refresh, preferred)?;
+    // Keep what was resolved from the lockfile on disk (as `cargo tree`
+    // updates `Cargo.lock`), so the next `tree`, `metadata` or build starts
+    // from it instead of resolving again.
+    if from_disk {
+        let _ = store_resolution(ws, &lock);
+    }
+    Ok((resolved, lock))
+}
+
+fn resolve_uncached(
     ws: &Workspace,
     offline: bool,
     existing: Option<&Lockfile>,
@@ -987,14 +1181,10 @@ pub fn store_resolution(ws: &Workspace, lock: &Lockfile) -> Result<()> {
     let targets = TargetSelection::default();
     let selected: Vec<usize> = (0..ws.members.len()).collect();
     let req = whole_workspace_request(&profile, false, &features, &targets, &selected);
-    LockfileManager::sync_all(ws.root(), lock).context("Failed to write lockfiles")?;
     sync_cargo_lock(ws, lock, false)?;
     let fingerprint = resolution_fingerprint(ws, &locals, &req);
-    let path = ws.root().join(".rune").join("resolve.fingerprint");
-    if let Some(parent) = path.parent() {
-        let _ = fs::create_dir_all(parent);
-    }
-    let _ = fs::write(path, fingerprint);
+    LockfileManager::sync_all_with_fingerprint(ws.root(), lock, Some(&fingerprint))
+        .context("Failed to write lockfiles")?;
     Ok(())
 }
 
@@ -1022,23 +1212,39 @@ pub fn download_all(resolved: &ResolvedGraph, offline: bool) -> Result<usize> {
 /// Resolves the workspace, or reuses the previous resolution when nothing
 /// that feeds it changed. Returns the graph and the lockfile it corresponds to.
 fn resolve(ws: &Workspace, locals: &Locals, req: &Request) -> Result<(ResolvedGraph, Lockfile)> {
+    resolve_with(ws, locals, req, true)
+}
+
+/// [`resolve`]; with `trust_cache` false, the binary lockfile is not reused
+/// even when its fingerprint matches (it was found not to cover the
+/// manifests).
+fn resolve_with(
+    ws: &Workspace,
+    locals: &Locals,
+    req: &Request,
+    trust_cache: bool,
+) -> Result<(ResolvedGraph, Lockfile)> {
     let root = ws.root();
-    let fingerprint_path = root.join(".rune").join("resolve.fingerprint");
-    let fingerprint = resolution_fingerprint(ws, locals, req);
-    let unchanged = fs::read_to_string(&fingerprint_path)
-        .map(|stored| stored.trim() == fingerprint)
-        .unwrap_or(false);
+    let inputs = resolution_inputs(ws, locals);
+    let fingerprint = with_cargo_lock(&inputs, root);
 
     // Fast path: nothing changed since the last resolution, and we have the
-    // binary lockfile that carries its feature sets.
-    if unchanged
-        && let Some(lock) = LockfileManager::load_binary(root)
+    // binary lockfile that carries its feature sets — with the fingerprint
+    // it was made from in the same file, so the two always belong together.
+    if trust_cache
+        && let Ok((lock, Some(stored))) =
+            LockfileManager::read_binary_with_fingerprint(&root.join("Rune.lock.bin"))
+        && stored == fingerprint
         && !lock.packages.is_empty()
     {
-        // Cheap check only: the lockfile can be missing (deleted, or a
-        // fresh checkout with only our cache present).
-        if !root.join("Cargo.lock").is_file() {
-            sync_cargo_lock(ws, &lock, req.locked)?;
+        // The lockfile can be missing (deleted, or a fresh checkout with only
+        // our cache present): write it, and record the new fingerprint.
+        if !root.join("Cargo.lock").is_file() && sync_cargo_lock(ws, &lock, req.locked)? {
+            let _ = LockfileManager::sync_all_with_fingerprint(
+                root,
+                &lock,
+                Some(&with_cargo_lock(&inputs, root)),
+            );
         }
         return Ok((resolved_from_lock(&lock), lock));
     }
@@ -1095,17 +1301,13 @@ fn resolve(ws: &Workspace, locals: &Locals, req: &Request) -> Result<(ResolvedGr
              (run `rune update` first)"
         );
     }
-    if existing_lock.as_ref() != Some(&lockfile) || LockfileManager::load_binary(root).is_none() {
-        LockfileManager::sync_all(root, &lockfile).context("Failed to write lockfiles")?;
-    }
     sync_cargo_lock(ws, &lockfile, req.locked)?;
-    // Recorded *after* `Cargo.lock` was (re)written: the fingerprint covers
-    // its content, and our own write must not look like an outside change.
-    let fingerprint = resolution_fingerprint(ws, locals, req);
-    if let Some(parent) = fingerprint_path.parent() {
-        let _ = fs::create_dir_all(parent);
-    }
-    let _ = fs::write(&fingerprint_path, &fingerprint);
+    // The fingerprint is taken *after* `Cargo.lock` was (re)written — it
+    // covers its content, and our own write must not look like an outside
+    // change — but from the manifests as they were before resolving.
+    let fingerprint = with_cargo_lock(&inputs, root);
+    LockfileManager::sync_all_with_fingerprint(root, &lockfile, Some(&fingerprint))
+        .context("Failed to write lockfiles")?;
 
     Ok((resolved, lockfile))
 }
@@ -1554,6 +1756,54 @@ impl Universe {
         }
         uni
     }
+}
+
+/// Declared dependencies a build for these platforms needs that the
+/// lockfile does not resolve (`app → serde`): a local package's non-optional
+/// dependency matching no locked package, or a locked package's edge to a
+/// package the lockfile does not contain.
+fn incomplete(
+    uni: &Universe,
+    locals: &Locals,
+    lock: &Lockfile,
+    applies: &dyn Fn(&Option<String>) -> bool,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    for (idx, view) in uni.views.iter().enumerate() {
+        let Origin::Local(li) = uni.origin[idx] else {
+            continue;
+        };
+        // Development dependencies matter for the workspace's own packages.
+        let member = locals.member_of[li].is_some();
+        for d in &view.deps {
+            if d.resolved.is_none()
+                && !d.optional
+                && (member || d.kind != DependencyKind::Dev)
+                && applies(&d.target)
+            {
+                out.push(format!("`{}` → `{}`", view.name, d.alias));
+            }
+        }
+    }
+    let ids: HashSet<String> = lock
+        .packages
+        .iter()
+        .map(|p| format!("{} {}", p.name, p.version))
+        .collect();
+    for p in &lock.packages {
+        for d in &p.decls {
+            if let Some(id) = &d.resolved
+                && d.kind != 1
+                && applies(&d.target)
+                && !ids.contains(id)
+            {
+                out.push(format!("`{}` → `{id}`", p.name));
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
 }
 
 fn kind_of(k: u8) -> DependencyKind {
@@ -2067,16 +2317,92 @@ fn check_rust_versions(
     Ok(())
 }
 
+/// Which packages' feature requests a build honors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Unification {
+    /// Only the selected packages' (Cargo's default).
+    Selected,
+    /// Every workspace member's.
+    Workspace,
+}
+
+/// `build.feature-unification` in Rune's settings, else Cargo's
+/// `resolver.feature-unification` config, else `selected`.
+fn feature_unification(ws: &Workspace) -> Result<Unification> {
+    let value = ws
+        .config
+        .settings
+        .feature_unification()
+        .or_else(|| ws.cargo_config.string(&["resolver", "feature-unification"]));
+    match value.as_deref() {
+        None | Some("selected") | Some("package") => Ok(Unification::Selected),
+        Some("workspace") => Ok(Unification::Workspace),
+        Some(other) => {
+            bail!("unknown feature unification `{other}`: expected `selected` or `workspace`")
+        }
+    }
+}
+
+/// Keeps the part of a feature resolution the selected roots reach: with
+/// workspace unification the other members only contribute features.
+fn reachable(mut res: FeatureResolution, roots: &[UnitRef]) -> FeatureResolution {
+    let mut from: HashMap<UnitRef, Vec<UnitRef>> = HashMap::new();
+    for e in &res.edges {
+        from.entry(e.from).or_default().push(e.to);
+    }
+    let mut seen: HashSet<UnitRef> = roots.iter().copied().collect();
+    let mut stack: Vec<UnitRef> = roots.to_vec();
+    while let Some(u) = stack.pop() {
+        for &to in from.get(&u).into_iter().flatten() {
+            if seen.insert(to) {
+                stack.push(to);
+            }
+        }
+    }
+    if seen.len() == res.features.len() {
+        return res;
+    }
+    res.features.retain(|u, _| seen.contains(u));
+    res.edges.retain(|e| seen.contains(&e.from));
+    res
+}
+
 /// Plans the build for `req`.
 pub fn plan(ws: &Workspace, req: &Request) -> Result<Plan> {
     let total = phase("plan");
     configure_git(ws, req.offline, false, None);
     let mut locals = Locals::load(ws)?;
-    let (_resolved, lock) = resolve(ws, &locals, req)?;
+    let (_resolved, mut lock) = resolve(ws, &locals, req)?;
     locals.extend_from_lock(ws, &lock)?;
-    let locals = locals;
     let roles = Roles::new(ws, req);
-    let uni = Universe::build(ws, &locals, &lock);
+    let applies = |t: &Option<String>| {
+        t.as_deref()
+            .is_none_or(|t| roles.target.info.matches(t) || roles.host.info.matches(t))
+    };
+    let mut uni = Universe::build(ws, &locals, &lock);
+    // Never build from a lockfile that leaves a declared dependency out:
+    // rustc would only say "undeclared crate". Resolve again from scratch,
+    // and if even that cannot place it, say which one.
+    let missing = incomplete(&uni, &locals, &lock, &applies);
+    if !missing.is_empty() {
+        tracing::debug!("the lockfile does not cover {missing:?}; resolving again");
+        locals = Locals::load(ws)?;
+        let (_resolved, fresh) = resolve_with(ws, &locals, req, false)?;
+        lock = fresh;
+        locals.extend_from_lock(ws, &lock)?;
+        uni = Universe::build(ws, &locals, &lock);
+        let still = incomplete(&uni, &locals, &lock, &applies);
+        if !still.is_empty() {
+            bail!(
+                "the dependency resolution does not contain {} (declared in the manifests); \
+                 `rune update` resolves everything again",
+                still.join(", ")
+            );
+        }
+    }
+    let locals = locals;
+    let lock = lock;
+    let uni = uni;
     let resolver_version = ws.root_manifest.resolver_version();
 
     // -- What is requested, and does it involve development dependencies?
@@ -2105,20 +2431,42 @@ pub fn plan(ws: &Workspace, req: &Request) -> Result<Plan> {
         });
     }
 
+    // With workspace feature unification, every other member's requests
+    // count too (their default features), but only what the selected
+    // packages reach is built.
+    let unify = feature_unification(ws)?;
+    let mut all_roots = roots.clone();
+    if unify == Unification::Workspace {
+        for (li, m) in locals.member_of.iter().enumerate() {
+            if m.is_some() && !roots.iter().any(|r| r.package == li) {
+                all_roots.push(RootRequest {
+                    package: li,
+                    features: Vec::new(),
+                    default_features: true,
+                    dev: include_dev,
+                });
+            }
+        }
+    }
+    let selected_units: Vec<UnitRef> = roots.iter().map(|r| (r.package, false)).collect();
+
     // -- Feature resolution, pass 1: which packages does this build reach in
     // either role? (Proc-macro-ness of registry crates isn't known before
     // their manifests are, so this may over-approximate roles, never packages.)
     let mut uni = uni;
     let either_role =
         |t: &str, _host: bool| roles.target.info.matches(t) || roles.host.info.matches(t);
-    let pass1 = unit_features::resolve(
-        &uni.views,
-        &roots,
-        &FeatureOptions {
-            resolver: resolver_version,
-            platform_matches: &either_role,
-            weak_activates: false,
-        },
+    let pass1 = reachable(
+        unit_features::resolve(
+            &uni.views,
+            &all_roots,
+            &FeatureOptions {
+                resolver: resolver_version,
+                platform_matches: &either_role,
+                weak_activates: false,
+            },
+        ),
+        &selected_units,
     );
 
     // -- Download and read the manifests of the registry crates we need.
@@ -2163,14 +2511,17 @@ pub fn plan(ws: &Workspace, req: &Request) -> Result<Plan> {
 
     // -- Feature resolution, pass 2: exact roles and platforms.
     let exact = |t: &str, host: bool| roles.of(host).info.matches(t);
-    let res = unit_features::resolve(
-        &uni.views,
-        &roots,
-        &FeatureOptions {
-            resolver: resolver_version,
-            platform_matches: &exact,
-            weak_activates: false,
-        },
+    let res = reachable(
+        unit_features::resolve(
+            &uni.views,
+            &all_roots,
+            &FeatureOptions {
+                resolver: resolver_version,
+                platform_matches: &exact,
+                weak_activates: false,
+            },
+        ),
+        &selected_units,
     );
     check_rust_versions(&uni, &locals, &reg, &res, req)?;
 

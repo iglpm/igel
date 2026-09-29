@@ -50,7 +50,7 @@ impl ValueKind {
             ValueKind::Uint => "a non-negative integer",
             ValueKind::Path => "a path",
             ValueKind::Text => "text",
-            ValueKind::Size => "a size such as `20GB` or `512MiB`",
+            ValueKind::Size => "a size such as `20GB` or `512MiB`, or `auto`",
             ValueKind::Threads => "`off`, `auto` or a number of threads",
             ValueKind::Duration => "a duration such as `14d`, `72h` or `2w`",
         }
@@ -111,6 +111,41 @@ pub const KEYS: &[KeyDef] = &[
         description: "Rebuild every crate (dependencies included) for release builds instead of \
                       restoring them from the content-addressable store. Off by default: release \
                       builds reuse cached artifacts just like dev builds do.",
+    },
+    KeyDef {
+        name: "build.feature-unification",
+        kind: ValueKind::Text,
+        default: "selected",
+        description: "Which packages' feature requests a build honors. `selected` (the \
+                      default): only the packages being built, so `-p a` compiles its \
+                      dependencies with just the features `a` needs. `workspace`: every \
+                      member's, so building any subset of the workspace reuses the same \
+                      dependency builds (what `cargo hakari` does, without a generated crate). \
+                      Cargo's `resolver.feature-unification` config is honored too.",
+    },
+    KeyDef {
+        name: "build.sandbox",
+        kind: ValueKind::Bool,
+        default: "false",
+        description: "Run build scripts and the compiler (which runs proc-macros) confined: no \
+                      network, and no writes outside the build directory (a build script: its \
+                      OUT_DIR) and the temporary directory. Linux: user namespaces; macOS: \
+                      sandbox-exec.",
+    },
+    KeyDef {
+        name: "build.sandbox-network",
+        kind: ValueKind::Text,
+        default: "",
+        description: "Packages whose build scripts may use the network in the sandbox \
+                      (comma-separated names), for those that download what they build.",
+    },
+    KeyDef {
+        name: "build.low-priority",
+        kind: ValueKind::Bool,
+        default: "false",
+        description: "Run compilers and build scripts at low scheduling priority, so the rest of \
+                      the machine (editor, browser, a call) stays responsive during a big build; \
+                      the build takes the cores nothing else wants. `rune watch` always does.",
     },
     KeyDef {
         name: "build.dependency-debuginfo",
@@ -193,9 +228,17 @@ pub const KEYS: &[KeyDef] = &[
     KeyDef {
         name: "cas.max-size",
         kind: ValueKind::Size,
-        default: "unlimited",
-        description: "Evict the least recently stored entries after a build when the store grows \
-                      beyond this size.",
+        default: "auto",
+        description: "Evict the least recently used entries after a build when the store grows \
+                      beyond this size. `auto` (the default): a tenth of the disk it is on, at \
+                      least 5 GiB and at most 50 GiB; `0`: unlimited.",
+    },
+    KeyDef {
+        name: "cas.compress-after",
+        kind: ValueKind::Duration,
+        default: "7d",
+        description: "Compress (zstd) store entries no build has used for this long; the next \
+                      build that needs one decompresses it. `0`: never compress.",
     },
     KeyDef {
         name: "cas.max-age",
@@ -244,6 +287,16 @@ pub const KEYS: &[KeyDef] = &[
                       files, arguments and RUST_/CARGO_/RUNE_ environment (`rune test --cached`). \
                       Only enable it if your tests depend on nothing else: no network, clock, or \
                       files outside the package.",
+    },
+    KeyDef {
+        name: "test.schedule",
+        kind: ValueKind::Text,
+        default: "binaries",
+        description: "How `rune test` spreads tests over the cores. `binaries`: each test \
+                      binary runs as one process, as with Cargo. `tests`: each binary's tests \
+                      are split into small batches, each its own process, scheduled across \
+                      every binary at once (like cargo-nextest) — faster when a few binaries \
+                      hold most tests, but tests no longer share a process.",
     },
     KeyDef {
         name: "test.doctests",
@@ -472,6 +525,35 @@ impl Settings {
 
     /// `build.release-rebuild-all`: rebuild every crate for release builds
     /// instead of using the content-addressable store.
+    /// `build.low-priority`.
+    /// `build.feature-unification`, when set: `selected` or `workspace`.
+    pub fn feature_unification(&self) -> Option<String> {
+        match self.values.get("build.feature-unification") {
+            Some((Value::Text(t), _)) => Some(t.clone()),
+            _ => None,
+        }
+    }
+
+    pub fn sandbox(&self) -> bool {
+        self.bool("build.sandbox", false)
+    }
+
+    /// `build.sandbox-network`: package names.
+    pub fn sandbox_network(&self) -> Vec<String> {
+        match self.values.get("build.sandbox-network") {
+            Some((Value::Text(t), _)) => t
+                .split([',', ' '])
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    pub fn low_priority(&self) -> bool {
+        self.bool("build.low-priority", false)
+    }
+
     pub fn release_rebuild_all(&self) -> bool {
         self.bool("build.release-rebuild-all", false)
     }
@@ -521,9 +603,24 @@ impl Settings {
         self.path("cas.dir")
     }
 
-    /// `cas.max-size` in bytes.
+    /// `cas.max-size` in bytes, as set (`None` when not set; `Some(0)` for
+    /// unlimited). See [`Self::cas_max_size_for`] for the value in force.
     pub fn cas_max_size(&self) -> Option<u64> {
         self.uint("cas.max-size")
+    }
+
+    /// The store size limit in force for a store at `store`: as set, or —
+    /// when not set — a tenth of the disk it is on, between 5 and 50 GiB.
+    /// `None`: unlimited.
+    pub fn cas_max_size_for(&self, store: &std::path::Path) -> Option<u64> {
+        match self.cas_max_size() {
+            Some(0) => None,
+            Some(n) => Some(n),
+            None => {
+                let disk = crate::sysinfo::disk_size(store)?;
+                Some((disk / 10).clamp(5 << 30, 50 << 30))
+            }
+        }
     }
 
     /// `cas.max-age` in seconds (30 days unless set; `None` when `0`).
@@ -531,6 +628,22 @@ impl Settings {
         match self.values.get("cas.max-age") {
             Some((Value::Text(t), _)) => crate::time::parse_duration(t).filter(|s| *s > 0),
             _ => Some(30 * 86_400),
+        }
+    }
+
+    /// `cas.compress-after` in seconds (7 days unless set; `None` when `0`).
+    pub fn cas_compress_after(&self) -> Option<u64> {
+        match self.values.get("cas.compress-after") {
+            Some((Value::Text(t), _)) => crate::time::parse_duration(t).filter(|s| *s > 0),
+            _ => Some(7 * 86_400),
+        }
+    }
+
+    /// `test.schedule`, when set.
+    pub fn test_schedule(&self) -> Option<String> {
+        match self.values.get("test.schedule") {
+            Some((Value::Text(t), _)) => Some(t.clone()),
+            _ => None,
         }
     }
 
@@ -734,6 +847,7 @@ fn from_toml(def: &KeyDef, item: &Item) -> Result<Value, &'static str> {
             TomlValue::Integer(n) => u64::try_from(*n.value())
                 .map(Value::Size)
                 .map_err(|_| expected),
+            TomlValue::String(s) if s.value() == "auto" => Ok(Value::Text("auto".into())),
             TomlValue::String(s) => parse_size(s.value()).map(Value::Size).ok_or(expected),
             _ => Err(expected),
         },
@@ -798,6 +912,7 @@ pub fn parse_value(def: &KeyDef, raw: &str) -> Result<Value, SettingsError> {
         ValueKind::Path => Err(bad()),
         ValueKind::Text if !raw.is_empty() => Ok(Value::Text(raw.to_string())),
         ValueKind::Text => Err(bad()),
+        ValueKind::Size if raw == "auto" => Ok(Value::Text("auto".into())),
         ValueKind::Size => parse_size(raw).map(Value::Size).ok_or_else(bad),
         ValueKind::Threads => parse_threads(raw).ok_or_else(bad),
         ValueKind::Duration => crate::time::parse_duration(raw)
