@@ -93,6 +93,9 @@ pub enum Commands {
     Tree(TreeArgs),
     /// Draw the package graph (or a build's units) as Graphviz DOT, Mermaid or JSON
     Graph(GraphArgs),
+    /// Show a package's features: which are on, and who turned each on
+    #[command(after_help = crate::help::examples(&[("rune features", "the workspace's features, and what each enables"), ("rune features serde", "which of serde's features are on, and who turned each on"), ("rune features tokio --all", "every feature, the ones that are off included")]))]
+    Features(FeaturesArgs),
     /// Explain why a package is in the dependency graph
     Why(WhyArgs),
     /// Download every dependency without building
@@ -827,6 +830,20 @@ impl CommonArgs {
         common.offline = m.offline;
         common
     }
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct FeaturesArgs {
+    #[command(flatten)]
+    pub manifest: ManifestArgs,
+    /// A dependency (`name`) to explain; the workspace's packages without
+    pub package: Option<String>,
+    /// Also list the features that are off
+    #[arg(long, short = 'a')]
+    pub all: bool,
+    /// The platform the build is for (default: this machine)
+    #[arg(long, value_name = "TRIPLE")]
+    pub target: Option<String>,
 }
 
 #[derive(Args, Debug, Clone)]

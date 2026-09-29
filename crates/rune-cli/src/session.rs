@@ -103,6 +103,10 @@ impl Session {
                     .and_then(|l| l.into_iter().next())
             })
             .filter(|t| !t.is_empty());
+        let target = common.target.clone().or(default_target);
+        if let Some(t) = &target {
+            check_target_installed(&ws, t)?;
+        }
         let selected = ws.select(&common.package, common.workspace, &common.exclude)?;
         let features = FeatureArgs::parse(
             &common.features,
@@ -117,7 +121,7 @@ impl Session {
             offline,
             locked,
             // `--target`, else `CARGO_BUILD_TARGET` / `build.target`.
-            target: common.target.clone().or(default_target),
+            target,
             features,
             selected,
             verbose: common.verbose,
@@ -407,6 +411,62 @@ pub fn drive(
         failures.iter().map(|(c, _)| c.clone()).collect();
     sess.maybe_gc();
     Ok((result, failures))
+}
+
+/// A build for a target whose standard library is not installed fails in
+/// every crate with rustc's "can't find crate for `core`"; say what to do
+/// instead, before anything is compiled. Custom targets (a `.json` spec) and
+/// `-Zbuild-std`, which builds the standard library itself, are left alone.
+fn check_target_installed(ws: &Workspace, target: &str) -> Result<()> {
+    if target.ends_with(".json")
+        || ws
+            .cargo_config
+            .string_list(&["unstable", "build-std"])
+            .is_some()
+        || ws.cargo_config.string(&["unstable", "build-std"]).is_some()
+    {
+        return Ok(());
+    }
+    let tc = rune_common::toolchain::global();
+    let Some(sysroot) = &tc.sysroot else {
+        return Ok(());
+    };
+    if sysroot
+        .join("lib/rustlib")
+        .join(target)
+        .join("lib")
+        .is_dir()
+    {
+        return Ok(());
+    }
+    let known = std::process::Command::new(&tc.rustc)
+        .args(["--print", "target-list"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .any(|l| l.trim() == target)
+        });
+    match known {
+        Some(false) => bail!(
+            "unknown target `{target}` (`rustc --print target-list` lists the ones this compiler knows)"
+        ),
+        _ => {
+            let rustup = sysroot.components().any(|c| c.as_os_str() == ".rustup")
+                || std::env::var_os("RUSTUP_HOME").is_some();
+            if rustup {
+                bail!(
+                    "the standard library for `{target}` is not installed; add it with:\n\n    rustup target add {target}\n"
+                )
+            }
+            bail!(
+                "the standard library for `{target}` is not installed in {}",
+                sysroot.display()
+            )
+        }
+    }
 }
 
 /// The crates the last build could not compile (`name vX.Y.Z`).

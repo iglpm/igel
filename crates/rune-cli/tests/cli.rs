@@ -5639,3 +5639,100 @@ pub fn make_answer(_: TokenStream) -> TokenStream {
     let out = p.ok(&["test"]);
     assert!(out.contains("(doc-tests) · 1 passed"), "{out}");
 }
+
+#[test]
+fn a_target_that_is_not_installed_is_reported_before_building() {
+    let p = lib_project();
+    let out = p.rune(&["build", "--target", "x86_64-unknown-linux-gnux"]);
+    assert!(!out.status.success());
+    assert!(
+        text(&out).contains("unknown target `x86_64-unknown-linux-gnux`"),
+        "{}",
+        text(&out)
+    );
+
+    // A real target without its standard library: what to run, not
+    // rustc's "can't find crate for `core`" in every crate.
+    let sysroot = String::from_utf8(
+        Command::new("rustc")
+            .args(["--print", "sysroot"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    let missing = [
+        "riscv64gc-unknown-none-elf",
+        "thumbv7em-none-eabihf",
+        "wasm32v1-none",
+    ]
+    .into_iter()
+    .find(|t| {
+        !std::path::Path::new(sysroot.trim())
+            .join("lib/rustlib")
+            .join(t)
+            .exists()
+    });
+    if let Some(t) = missing {
+        let out = p.rune(&["build", "--target", t]);
+        assert!(!out.status.success());
+        let msg = text(&out);
+        assert!(
+            msg.contains(&format!("the standard library for `{t}` is not installed")),
+            "{msg}"
+        );
+        assert!(!msg.contains("can't find crate"), "{msg}");
+    }
+}
+
+#[test]
+fn features_says_which_are_on_and_who_turned_them_on() {
+    let p = Project::new();
+    p.write(
+        "Cargo.toml",
+        "[workspace]\nresolver = \"2\"\nmembers = [\"app\", \"lib\"]\n",
+    );
+    p.write(
+        "lib/Cargo.toml",
+        "[package]\nname = \"lib\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
+         [features]\ndefault = [\"std\"]\nstd = []\nfast = [\"simd\"]\nsimd = []\nunused = []\n",
+    );
+    p.write("lib/src/lib.rs", "");
+    p.write(
+        "app/Cargo.toml",
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
+         [dependencies]\nlib = { path = \"../lib\", features = [\"fast\"] }\n\n\
+         [features]\nturbo = [\"lib/simd\"]\n",
+    );
+    p.write("app/src/main.rs", "fn main() {}\n");
+
+    let out = p.ok(&["features", "lib"]);
+    let line = |f: &str| {
+        out.lines()
+            .find(|l| l.contains(&format!("+ {f} ")) || l.trim_end().ends_with(&format!("+ {f}")))
+            .unwrap_or_else(|| panic!("no `{f}` line in:\n{out}"))
+            .to_string()
+    };
+    assert!(
+        out.contains("lib 0.1.0") && out.contains("4 of 5 features on"),
+        "{out}"
+    );
+    assert!(line("fast").contains("app"), "{out}");
+    assert!(line("simd").contains("feature `fast`"), "{out}");
+    assert!(line("default").contains("default features of app"), "{out}");
+    assert!(line("std").contains("feature `default`"), "{out}");
+    assert!(!out.contains("unused"), "{out}");
+    assert!(p.ok(&["features", "lib", "--all"]).contains("- unused"));
+
+    // Without an argument: what the workspace's packages declare.
+    let out = p.ok(&["features"]);
+    assert!(out.contains("turbo") && out.contains("lib/simd"), "{out}");
+
+    let out = p.rune(&["features", "nope"]);
+    assert!(!out.status.success());
+    assert!(
+        text(&out).contains("`nope` is not in what a build"),
+        "{}",
+        text(&out)
+    );
+}

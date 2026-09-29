@@ -86,6 +86,7 @@ fn main() {
         Commands::Tree(a) => cmd_deps::tree(a),
         Commands::Graph(a) => cmd_graph::graph(a),
         Commands::Why(a) => cmd_deps::why(a),
+        Commands::Features(a) => cmd_deps::features(a),
         Commands::Fetch(a) => cmd_deps::fetch(a),
         Commands::GenerateLockfile(a) => cmd_deps::generate_lockfile(a),
         Commands::LocateProject(a) => cmd_deps::locate_project(a),

@@ -82,7 +82,7 @@ set, dependency edges, ordering and format (a regenerated lock differs only
 where crates.io has published newer releases than the ones pinned).
 
 **Proof points**
-- 444 automated tests (`cargo test --workspace` and `rune test` both pass),
+- 452 automated tests (`cargo test --workspace` and `rune test` both pass),
   including end-to-end tests for build scripts, host/target roles, features per
   selection, git (tag/branch/rev/submodules/foreign workspaces), patches,
   local/vendored/authenticated registries, wrappers, runners, config, CAS
@@ -95,7 +95,7 @@ where crates.io has published newer releases than the ones pinned).
   `bindgen`, `cxx`, bundled SQLite, `libz-sys` + CoreFoundation, `pyo3`
   extension module and embedded Python, `cbindgen` + staticlib/cdylib used from C,
   `libloading` plugins.
-- Rune builds and tests **itself** (183 units, 444 tests) from an empty CAS
+- Rune builds and tests **itself** (183 units, 452 tests) from an empty CAS
   against live crates.io, restores everything from the CAS after `rm -rf
   .rune/target` (0 compiled, 76 ms), and a no-op build takes ~50 ms of wall
   time (Cargo: 180–230 ms) — §12.
@@ -254,7 +254,7 @@ a test or benchmark before they are claimed in the README.
 | P12 upgrading | ✅ `rune outdated`, `rune upgrade [--incompatible]`; `rune add` lists the release's features (enabled ones marked, as Cargo does), its `rust-version` and publication date (§12). Licence and download trend ⬜ (not in the index). |
 | P15 build-time code | 🟡 `rune tree --exec-surface`, `resolve.min-release-age` ✅ (§12); the sandbox ⬜. |
 | P16 provenance | 🟡 `rune sbom` (CycloneDX/SPDX) ✅ (§12); attestation, reproducibility check ⬜. |
-| P10 feature questions | 🟡 `rune tree -e features -i <crate>` says which package or feature turned each feature on (§12). Workspace-wide unification ⬜. |
+| P10 feature questions | 🟡 `rune features <crate>` lists which features are on and who turned each on (§13); `rune tree -e features -i <crate>` draws it as a tree (§12). Workspace-wide unification ⬜. |
 | P13, P14 | ⬜ |
 
 ### 4.1 Build speed and feedback loop
@@ -557,7 +557,7 @@ and cache lookups for IDEs, Bazel-style wrappers and corporate tooling (see P17)
 | **M4** | Observability | G4 + `rune cas inspect`, `rune explain-miss` (F2), structured diagnostics. |
 | **M5** | Sharing | *Done:* shared-directory store ✅, HTTP backend ✅, **Cairn** server with peers/replication/sharding ✅, `--deps-only` ✅. `cas export/import` ✅ (§12). *Open:* signed manifests, TLS in Cairn, S3 backend; G5 shared documentation. |
 | **M6** | Platforms | *Started:* macOS aarch64 test suite passes, Apple debuginfo default ✅, Apple deployment target/SDK identity ✅ (§12). *Open:* G6 (Windows, macOS SDK identity) + G7 + CI on Windows/macOS; `-Zbuild-std` in the CAS (F8). |
-| **M7** | Daily driver | *Started:* P3 concurrency ✅, P4–P6 `rune doctor`/`cas du`/dependency debuginfo ✅, `--message-format=json` ✅, `--deps-only` ✅. `rune watch` ✅, scripts ✅, `rune affected` ✅, build-script hints ✅, P2 check ⇄ build ✅, `fix`/`clippy --fix`/`clippy -- flags`/`fmt -- --check`/`rustc`/`rustdoc`, `update --precise`, `add --git/--rename/--target`, status on stderr (§11). Test runner retries/flaky/JUnit/JSON, `outdated`/`upgrade`, `unused`, `graph`, `explain` ✅ (§12). *Open:* per-test scheduling, `rune features` (P10). |
+| **M7** | Daily driver | *Started:* P3 concurrency ✅, P4–P6 `rune doctor`/`cas du`/dependency debuginfo ✅, `--message-format=json` ✅, `--deps-only` ✅. `rune watch` ✅, scripts ✅, `rune affected` ✅, build-script hints ✅, P2 check ⇄ build ✅, `fix`/`clippy --fix`/`clippy -- flags`/`fmt -- --check`/`rustc`/`rustdoc`, `update --precise`, `add --git/--rename/--target`, status on stderr (§11). Test runner retries/flaky/JUnit/JSON, `outdated`/`upgrade`, `unused`, `graph`, `explain` ✅ (§12). `rune features` (§13). *Open:* per-test scheduling, workspace feature unification (P10). |
 | **M8** | Supply chain | *Done (§12):* exec-surface report, `min-release-age`, SBOM. *Open:* sandbox as a security boundary, attestation, reproducibility check. Builds on M1. |
 | **M9** | Faster than Cargo on edits | P9 cached tests: opt-in ✅, default-on after M1. P1 early cutoff is blocked on compiler support, see P1. |
 
@@ -566,7 +566,7 @@ and cache lookups for IDEs, Bazel-style wrappers and corporate tooling (see P17)
 ## 7. How to verify the current state
 
 ```bash
-cargo test --workspace                       # 444 tests, no network needed
+cargo test --workspace                       # 452 tests, no network needed
 cargo clippy --workspace --all-targets
 
 # Rune builds and tests itself against live crates.io (use a scratch copy
@@ -1097,12 +1097,13 @@ On a 10-core M5 a cold build is limited by the chain of crates rather than by
 the cores (the one-line hint and `--timings` show which); everything a store
 hit or a smaller rebuild saves above holds there as well.
 
-**Tests:** 444 (91 new), passing under `cargo test` and under `rune test` on
+**Tests:** 452 (99 new), passing under `cargo test` and under `rune test` on
 Rune's own workspace; clippy clean.
 
 **Not done:** Windows; the sandbox (G1) and with it default-on cached tests;
-a PubGrub resolver; scheduling single tests across binaries; `rune features`
-(P10); zstd and pinning in the store (P6); measurements on the M5 itself.
+a PubGrub resolver; scheduling single tests across binaries; workspace-wide
+feature unification (P10); zstd and pinning in the store (P6); measurements on
+the M5 itself.
 
 ## 13. What changed in the CLI and network update (2026-09-29)
 
@@ -1162,3 +1163,18 @@ interleaved with the previous binary):
   `verify-project`, `metadata`).
 - The brand violet falls back to its 256-colour neighbour where the terminal
   has no truecolor (it was rounded to blue).
+- Workspace crates are compiled from the workspace root with relative paths,
+  as Cargo does: errors point at `src/main.rs:1:26` (they showed long absolute
+  paths that wrapped), panics name `src/main.rs`, and an artifact's paths no
+  longer depend on where the checkout lives. A failed build ends with one line
+  naming the crates that did not compile.
+- `rune features [crate]` (P10): a workspace package's features and what each
+  enables, or a dependency's features that are on and who turned each on — a
+  dependent asking for it, the dependents' default features, a dependent's own
+  feature (`reqwest feature stream`), or another feature of the crate itself.
+- Friendlier failures (F13 in part): a `--target` whose standard library is not
+  installed is reported before anything compiles, with the `rustup target add`
+  line (an unknown triple is named as such), instead of rustc's "can't find crate
+  for `core`" in every crate; `rune add` of a crate that does not exist suggests
+  the ones it probably meant (`serdee` → `serde`); outside a project, the error
+  says how to create one.

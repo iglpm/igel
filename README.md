@@ -42,6 +42,7 @@ rune add serde -F derive       # lists the release's features, + for those turne
 rune tree -i serde             # who depends on serde? (what a build on this machine uses)
 rune tree -e features -i serde # which package turned on each of serde's features
 rune why serde
+rune features serde            # which of serde's features are on, and who turned each on
 rune update                    # only re-downloads changed index entries
 rune new my-app                # or: rune init  (add --manifest rune for a Rune.toml project)
 rune build --deps-only         # just the dependencies: a Docker layer / CI cache step

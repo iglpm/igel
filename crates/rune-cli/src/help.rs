@@ -34,8 +34,8 @@ const ALL: &[(&str, &[&str])] = &[
     (
         "Dependencies",
         &[
-            "add", "remove", "update", "outdated", "upgrade", "unused", "tree", "why", "graph",
-            "fetch", "vendor",
+            "add", "remove", "update", "outdated", "upgrade", "unused", "tree", "why", "features",
+            "graph", "fetch", "vendor",
         ],
     ),
     (
@@ -86,6 +86,7 @@ fn short(name: &str) -> Option<&'static str> {
         "unused" => "Find dependencies nothing uses",
         "tree" => "Show the dependency tree",
         "why" => "Explain why a package is in the graph",
+        "features" => "Which features are on, and who turned them on",
         "graph" => "Draw the package graph (DOT, Mermaid, JSON)",
         "fetch" => "Download every dependency",
         "vendor" => "Copy the dependencies into the project",
