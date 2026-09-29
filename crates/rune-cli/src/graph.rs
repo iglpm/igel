@@ -539,10 +539,34 @@ fn msrv_for_resolution(ws: &Workspace) -> Option<semver::Version> {
 /// The command line does not — version resolution is independent of the
 /// selected packages and features.
 fn resolution_fingerprint(ws: &Workspace, locals: &Locals, _req: &Request) -> String {
+    with_cargo_lock(&resolution_inputs(ws, locals), ws.root())
+}
+
+/// A hash of everything a resolution is made from except `Cargo.lock`: the
+/// manifests (read now — take it *before* resolving, so a manifest saved
+/// while the resolution runs makes the next build resolve again instead of
+/// trusting a lockfile made from the old one), the configuration files
+/// (`[patch]`, source replacement, registries) and settings, and the exact
+/// `rune` binary (a newer one may resolve differently; the version number
+/// alone does not change between development builds).
+fn resolution_inputs(ws: &Workspace, locals: &Locals) -> String {
     let mut hasher = rune_common::hash::HashBuilder::new();
     hasher.update(env!("CARGO_PKG_VERSION").as_bytes());
+    if let Some(meta) = std::env::current_exe()
+        .ok()
+        .and_then(|e| fs::metadata(e).ok())
+    {
+        hasher.update(&meta.len().to_le_bytes());
+        if let Ok(t) = meta.modified()
+            && let Ok(d) = t.duration_since(std::time::UNIX_EPOCH)
+        {
+            hasher.update(&d.as_nanos().to_le_bytes());
+        }
+    }
     let mut paths: Vec<PathBuf> = vec![ws.manifest_path()];
     paths.extend(locals.list.iter().map(|m| m.manifest_path.clone()));
+    paths.extend(ws.cargo_config.files.iter().cloned());
+    paths.push(ws.root().join(rune_common::settings::PROJECT_FILE));
     paths.sort();
     paths.dedup();
     for path in paths {
@@ -551,9 +575,17 @@ fn resolution_fingerprint(ws: &Workspace, locals: &Locals, _req: &Request) -> St
             hasher.update(&contents);
         }
     }
-    // `Cargo.lock` seeds the versions chosen, so a `cargo update` (or a
-    // teammate's change) is picked up rather than shadowed by our binary lock.
-    if let Ok(contents) = fs::read(ws.root().join("Cargo.lock")) {
+    hasher.update(format!("{:?}", ws.config.settings.min_release_age()).as_bytes());
+    hasher.finish_blake3()
+}
+
+/// `inputs` plus the current `Cargo.lock`, which seeds the versions chosen:
+/// a `cargo update` or a teammate's change is picked up rather than shadowed
+/// by the binary lockfile.
+fn with_cargo_lock(inputs: &str, root: &Path) -> String {
+    let mut hasher = rune_common::hash::HashBuilder::new();
+    hasher.update(inputs.as_bytes());
+    if let Ok(contents) = fs::read(root.join("Cargo.lock")) {
         hasher.update(b"\0Cargo.lock\0");
         hasher.update(&contents);
     }
@@ -987,14 +1019,10 @@ pub fn store_resolution(ws: &Workspace, lock: &Lockfile) -> Result<()> {
     let targets = TargetSelection::default();
     let selected: Vec<usize> = (0..ws.members.len()).collect();
     let req = whole_workspace_request(&profile, false, &features, &targets, &selected);
-    LockfileManager::sync_all(ws.root(), lock).context("Failed to write lockfiles")?;
     sync_cargo_lock(ws, lock, false)?;
     let fingerprint = resolution_fingerprint(ws, &locals, &req);
-    let path = ws.root().join(".rune").join("resolve.fingerprint");
-    if let Some(parent) = path.parent() {
-        let _ = fs::create_dir_all(parent);
-    }
-    let _ = fs::write(path, fingerprint);
+    LockfileManager::sync_all_with_fingerprint(ws.root(), lock, Some(&fingerprint))
+        .context("Failed to write lockfiles")?;
     Ok(())
 }
 
@@ -1022,23 +1050,39 @@ pub fn download_all(resolved: &ResolvedGraph, offline: bool) -> Result<usize> {
 /// Resolves the workspace, or reuses the previous resolution when nothing
 /// that feeds it changed. Returns the graph and the lockfile it corresponds to.
 fn resolve(ws: &Workspace, locals: &Locals, req: &Request) -> Result<(ResolvedGraph, Lockfile)> {
+    resolve_with(ws, locals, req, true)
+}
+
+/// [`resolve`]; with `trust_cache` false, the binary lockfile is not reused
+/// even when its fingerprint matches (it was found not to cover the
+/// manifests).
+fn resolve_with(
+    ws: &Workspace,
+    locals: &Locals,
+    req: &Request,
+    trust_cache: bool,
+) -> Result<(ResolvedGraph, Lockfile)> {
     let root = ws.root();
-    let fingerprint_path = root.join(".rune").join("resolve.fingerprint");
-    let fingerprint = resolution_fingerprint(ws, locals, req);
-    let unchanged = fs::read_to_string(&fingerprint_path)
-        .map(|stored| stored.trim() == fingerprint)
-        .unwrap_or(false);
+    let inputs = resolution_inputs(ws, locals);
+    let fingerprint = with_cargo_lock(&inputs, root);
 
     // Fast path: nothing changed since the last resolution, and we have the
-    // binary lockfile that carries its feature sets.
-    if unchanged
-        && let Some(lock) = LockfileManager::load_binary(root)
+    // binary lockfile that carries its feature sets — with the fingerprint
+    // it was made from in the same file, so the two always belong together.
+    if trust_cache
+        && let Ok((lock, Some(stored))) =
+            LockfileManager::read_binary_with_fingerprint(&root.join("Rune.lock.bin"))
+        && stored == fingerprint
         && !lock.packages.is_empty()
     {
-        // Cheap check only: the lockfile can be missing (deleted, or a
-        // fresh checkout with only our cache present).
-        if !root.join("Cargo.lock").is_file() {
-            sync_cargo_lock(ws, &lock, req.locked)?;
+        // The lockfile can be missing (deleted, or a fresh checkout with only
+        // our cache present): write it, and record the new fingerprint.
+        if !root.join("Cargo.lock").is_file() && sync_cargo_lock(ws, &lock, req.locked)? {
+            let _ = LockfileManager::sync_all_with_fingerprint(
+                root,
+                &lock,
+                Some(&with_cargo_lock(&inputs, root)),
+            );
         }
         return Ok((resolved_from_lock(&lock), lock));
     }
@@ -1095,17 +1139,13 @@ fn resolve(ws: &Workspace, locals: &Locals, req: &Request) -> Result<(ResolvedGr
              (run `rune update` first)"
         );
     }
-    if existing_lock.as_ref() != Some(&lockfile) || LockfileManager::load_binary(root).is_none() {
-        LockfileManager::sync_all(root, &lockfile).context("Failed to write lockfiles")?;
-    }
     sync_cargo_lock(ws, &lockfile, req.locked)?;
-    // Recorded *after* `Cargo.lock` was (re)written: the fingerprint covers
-    // its content, and our own write must not look like an outside change.
-    let fingerprint = resolution_fingerprint(ws, locals, req);
-    if let Some(parent) = fingerprint_path.parent() {
-        let _ = fs::create_dir_all(parent);
-    }
-    let _ = fs::write(&fingerprint_path, &fingerprint);
+    // The fingerprint is taken *after* `Cargo.lock` was (re)written — it
+    // covers its content, and our own write must not look like an outside
+    // change — but from the manifests as they were before resolving.
+    let fingerprint = with_cargo_lock(&inputs, root);
+    LockfileManager::sync_all_with_fingerprint(root, &lockfile, Some(&fingerprint))
+        .context("Failed to write lockfiles")?;
 
     Ok((resolved, lockfile))
 }
@@ -1554,6 +1594,54 @@ impl Universe {
         }
         uni
     }
+}
+
+/// Declared dependencies a build for these platforms needs that the
+/// lockfile does not resolve (`app → serde`): a local package's non-optional
+/// dependency matching no locked package, or a locked package's edge to a
+/// package the lockfile does not contain.
+fn incomplete(
+    uni: &Universe,
+    locals: &Locals,
+    lock: &Lockfile,
+    applies: &dyn Fn(&Option<String>) -> bool,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    for (idx, view) in uni.views.iter().enumerate() {
+        let Origin::Local(li) = uni.origin[idx] else {
+            continue;
+        };
+        // Development dependencies matter for the workspace's own packages.
+        let member = locals.member_of[li].is_some();
+        for d in &view.deps {
+            if d.resolved.is_none()
+                && !d.optional
+                && (member || d.kind != DependencyKind::Dev)
+                && applies(&d.target)
+            {
+                out.push(format!("`{}` → `{}`", view.name, d.alias));
+            }
+        }
+    }
+    let ids: HashSet<String> = lock
+        .packages
+        .iter()
+        .map(|p| format!("{} {}", p.name, p.version))
+        .collect();
+    for p in &lock.packages {
+        for d in &p.decls {
+            if let Some(id) = &d.resolved
+                && d.kind != 1
+                && applies(&d.target)
+                && !ids.contains(id)
+            {
+                out.push(format!("`{}` → `{id}`", p.name));
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
 }
 
 fn kind_of(k: u8) -> DependencyKind {
@@ -2072,11 +2160,37 @@ pub fn plan(ws: &Workspace, req: &Request) -> Result<Plan> {
     let total = phase("plan");
     configure_git(ws, req.offline, false, None);
     let mut locals = Locals::load(ws)?;
-    let (_resolved, lock) = resolve(ws, &locals, req)?;
+    let (_resolved, mut lock) = resolve(ws, &locals, req)?;
     locals.extend_from_lock(ws, &lock)?;
-    let locals = locals;
     let roles = Roles::new(ws, req);
-    let uni = Universe::build(ws, &locals, &lock);
+    let applies = |t: &Option<String>| {
+        t.as_deref()
+            .is_none_or(|t| roles.target.info.matches(t) || roles.host.info.matches(t))
+    };
+    let mut uni = Universe::build(ws, &locals, &lock);
+    // Never build from a lockfile that leaves a declared dependency out:
+    // rustc would only say "undeclared crate". Resolve again from scratch,
+    // and if even that cannot place it, say which one.
+    let missing = incomplete(&uni, &locals, &lock, &applies);
+    if !missing.is_empty() {
+        tracing::debug!("the lockfile does not cover {missing:?}; resolving again");
+        locals = Locals::load(ws)?;
+        let (_resolved, fresh) = resolve_with(ws, &locals, req, false)?;
+        lock = fresh;
+        locals.extend_from_lock(ws, &lock)?;
+        uni = Universe::build(ws, &locals, &lock);
+        let still = incomplete(&uni, &locals, &lock, &applies);
+        if !still.is_empty() {
+            bail!(
+                "the dependency resolution does not contain {} (declared in the manifests); \
+                 `rune update` resolves everything again",
+                still.join(", ")
+            );
+        }
+    }
+    let locals = locals;
+    let lock = lock;
+    let uni = uni;
     let resolver_version = ws.root_manifest.resolver_version();
 
     // -- What is requested, and does it involve development dependencies?

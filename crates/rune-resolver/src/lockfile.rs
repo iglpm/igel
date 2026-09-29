@@ -8,6 +8,12 @@ use tracing::debug;
 /// Bumped whenever the binary layout changes; an unknown version is treated as
 /// "no binary lockfile", which just costs one re-resolution.
 const BINARY_LOCK_MAGIC: &[u8; 9] = b"RUNELOCK\x02";
+/// The current format: the magic, then the fingerprint of what the
+/// resolution was made from (a `u16` length and the bytes), then the lock.
+/// Keeping both in one file, replaced in one rename, means a lockfile can
+/// never be paired with another resolution's fingerprint — which two
+/// `rune` processes writing separate files at once could do.
+const BINARY_LOCK_MAGIC_V3: &[u8; 9] = b"RUNELOCK\x03";
 
 #[derive(Debug, Error)]
 pub enum LockfileError {
@@ -260,26 +266,73 @@ impl LockfileManager {
 
     /// Reads a binary lockfile (`Rune.lock.bin`).
     pub fn read_binary(path: &Path) -> Result<Lockfile> {
+        Self::read_binary_with_fingerprint(path).map(|(lock, _)| lock)
+    }
+
+    /// Reads a binary lockfile and the fingerprint of the inputs it was
+    /// resolved from (`None` for the older format that had none).
+    pub fn read_binary_with_fingerprint(path: &Path) -> Result<(Lockfile, Option<String>)> {
         let mut file = File::open(path)?;
         let mut magic = [0u8; 9];
         file.read_exact(&mut magic)?;
+        let mut data = Vec::new();
+        file.read_to_end(&mut data)?;
+        if &magic == BINARY_LOCK_MAGIC_V3 {
+            if data.len() < 2 {
+                return Err(LockfileError::InvalidMagic);
+            }
+            let len = u16::from_le_bytes([data[0], data[1]]) as usize;
+            let rest = &data[2..];
+            if rest.len() < len {
+                return Err(LockfileError::InvalidMagic);
+            }
+            let fingerprint = String::from_utf8_lossy(&rest[..len]).into_owned();
+            let lockfile: Lockfile = bincode::deserialize(&rest[len..])?;
+            return Ok((lockfile, Some(fingerprint).filter(|f| !f.is_empty())));
+        }
         if &magic != BINARY_LOCK_MAGIC {
             return Err(LockfileError::InvalidMagic);
         }
-
-        let mut data = Vec::new();
-        file.read_to_end(&mut data)?;
         let lockfile: Lockfile = bincode::deserialize(&data)?;
-        Ok(lockfile)
+        Ok((lockfile, None))
     }
 
     /// Writes a binary lockfile (`Rune.lock.bin`).
     pub fn write_binary(lock: &Lockfile, path: &Path) -> Result<()> {
+        Self::write_binary_with_fingerprint(lock, path, None)
+    }
+
+    /// Writes a binary lockfile carrying `fingerprint`, atomically: to a
+    /// temporary file beside it, then renamed over it, so a reader (another
+    /// `rune`, an editor running `rune check`) never sees half of one.
+    pub fn write_binary_with_fingerprint(
+        lock: &Lockfile,
+        path: &Path,
+        fingerprint: Option<&str>,
+    ) -> Result<()> {
         let serialized = bincode::serialize(lock)?;
-        let mut file = File::create(path)?;
-        file.write_all(BINARY_LOCK_MAGIC)?;
-        file.write_all(&serialized)?;
-        file.sync_data()?;
+        let fp = fingerprint.unwrap_or("").as_bytes();
+        let fp = &fp[..fp.len().min(u16::MAX as usize)];
+        let tmp = path.with_extension(format!(
+            "bin.{}.{}.tmp",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.subsec_nanos())
+                .unwrap_or(0)
+        ));
+        {
+            let mut file = File::create(&tmp)?;
+            file.write_all(BINARY_LOCK_MAGIC_V3)?;
+            file.write_all(&(fp.len() as u16).to_le_bytes())?;
+            file.write_all(fp)?;
+            file.write_all(&serialized)?;
+            file.sync_data()?;
+        }
+        if let Err(e) = fs::rename(&tmp, path) {
+            let _ = fs::remove_file(&tmp);
+            return Err(e.into());
+        }
         Ok(())
     }
 
@@ -320,8 +373,18 @@ impl LockfileManager {
     /// tooling and CI depend on. `Cargo.lock` is only ever written by an
     /// explicit, user-initiated `rune lockfile export --format cargo`.
     pub fn sync_all(project_root: &Path, lock: &Lockfile) -> Result<()> {
+        Self::sync_all_with_fingerprint(project_root, lock, None)
+    }
+
+    /// [`Self::sync_all`], recording the fingerprint of the inputs the
+    /// resolution was made from in the same file.
+    pub fn sync_all_with_fingerprint(
+        project_root: &Path,
+        lock: &Lockfile,
+        fingerprint: Option<&str>,
+    ) -> Result<()> {
         let bin_path = project_root.join("Rune.lock.bin");
-        Self::write_binary(lock, &bin_path)?;
+        Self::write_binary_with_fingerprint(lock, &bin_path, fingerprint)?;
         debug!("Wrote Rune.lock.bin at {}", project_root.display());
         Ok(())
     }
@@ -350,6 +413,13 @@ mod tests {
 
         LockfileManager::write_binary(&lock, &bin_path).unwrap();
         let loaded = LockfileManager::read_binary(&bin_path).unwrap();
+        // The fingerprint travels in the same file.
+        LockfileManager::write_binary_with_fingerprint(&lock, &bin_path, Some("abc")).unwrap();
+        let (again, fp) = LockfileManager::read_binary_with_fingerprint(&bin_path).unwrap();
+        assert_eq!(again, lock);
+        assert_eq!(fp.as_deref(), Some("abc"));
+        // No temporary file is left behind.
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
 
         assert_eq!(lock, loaded);
     }

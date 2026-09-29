@@ -5736,3 +5736,45 @@ fn features_says_which_are_on_and_who_turned_them_on() {
         text(&out)
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn a_lockfile_from_another_resolution_is_never_trusted() {
+    // Two `rune` processes at once (an editor's `rune check` and a build),
+    // or a manifest saved while a resolution runs, could leave the lockfile
+    // of one resolution next to the fingerprint of another: the next build
+    // then trusted a lockfile without the new dependency, and rustc said
+    // "undeclared crate". Recreate exactly that pairing.
+    let reg = local_registry(&[("foo", "1.0.0", &[])]);
+    let p = app_with(&reg, "");
+    p.ok(&["build"]);
+    let lock_path = p.path().join("Rune.lock.bin");
+    let old = std::fs::read(&lock_path).unwrap();
+    p.write(
+        "Cargo.toml",
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[dependencies]\nfoo = \"1\"\n",
+    );
+    p.write("src/main.rs", "fn main() { foo::f(); }\n");
+    p.ok(&["build"]);
+    let new = std::fs::read(&lock_path).unwrap();
+    // `RUNELOCK\x03`, a u16 fingerprint length, the fingerprint, the lock.
+    assert_eq!(&new[..9], b"RUNELOCK\x03");
+    let header = |b: &[u8]| 11 + u16::from_le_bytes([b[9], b[10]]) as usize;
+    let mut spliced = new[..header(&new)].to_vec();
+    spliced.extend_from_slice(&old[header(&old)..]);
+    std::fs::write(&lock_path, spliced).unwrap();
+
+    p.write("src/main.rs", "fn main() { foo::f(); foo::f(); }\n");
+    let out = p.ok(&["build"]);
+    assert!(!out.contains("undeclared"), "{out}");
+    // …and the lockfile is whole again.
+    let fixed = std::fs::read(&lock_path).unwrap();
+    assert_eq!(fixed, std::fs::read(&lock_path).unwrap());
+    assert!(p.read("Cargo.lock").contains("name = \"foo\""));
+
+    // A truncated lockfile (an interrupted write before writes were atomic)
+    // is simply resolved again.
+    std::fs::write(&lock_path, &fixed[..fixed.len() / 2]).unwrap();
+    p.write("src/main.rs", "fn main() { foo::f(); }\n");
+    p.ok(&["build"]);
+}
