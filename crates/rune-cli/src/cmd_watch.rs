@@ -118,6 +118,8 @@ pub fn watch(args: WatchArgs) -> Result<()> {
     let ws = crate::workspace::Workspace::load(None)
         .context("`rune watch` needs to be run inside a project")?;
     let root = ws.config.project_root.clone();
+    // Rebuilds run while you type: they should never make the editor lag.
+    rune_common::sysinfo::lower_priority();
     let commands: Vec<Vec<String>> = if args.exec.is_empty() {
         vec![vec!["check".to_string()]]
     } else {

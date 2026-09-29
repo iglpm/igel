@@ -74,6 +74,24 @@ pub struct ArtifactManifest {
     pub stored_at: u64,
     /// Size in bytes of all artifacts combined.
     pub total_size: u64,
+    /// The artifacts are stored zstd-compressed, as `<filename>.zst`: the
+    /// entry went unused for a while (see [`CasStore::compress`]). The next
+    /// use decompresses them again.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub compressed: bool,
+    /// Bytes on disk while compressed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stored_size: Option<u64>,
+}
+
+impl ArtifactManifest {
+    /// Bytes the entry's artifacts take on disk.
+    pub fn disk_size(&self) -> u64 {
+        match self.stored_size {
+            Some(n) if self.compressed => n,
+            _ => self.total_size,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -237,11 +255,113 @@ impl CasStore {
             }
             Err(_) => return None,
         };
-        let manifest = serde_json::from_str::<ArtifactManifest>(&content).ok()?;
+        let mut manifest = serde_json::from_str::<ArtifactManifest>(&content).ok()?;
+        if manifest.compressed {
+            manifest = self.inflate(&dir, manifest)?;
+        }
         Some(CasEntry {
             manifest,
             object_dir: dir,
         })
+    }
+
+    /// Decompresses an entry [`Self::compress`] compressed, so it can be
+    /// hard-linked again. Each file is checked against its recorded hash and
+    /// renamed into place; the manifest is rewritten last. `None` if the
+    /// entry is damaged (a miss, like any damaged entry).
+    fn inflate(&self, dir: &Path, mut manifest: ArtifactManifest) -> Option<ArtifactManifest> {
+        for a in &manifest.artifacts {
+            let dest = dir.join(&a.filename);
+            // Another process may have decompressed it already.
+            if fs::metadata(&dest).is_ok_and(|m| m.len() == a.size) {
+                continue;
+            }
+            let packed = dir.join(format!("{}.zst", a.filename));
+            let tmp = dir.join(format!(
+                ".{}.{}.{}.tmp",
+                a.filename,
+                std::process::id(),
+                unique()
+            ));
+            let result = (|| -> std::io::Result<()> {
+                let mut input = File::open(&packed)?;
+                let mut out = File::create(&tmp)?;
+                zstd::stream::copy_decode(&mut input, &mut out)?;
+                Ok(())
+            })();
+            let sound = result.is_ok()
+                && fs::metadata(&tmp).is_ok_and(|m| m.len() == a.size)
+                && hash_file(&tmp).is_ok_and(|h| h == a.hash);
+            if !sound {
+                let _ = fs::remove_file(&tmp);
+                debug!("compressed entry {} is damaged", manifest.cache_key);
+                return None;
+            }
+            make_read_only(&tmp);
+            fs::rename(&tmp, &dest).ok()?;
+        }
+        manifest.compressed = false;
+        manifest.stored_size = None;
+        let tmp = dir.join(format!(".manifest.{}.{}.tmp", std::process::id(), unique()));
+        fs::write(&tmp, serde_json::to_string(&manifest).ok()?).ok()?;
+        fs::rename(&tmp, dir.join("manifest.json")).ok()?;
+        for a in &manifest.artifacts {
+            let _ = fs::remove_file(dir.join(format!("{}.zst", a.filename)));
+        }
+        Some(manifest)
+    }
+
+    /// Compresses the artifacts of the entry in `dir` with zstd, keeping them
+    /// only when that saves at least a tenth. Returns the bytes saved. The
+    /// entry stays valid throughout: the compressed files and the manifest
+    /// that names them are written before the originals are removed.
+    pub fn compress(&self, dir: &Path) -> Result<u64> {
+        let content = fs::read_to_string(dir.join("manifest.json"))?;
+        let mut manifest: ArtifactManifest = serde_json::from_str(&content)?;
+        if manifest.compressed || manifest.artifacts.is_empty() {
+            return Ok(0);
+        }
+        let mut packed_total = 0;
+        let mut written = Vec::new();
+        for a in &manifest.artifacts {
+            let src = dir.join(&a.filename);
+            let dest = dir.join(format!("{}.zst", a.filename));
+            let tmp = dir.join(format!(
+                ".{}.zst.{}.{}.tmp",
+                a.filename,
+                std::process::id(),
+                unique()
+            ));
+            let mut input = File::open(&src)?;
+            let out = File::create(&tmp)?;
+            let mut enc = zstd::stream::Encoder::new(out, 3)?;
+            std::io::copy(&mut input, &mut enc)?;
+            enc.finish()?;
+            packed_total += fs::metadata(&tmp)?.len();
+            fs::rename(&tmp, &dest)?;
+            written.push(dest);
+        }
+        if packed_total > manifest.total_size - manifest.total_size / 10 {
+            for w in written {
+                let _ = fs::remove_file(w);
+            }
+            return Ok(0);
+        }
+        manifest.compressed = true;
+        manifest.stored_size = Some(packed_total);
+        let tmp = dir.join(format!(".manifest.{}.{}.tmp", std::process::id(), unique()));
+        fs::write(&tmp, serde_json::to_string(&manifest)?)?;
+        // Keep the entry's last-use time: compressing is not a use.
+        let used = fs::metadata(dir.join("manifest.json"))?.modified()?;
+        fs::rename(&tmp, dir.join("manifest.json"))?;
+        let _ = filetime::set_file_mtime(
+            dir.join("manifest.json"),
+            filetime::FileTime::from_system_time(used),
+        );
+        for a in &manifest.artifacts {
+            let _ = fs::remove_file(dir.join(&a.filename));
+        }
+        Ok(manifest.total_size - packed_total)
     }
 
     /// Whether an entry exists for `cache_key`.
@@ -357,6 +477,8 @@ impl CasStore {
             artifacts,
             stored_at,
             total_size,
+            compressed: false,
+            stored_size: None,
         };
 
         let tmp_manifest = dir.join(format!(".manifest.{}.tmp", std::process::id()));
@@ -650,6 +772,12 @@ fn touch_if_stale(manifest: &Path) {
 }
 
 /// Blake3 of a file's contents, hex encoded.
+/// A number no other call in this process gets, for temporary file names.
+fn unique() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
 pub(crate) fn hash_file(path: &Path) -> Result<String> {
     let mut hasher = blake3::Hasher::new();
     hasher.update_reader(File::open(path)?)?;

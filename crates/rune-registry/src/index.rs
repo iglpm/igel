@@ -282,6 +282,15 @@ impl SparseIndexClient {
 
         let url = format!("{}/{}", self.base_url, rel_path);
         let have_cache = cached_file.is_file();
+        use rune_common::progress::{Event, emit};
+        emit(Event::IndexStarted { name });
+        struct Finished<'a>(&'a str);
+        impl Drop for Finished<'_> {
+            fn drop(&mut self) {
+                emit(Event::IndexFinished { name: self.0 });
+            }
+        }
+        let _finished = Finished(name);
         let etag = have_cache
             .then(|| fs::read_to_string(&etag_file).ok())
             .flatten();

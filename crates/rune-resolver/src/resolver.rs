@@ -261,6 +261,9 @@ pub struct DependencyResolver {
     /// Newly chosen releases must have been published at least this long
     /// ago (`resolve.min-release-age`); locked ones are kept regardless.
     min_release_age: Option<std::time::Duration>,
+    /// The registry releases a failed round had chosen (`(registry, name,
+    /// version)`): where to look for the requirement nothing satisfies.
+    partial: Vec<(String, String, Version)>,
 }
 
 impl Default for DependencyResolver {
@@ -283,6 +286,7 @@ impl DependencyResolver {
             prefer: HashMap::new(),
             exclude: HashSet::new(),
             min_release_age: None,
+            partial: Vec::new(),
         }
     }
 
@@ -407,6 +411,149 @@ impl DependencyResolver {
         }
     }
 
+    /// Fetches the index of every registry crate the resolution will probably
+    /// need, starting from `seeds` (`(registry, name, requirement)`), with
+    /// many requests in flight and no waiting between levels: as each index
+    /// file arrives, the version resolution is likely to choose (the locked
+    /// one, else the newest that matches) is looked up and its dependencies —
+    /// the optional ones its default features turn on included — are
+    /// requested at once.
+    ///
+    /// Waiting for a whole BFS generation before starting the next paid the
+    /// slowest request of every level (13 levels for a 469-package graph).
+    /// A wrong guess costs a spare request, never correctness: the walk
+    /// that follows decides, and fetches whatever is still missing.
+    fn prefetch_closure(
+        &mut self,
+        seeds: Vec<(String, String, VersionReq)>,
+        existing_lock: Option<&Lockfile>,
+    ) {
+        use std::sync::{Condvar, Mutex};
+        if self.offline || seeds.is_empty() {
+            return;
+        }
+        let _timer = rune_common::timing::phase("index prefetch");
+        let mut registries: Vec<String> = seeds.iter().map(|(r, ..)| r.clone()).collect();
+        registries.sort();
+        registries.dedup();
+        for r in &registries {
+            let _ = self.client(r);
+        }
+        let locked: HashMap<&str, Vec<Version>> = existing_lock.map_or_else(HashMap::new, |lock| {
+            let mut m: HashMap<&str, Vec<Version>> = HashMap::new();
+            for p in lock.packages.iter().filter(|p| p.source.is_some()) {
+                if let Ok(v) = Version::parse(&p.version) {
+                    m.entry(p.name.as_str()).or_default().push(v);
+                }
+            }
+            m
+        });
+
+        struct State {
+            queue: VecDeque<(String, String, VersionReq)>,
+            seen: HashSet<(String, String)>,
+            in_flight: usize,
+            fetched: Vec<((String, String), CrateIndex)>,
+        }
+        let mut seen = HashSet::new();
+        let mut queue = VecDeque::new();
+        for (r, n, req) in seeds {
+            if seen.insert((r.clone(), n.clone())) {
+                queue.push_back((r, n, req));
+            }
+        }
+        let state = Mutex::new(State {
+            queue,
+            seen,
+            in_flight: 0,
+            fetched: Vec::new(),
+        });
+        let wake = Condvar::new();
+        let clients = &self.clients;
+        let cached = &self.cached_indices;
+        let refresh = self.refresh;
+        std::thread::scope(|scope| {
+            for _ in 0..PREFETCH_WORKERS {
+                scope.spawn(|| {
+                    loop {
+                        let (registry, name, req) = {
+                            let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
+                            loop {
+                                if let Some(item) = st.queue.pop_front() {
+                                    st.in_flight += 1;
+                                    break item;
+                                }
+                                if st.in_flight == 0 {
+                                    wake.notify_all();
+                                    return;
+                                }
+                                st = wake.wait(st).unwrap_or_else(|e| e.into_inner());
+                            }
+                        };
+                        let key = (registry.clone(), name.clone());
+                        // Already in memory: its dependencies are needed now
+                        // (it is a seed), but it costs no request.
+                        let (index, fresh) = match cached.get(&key) {
+                            Some(i) => (Some(i.clone()), false),
+                            None => (
+                                clients.get(&registry).and_then(|c| {
+                                    if refresh {
+                                        c.refresh_crate(&name).ok()
+                                    } else {
+                                        c.fetch_crate(&name).ok()
+                                    }
+                                }),
+                                true,
+                            ),
+                        };
+                        let children = index
+                            .as_ref()
+                            .map(|i| {
+                                likely_dependencies(
+                                    i,
+                                    &req,
+                                    locked.get(name.as_str()).map(Vec::as_slice),
+                                )
+                            })
+                            .unwrap_or_default();
+                        let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
+                        for (dep_registry, dep_name, dep_req) in children {
+                            let dep_registry = dep_registry.unwrap_or_else(|| registry.clone());
+                            // Only registries with a client ready (the
+                            // walk handles anything else).
+                            if !clients.contains_key(&dep_registry) {
+                                continue;
+                            }
+                            // A crate already in memory was expanded when
+                            // it was fetched.
+                            let dep_key = (dep_registry.clone(), dep_name.clone());
+                            if cached.contains_key(&dep_key) {
+                                continue;
+                            }
+                            if st.seen.insert(dep_key) {
+                                st.queue.push_back((dep_registry, dep_name, dep_req));
+                            }
+                        }
+                        if fresh && let Some(index) = index {
+                            st.fetched.push((key, index));
+                        }
+                        st.in_flight -= 1;
+                        wake.notify_all();
+                    }
+                });
+            }
+        });
+        let fetched = std::mem::take(
+            &mut state
+                .into_inner()
+                .unwrap_or_else(|e| e.into_inner())
+                .fetched,
+        );
+        for (key, index) in fetched {
+            self.cached_indices.insert(key, index);
+        }
+    }
+
     /// Resolves dependencies for a set of root manifests and optional existing lockfile.
     pub fn resolve(
         &mut self,
@@ -442,26 +589,37 @@ impl DependencyResolver {
         // version every requirement accepts, or, when there is none, by
         // backtracking away from the release that brought the odd requirement
         // in — and the walk re-run. Almost every graph needs one round.
-        let mut last: Option<ResolvedGraph> = None;
+        let mut last: Option<(ResolvedGraph, Vec<Edge>)> = None;
+        // The complete solver runs at most once, when the walk's own repairs
+        // run out.
+        let mut solved = false;
         for _ in 0..64 {
             let round =
                 self.resolve_round(project_root, root_dependencies, existing_lock, workspace);
             let (graph, edges) = match round {
                 Ok(r) => r,
-                // A backtracking step left nothing to choose: keep the last
-                // complete resolution.
+                // A release needs something that does not exist: move away
+                // from every release that asked for it, as Cargo would.
+                Err(ResolverError::NoMatchingVersion { name, req })
+                    if self.backtrack_from_missing(&name, &req) =>
+                {
+                    continue;
+                }
+                // A backtracking step left nothing to choose: solve the
+                // version choice as a whole, or keep the last complete
+                // resolution.
                 Err(e) => {
-                    let Some(graph) = last else { return Err(e) };
-                    for (_, name, versions) in compatible_duplicates(&graph) {
-                        tracing::warn!(
-                            "could not settle on one version of `{name}` ({}); using them side by side",
-                            versions
-                                .iter()
-                                .map(|v| v.to_string())
-                                .collect::<Vec<_>>()
-                                .join(" and ")
-                        );
+                    let Some((graph, edges)) = last else {
+                        return Err(e);
+                    };
+                    if !solved {
+                        solved = true;
+                        if self.solve_whole(&graph, &edges) {
+                            last = Some((graph, edges));
+                            continue;
+                        }
                     }
+                    warn_side_by_side(&graph);
                     return Ok(graph);
                 }
             };
@@ -475,22 +633,84 @@ impl DependencyResolver {
                 progressed |= self.settle(&registry, &name, &versions, &edges, &graph);
             }
             if !progressed {
-                for (_, name, versions) in compatible_duplicates(&graph) {
-                    tracing::warn!(
-                        "no single version of `{name}` satisfies every requirement in the \
-                         graph; using {} side by side (Cargo would refuse)",
-                        versions
-                            .iter()
-                            .map(|v| v.to_string())
-                            .collect::<Vec<_>>()
-                            .join(" and ")
-                    );
+                if !solved {
+                    solved = true;
+                    if self.solve_whole(&graph, &edges) {
+                        last = Some((graph, edges));
+                        continue;
+                    }
                 }
+                warn_side_by_side(&graph);
                 return Ok(graph);
             }
-            last = Some(graph);
+            last = Some((graph, edges));
         }
-        last.ok_or_else(|| ResolverError::Manifest("version resolution did not settle".into()))
+        last.map(|(g, _)| g)
+            .ok_or_else(|| ResolverError::Manifest("version resolution did not settle".into()))
+    }
+
+    /// Runs the complete solver over the graph's version choice. On success
+    /// its choice becomes the walk's preference (and earlier backtracking is
+    /// forgotten); otherwise its explanation is shown. Returns whether the
+    /// walk should run again.
+    fn solve_whole(&mut self, graph: &ResolvedGraph, edges: &[Edge]) -> bool {
+        let _timer = rune_common::timing::phase("version solving");
+        let requirements: Vec<crate::solver::Requirement<'_>> = edges
+            .iter()
+            .map(|e| crate::solver::Requirement {
+                from: e.from.as_deref(),
+                registry: &e.registry,
+                name: &e.name,
+                req: &e.req,
+            })
+            .collect();
+        match crate::solver::solve(self, graph, &requirements) {
+            crate::solver::Solution::Found(chosen) => {
+                for (registry, name, v) in chosen {
+                    let list = self.prefer.entry((registry, name)).or_default();
+                    list.retain(|p| compat_class(p) != compat_class(&v));
+                    list.push(v);
+                }
+                self.exclude.clear();
+                true
+            }
+            crate::solver::Solution::Impossible(why) => {
+                tracing::warn!("no set of versions satisfies every requirement:\n{why}");
+                false
+            }
+        }
+    }
+
+    /// Excludes the releases of the failed round that require `name` as
+    /// `req` (which no version satisfies). Returns whether there were any.
+    fn backtrack_from_missing(&mut self, name: &str, req: &str) -> bool {
+        let Ok(wanted) = VersionReq::from_str(req) else {
+            return false;
+        };
+        let mut progressed = false;
+        for (registry, pkg, version) in std::mem::take(&mut self.partial) {
+            let requires = self
+                .get_or_fetch_index(&registry, &pkg)
+                .ok()
+                .and_then(|i| i.get_version(&version.to_string()))
+                .is_some_and(|rec| {
+                    rec.deps.iter().any(|d| {
+                        d.kind.as_deref() != Some("dev")
+                            && d.package.as_deref().unwrap_or(&d.name) == name
+                            && VersionReq::from_str(&d.req).is_ok_and(|r| r == wanted)
+                    })
+                });
+            if requires {
+                tracing::debug!("{pkg} {version} needs {name} {req}, which does not exist");
+                progressed |= self.exclude.insert((registry, pkg, version));
+            }
+        }
+        progressed
+    }
+
+    /// The index of a crate, fetched if needed (for the solver).
+    pub(crate) fn index_for(&mut self, registry: &str, name: &str) -> Result<&CrateIndex> {
+        self.get_or_fetch_index(registry, name)
     }
 
     /// One conflict: `versions` of `name` share a compatible range. Returns
@@ -639,7 +859,27 @@ impl DependencyResolver {
             }));
         }
         if !self.offline {
-            self.prefetch(hints.iter().map(|(r, n)| (r.as_str(), n.as_str())));
+            // Everything reachable from the roots (and whatever the lockfile
+            // names), in one pipelined wave.
+            let mut seeds: Vec<(String, String, VersionReq)> = hints
+                .iter()
+                .map(|(r, n)| (r.clone(), n.clone(), VersionReq::STAR))
+                .collect();
+            for (name, spec) in root_dependencies {
+                if spec.path.is_some() || spec.git.is_some() {
+                    continue;
+                }
+                if let Ok(registry) =
+                    rune_registry::source::defs().index_for_name(spec.registry.as_deref())
+                {
+                    seeds.push((
+                        registry,
+                        spec.package.clone().unwrap_or_else(|| name.clone()),
+                        spec.version.clone().unwrap_or(VersionReq::STAR),
+                    ));
+                }
+            }
+            self.prefetch_closure(seeds, existing_lock);
         }
 
         let mut resolved_packages: HashMap<String, ResolvedPackage> = HashMap::new();
@@ -691,14 +931,27 @@ impl DependencyResolver {
             // lookups it needs can be issued concurrently up front.
             while !queue.is_empty() {
                 let generation: Vec<_> = queue.drain(..).collect();
-                self.prefetch(
-                    generation
-                        .iter()
-                        .filter(|(_, _, _, _, local_dir, _)| local_dir.is_none())
-                        .map(|(name, _, _, _, _, registry)| (registry.as_str(), name.as_str())),
-                );
+                // Whatever this generation needs that is not in memory yet
+                // (and what that needs, and so on), pipelined.
+                let missing: Vec<(String, String, VersionReq)> = generation
+                    .iter()
+                    .filter(|(name, _, _, _, local_dir, registry)| {
+                        local_dir.is_none()
+                            && !self
+                                .cached_indices
+                                .contains_key(&(registry.clone(), name.clone()))
+                    })
+                    .map(|(name, req, _, _, _, registry)| {
+                        (registry.clone(), name.clone(), req.clone())
+                    })
+                    .collect();
+                if self.offline {
+                    self.prefetch(missing.iter().map(|(r, n, _)| (r.as_str(), n.as_str())));
+                } else {
+                    self.prefetch_closure(missing, existing_lock);
+                }
                 for (name, req, features, default_features, local_dir, registry) in generation {
-                    resolve_one_queue_item(
+                    let step = resolve_one_queue_item(
                         name,
                         req,
                         features,
@@ -713,7 +966,19 @@ impl DependencyResolver {
                         workspace,
                         existing_lock,
                         self,
-                    )?;
+                    );
+                    if let Err(e) = step {
+                        self.partial = resolved_packages
+                            .values()
+                            .filter_map(|p| match &p.source {
+                                PackageSource::Registry(r) => {
+                                    Some((r.clone(), p.name.clone(), p.version.clone()))
+                                }
+                                _ => None,
+                            })
+                            .collect();
+                        return Err(e);
+                    }
                 }
             }
 
@@ -814,6 +1079,93 @@ impl DependencyResolver {
     }
 }
 
+/// Index requests the pipelined prefetch keeps in flight. Index files are
+/// tiny: the cost is round-trip latency, so far more than the CPU count.
+const PREFETCH_WORKERS: usize = 96;
+
+/// What the resolution will probably need after choosing a version of
+/// `index` for `req`: the locked version if one matches, else the newest
+/// matching one; its normal and build dependencies, the optional ones its
+/// default features switch on included. `(registry if another, name,
+/// requirement)`.
+fn likely_dependencies(
+    index: &CrateIndex,
+    req: &VersionReq,
+    locked: Option<&[Version]>,
+) -> Vec<(Option<String>, String, VersionReq)> {
+    let versions: Vec<(&IndexRecord, Version)> = index
+        .versions
+        .iter()
+        .filter_map(|r| Some((r, Version::parse(&r.vers).ok()?)))
+        .filter(|(_, v)| req.matches(v))
+        .collect();
+    let chosen = locked
+        .and_then(|l| {
+            versions
+                .iter()
+                .filter(|(_, v)| l.contains(v))
+                .max_by(|a, b| a.1.cmp(&b.1))
+        })
+        .or_else(|| {
+            versions
+                .iter()
+                .filter(|(r, _)| !r.yanked)
+                .max_by(|a, b| a.1.cmp(&b.1))
+        });
+    let Some((record, _)) = chosen else {
+        return Vec::new();
+    };
+    let on = default_enabled_dependencies(record);
+    record
+        .deps
+        .iter()
+        .filter(|d| d.kind.as_deref() != Some("dev"))
+        .filter(|d| !d.optional || on.contains(d.name.as_str()))
+        .map(|d| {
+            (
+                d.registry.as_deref().map(normalize_registry),
+                d.package.clone().unwrap_or_else(|| d.name.clone()),
+                VersionReq::from_str(&d.req).unwrap_or(VersionReq::STAR),
+            )
+        })
+        .collect()
+}
+
+/// The optional dependencies (by the name the package uses) that `record`'s
+/// `default` feature turns on, directly or through other features.
+fn default_enabled_dependencies(record: &IndexRecord) -> HashSet<String> {
+    let features = record.all_features();
+    let optional: HashSet<&str> = record
+        .deps
+        .iter()
+        .filter(|d| d.optional)
+        .map(|d| d.name.as_str())
+        .collect();
+    let mut on = HashSet::new();
+    let mut seen = HashSet::new();
+    let mut stack = vec!["default".to_string()];
+    while let Some(f) = stack.pop() {
+        if !seen.insert(f.clone()) {
+            continue;
+        }
+        for entry in features.get(&f).into_iter().flatten() {
+            if let Some(dep) = entry.strip_prefix("dep:") {
+                on.insert(dep.to_string());
+            } else if let Some((dep, _)) = entry.split_once('/') {
+                // `dep?/feat` only adds to a dependency that is on anyway.
+                if !dep.ends_with('?') && optional.contains(dep) {
+                    on.insert(dep.to_string());
+                }
+            } else if features.contains_key(entry) {
+                stack.push(entry.clone());
+            } else if optional.contains(entry.as_str()) {
+                on.insert(entry.clone());
+            }
+        }
+    }
+    on
+}
+
 /// A requirement in force: `from` (a package id, `None` for a root) needs
 /// `name` from `registry` matching `req`.
 struct Edge {
@@ -825,12 +1177,25 @@ struct Edge {
 
 /// Which versions Cargo counts as compatible (one allowed per class):
 /// the same major, the same minor for `0.x`, the same patch for `0.0.x`.
-fn compat_class(v: &Version) -> (u64, u64, u64) {
-    match (v.major, v.minor) {
-        (0, 0) => (0, 0, v.patch),
-        (0, m) => (0, m, 0),
-        (m, _) => (m, 0, 0),
+use crate::solver::compat_class;
+
+/// Says which crates end up in several versions of one compatible range.
+fn warn_side_by_side(graph: &ResolvedGraph) {
+    for (_, name, versions) in compatible_duplicates(graph) {
+        tracing::warn!(
+            "no single version of `{name}` satisfies every requirement in the \
+             graph; using {} side by side (Cargo would refuse)",
+            versions
+                .iter()
+                .map(|v| v.to_string())
+                .collect::<Vec<_>>()
+                .join(" and ")
+        );
     }
+}
+
+pub(crate) fn normalize_registry_pub(url: &str) -> String {
+    normalize_registry(url)
 }
 
 /// Registry crates present in more than one version of one compatible class.
@@ -1456,4 +1821,177 @@ pub fn matches_target(target_str: Option<&str>, target_triple: &str) -> bool {
         // treat them as inapplicable rather than guessing.
         _ => false,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rune_registry::IndexDependency;
+
+    fn dep(name: &str, req: &str, optional: bool, kind: Option<&str>) -> IndexDependency {
+        IndexDependency {
+            name: name.into(),
+            req: req.into(),
+            features: vec![],
+            optional,
+            default_features: true,
+            target: None,
+            kind: kind.map(str::to_string),
+            package: None,
+            registry: None,
+        }
+    }
+
+    fn record(vers: &str, deps: Vec<IndexDependency>, features: &[(&str, &[&str])]) -> IndexRecord {
+        IndexRecord {
+            name: "pkg".into(),
+            vers: vers.into(),
+            deps,
+            cksum: String::new(),
+            features: features
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.iter().map(|s| s.to_string()).collect()))
+                .collect(),
+            features2: None,
+            yanked: false,
+            rust_version: None,
+            pubtime: None,
+        }
+    }
+
+    #[test]
+    fn the_solver_moves_several_crates_at_once_or_explains_why_it_cannot() {
+        let mut resolver = DependencyResolver::new().offline(true);
+        let reg = CRATES_IO.to_string();
+        let mut add = |name: &str, versions: Vec<IndexRecord>| {
+            let versions = versions
+                .into_iter()
+                .map(|mut r| {
+                    r.name = name.into();
+                    r
+                })
+                .collect();
+            resolver.cached_indices.insert(
+                (reg.clone(), name.into()),
+                CrateIndex {
+                    name: name.into(),
+                    versions,
+                },
+            );
+        };
+        // The newest `x` and the newest `y` pin different `z`s: one of them
+        // has to move back, and then everything fits.
+        add(
+            "x",
+            vec![
+                record("1.0.0", vec![dep("z", "^1", false, None)], &[]),
+                record("2.0.0", vec![dep("z", "=1.1.0", false, None)], &[]),
+            ],
+        );
+        add(
+            "y",
+            vec![
+                record("1.0.0", vec![dep("z", "^1", false, None)], &[]),
+                record("2.0.0", vec![dep("z", "=1.0.0", false, None)], &[]),
+            ],
+        );
+        add(
+            "z",
+            vec![record("1.0.0", vec![], &[]), record("1.1.0", vec![], &[])],
+        );
+        let star = VersionReq::STAR;
+        let pinned = VersionReq::from_str("=2.0.0").unwrap();
+        let reqs = |x: &'static VersionReq, y: &'static VersionReq| {
+            vec![
+                crate::solver::Requirement {
+                    from: None,
+                    registry: CRATES_IO,
+                    name: "x",
+                    req: x,
+                },
+                crate::solver::Requirement {
+                    from: None,
+                    registry: CRATES_IO,
+                    name: "y",
+                    req: y,
+                },
+            ]
+        };
+        let star: &'static VersionReq = Box::leak(Box::new(star));
+        let pinned: &'static VersionReq = Box::leak(Box::new(pinned));
+        let graph = ResolvedGraph::default();
+        let v = |s: &str| Version::parse(s).unwrap();
+        match crate::solver::solve(&mut resolver, &graph, &reqs(star, star)) {
+            crate::solver::Solution::Found(mut chosen) => {
+                chosen.sort();
+                let z = chosen.iter().find(|(_, n, _)| n == "z").unwrap().2.clone();
+                let x = chosen.iter().find(|(_, n, _)| n == "x").unwrap().2.clone();
+                let y = chosen.iter().find(|(_, n, _)| n == "y").unwrap().2.clone();
+                // Exactly one `z`, and whatever pinned it got it.
+                assert!(x != v("2.0.0") || z == v("1.1.0"));
+                assert!(y != v("2.0.0") || z == v("1.0.0"));
+                assert!(x == v("2.0.0") || y == v("2.0.0"), "keeps one newest");
+            }
+            crate::solver::Solution::Impossible(why) => panic!("{why}"),
+        }
+        // Both pinned to their newest: impossible, and the reason names them.
+        match crate::solver::solve(&mut resolver, &graph, &reqs(pinned, pinned)) {
+            crate::solver::Solution::Impossible(why) => {
+                assert!(why.contains("x 2.0.0 depends on z 1.1.0"), "{why}");
+                assert!(why.contains("y 2.0.0 depends on z 1.0.0"), "{why}");
+            }
+            crate::solver::Solution::Found(c) => panic!("{c:?}"),
+        }
+    }
+
+    #[test]
+    fn the_prefetch_follows_the_version_resolution_would_pick() {
+        let index = CrateIndex {
+            name: "pkg".into(),
+            versions: vec![
+                record("1.0.0", vec![dep("old", "1", false, None)], &[]),
+                record(
+                    "1.2.0",
+                    vec![
+                        dep("always", "^2", false, None),
+                        dep("builder", "1", false, Some("build")),
+                        dep("tests_only", "1", false, Some("dev")),
+                        dep("by_default", "1", true, None),
+                        dep("via_feature", "1", true, None),
+                        dep("weak", "1", true, None),
+                        dep("never", "1", true, None),
+                    ],
+                    &[
+                        ("default", &["std", "dep:by_default"]),
+                        ("std", &["via_feature/std", "weak?/std"]),
+                        ("extra", &["never"]),
+                    ],
+                ),
+            ],
+        };
+        let names = |deps: Vec<(Option<String>, String, VersionReq)>| {
+            let mut n: Vec<String> = deps.into_iter().map(|(_, n, _)| n).collect();
+            n.sort();
+            n
+        };
+        // The newest matching release, its normal and build dependencies and
+        // the optional ones `default` turns on (not through `weak?/…`).
+        assert_eq!(
+            names(likely_dependencies(&index, &VersionReq::STAR, None)),
+            ["always", "builder", "by_default", "via_feature"]
+        );
+        // A locked version wins over the newest.
+        let locked = [Version::parse("1.0.0").unwrap()];
+        assert_eq!(
+            names(likely_dependencies(
+                &index,
+                &VersionReq::STAR,
+                Some(&locked)
+            )),
+            ["old"]
+        );
+        // Nothing matches: nothing to follow.
+        let req = VersionReq::parse("^3").unwrap();
+        assert!(likely_dependencies(&index, &req, None).is_empty());
+    }
 }

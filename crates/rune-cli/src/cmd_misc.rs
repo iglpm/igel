@@ -5,7 +5,7 @@ use colored::Colorize;
 use rune_cas::CasStore;
 use rune_cas::gc::{GcConfig, run_gc};
 use rune_common::settings::{
-    self, KEYS, Origin, Scope, Settings, config_path, format_size, key_def, parse_size,
+    self, KEYS, Origin, Scope, Settings, config_path, key_def, parse_size,
 };
 use rune_common::{Edition, RuneConfig};
 use rune_resolver::lockfile::LockfileManager;
@@ -234,11 +234,24 @@ pub fn clean(args: CleanArgs) -> Result<()> {
     };
 
     if target.exists() {
+        let (files, size) = walkdir::WalkDir::new(&target)
+            .into_iter()
+            .flatten()
+            .filter(|e| e.file_type().is_file())
+            .filter_map(|e| e.metadata().ok())
+            .fold((0usize, 0u64), |(n, b), m| (n + 1, b + m.len()));
         fs::remove_dir_all(&target)
             .with_context(|| format!("failed to remove {}", target.display()))?;
-        ui::action("cleaned", target.display());
+        ui::action(
+            "cleaned",
+            format!(
+                "{} {}",
+                ui::rel(&target),
+                format!("({}, {})", ui::plural(files, "file"), ui::bytes(size)).dimmed()
+            ),
+        );
     } else {
-        println!("nothing to clean");
+        ui::summary("nothing to clean");
     }
     Ok(())
 }
@@ -398,18 +411,37 @@ pub fn config(cmd: ConfigCommands) -> Result<()> {
             }
             let rows = settings.effective();
             let width = rows.iter().map(|(d, ..)| d.name.len()).max().unwrap_or(0);
-            let vwidth = rows.iter().map(|(_, v, _)| v.len()).max().unwrap_or(0);
+            let text_width = crate::ui::term_width().clamp(40, 100) - 4;
+            let mut page = crate::pager::Page::new("rune config list");
+            page.line(format!(
+                "{}  {}",
+                crate::ui::brand("settings"),
+                "values you set are highlighted · change one with `rune config set <key> <value>`"
+                    .dimmed()
+            ));
+            let mut section = "";
             for (def, value, origin) in rows {
-                let set = origin != Origin::Default;
-                let line = format!("{:<width$} = {:<vwidth$}", def.name, value);
-                let line = if set { line.bold().to_string() } else { line };
-                if show_origin {
-                    println!("{line}  {}", format!("# {origin}").dimmed());
-                } else {
-                    println!("{line}");
+                let this = def.name.split('.').next().unwrap_or("");
+                if this != section {
+                    section = this;
+                    page.blank();
                 }
-                println!("    {}", def.description.dimmed());
+                let set = origin != Origin::Default;
+                let value = if set {
+                    crate::ui::brand(&value)
+                } else {
+                    value.clone()
+                };
+                let mut line = format!("{:<width$}  {value}", def.name.bold());
+                if show_origin || set {
+                    line.push_str(&format!("  {}", format!("# {origin}").dimmed()));
+                }
+                page.line(line);
+                for l in crate::ui::wrap(def.description, text_width) {
+                    page.line(format!("    {}", l.dimmed()));
+                }
             }
+            page.show();
         }
         ConfigCommands::Get {
             key,
@@ -531,6 +563,38 @@ pub fn cas(cmd: CasCommands) -> Result<()> {
             ));
         }
         CasCommands::Export(_) => unreachable!("handled by cmd_build::cas_export"),
+        CasCommands::Pin(_) => unreachable!("handled by cmd_build::cas_pin"),
+        CasCommands::Unpin => {
+            let root = crate::workspace::find_project_root(None)
+                .context("could not find `Cargo.toml` in this directory or any parent")?;
+            if rune_cas::pins::unpin(&cas, &root) {
+                ui::summary(format!("unpinned {}", root.display()));
+            } else {
+                ui::detail(format!("{} was not pinned", root.display()));
+            }
+        }
+        CasCommands::Pins => {
+            let pins = rune_cas::pins::list(&cas);
+            if pins.is_empty() {
+                ui::detail("no workspace is pinned (`rune cas pin` pins the current one)");
+            }
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            for p in pins {
+                let present = p.keys.iter().filter(|k| cas.contains(k)).count();
+                ui::out(format!(
+                    "  {}  {}",
+                    p.project.display(),
+                    format!(
+                        "{present} entries, pinned {}",
+                        format_idle(now.saturating_sub(p.pinned_at))
+                    )
+                    .dimmed()
+                ));
+            }
+        }
         CasCommands::Stats => {
             let stats = cas.stats().unwrap_or_default();
             let total = stats.hits + stats.misses;
@@ -539,26 +603,62 @@ pub fn cas(cmd: CasCommands) -> Result<()> {
             } else {
                 0.0
             };
-            ui::heading("content-addressable store");
-            println!("  location     {}", config.cas_dir.display());
-            println!("  entries      {}", stats.total_entries);
-            println!(
-                "  size         {}",
-                format_size_human(stats.total_size_bytes)
-            );
-            println!("  hits         {}", stats.hits.to_string().green());
-            println!("  misses       {}", stats.misses.to_string().yellow());
-            println!("  hit rate     {hit_rate:.1}%");
-            if let Some(max) = config.settings.cas_max_size() {
-                println!("  max size     {}", format_size(max));
+            ui::heading("build cache");
+            let mut rows = vec![
+                ("location", config.cas_dir.display().to_string()),
+                ("entries", stats.total_entries.to_string()),
+                ("size", format_size_human(stats.total_size_bytes)),
+                (
+                    "hit rate",
+                    if total > 0 {
+                        format!(
+                            "{hit_rate:.1}%  {}",
+                            format!("({} reused, {} compiled)", stats.hits, stats.misses).dimmed()
+                        )
+                    } else {
+                        "no builds recorded yet".dimmed().to_string()
+                    },
+                ),
+            ];
+            if let Some(max) = config.settings.cas_max_size_for(&config.cas_dir) {
+                rows.push(("max size", format_size_human(max)));
+            }
+            if let Some(age) = config.settings.cas_max_age() {
+                rows.push((
+                    "cleanup",
+                    format!("entries unused for {} days are removed", age / 86_400),
+                ));
+            }
+            if let Some(idle) = config.settings.cas_compress_after() {
+                rows.push((
+                    "compression",
+                    format!(
+                        "entries unused for {} are compressed",
+                        format_idle_threshold(idle)
+                    ),
+                ));
+            }
+            let pins = rune_cas::pins::list(&cas);
+            if !pins.is_empty() {
+                rows.push(("pinned", ui::plural(pins.len(), "workspace")));
+            }
+            for l in ui::kv_lines(&rows, 2) {
+                ui::out(l);
             }
         }
         CasCommands::Du(args) => {
             let u = rune_cas::usage::usage(&cas);
-            ui::heading("content-addressable store usage");
-            println!("  location     {}", config.cas_dir.display());
-            println!("  entries      {}", u.entries);
-            println!("  size         {}", format_size_human(u.bytes));
+            ui::heading("build cache usage");
+            for l in ui::kv_lines(
+                &[
+                    ("location", config.cas_dir.display().to_string()),
+                    ("entries", u.entries.to_string()),
+                    ("size", format_size_human(u.bytes)),
+                ],
+                2,
+            ) {
+                ui::out(l);
+            }
             if u.packages.is_empty() {
                 return Ok(());
             }
@@ -603,11 +703,15 @@ pub fn cas(cmd: CasCommands) -> Result<()> {
             }
         }
         CasCommands::Gc(args) => {
+            // Started by a build to tidy up: stay out of the way.
+            if std::env::var_os("RUNE_BACKGROUND").is_some() {
+                rune_common::sysinfo::lower_priority();
+            }
             let max_size = match &args.max_size {
                 Some(s) => Some(parse_size(s).with_context(|| format!("invalid size `{s}`"))?),
-                None => config.settings.cas_max_size(),
+                None => config.settings.cas_max_size_for(&config.cas_dir),
             };
-            if max_size.is_none() && args.max_age.is_none() {
+            if max_size.is_none() && args.max_age.is_none() && args.compress_idle.is_none() {
                 bail!(
                     "nothing to do: pass --max-size / --max-age, or set `cas.max-size` with `rune config set`"
                 );
@@ -617,6 +721,7 @@ pub fn cas(cmd: CasCommands) -> Result<()> {
                 &GcConfig {
                     max_size_bytes: max_size,
                     max_age_secs: args.max_age,
+                    compress_idle_secs: args.compress_idle,
                 },
             )
             .map_err(|e| anyhow::anyhow!("CAS GC failed: {e}"))?;
@@ -628,11 +733,27 @@ pub fn cas(cmd: CasCommands) -> Result<()> {
                     format_size_human(report.bytes_freed)
                 ),
             );
+            if report.entries_compressed > 0 {
+                ui::action(
+                    "compressed",
+                    format!(
+                        "{} idle entries, {} saved",
+                        report.entries_compressed,
+                        format_size_human(report.bytes_compressed_away)
+                    ),
+                );
+            }
             ui::detail(format!(
                 "{} entries remaining, {}",
                 report.entries_remaining,
                 format_size_human(report.bytes_remaining)
             ));
+            if report.entries_pinned > 0 {
+                ui::detail(format!(
+                    "{} entries kept for pinned workspaces",
+                    report.entries_pinned
+                ));
+            }
         }
     }
     Ok(())
@@ -912,10 +1033,22 @@ pub fn affected(args: crate::args::AffectedArgs) -> Result<()> {
             .output()
             .context("failed to run `git` (needed by `rune affected`)")?;
         if !out.status.success() {
+            let err = String::from_utf8_lossy(&out.stderr);
+            if err.contains("not a git repository") {
+                bail!(
+                    "`rune affected` compares git revisions, and this project is not in a git repository"
+                );
+            }
+            if err.contains("unknown revision") || err.contains("bad revision") {
+                bail!(
+                    "git knows no revision to compare with here (a repository without commits, \
+                     or a shallow clone missing the base): commit first, or pass --base <rev>"
+                );
+            }
             bail!(
                 "`git {}` failed: {}",
                 extra.join(" "),
-                String::from_utf8_lossy(&out.stderr).trim()
+                err.lines().next().unwrap_or("").trim()
             );
         }
         Ok(String::from_utf8_lossy(&out.stdout)
@@ -1009,4 +1142,38 @@ fn write_if_changed(path: &Path, content: &str) -> Result<()> {
         return Ok(());
     }
     std::fs::write(path, content).with_context(|| format!("cannot write {}", path.display()))
+}
+
+/// `rune version [-v]`.
+pub fn version(verbose: bool) -> Result<()> {
+    println!("rune {}", env!("RUNE_VERSION"));
+    if !verbose {
+        return Ok(());
+    }
+    let tc = rune_common::toolchain::global();
+    let mut rows = vec![
+        ("release", env!("CARGO_PKG_VERSION").to_string()),
+        ("commit-hash", env!("RUNE_COMMIT_HASH").to_string()),
+        ("commit-date", env!("RUNE_COMMIT_DATE").to_string()),
+        ("host", env!("RUNE_BUILD_TARGET").to_string()),
+        (
+            "os",
+            format!("{} {}", std::env::consts::OS, std::env::consts::ARCH),
+        ),
+        ("rustc", format!("{} ({})", tc.version, tc.host)),
+    ];
+    rows.retain(|(_, v)| !v.is_empty());
+    let width = rows.iter().map(|(k, _)| k.len()).max().unwrap_or(0);
+    for (k, v) in rows {
+        println!("{k:<width$}  {v}");
+    }
+    Ok(())
+}
+
+/// `rune completions <shell>`.
+pub fn completions(shell: clap_complete::Shell) -> Result<()> {
+    use clap::CommandFactory;
+    let mut cmd = crate::args::Cli::command();
+    clap_complete::generate(shell, &mut cmd, "rune", &mut std::io::stdout());
+    Ok(())
 }

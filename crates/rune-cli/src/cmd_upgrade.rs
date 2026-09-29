@@ -233,16 +233,18 @@ fn statuses(ws: &Workspace, deps: &[Declared], offline: bool) -> Result<Vec<Stat
     }
     let mut records: HashMap<(String, String), rune_registry::CrateIndex> = HashMap::new();
     for (index, names) in &by_registry {
-        ui::action(
+        let checking = ui::Activity::start(
             "checking",
             format!(
-                "{} crates in the {} index",
-                names.len(),
+                "{} in the {} index",
+                ui::plural(names.len(), "crate"),
                 defs.name_of(index)
             ),
         );
         let client = rune_registry::source::IndexClient::for_registry(index, offline)?;
-        for (name, found) in names.iter().zip(client.fetch_many_with(names, !offline)) {
+        let fetched = client.fetch_many_with(names, !offline);
+        checking.clear();
+        for (name, found) in names.iter().zip(fetched) {
             match found {
                 Ok(ci) => {
                     records.insert((index.clone(), name.clone()), ci);

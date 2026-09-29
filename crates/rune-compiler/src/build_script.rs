@@ -275,7 +275,17 @@ impl BuildScriptRunner {
         env: &BuildScriptEnv,
         configure: &dyn Fn(&mut Command),
     ) -> Result<BuildScriptOutput> {
-        let mut cmd = Command::new(binary);
+        Self::execute_command(Command::new(binary), env, configure)
+    }
+
+    /// Like [`Self::execute_with`], for a command that runs the script
+    /// (through a sandbox, say) and gets the script's arguments and
+    /// environment added.
+    pub fn execute_command(
+        mut cmd: Command,
+        env: &BuildScriptEnv,
+        configure: &dyn Fn(&mut Command),
+    ) -> Result<BuildScriptOutput> {
         configure(&mut cmd);
 
         // Cargo always runs a build script with its crate's manifest

@@ -2147,11 +2147,51 @@ fn trim_paths_keeps_this_machines_paths_out_of_the_binary() {
         );
     }
 
-    // Without it, the absolute path is there, as with Cargo.
+    // Without it, the workspace's own paths are still relative to its root,
+    // as with Cargo (it compiles them from there), so panics name
+    // `src/main.rs` either way.
     p.write("Cargo.toml", LIB_MANIFEST);
     p.ok(&["build", "--release"]);
     let run = Command::new(&exe).output().unwrap();
-    assert!(String::from_utf8_lossy(&run.stderr).contains(root.to_str().unwrap()));
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert!(stderr.contains("src/main.rs:1"), "{stderr}");
+    assert!(!stderr.contains(root.to_str().unwrap()), "{stderr}");
+}
+
+#[test]
+fn compiler_messages_name_workspace_files_relative_to_the_root() {
+    let p = Project::new();
+    p.write(
+        "Cargo.toml",
+        "[workspace]\nresolver = \"2\"\nmembers = [\"app\"]\n",
+    );
+    p.write(
+        "app/Cargo.toml",
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    p.write("app/src/main.rs", "fn main() { let x: u32 = \"no\"; }\n");
+    let out = p.rune(&["build"]);
+    assert!(!out.status.success());
+    let text = text(&out);
+    assert!(text.contains("--> app/src/main.rs:1:26"), "{text}");
+    let root = p.path().canonicalize().unwrap();
+    assert!(!text.contains(root.to_str().unwrap()), "{text}");
+    // One verdict, after the compiler's message.
+    let verdict = text.find("could not compile app v0.1.0").expect(&text);
+    assert!(verdict > text.find("mismatched types").unwrap(), "{text}");
+    assert_eq!(text.matches("could not compile").count(), 1, "{text}");
+
+    // `rune fix` finds the files through those relative paths.
+    p.write(
+        "app/src/main.rs",
+        "#![warn(unused_parens)]\nfn main() { let x = (1); let _ = x; }\n",
+    );
+    p.ok(&["fix", "--allow-no-vcs"]);
+    assert!(
+        p.read("app/src/main.rs").contains("let x = 1;"),
+        "{}",
+        p.read("app/src/main.rs")
+    );
 }
 
 #[test]
@@ -5598,4 +5638,391 @@ pub fn make_answer(_: TokenStream) -> TokenStream {
     );
     let out = p.ok(&["test"]);
     assert!(out.contains("(doc-tests) · 1 passed"), "{out}");
+}
+
+#[test]
+fn a_target_that_is_not_installed_is_reported_before_building() {
+    let p = lib_project();
+    let out = p.rune(&["build", "--target", "x86_64-unknown-linux-gnux"]);
+    assert!(!out.status.success());
+    assert!(
+        text(&out).contains("unknown target `x86_64-unknown-linux-gnux`"),
+        "{}",
+        text(&out)
+    );
+
+    // A real target without its standard library: what to run, not
+    // rustc's "can't find crate for `core`" in every crate.
+    let sysroot = String::from_utf8(
+        Command::new("rustc")
+            .args(["--print", "sysroot"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    let missing = [
+        "riscv64gc-unknown-none-elf",
+        "thumbv7em-none-eabihf",
+        "wasm32v1-none",
+    ]
+    .into_iter()
+    .find(|t| {
+        !std::path::Path::new(sysroot.trim())
+            .join("lib/rustlib")
+            .join(t)
+            .exists()
+    });
+    if let Some(t) = missing {
+        let out = p.rune(&["build", "--target", t]);
+        assert!(!out.status.success());
+        let msg = text(&out);
+        assert!(
+            msg.contains(&format!("the standard library for `{t}` is not installed")),
+            "{msg}"
+        );
+        assert!(!msg.contains("can't find crate"), "{msg}");
+    }
+}
+
+#[test]
+fn features_says_which_are_on_and_who_turned_them_on() {
+    let p = Project::new();
+    p.write(
+        "Cargo.toml",
+        "[workspace]\nresolver = \"2\"\nmembers = [\"app\", \"lib\"]\n",
+    );
+    p.write(
+        "lib/Cargo.toml",
+        "[package]\nname = \"lib\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
+         [features]\ndefault = [\"std\"]\nstd = []\nfast = [\"simd\"]\nsimd = []\nunused = []\n",
+    );
+    p.write("lib/src/lib.rs", "");
+    p.write(
+        "app/Cargo.toml",
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
+         [dependencies]\nlib = { path = \"../lib\", features = [\"fast\"] }\n\n\
+         [features]\nturbo = [\"lib/simd\"]\n",
+    );
+    p.write("app/src/main.rs", "fn main() {}\n");
+
+    let out = p.ok(&["features", "lib"]);
+    let line = |f: &str| {
+        out.lines()
+            .find(|l| l.contains(&format!("+ {f} ")) || l.trim_end().ends_with(&format!("+ {f}")))
+            .unwrap_or_else(|| panic!("no `{f}` line in:\n{out}"))
+            .to_string()
+    };
+    assert!(
+        out.contains("lib 0.1.0") && out.contains("4 of 5 features on"),
+        "{out}"
+    );
+    assert!(line("fast").contains("app"), "{out}");
+    assert!(line("simd").contains("feature `fast`"), "{out}");
+    assert!(line("default").contains("default features of app"), "{out}");
+    assert!(line("std").contains("feature `default`"), "{out}");
+    assert!(!out.contains("unused"), "{out}");
+    assert!(p.ok(&["features", "lib", "--all"]).contains("- unused"));
+
+    // Without an argument: what the workspace's packages declare.
+    let out = p.ok(&["features"]);
+    assert!(out.contains("turbo") && out.contains("lib/simd"), "{out}");
+
+    let out = p.rune(&["features", "nope"]);
+    assert!(!out.status.success());
+    assert!(
+        text(&out).contains("`nope` is not in what a build"),
+        "{}",
+        text(&out)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_lockfile_from_another_resolution_is_never_trusted() {
+    // Two `rune` processes at once (an editor's `rune check` and a build),
+    // or a manifest saved while a resolution runs, could leave the lockfile
+    // of one resolution next to the fingerprint of another: the next build
+    // then trusted a lockfile without the new dependency, and rustc said
+    // "undeclared crate". Recreate exactly that pairing.
+    let reg = local_registry(&[("foo", "1.0.0", &[])]);
+    let p = app_with(&reg, "");
+    p.ok(&["build"]);
+    let lock_path = p.path().join("Rune.lock.bin");
+    let old = std::fs::read(&lock_path).unwrap();
+    p.write(
+        "Cargo.toml",
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[dependencies]\nfoo = \"1\"\n",
+    );
+    p.write("src/main.rs", "fn main() { foo::f(); }\n");
+    p.ok(&["build"]);
+    let new = std::fs::read(&lock_path).unwrap();
+    // `RUNELOCK\x03`, a u16 fingerprint length, the fingerprint, the lock.
+    assert_eq!(&new[..9], b"RUNELOCK\x03");
+    let header = |b: &[u8]| 11 + u16::from_le_bytes([b[9], b[10]]) as usize;
+    let mut spliced = new[..header(&new)].to_vec();
+    spliced.extend_from_slice(&old[header(&old)..]);
+    std::fs::write(&lock_path, spliced).unwrap();
+
+    p.write("src/main.rs", "fn main() { foo::f(); foo::f(); }\n");
+    let out = p.ok(&["build"]);
+    assert!(!out.contains("undeclared"), "{out}");
+    // …and the lockfile is whole again.
+    let fixed = std::fs::read(&lock_path).unwrap();
+    assert_eq!(fixed, std::fs::read(&lock_path).unwrap());
+    assert!(p.read("Cargo.lock").contains("name = \"foo\""));
+
+    // A truncated lockfile (an interrupted write before writes were atomic)
+    // is simply resolved again.
+    std::fs::write(&lock_path, &fixed[..fixed.len() / 2]).unwrap();
+    p.write("src/main.rs", "fn main() { foo::f(); }\n");
+    p.ok(&["build"]);
+}
+
+#[test]
+fn workspace_feature_unification_shares_dependency_builds_across_selections() {
+    let p = Project::new();
+    p.write(
+        "Cargo.toml",
+        "[workspace]\nmembers = [\"crates/*\"]\nresolver = \"2\"\n",
+    );
+    p.write(
+        "crates/shared/Cargo.toml",
+        "[package]\nname = \"shared\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[features]\nextra = []\n",
+    );
+    p.write(
+        "crates/shared/src/lib.rs",
+        "pub fn extra() -> bool { cfg!(feature = \"extra\") }\n",
+    );
+    p.write(
+        "crates/a/Cargo.toml",
+        "[package]\nname = \"a\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[dependencies]\nshared = { path = \"../shared\" }\n",
+    );
+    p.write(
+        "crates/a/src/main.rs",
+        "fn main() { println!(\"extra={}\", shared::extra()); }\n",
+    );
+    // `b` asks for the feature — and does not compile, so it must never be
+    // built when only `a` is selected.
+    p.write(
+        "crates/b/Cargo.toml",
+        "[package]\nname = \"b\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[dependencies]\nshared = { path = \"../shared\", features = [\"extra\"] }\n",
+    );
+    p.write("crates/b/src/lib.rs", "this does not compile\n");
+
+    // By default only the selected package's requests count.
+    assert!(p.ok(&["run", "-p", "a"]).contains("extra=false"));
+
+    // Rune's setting: `b`'s request counts, `b` itself is not built.
+    p.write(
+        "Rune.toml",
+        "[build]\nfeature-unification = \"workspace\"\n",
+    );
+    assert!(p.ok(&["run", "-p", "a"]).contains("extra=true"));
+
+    // Cargo's config key does the same.
+    p.write("Rune.toml", "");
+    p.write(
+        ".cargo/config.toml",
+        "[resolver]\nfeature-unification = \"workspace\"\n",
+    );
+    assert!(p.ok(&["run", "-p", "a"]).contains("extra=true"));
+
+    p.write(
+        ".cargo/config.toml",
+        "[resolver]\nfeature-unification = \"everything\"\n",
+    );
+    let bad = p.rune(&["build", "-p", "a"]);
+    assert!(!bad.status.success());
+    assert!(
+        text(&bad).contains("unknown feature unification"),
+        "{}",
+        text(&bad)
+    );
+}
+
+#[test]
+fn pinned_workspaces_survive_cleanup_and_idle_entries_are_compressed() {
+    let p = Project::new();
+    p.write("Cargo.toml", LIB_MANIFEST);
+    p.write(
+        "src/lib.rs",
+        &format!(
+            "pub fn f() -> &'static str {{ \"{}\" }}\n",
+            "x".repeat(20_000)
+        ),
+    );
+    p.ok(&["build"]);
+    let cas = p.home().join("cas");
+    let manifests: Vec<PathBuf> = walkdir::WalkDir::new(cas.join("objects"))
+        .into_iter()
+        .flatten()
+        .filter(|e| e.file_name() == "manifest.json")
+        .map(|e| e.into_path())
+        .collect();
+    assert!(!manifests.is_empty());
+    // Everything was stored and last used 40 days ago.
+    let then = std::time::SystemTime::now() - std::time::Duration::from_secs(40 * 86_400);
+    let age = || {
+        for m in &manifests {
+            let mut json: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(m).unwrap()).unwrap();
+            json["stored_at"] = then
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+                .into();
+            let mut perms = std::fs::metadata(m).unwrap().permissions();
+            #[allow(clippy::permissions_set_readonly_false)]
+            perms.set_readonly(false);
+            std::fs::set_permissions(m, perms).unwrap();
+            std::fs::write(m, json.to_string()).unwrap();
+            std::fs::File::open(m).unwrap().set_modified(then).unwrap();
+        }
+    };
+    age();
+
+    let out = p.ok(&["cas", "pin"]);
+    assert!(out.contains("pinned"), "{out}");
+    assert!(p.ok(&["cas", "pins"]).contains("entries"));
+
+    // Pinned: kept, but compressed.
+    let out = p.ok(&["cas", "gc", "--max-age", "30d", "--compress-idle", "7d"]);
+    assert!(out.contains("0 entries"), "{out}");
+    assert!(out.contains("kept for pinned"), "{out}");
+    assert!(manifests.iter().all(|m| m.exists()));
+    let compressed = |m: &PathBuf| {
+        std::fs::read_dir(m.parent().unwrap())
+            .unwrap()
+            .flatten()
+            .any(|e| e.file_name().to_string_lossy().ends_with(".zst"))
+    };
+    assert!(manifests.iter().any(compressed), "{out}");
+
+    // A fresh build restores from the compressed entries.
+    p.ok(&["clean"]);
+    assert!(p.ok(&["build"]).contains("0 compiled · 1 cached"));
+    assert!(!manifests.iter().any(compressed));
+
+    // Unpinned, old entries go.
+    age();
+    assert!(p.ok(&["cas", "unpin"]).contains("unpinned"));
+    p.ok(&["cas", "gc", "--max-age", "30d"]);
+    assert!(manifests.iter().all(|m| !m.exists()));
+}
+
+#[test]
+fn tests_can_be_scheduled_one_batch_at_a_time_across_binaries() {
+    let p = lib_project();
+    let mut tests = String::new();
+    for i in 0..12 {
+        tests.push_str(&format!(
+            "#[test] fn t{i}() {{ std::thread::sleep(std::time::Duration::from_millis(50)); }}\n"
+        ));
+    }
+    tests.push_str("#[test] #[ignore] fn slow() {}\n");
+    p.write("tests/many.rs", &tests);
+    p.write("tests/other.rs", "#[test] fn alone() {}\n");
+
+    let whole = p.ok(&["test", "--no-doc"]);
+    let split = p.ok(&["test", "--no-doc", "--schedule", "tests"]);
+    // The same totals either way: every test ran exactly once.
+    assert!(split.contains("12 passed, 1 ignored"), "{split}");
+    assert!(split.contains("14 passed · 1 ignored"), "{split}");
+    assert!(whole.contains("14 passed · 1 ignored"), "{whole}");
+
+    // A filter: the rest counts as filtered out, once.
+    let out = p.ok(&["test", "--no-doc", "--schedule", "tests", "t1"]);
+    assert!(out.contains("3 passed"), "{out}"); // t1, t10, t11
+
+    // A failure in one batch fails the binary, and the setting works too.
+    p.write("Rune.toml", "[test]\nschedule = \"tests\"\n");
+    p.write(
+        "tests/other.rs",
+        "#[test] fn alone() {}\n#[test] fn broken() { panic!(\"nope\") }\n",
+    );
+    let out = p.rune(&["test", "--no-doc", "--no-fail-fast"]);
+    assert!(!out.status.success());
+    let t = text(&out);
+    assert!(t.contains("nope") && t.contains("1 failed"), "{t}");
+}
+
+#[cfg(unix)]
+#[test]
+fn resolution_moves_back_from_a_release_whose_dependency_does_not_exist() {
+    // The newest `b` needs a `c` that was never published; Cargo takes the
+    // older `b`.
+    let reg = local_registry(&[
+        ("b", "1.0.0", &[("c", "^1.0")]),
+        ("b", "1.1.0", &[("c", "^2.0")]),
+        ("c", "1.0.0", &[]),
+    ]);
+    let p = app_with(&reg, "b = \"1\"\n");
+    let out = p.ok(&["build"]);
+    assert_eq!(locked(&p), ["app 0.1.0", "b 1.0.0", "c 1.0.0"], "{out}");
+}
+
+#[cfg(unix)]
+#[test]
+fn an_impossible_version_choice_is_explained() {
+    let reg = local_registry(&[
+        ("a", "1.0.0", &[]),
+        ("a", "1.1.0", &[]),
+        ("b", "1.0.0", &[("a", "=1.1.0")]),
+    ]);
+    let p = app_with(&reg, "a = \"=1.0.0\"\nb = \"1\"\n");
+    let out = p.rune(&["build"]);
+    let t = text(&out);
+    // Cargo refuses; Rune explains, then builds with both versions.
+    assert!(t.contains("b 1.0.0 depends on a 1.1.0"), "{t}");
+    assert!(t.contains("side by side"), "{t}");
+    assert!(out.status.success(), "{t}");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn the_sandbox_confines_build_scripts() {
+    let p = lib_project();
+    // Some systems (Ubuntu 23.10+ with AppArmor) do not allow the
+    // namespaces the sandbox needs.
+    let probe = p.rune(&["__sandbox", "--", "true"]);
+    if !probe.status.success() {
+        eprintln!("skipped: {}", text(&probe));
+        return;
+    }
+    let outside = p.home().join("planted");
+    p.write(
+        "build.rs",
+        &format!(
+            r#"
+fn main() {{
+    let out = std::env::var("OUT_DIR").unwrap();
+    std::fs::write(format!("{{out}}/generated.rs"), "pub const OK: u8 = 1;").unwrap();
+    let planted = std::fs::write({outside:?}, "x").is_ok();
+    let net = std::net::TcpStream::connect_timeout(
+        &"1.1.1.1:80".parse().unwrap(),
+        std::time::Duration::from_millis(500),
+    )
+    .map_err(|e| e.kind());
+    println!("cargo::warning=planted={{planted}} net_unreachable={{}}",
+        net.as_ref().err() == Some(&std::io::ErrorKind::NetworkUnreachable));
+}}
+"#
+        ),
+    );
+    p.write(
+        "src/lib.rs",
+        "include!(concat!(env!(\"OUT_DIR\"), \"/generated.rs\"));\n",
+    );
+    // Without the sandbox a build script can write anywhere.
+    let out = p.ok(&["build"]);
+    assert!(out.contains("planted=true"), "{out}");
+    std::fs::remove_file(&outside).unwrap();
+
+    p.write("Rune.toml", "[build]\nsandbox = true\n");
+    let out = p.ok(&["build", "--rebuild-all"]);
+    // OUT_DIR works; nothing else is writable, and there is no network.
+    assert!(out.contains("planted=false"), "{out}");
+    assert!(out.contains("net_unreachable=true"), "{out}");
+    assert!(!outside.exists());
 }

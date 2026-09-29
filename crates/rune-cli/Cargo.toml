@@ -1,10 +1,15 @@
 [package]
 name = "rune-cli"
-description = "The rune command-line interface"
+description = "A fast build system and package manager for Rust, compatible with Cargo projects"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "../../README.md"
+keywords = ["build", "cargo", "package-manager", "cache", "cli"]
+categories = ["development-tools::build-utils", "command-line-utilities"]
 
 [[bin]]
 name = "rune"
@@ -20,6 +25,7 @@ rune-cas.workspace = true
 rune-registry.workspace = true
 rune-resolver.workspace = true
 clap.workspace = true
+clap_complete = "4"
 colored.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -31,6 +37,7 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 anyhow.workspace = true
 indicatif.workspace = true
+console.workspace = true
 semver.workspace = true
 rayon.workspace = true
 tar.workspace = true
@@ -38,9 +45,8 @@ flate2.workspace = true
 glob.workspace = true
 walkdir.workspace = true
 blake3.workspace = true
+reqwest.workspace = true
+tempfile.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
-
-[dev-dependencies]
-tempfile.workspace = true

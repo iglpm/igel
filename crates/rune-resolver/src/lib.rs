@@ -8,6 +8,7 @@ pub mod features;
 pub mod lockfile;
 pub mod patch;
 pub mod resolver;
+mod solver;
 pub mod tree;
 pub mod unit_features;
 

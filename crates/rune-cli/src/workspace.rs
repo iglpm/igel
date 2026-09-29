@@ -84,7 +84,8 @@ impl Workspace {
                 let cwd = std::env::current_dir()?;
                 find_manifest_upwards(&cwd).with_context(|| {
                     format!(
-                        "could not find `Cargo.toml` or `Rune.toml` in `{}` or any parent directory",
+                        "could not find `Cargo.toml` or `Rune.toml` in `{}` or any parent directory \
+                         (`rune new <name>` creates a package, `rune init` makes this directory one)",
                         cwd.display()
                     )
                 })?

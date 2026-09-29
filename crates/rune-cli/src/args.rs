@@ -7,7 +7,9 @@ use std::path::PathBuf;
 #[command(
     name = "rune",
     about = "A fast, next-generation build system & package manager for Rust",
-    version,
+    version = env!("RUNE_VERSION"),
+    styles = crate::help::styles(),
+    disable_help_subcommand = true,
     long_about = "Rune is an alternative build system and package manager for Rust that is \
         significantly faster through content-addressable caching (CAS), \
         parallel scheduling, streaming sparse registry resolution, and rmeta pipelining. \
@@ -15,12 +17,17 @@ use std::path::PathBuf;
 )]
 pub struct Cli {
     /// Coloring of output
-    #[arg(long, global = true, value_parser = ["auto", "always", "never"], default_value = "auto")]
+    #[arg(long, global = true, value_parser = ["auto", "always", "never"], default_value = "auto", hide = true)]
     pub color: String,
 
     /// Override a configuration value (`KEY=VALUE` in TOML, e.g.
     /// `profile.release.lto=true`), or read a configuration file (`PATH.toml`)
-    #[arg(long = "config", global = true, value_name = "KEY=VALUE|PATH")]
+    #[arg(
+        long = "config",
+        global = true,
+        value_name = "KEY=VALUE|PATH",
+        hide = true
+    )]
     pub config_overrides: Vec<String>,
 
     #[command(subcommand)]
@@ -29,17 +36,33 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Commands {
+    /// Show version information
+    #[command(after_help = crate::help::examples(&[("rune version", "the version and commit"), ("rune version -v", "also the host, toolchain and settings in effect")]))]
+    Version {
+        /// Also show the commit, host and toolchain
+        #[arg(short, long)]
+        verbose: bool,
+    },
+    /// Print a shell completion script
+    #[command(after_help = crate::help::examples(&[("rune completions bash > ~/.local/share/bash-completion/completions/rune", "bash"), ("rune completions zsh > ~/.zfunc/_rune", "zsh (with ~/.zfunc in $fpath)"), ("rune completions fish > ~/.config/fish/completions/rune.fish", "fish")]))]
+    Completions {
+        /// bash, zsh, fish, elvish or powershell
+        shell: clap_complete::Shell,
+    },
     /// Compile the current package (and its dependencies)
     #[command(visible_alias = "b")]
+    #[command(after_help = crate::help::examples(&[("rune build", "debug build of the current package"), ("rune build -r", "optimized (release) build"), ("rune build -p app --bin cli", "one binary of one workspace package"), ("rune build --timings", "show what the build waited on")]))]
     Build(BuildArgs),
     /// Type-check the package without producing binaries
     #[command(visible_alias = "c")]
     Check(BuildArgs),
     /// Compile and run the package's tests
     #[command(visible_alias = "t")]
+    #[command(after_help = crate::help::examples(&[("rune test", "every test of the package"), ("rune test parse", "only tests whose name contains \"parse\""), ("rune test --workspace --retries 2", "the whole workspace, retrying flaky tests"), ("rune test -- --nocapture", "pass arguments to the test binaries")]))]
     Test(TestArgs),
     /// Compile and run a binary or example
     #[command(visible_alias = "r")]
+    #[command(after_help = crate::help::examples(&[("rune run", "build and run the package's binary"), ("rune run --bin cli -- --help", "run one binary, with arguments of its own"), ("rune run --example demo -r", "an optimized example")]))]
     Run(RunArgs),
     /// Compile and run the package's benchmarks
     Bench(TestArgs),
@@ -62,6 +85,7 @@ pub enum Commands {
     /// Create a new package in an existing directory
     Init(InitArgs),
     /// Add a dependency to the manifest and resolve lockfiles
+    #[command(after_help = crate::help::examples(&[("rune add serde -F derive", "with a feature"), ("rune add tokio@1.40", "a version requirement"), ("rune add --dev insta", "a dev-dependency"), ("rune add mylib --path ../mylib", "a local package")]))]
     Add(AddArgs),
     /// Remove a dependency from the manifest
     #[command(visible_alias = "rm")]
@@ -78,9 +102,13 @@ pub enum Commands {
     /// Write a software bill of materials (CycloneDX or SPDX JSON)
     Sbom(SbomArgs),
     /// Display the resolved dependency tree
+    #[command(after_help = crate::help::examples(&[("rune tree", "the whole dependency tree"), ("rune tree --depth 1", "direct dependencies only"), ("rune tree -i syn", "what depends on syn"), ("rune tree -e features -i serde", "why each of serde's features is on")]))]
     Tree(TreeArgs),
     /// Draw the package graph (or a build's units) as Graphviz DOT, Mermaid or JSON
     Graph(GraphArgs),
+    /// Show a package's features: which are on, and who turned each on
+    #[command(after_help = crate::help::examples(&[("rune features", "the workspace's features, and what each enables"), ("rune features serde", "which of serde's features are on, and who turned each on"), ("rune features tokio --all", "every feature, the ones that are off included")]))]
+    Features(FeaturesArgs),
     /// Explain why a package is in the dependency graph
     Why(WhyArgs),
     /// Download every dependency without building
@@ -108,6 +136,7 @@ pub enum Commands {
     /// Manage a crate's owners on the registry
     Owner(OwnerArgs),
     /// Search the registry for crates
+    #[command(after_help = crate::help::examples(&[("rune search http client", "crates matching all the words"), ("rune search serde --limit 50", "more results (scroll with the arrow keys, search with /)")]))]
     Search(SearchArgs),
     /// Show a crate's description, features and dependencies
     Info(InfoArgs),
@@ -122,6 +151,7 @@ pub enum Commands {
     /// Check the toolchain, machine and project for what slows builds down
     Doctor,
     /// Re-run commands whenever the project's files change
+    #[command(after_help = crate::help::examples(&[("rune watch", "check on every change"), ("rune watch -x test", "run the tests on every change"), ("rune watch -x check -x \"test --lib\"", "several commands, one after another")]))]
     Watch(WatchArgs),
     /// List the workspace packages a change can influence (for selective CI)
     Affected(AffectedArgs),
@@ -136,93 +166,124 @@ pub enum Commands {
     /// Manage binary and standard lockfiles
     #[command(subcommand)]
     Lockfile(LockfileCommands),
+    /// Manage Rune itself (updates and uninstallation)
+    #[command(name = "self", subcommand)]
+    Self_(SelfCommands),
+    /// Update Rune to the latest release (alias for `rune self update`)
+    #[command(name = "self-update", hide = true)]
+    SelfUpdate(SelfUpdateArgs),
 }
 
 /// Flags shared by every command that resolves and builds.
 #[derive(Args, Debug, Clone, Default)]
 pub struct CommonArgs {
-    /// Path to the manifest (Cargo.toml or Rune.toml), or a directory holding one
-    #[arg(long, value_name = "PATH")]
-    pub manifest_path: Option<PathBuf>,
-
     /// Package to operate on (repeatable)
-    #[arg(short = 'p', long = "package", value_name = "SPEC")]
+    #[arg(
+        short = 'p',
+        long = "package",
+        value_name = "SPEC",
+        help_heading = "Package Selection"
+    )]
     pub package: Vec<String>,
 
     /// Operate on every workspace member
-    #[arg(long, alias = "all")]
+    #[arg(long, alias = "all", help_heading = "Package Selection")]
     pub workspace: bool,
 
     /// Exclude a package from --workspace (repeatable)
-    #[arg(long, value_name = "SPEC")]
+    #[arg(long, value_name = "SPEC", help_heading = "Package Selection")]
     pub exclude: Vec<String>,
 
     /// Features to activate (comma or space separated, repeatable)
-    #[arg(short = 'F', long, value_name = "FEATURES")]
+    #[arg(
+        short = 'F',
+        long,
+        value_name = "FEATURES",
+        help_heading = "Feature Selection"
+    )]
     pub features: Vec<String>,
 
     /// Activate every feature of the selected packages
-    #[arg(long)]
+    #[arg(long, help_heading = "Feature Selection")]
     pub all_features: bool,
 
     /// Do not activate the `default` feature
-    #[arg(long)]
+    #[arg(long, help_heading = "Feature Selection")]
     pub no_default_features: bool,
 
     /// Build with the optimized `release` profile
-    #[arg(short = 'r', long)]
+    #[arg(short = 'r', long, help_heading = "Compilation Options")]
     pub release: bool,
 
     /// Build with the named profile
-    #[arg(long, value_name = "NAME", conflicts_with = "release")]
+    #[arg(
+        long,
+        value_name = "NAME",
+        conflicts_with = "release",
+        help_heading = "Compilation Options"
+    )]
     pub profile: Option<String>,
 
     /// Ignore `rust-version` specifications in packages
-    #[arg(long)]
+    #[arg(long, help_heading = "Compilation Options")]
     pub ignore_rust_version: bool,
 
     /// Build for the given target triple
-    #[arg(long, value_name = "TRIPLE")]
+    #[arg(long, value_name = "TRIPLE", help_heading = "Compilation Options")]
     pub target: Option<String>,
 
     /// Number of parallel jobs (default: number of CPUs)
-    #[arg(short = 'j', long, value_name = "N")]
+    #[arg(
+        short = 'j',
+        long,
+        value_name = "N",
+        help_heading = "Compilation Options"
+    )]
     pub jobs: Option<usize>,
 
     /// Directory for build output
-    #[arg(long, value_name = "DIR")]
+    #[arg(long, value_name = "DIR", help_heading = "Compilation Options")]
     pub target_dir: Option<PathBuf>,
 
     /// Show verbose output
-    #[arg(short = 'v', long)]
+    #[arg(short = 'v', long, help_heading = "Output")]
     pub verbose: bool,
 
     /// Suppress progress and summary output
-    #[arg(short = 'q', long)]
+    #[arg(short = 'q', long, help_heading = "Output")]
     pub quiet: bool,
 
+    /// Path to the manifest (Cargo.toml or Rune.toml), or a directory holding one
+    #[arg(long, value_name = "PATH", help_heading = "Manifest")]
+    pub manifest_path: Option<PathBuf>,
+
     /// Fail if the lockfile would need to change
-    #[arg(long)]
+    #[arg(long, help_heading = "Manifest")]
     pub locked: bool,
 
     /// Use only locally cached registry data; never touch the network
-    #[arg(long)]
+    #[arg(long, help_heading = "Manifest")]
     pub offline: bool,
 
     /// Equivalent to --locked --offline
-    #[arg(long)]
+    #[arg(long, help_heading = "Manifest")]
     pub frozen: bool,
 
     /// Print how long each phase of the build takes and the chain of crates
     /// that determined its length; write an HTML timeline to
     /// `.rune/timings/rune-timing.html` and a Chrome trace to
     /// `.rune/fingerprints/trace.json`
-    #[arg(long)]
+    #[arg(long, help_heading = "Compilation Options")]
     pub timings: bool,
 
     /// Output format of compiler messages: `human` (default) or `json` — one
     /// JSON object per line on stdout, in Cargo's format
-    #[arg(long, value_name = "FMT", default_value = "human")]
+    #[arg(
+        long,
+        value_name = "FMT",
+        default_value = "human",
+        help_heading = "Output"
+    )]
     pub message_format: String,
 
     /// Recompile everything even if cached (`--rebuild-all=false` to force
@@ -233,7 +294,7 @@ pub struct CommonArgs {
         num_args = 0..=1,
         default_missing_value = "true",
         require_equals = true
-    )]
+    , help_heading = "Compilation Options")]
     pub rebuild_all: Option<bool>,
 }
 
@@ -241,34 +302,34 @@ pub struct CommonArgs {
 #[derive(Args, Debug, Clone, Default)]
 pub struct TargetArgs {
     /// Only the library
-    #[arg(long)]
+    #[arg(long, help_heading = "Target Selection")]
     pub lib: bool,
     /// All binaries
-    #[arg(long)]
+    #[arg(long, help_heading = "Target Selection")]
     pub bins: bool,
     /// The named binary (repeatable)
-    #[arg(long, value_name = "NAME")]
+    #[arg(long, value_name = "NAME", help_heading = "Target Selection")]
     pub bin: Vec<String>,
     /// All examples
-    #[arg(long)]
+    #[arg(long, help_heading = "Target Selection")]
     pub examples: bool,
     /// The named example (repeatable)
-    #[arg(long, value_name = "NAME")]
+    #[arg(long, value_name = "NAME", help_heading = "Target Selection")]
     pub example: Vec<String>,
     /// All integration tests
-    #[arg(long)]
+    #[arg(long, help_heading = "Target Selection")]
     pub tests: bool,
     /// The named integration test (repeatable)
-    #[arg(long, value_name = "NAME")]
+    #[arg(long, value_name = "NAME", help_heading = "Target Selection")]
     pub test: Vec<String>,
     /// All benchmarks
-    #[arg(long)]
+    #[arg(long, help_heading = "Target Selection")]
     pub benches: bool,
     /// The named benchmark (repeatable)
-    #[arg(long, value_name = "NAME")]
+    #[arg(long, value_name = "NAME", help_heading = "Target Selection")]
     pub bench: Vec<String>,
     /// Every target
-    #[arg(long)]
+    #[arg(long, help_heading = "Target Selection")]
     pub all_targets: bool,
 }
 
@@ -342,6 +403,12 @@ pub struct TestArgs {
     /// Also write the results as JUnit XML (for CI test reports)
     #[arg(long, value_name = "PATH")]
     pub junit: Option<PathBuf>,
+
+    /// `tests`: split test binaries into batches of tests scheduled across
+    /// all cores, each batch its own process; `binaries`: one process per
+    /// binary (default: `test.schedule`, else `binaries`)
+    #[arg(long, value_name = "HOW", value_parser = ["binaries", "tests"])]
+    pub schedule: Option<String>,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -791,6 +858,20 @@ impl CommonArgs {
 }
 
 #[derive(Args, Debug, Clone)]
+pub struct FeaturesArgs {
+    #[command(flatten)]
+    pub manifest: ManifestArgs,
+    /// A dependency (`name`) to explain; the workspace's packages without
+    pub package: Option<String>,
+    /// Also list the features that are off
+    #[arg(long, short = 'a')]
+    pub all: bool,
+    /// The platform the build is for (default: this machine)
+    #[arg(long, value_name = "TRIPLE")]
+    pub target: Option<String>,
+}
+
+#[derive(Args, Debug, Clone)]
 pub struct WhyArgs {
     #[command(flatten)]
     pub manifest: ManifestArgs,
@@ -934,6 +1015,12 @@ pub enum CasCommands {
     Stats,
     /// Garbage collect the CAS store by size or age
     Gc(CasGcArgs),
+    /// Keep what this workspace's builds need through every cleanup
+    Pin(Box<CasPinArgs>),
+    /// Stop keeping this workspace's entries
+    Unpin,
+    /// List pinned workspaces
+    Pins,
     /// Show which packages take the space, and how much has gone unused
     Du(CasDuArgs),
     /// Write the store entries a build of the workspace needs into one file
@@ -976,6 +1063,19 @@ pub struct CasGcArgs {
     /// seconds)
     #[arg(long, value_name = "DURATION", value_parser = parse_age)]
     pub max_age: Option<u64>,
+
+    /// Compress (zstd) entries no build has used for this long
+    #[arg(long, value_name = "DURATION", value_parser = parse_age)]
+    pub compress_idle: Option<u64>,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct CasPinArgs {
+    #[command(flatten)]
+    pub build: BuildArgs,
+    /// Which commands' entries to keep (repeatable): `build`, `check`, `test`
+    #[arg(long = "for", value_name = "COMMAND", default_values_t = ["build".to_string(), "check".to_string(), "test".to_string()], value_parser = ["build", "check", "test"])]
+    pub for_commands: Vec<String>,
 }
 
 fn parse_age(s: &str) -> Result<u64, String> {
@@ -996,6 +1096,60 @@ pub enum LockfileCommands {
     /// Migrate from Cargo.lock to Rune binary lockfile
     Migrate,
 }
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum SelfCommands {
+    /// Update Rune to the latest (or a specified) release
+    #[command(after_help = crate::help::examples(&[
+        ("rune self update", "update to the latest release"),
+        ("rune self update --check", "check for newer releases without installing"),
+        ("rune self update --version v0.1.0", "install a specific release"),
+        ("rune self update --force", "reinstall even if already up to date"),
+    ]))]
+    Update(SelfUpdateArgs),
+
+    /// Uninstall Rune from the system
+    #[command(after_help = crate::help::examples(&[
+        ("rune self uninstall", "remove the rune binary"),
+        ("rune self uninstall --purge", "also remove cache and configuration (~/.rune)"),
+    ]))]
+    Uninstall(SelfUninstallArgs),
+}
+
+#[derive(Args, Debug, Clone, Default)]
+pub struct SelfUpdateArgs {
+    /// Update to a specific release version (e.g. `v0.2.0` or `0.2.0`)
+    #[arg(short = 'v', long)]
+    pub version: Option<String>,
+
+    /// Check if a newer version is available without installing it
+    #[arg(long)]
+    pub check: bool,
+
+    /// Force reinstallation even if already on the latest version
+    #[arg(short, long)]
+    pub force: bool,
+
+    /// Path to the binary to replace (defaults to currently executing binary)
+    #[arg(long)]
+    pub to: Option<PathBuf>,
+
+    /// GitHub repository to download from (defaults to `runepm/rune` or $RUNE_REPOSITORY)
+    #[arg(long)]
+    pub repo: Option<String>,
+}
+
+#[derive(Args, Debug, Clone, Default)]
+pub struct SelfUninstallArgs {
+    /// Also remove global cache and configuration (`~/.rune` or $RUNE_HOME)
+    #[arg(long)]
+    pub purge: bool,
+
+    /// Skip confirmation prompt
+    #[arg(short = 'y', long)]
+    pub yes: bool,
+}
+
 
 #[cfg(test)]
 mod tests {
@@ -1072,6 +1226,45 @@ mod tests {
     fn short_aliases() {
         for alias in ["b", "c", "t", "r"] {
             assert!(Cli::try_parse_from(["rune", alias]).is_ok(), "{alias}");
+        }
+    }
+
+    #[test]
+    fn self_commands_parse() {
+        let cli = Cli::try_parse_from(["rune", "self", "update"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Self_(SelfCommands::Update(_))
+        ));
+
+        let cli = Cli::try_parse_from(["rune", "self", "update", "--check"]).unwrap();
+        if let Commands::Self_(SelfCommands::Update(args)) = cli.command {
+            assert!(args.check);
+        } else {
+            panic!();
+        }
+
+        let cli = Cli::try_parse_from(["rune", "self", "update", "-v", "v0.2.0", "--force"]).unwrap();
+        if let Commands::Self_(SelfCommands::Update(args)) = cli.command {
+            assert_eq!(args.version.as_deref(), Some("v0.2.0"));
+            assert!(args.force);
+        } else {
+            panic!();
+        }
+
+        let cli = Cli::try_parse_from(["rune", "self-update", "--check"]).unwrap();
+        if let Commands::SelfUpdate(args) = cli.command {
+            assert!(args.check);
+        } else {
+            panic!();
+        }
+
+        let cli = Cli::try_parse_from(["rune", "self", "uninstall", "--purge", "-y"]).unwrap();
+        if let Commands::Self_(SelfCommands::Uninstall(args)) = cli.command {
+            assert!(args.purge);
+            assert!(args.yes);
+        } else {
+            panic!();
         }
     }
 }

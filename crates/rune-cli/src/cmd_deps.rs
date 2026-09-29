@@ -6,7 +6,7 @@ use colored::Colorize;
 use rune_common::settings::Settings;
 use rune_resolver::lockfile::LockfileManager;
 use rune_resolver::{TreeOptions, render_tree, trace_why};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use toml_edit::{Array, DocumentMut, Item, Table, Value};
 
@@ -229,13 +229,34 @@ pub fn add(args: AddArgs) -> Result<()> {
             inline.insert("workspace", Value::from(true));
             version_shown = "from the workspace".to_string();
         } else {
-            ui::action(
-                "updating",
-                format!("`{name}` from the {} index", defs.name_of(&index_url)),
+            let looking = ui::Activity::start(
+                "looking up",
+                format!("`{name}` in the {} index", defs.name_of(&index_url)),
             );
-            let index = client
-                .refresh_crate(&name)
-                .with_context(|| format!("could not find `{name}` in the registry"))?;
+            let index = match client.refresh_crate(&name) {
+                Ok(index) => index,
+                Err(rune_registry::index::IndexError::CrateNotFound(_)) => {
+                    looking.clear();
+                    let registry = defs.name_of(&index_url);
+                    let similar = similar_crates(&index_url, &name);
+                    if similar.is_empty() {
+                        bail!("no crate named `{name}` in the {registry} registry");
+                    }
+                    bail!(
+                        "no crate named `{name}` in the {registry} registry; did you mean {}?",
+                        similar
+                            .iter()
+                            .map(|s| format!("`{s}`"))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    );
+                }
+                Err(e) => {
+                    return Err(anyhow::Error::new(e)
+                        .context(format!("could not look up `{name}` in the registry")));
+                }
+            };
+            looking.clear();
             let requirement = match ver_req {
                 Some(v) => v,
                 None => {
@@ -457,7 +478,6 @@ pub fn update(args: UpdateArgs) -> Result<()> {
         bail!("`rune update` needs the network to look for new releases (drop --offline)");
     }
     let before = LockfileManager::load_fast(ws.root());
-    ui::action("updating", "crates.io index");
 
     // `NAME` or `NAME@VERSION` (to pick one of several locked versions),
     // positional or with `-p` as in older Cargo.
@@ -595,7 +615,10 @@ pub fn fetch(args: ManifestArgs) -> Result<()> {
     let (resolved, lock) = graph::resolve_fresh(&ws, offline, existing.as_ref(), false)?;
     graph::store_resolution(&ws, &lock)?;
     let n = graph::download_all(&resolved, offline)?;
-    ui::action("fetched", format!("{n} crates"));
+    ui::summary(format!(
+        "{} available offline",
+        ui::plural(n, "registry crate")
+    ));
     Ok(())
 }
 
@@ -687,6 +710,279 @@ pub fn tree(args: TreeArgs) -> Result<()> {
     Ok(())
 }
 
+/// `rune features [DEP]`: a package's features, which are on in a build on
+/// this platform, and what turned each on.
+pub fn features(args: crate::args::FeaturesArgs) -> Result<()> {
+    let (ws, offline) = load(&args.manifest)?;
+    let target = match args.target.as_deref() {
+        Some(t) => t.to_string(),
+        None => rune_common::toolchain::global().host.to_string(),
+    };
+    let mut resolved = graph::tree_view(&ws, offline, Some(&target))?;
+    let members: Vec<String> = ws.members.iter().map(|m| m.id()).collect();
+    // The workspace's own feature tables come from their manifests.
+    for m in &ws.members {
+        if let Some(p) = resolved.packages.get_mut(&m.id())
+            && p.declared_features.is_empty()
+        {
+            p.declared_features = m
+                .manifest
+                .features
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+        }
+    }
+
+    let Some(wanted) = &args.package else {
+        // The workspace's own packages: what they declare.
+        let (with, without): (Vec<_>, Vec<_>) = ws
+            .members
+            .iter()
+            .partition(|m| !m.manifest.features.is_empty());
+        for (i, m) in with.iter().enumerate() {
+            if i > 0 {
+                ui::out("");
+            }
+            let declared: BTreeMap<&String, &Vec<String>> = m.manifest.features.iter().collect();
+            let default: BTreeSet<&str> = declared
+                .get(&"default".to_string())
+                .map(|d| d.iter().map(String::as_str).collect())
+                .unwrap_or_default();
+            ui::out(format!(
+                "{} {}  {}",
+                ui::brand(&m.name),
+                m.version.to_string().dimmed(),
+                if declared.is_empty() {
+                    "no features".dimmed().to_string()
+                } else {
+                    format!(
+                        "{}, {} on by default",
+                        ui::plural(declared.len(), "feature"),
+                        default.len()
+                    )
+                    .dimmed()
+                    .to_string()
+                }
+            ));
+            let w = declared.keys().map(|k| k.len()).max().unwrap_or(0);
+            for (name, enables) in &declared {
+                let on = name.as_str() == "default" || default.contains(name.as_str());
+                let line = format!(
+                    "  {} {}  {}",
+                    if on {
+                        "+".green().bold().to_string()
+                    } else {
+                        " ".into()
+                    },
+                    if on {
+                        format!("{name:<w$}").bold().to_string()
+                    } else {
+                        format!("{name:<w$}")
+                    },
+                    enables.join(", ").dimmed()
+                );
+                ui::out(line.trim_end());
+            }
+        }
+        if !without.is_empty() {
+            if !with.is_empty() {
+                ui::out("");
+            }
+            let names: Vec<String> = without.iter().map(|m| m.name.clone()).collect();
+            ui::out(format!(
+                "{} {}",
+                names.join(", "),
+                if names.len() == 1 {
+                    "declares no features"
+                } else {
+                    "declare no features"
+                }
+                .dimmed()
+            ));
+        }
+        return Ok(());
+    };
+
+    let found: Vec<&rune_resolver::ResolvedPackage> = resolved
+        .packages
+        .values()
+        .filter(|p| p.name == *wanted)
+        .collect();
+    if found.is_empty() {
+        bail!(
+            "`{wanted}` is not in what a build for {target} uses (see `rune tree`, or `rune why {wanted}`)"
+        );
+    }
+    for (n, pkg) in found.iter().enumerate() {
+        if n > 0 {
+            ui::out("");
+        }
+        let on: BTreeSet<&str> = pkg.features.iter().map(String::as_str).collect();
+        let mut all: BTreeSet<&str> = pkg.declared_features.keys().map(String::as_str).collect();
+        all.extend(on.iter().copied());
+        // Optional dependencies are features too, when nothing names them
+        // with `dep:`.
+        ui::out(format!(
+            "{} {}  {}",
+            ui::brand(&pkg.name),
+            pkg.version.to_string().dimmed(),
+            format!("{} of {} features on", on.len(), all.len()).dimmed()
+        ));
+        let w = all.iter().map(|f| f.len()).max().unwrap_or(0);
+        for f in &all {
+            let is_on = on.contains(f);
+            if !is_on && !args.all {
+                continue;
+            }
+            let reasons = if is_on {
+                who_enables(&resolved, pkg, f, &members)
+            } else {
+                Vec::new()
+            };
+            let mark = if is_on {
+                "+".green().bold().to_string()
+            } else {
+                "-".dimmed().to_string()
+            };
+            let name = if is_on {
+                format!("{f:<w$}").bold().to_string()
+            } else {
+                format!("{f:<w$}").dimmed().to_string()
+            };
+            let why = if reasons.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "{} {}",
+                    "←".dimmed(),
+                    reasons.join(&", ".dimmed().to_string())
+                )
+            };
+            ui::out(format!("  {mark} {name}  {why}").trim_end());
+        }
+        let off = all.len() - on.len();
+        if off > 0 && !args.all {
+            ui::out(format!(
+                "  {}",
+                format!("{} off (`--all` lists them)", off).dimmed()
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// What turns on feature `f` of `pkg` in `graph`, as display fragments:
+/// another feature of the package itself, dependents that ask for it, the
+/// dependents' default features, or a dependent's own feature (`serde/derive`).
+fn who_enables(
+    graph: &rune_resolver::ResolvedGraph,
+    pkg: &rune_resolver::ResolvedPackage,
+    f: &str,
+    members: &[String],
+) -> Vec<String> {
+    let label = |p: &rune_resolver::ResolvedPackage| -> String {
+        let id = format!("{} {}", p.name, p.version);
+        if members.contains(&id) {
+            p.name.bold().to_string()
+        } else {
+            p.name.clone()
+        }
+    };
+    let pkg_on: BTreeSet<&str> = pkg.features.iter().map(String::as_str).collect();
+    let mut internal: Vec<String> = Vec::new();
+    let mut declared: Vec<String> = Vec::new();
+    let mut defaults: Vec<String> = Vec::new();
+    let mut via_feature: Vec<String> = Vec::new();
+    // Inside the package: another feature that lists this one.
+    let mut own: Vec<(&String, &Vec<String>)> = pkg.declared_features.iter().collect();
+    own.sort();
+    for (g, values) in own {
+        if g != f && pkg_on.contains(g.as_str()) && values.iter().any(|v| v == f) {
+            internal.push(format!("feature `{g}`"));
+        }
+    }
+    let mut parents: Vec<&rune_resolver::ResolvedPackage> = graph.packages.values().collect();
+    parents.sort_by(|a, b| (&a.name, &a.version).cmp(&(&b.name, &b.version)));
+    for parent in parents {
+        let parent_on: BTreeSet<&str> = parent.features.iter().map(String::as_str).collect();
+        for dep in &parent.dependencies {
+            let real = dep.package.as_deref().unwrap_or(&dep.name);
+            if real != pkg.name
+                || !semver::VersionReq::parse(&dep.req).is_ok_and(|r| r.matches(&pkg.version))
+            {
+                continue;
+            }
+            // An optional dependency the parent does not turn on adds nothing.
+            let active = !dep.optional
+                || parent_on.contains(dep.name.as_str())
+                || parent.declared_features.iter().any(|(g, vals)| {
+                    parent_on.contains(g.as_str())
+                        && vals.iter().any(|v| v == &format!("dep:{}", dep.name))
+                });
+            if !active {
+                continue;
+            }
+            let who = match dep.kind {
+                rune_manifest::DependencyKind::Build => format!("{} (build)", label(parent)),
+                rune_manifest::DependencyKind::Dev => format!("{} (dev)", label(parent)),
+                _ => label(parent),
+            };
+            if dep.features.iter().any(|x| x == f) {
+                declared.push(who.clone());
+            }
+            if f == "default" && dep.default_features {
+                defaults.push(who.clone());
+            }
+            let mut parent_features: Vec<(&String, &Vec<String>)> =
+                parent.declared_features.iter().collect();
+            parent_features.sort();
+            for (g, vals) in parent_features {
+                if !parent_on.contains(g.as_str()) {
+                    continue;
+                }
+                let hit = vals.iter().any(|v| {
+                    v.split_once('/')
+                        .is_some_and(|(d, feat)| feat == f && d.trim_end_matches('?') == dep.name)
+                });
+                if hit {
+                    via_feature.push(format!(
+                        "{} {}",
+                        label(parent),
+                        format!("feature `{g}`").dimmed()
+                    ));
+                }
+            }
+        }
+    }
+    let list = |mut names: Vec<String>| -> String {
+        names.dedup();
+        const SHOWN: usize = 3;
+        let more = names.len().saturating_sub(SHOWN);
+        names.truncate(SHOWN);
+        let mut s = names.join(", ");
+        if more > 0 {
+            s.push_str(&format!(" +{more}").dimmed().to_string());
+        }
+        s
+    };
+    let mut out = internal;
+    if !declared.is_empty() {
+        out.push(list(declared));
+    }
+    if !defaults.is_empty() {
+        out.push(format!(
+            "{} {}",
+            "default features of".dimmed(),
+            list(defaults)
+        ));
+    }
+    if !via_feature.is_empty() {
+        out.push(list(via_feature));
+    }
+    out
+}
+
 pub fn why(args: WhyArgs) -> Result<()> {
     let (ws, offline) = load(&args.manifest)?;
     let resolved = resolved_for_inspection(&ws, offline)?;
@@ -698,9 +994,36 @@ pub fn why(args: WhyArgs) -> Result<()> {
             args.package
         ));
     } else {
-        println!("{} is required by:", args.package.bold());
+        ui::out(format!(
+            "{} {}",
+            ui::brand(&args.package),
+            format!(
+                "is in the graph through {}:",
+                ui::plural(chains.len(), "path")
+            )
+            .dimmed()
+        ));
+        let arrow = " → ".dimmed().to_string();
         for chain in chains {
-            println!("  {}", chain.join(" -> ".dimmed().to_string().as_str()));
+            let last = chain.len().saturating_sub(1);
+            let steps: Vec<String> = chain
+                .iter()
+                .enumerate()
+                .map(|(i, step)| {
+                    let (name, version) = step.rsplit_once(' ').unwrap_or((step, ""));
+                    let name = if i == last {
+                        ui::brand(name)
+                    } else {
+                        name.to_string()
+                    };
+                    if version.is_empty() {
+                        name
+                    } else {
+                        format!("{name} {}", version.dimmed())
+                    }
+                })
+                .collect();
+            ui::out(format!("  {}", steps.join(&arrow)));
         }
     }
     Ok(())
@@ -978,5 +1301,71 @@ pub fn verify_project(args: ManifestArgs) -> Result<()> {
             println!("{}", serde_json::json!({ "invalid": why.trim() }));
             std::process::exit(1);
         }
+    }
+}
+
+/// Published crates whose names are close to `name` (a typo, `_` for `-`),
+/// from a registry search; empty when the registry has no search or is
+/// unreachable.
+fn similar_crates(index_url: &str, name: &str) -> Vec<String> {
+    let Ok(api) = rune_registry::api::RegistryApi::for_index(index_url) else {
+        return Vec::new();
+    };
+    let wanted = name.to_lowercase().replace('_', "-");
+    let limit = (wanted.len() / 3).clamp(1, 3);
+    // Search is by words, so a typo finds nothing: try the name cut short
+    // too (`serdee` → `serde`, `serd`).
+    let chars: Vec<char> = name.chars().collect();
+    let mut queries = vec![name.to_string()];
+    for cut in 1..=2 {
+        if chars.len() > cut + 2 {
+            queries.push(chars[..chars.len() - cut].iter().collect());
+        }
+    }
+    let mut close: Vec<(usize, String)> = Vec::new();
+    for q in queries {
+        let Ok((hits, _)) = api.search(&q, 20) else {
+            return Vec::new();
+        };
+        for h in hits {
+            let d = edit_distance(&wanted, &h.name.to_lowercase().replace('_', "-"));
+            if d <= limit && !close.iter().any(|(_, n)| *n == h.name) {
+                close.push((d, h.name));
+            }
+        }
+        if close.iter().any(|(d, _)| *d <= 1) {
+            break;
+        }
+    }
+    close.sort();
+    close.into_iter().take(3).map(|(_, n)| n).collect()
+}
+
+/// Levenshtein distance.
+fn edit_distance(a: &str, b: &str) -> usize {
+    let b: Vec<char> = b.chars().collect();
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    for (i, ca) in a.chars().enumerate() {
+        let mut cur = vec![i + 1];
+        for (j, cb) in b.iter().enumerate() {
+            let cost = usize::from(ca != *cb);
+            cur.push((prev[j] + cost).min(prev[j + 1] + 1).min(cur[j] + 1));
+        }
+        prev = cur;
+    }
+    prev[b.len()]
+}
+
+#[cfg(test)]
+mod similar_tests {
+    use super::edit_distance;
+
+    #[test]
+    fn typos_are_close() {
+        assert_eq!(edit_distance("serdee", "serde"), 1);
+        assert_eq!(edit_distance("anyhw", "anyhow"), 1);
+        assert_eq!(edit_distance("reqwset", "reqwest"), 2);
+        assert_eq!(edit_distance("", "abc"), 3);
+        assert_eq!(edit_distance("tokio", "tokio"), 0);
     }
 }

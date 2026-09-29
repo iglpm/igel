@@ -48,6 +48,7 @@ impl RustcInvoker {
         let (artifacts, diagnostics) = parse_rustc_output(&stderr_raw);
 
         Ok(CompilationResult {
+            peak_memory: None,
             success: output.status.success(),
             exit_code: output.status.code().unwrap_or(1),
             artifacts,
@@ -124,7 +125,7 @@ impl RustcInvoker {
             line.clear();
         }
 
-        let status = child.wait()?;
+        let (status, peak_memory) = wait_with_peak_memory(&mut child)?;
 
         Ok(CompilationResult {
             success: status.success(),
@@ -132,6 +133,48 @@ impl RustcInvoker {
             artifacts,
             diagnostics,
             stderr_raw,
+            peak_memory,
         })
     }
+}
+
+/// Waits for `child` and returns its exit status and peak memory: `wait4`
+/// hands back the process's resource usage with its status, which the
+/// scheduler uses to start only as many compilers as memory allows.
+#[cfg(unix)]
+fn wait_with_peak_memory(
+    child: &mut std::process::Child,
+) -> std::io::Result<(std::process::ExitStatus, Option<u64>)> {
+    use std::os::unix::process::ExitStatusExt;
+    let pid = child.id() as libc::pid_t;
+    let mut status: libc::c_int = 0;
+    // SAFETY: an all-zero `rusage` is a valid value to be overwritten.
+    let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+    loop {
+        // SAFETY: `pid` is our own unreaped child; the pointers are valid.
+        let r = unsafe { libc::wait4(pid, &mut status, 0, &mut usage) };
+        if r == pid {
+            break;
+        }
+        let err = std::io::Error::last_os_error();
+        if err.kind() != std::io::ErrorKind::Interrupted {
+            // Reaped elsewhere (should not happen): fall back to std.
+            return child.wait().map(|s| (s, None));
+        }
+    }
+    // Linux reports kilobytes, macOS bytes.
+    let max = usage.ru_maxrss.max(0) as u64;
+    let bytes = if cfg!(target_os = "macos") {
+        max
+    } else {
+        max * 1024
+    };
+    Ok((std::process::ExitStatus::from_raw(status), Some(bytes)))
+}
+
+#[cfg(not(unix))]
+fn wait_with_peak_memory(
+    child: &mut std::process::Child,
+) -> std::io::Result<(std::process::ExitStatus, Option<u64>)> {
+    child.wait().map(|s| (s, None))
 }

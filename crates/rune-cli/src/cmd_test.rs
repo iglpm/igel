@@ -193,6 +193,8 @@ pub fn run(args: TestArgs, mode: Mode) -> Result<()> {
             exe: PathBuf,
             member: usize,
             harness: bool,
+            /// `--schedule tests`: only these tests, one batch of the binary.
+            batch: Option<Batch>,
         },
         Doc {
             order: usize,
@@ -235,7 +237,20 @@ pub fn run(args: TestArgs, mode: Mode) -> Result<()> {
         .unwrap_or_default(),
     );
 
-    let runner_count = sess.jobs.clamp(1, 16);
+    let runner_count = sess.jobs.clamp(1, 64);
+    // `--schedule tests`: binaries are split into batches of tests, which the
+    // runners take from one queue. How many batches each binary was split
+    // into, for the printer to put its results back together.
+    let schedule = args
+        .schedule
+        .clone()
+        .or_else(|| sess.ws.config.settings.test_schedule())
+        .unwrap_or_else(|| "binaries".into());
+    if !matches!(schedule.as_str(), "binaries" | "tests") {
+        anyhow::bail!("unknown test schedule `{schedule}`: expected `binaries` or `tests`");
+    }
+    let split = schedule == "tests" && !bench && splittable(&args.test_args);
+    let parts_of: std::sync::Mutex<HashMap<usize, usize>> = Default::default();
     let build_result = std::thread::scope(|scope| -> Result<_> {
         // Runner threads.
         for _ in 0..runner_count {
@@ -286,7 +301,13 @@ pub fn run(args: TestArgs, mode: Mode) -> Result<()> {
                             exe,
                             member,
                             harness,
+                            batch,
                         } => {
+                            let run_args: Vec<String> = match &batch {
+                                Some(b) => batch_args(args_ref, &b.tests),
+                                None => libtest_args.clone(),
+                            };
+                            let libtest_args = &run_args;
                             let member = &sess.ws.members[member];
                             if let (Some(cas), true) = (test_cas, harness) {
                                 let package_hash = {
@@ -344,7 +365,12 @@ pub fn run(args: TestArgs, mode: Mode) -> Result<()> {
                                     let mut text =
                                         String::from_utf8_lossy(&out.stdout).into_owned();
                                     text.push_str(&String::from_utf8_lossy(&out.stderr));
-                                    let counts = parse_counts(&text);
+                                    let mut counts = parse_counts(&text);
+                                    if let Some(b) = &batch {
+                                        // Each batch reports the rest of the
+                                        // binary as filtered out.
+                                        counts.filtered = b.filtered;
+                                    }
                                     let mut result = TestResult {
                                         order,
                                         outcome: if out.status.success() {
@@ -416,6 +442,7 @@ pub fn run(args: TestArgs, mode: Mode) -> Result<()> {
         // Printer thread: emits results in `order`.
         let printer = {
             let res_rx = res_rx.clone();
+            let parts_of = &parts_of;
             let labels = &labels;
             let json = sess.json;
             scope.spawn(move || {
@@ -426,8 +453,24 @@ pub fn run(args: TestArgs, mode: Mode) -> Result<()> {
                 let mut ran = 0usize;
                 let mut suites: Vec<crate::test_report::Suite> = Vec::new();
                 let mut flaky: Vec<String> = Vec::new();
+                let mut partial: HashMap<usize, (usize, TestResult)> = HashMap::new();
                 while next < total_slots {
                     let Ok(r) = res_rx.recv() else { break };
+                    let parts = parts_of.lock().unwrap().get(&r.order).copied().unwrap_or(1);
+                    let r = if parts > 1 {
+                        let order = r.order;
+                        let merged = match partial.remove(&order) {
+                            Some((n, acc)) => (n + 1, merge(acc, r)),
+                            None => (1, r),
+                        };
+                        if merged.0 < parts {
+                            partial.insert(order, merged);
+                            continue;
+                        }
+                        merged.1
+                    } else {
+                        r
+                    };
                     pending.insert(r.order, r);
                     while let Some(r) = pending.remove(&next) {
                         if !json {
@@ -439,26 +482,23 @@ pub fn run(args: TestArgs, mode: Mode) -> Result<()> {
                             if json {
                                 // One line per binary, after the build's
                                 // compiler messages, for tools.
-                                println!(
-                                    "{}",
-                                    serde_json::json!({
-                                        "reason": "test-suite-finished",
-                                        "suite": suite.name,
-                                        "outcome": match r.outcome {
-                                            Outcome::Passed => "passed",
-                                            Outcome::Cached => "cached",
-                                            Outcome::Failed => "failed",
-                                            Outcome::CompileFailed => "not-built",
-                                            Outcome::Skipped => "skipped",
-                                        },
-                                        "seconds": suite.seconds,
-                                        "passed": r.counts.passed,
-                                        "failed": r.counts.failed,
-                                        "ignored": r.counts.ignored,
-                                        "tests": suite.cases,
-                                        "error": suite.error,
-                                    })
-                                );
+                                ui::out(serde_json::json!({
+                                    "reason": "test-suite-finished",
+                                    "suite": suite.name,
+                                    "outcome": match r.outcome {
+                                        Outcome::Passed => "passed",
+                                        Outcome::Cached => "cached",
+                                        Outcome::Failed => "failed",
+                                        Outcome::CompileFailed => "not-built",
+                                        Outcome::Skipped => "skipped",
+                                    },
+                                    "seconds": suite.seconds,
+                                    "passed": r.counts.passed,
+                                    "failed": r.counts.failed,
+                                    "ignored": r.counts.ignored,
+                                    "tests": suite.cases,
+                                    "error": suite.error,
+                                }));
                             }
                             suites.push(suite);
                         }
@@ -484,12 +524,31 @@ pub fn run(args: TestArgs, mode: Mode) -> Result<()> {
             let exe = find_executable(artifacts, sess, plan, r);
             match exe {
                 Some(exe) if !args.no_run => {
-                    let _ = job_tx.send(Job::Binary {
-                        order: r.order,
-                        exe,
-                        member: r.member,
-                        harness: r.harness,
-                    });
+                    let batches = if split && r.harness {
+                        split_into_batches(sess, &exe, r.member, &args, runner_count)
+                    } else {
+                        Vec::new()
+                    };
+                    if batches.len() > 1 {
+                        parts_of.lock().unwrap().insert(r.order, batches.len());
+                        for b in batches {
+                            let _ = job_tx.send(Job::Binary {
+                                order: r.order,
+                                exe: exe.clone(),
+                                member: r.member,
+                                harness: true,
+                                batch: Some(b),
+                            });
+                        }
+                    } else {
+                        let _ = job_tx.send(Job::Binary {
+                            order: r.order,
+                            exe,
+                            member: r.member,
+                            harness: r.harness,
+                            batch: batches.into_iter().next(),
+                        });
+                    }
                 }
                 Some(exe) => {
                     ui::action("built", exe.display());
@@ -739,7 +798,7 @@ pub fn run(args: TestArgs, mode: Mode) -> Result<()> {
         ));
     }
     if !failed_labels.is_empty() {
-        eprintln!();
+        ui::err("");
         ui::error(format!(
             "{} failed: {}",
             if failed_labels.len() == 1 {
@@ -803,6 +862,135 @@ fn label_for(sess: &Session, r: &Requested) -> String {
         TargetKind::Test => format!("{pkg} (test {})", r.target),
         TargetKind::Bench => format!("{pkg} (bench {})", r.target),
         TargetKind::Example => format!("{pkg} (example {})", r.target),
+    }
+}
+
+/// One batch of a test binary's tests (`--schedule tests`).
+struct Batch {
+    tests: Vec<String>,
+    /// What the binary's own summary would call "filtered out", reported by
+    /// the first batch only (so the parts add up to the whole binary).
+    filtered: u64,
+}
+
+/// Libtest arguments `--schedule tests` knows how to carry over to a batch;
+/// anything else (positional filters, `--format`, ...) runs whole binaries.
+fn splittable(test_args: &[String]) -> bool {
+    let mut it = test_args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--ignored" | "--include-ignored" | "--nocapture" | "--show-output" | "--exact" => {}
+            "--skip" => {
+                it.next();
+            }
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// Lists a harness binary's tests (honoring the filter, `--skip`,
+/// `--ignored`) and splits them into batches small enough that every core
+/// stays busy until the end of the run.
+fn split_into_batches(
+    sess: &Session,
+    exe: &std::path::Path,
+    member: usize,
+    args: &TestArgs,
+    cores: usize,
+) -> Vec<Batch> {
+    let list = |with_filter: bool| -> Option<Vec<String>> {
+        let m = &sess.ws.members[member];
+        let mut cmd = sess.command_for(exe);
+        cmd.args(["--list", "--format", "terse"]);
+        if with_filter && let Some(f) = &args.filter {
+            cmd.arg(f);
+        }
+        cmd.args(&args.test_args)
+            .current_dir(&m.dir)
+            .stdin(Stdio::null())
+            .stderr(Stdio::null());
+        apply_run_env(&mut cmd, m, sess);
+        let out = cmd.output().ok().filter(|o| o.status.success())?;
+        Some(
+            String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .filter_map(|l| l.strip_suffix(": test"))
+                .map(str::to_string)
+                .collect(),
+        )
+    };
+    let Some(tests) = list(true) else {
+        return Vec::new();
+    };
+    if tests.is_empty() {
+        return Vec::new();
+    }
+    let filtered = match &args.filter {
+        Some(_) => list(false).map_or(0, |all| all.len().saturating_sub(tests.len())) as u64,
+        None => 0,
+    };
+    // A few batches per core: a slow batch is balanced by the others.
+    let size = tests.len().div_ceil(cores * 4).max(1);
+    tests
+        .chunks(size)
+        .enumerate()
+        .map(|(i, chunk)| Batch {
+            tests: chunk.to_vec(),
+            filtered: if i == 0 { filtered } else { 0 },
+        })
+        .collect()
+}
+
+/// The arguments that run exactly `tests` of a harness binary.
+fn batch_args(args: &TestArgs, tests: &[String]) -> Vec<String> {
+    let mut out = vec!["--exact".to_string()];
+    // Each batch is one of many processes sharing the cores.
+    out.push("--test-threads".into());
+    out.push(args.test_threads.unwrap_or(1).to_string());
+    let mut it = args.test_args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--skip" => {
+                it.next();
+            }
+            "--exact" => {}
+            _ => out.push(a.clone()),
+        }
+    }
+    out.extend(tests.iter().cloned());
+    out
+}
+
+/// Puts the results of two batches of one binary together.
+fn merge(a: TestResult, b: TestResult) -> TestResult {
+    use Outcome::*;
+    let outcome = match (&a.outcome, &b.outcome) {
+        (CompileFailed, _) | (_, CompileFailed) => CompileFailed,
+        (Failed, _) | (_, Failed) => Failed,
+        (Skipped, Skipped) => Skipped,
+        (Cached, Cached) => Cached,
+        _ => Passed,
+    };
+    let mut counts = a.counts;
+    counts.add(b.counts);
+    let mut output = a.output;
+    if !b.output.is_empty() {
+        if !output.is_empty() && !output.ends_with('\n') {
+            output.push('\n');
+        }
+        output.push_str(&b.output);
+    }
+    let mut flaky = a.flaky;
+    flaky.extend(b.flaky);
+    TestResult {
+        order: a.order,
+        outcome,
+        counts,
+        output,
+        // The batches ran side by side: the longest is the binary's time.
+        took: a.took.max(b.took),
+        flaky,
     }
 }
 
@@ -968,12 +1156,12 @@ fn print_result(label: &str, r: &TestResult, verbose: bool) {
                 ),
             );
             if verbose && !r.output.is_empty() {
-                println!("{}", r.output);
+                ui::out(&r.output);
             }
         }
         Outcome::Failed => {
             ui::error(format!("FAILED {} · {}", label.bold(), took));
-            println!("{}", r.output);
+            ui::out(&r.output);
         }
         Outcome::CompileFailed => {
             ui::error(format!("could not build {}: {}", label.bold(), r.output));
