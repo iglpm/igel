@@ -1143,3 +1143,37 @@ fn write_if_changed(path: &Path, content: &str) -> Result<()> {
     }
     std::fs::write(path, content).with_context(|| format!("cannot write {}", path.display()))
 }
+
+/// `rune version [-v]`.
+pub fn version(verbose: bool) -> Result<()> {
+    println!("rune {}", env!("RUNE_VERSION"));
+    if !verbose {
+        return Ok(());
+    }
+    let tc = rune_common::toolchain::global();
+    let mut rows = vec![
+        ("release", env!("CARGO_PKG_VERSION").to_string()),
+        ("commit-hash", env!("RUNE_COMMIT_HASH").to_string()),
+        ("commit-date", env!("RUNE_COMMIT_DATE").to_string()),
+        ("host", env!("RUNE_BUILD_TARGET").to_string()),
+        (
+            "os",
+            format!("{} {}", std::env::consts::OS, std::env::consts::ARCH),
+        ),
+        ("rustc", format!("{} ({})", tc.version, tc.host)),
+    ];
+    rows.retain(|(_, v)| !v.is_empty());
+    let width = rows.iter().map(|(k, _)| k.len()).max().unwrap_or(0);
+    for (k, v) in rows {
+        println!("{k:<width$}  {v}");
+    }
+    Ok(())
+}
+
+/// `rune completions <shell>`.
+pub fn completions(shell: clap_complete::Shell) -> Result<()> {
+    use clap::CommandFactory;
+    let mut cmd = crate::args::Cli::command();
+    clap_complete::generate(shell, &mut cmd, "rune", &mut std::io::stdout());
+    Ok(())
+}

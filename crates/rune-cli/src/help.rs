@@ -45,7 +45,18 @@ const ALL: &[(&str, &[&str])] = &[
         ],
     ),
     ("Registry", &["search", "info", "install", "uninstall"]),
-    ("Rune", &["doctor", "cas", "config", "affected", "script"]),
+    (
+        "Rune",
+        &[
+            "doctor",
+            "cas",
+            "config",
+            "affected",
+            "script",
+            "version",
+            "completions",
+        ],
+    ),
     (
         "Tools and Cargo compatibility",
         &[
@@ -107,6 +118,8 @@ fn short(name: &str) -> Option<&'static str> {
         "config" => "View and change settings",
         "affected" => "Packages a change can affect (for CI)",
         "script" => "Run a single-file Rust script",
+        "version" => "Show version information",
+        "completions" => "Print a shell completion script",
         "rustc" => "Build, passing extra flags to rustc",
         "rustdoc" => "Document, passing extra flags to rustdoc",
         "metadata" => "Workspace and dependency metadata as JSON",

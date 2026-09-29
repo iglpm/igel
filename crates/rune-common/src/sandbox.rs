@@ -170,9 +170,20 @@ fn confine(writable: &[PathBuf], network: bool) -> Result<(), String> {
             flags |= libc::CLONE_NEWNET;
         }
         if libc::unshare(flags) != 0 {
-            return Err(err(
-                "cannot create namespaces (unprivileged user namespaces may be disabled)",
-            ));
+            let mut why = err("cannot create namespaces");
+            let restricted =
+                std::fs::read_to_string("/proc/sys/kernel/apparmor_restrict_unprivileged_userns")
+                    .is_ok_and(|v| v.trim() == "1");
+            if restricted {
+                why.push_str(
+                    " — AppArmor restricts unprivileged user namespaces here (Ubuntu 23.10+); \
+                     allow them with `sysctl kernel.apparmor_restrict_unprivileged_userns=0` \
+                     or an AppArmor profile for rune",
+                );
+            } else {
+                why.push_str(" — unprivileged user namespaces may be disabled");
+            }
+            return Err(why);
         }
         // Keep our own identity inside the namespace.
         let _ = std::fs::write("/proc/self/setgroups", "deny");

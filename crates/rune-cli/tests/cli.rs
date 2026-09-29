@@ -5983,6 +5983,13 @@ fn an_impossible_version_choice_is_explained() {
 #[test]
 fn the_sandbox_confines_build_scripts() {
     let p = lib_project();
+    // Some systems (Ubuntu 23.10+ with AppArmor) do not allow the
+    // namespaces the sandbox needs.
+    let probe = p.rune(&["__sandbox", "--", "true"]);
+    if !probe.status.success() {
+        eprintln!("skipped: {}", text(&probe));
+        return;
+    }
     let outside = p.home().join("planted");
     p.write(
         "build.rs",

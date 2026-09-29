@@ -7,7 +7,7 @@ use std::path::PathBuf;
 #[command(
     name = "rune",
     about = "A fast, next-generation build system & package manager for Rust",
-    version,
+    version = env!("RUNE_VERSION"),
     styles = crate::help::styles(),
     disable_help_subcommand = true,
     long_about = "Rune is an alternative build system and package manager for Rust that is \
@@ -36,6 +36,19 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Commands {
+    /// Show version information
+    #[command(after_help = crate::help::examples(&[("rune version", "the version and commit"), ("rune version -v", "also the host, toolchain and settings in effect")]))]
+    Version {
+        /// Also show the commit, host and toolchain
+        #[arg(short, long)]
+        verbose: bool,
+    },
+    /// Print a shell completion script
+    #[command(after_help = crate::help::examples(&[("rune completions bash > ~/.local/share/bash-completion/completions/rune", "bash"), ("rune completions zsh > ~/.zfunc/_rune", "zsh (with ~/.zfunc in $fpath)"), ("rune completions fish > ~/.config/fish/completions/rune.fish", "fish")]))]
+    Completions {
+        /// bash, zsh, fish, elvish or powershell
+        shell: clap_complete::Shell,
+    },
     /// Compile the current package (and its dependencies)
     #[command(visible_alias = "b")]
     #[command(after_help = crate::help::examples(&[("rune build", "debug build of the current package"), ("rune build -r", "optimized (release) build"), ("rune build -p app --bin cli", "one binary of one workspace package"), ("rune build --timings", "show what the build waited on")]))]

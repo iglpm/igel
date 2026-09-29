@@ -116,6 +116,8 @@ fn main() {
         Commands::Cas(args::CasCommands::Export(a)) => cmd_build::cas_export(*a),
         Commands::Cas(args::CasCommands::Pin(a)) => cmd_build::cas_pin(*a),
         Commands::Cas(c) => cmd_misc::cas(c),
+        Commands::Version { verbose } => cmd_misc::version(verbose),
+        Commands::Completions { shell } => cmd_misc::completions(shell),
         Commands::Doctor => cmd_misc::doctor(),
         Commands::Watch(a) => cmd_watch::watch(a),
         Commands::Affected(a) => cmd_misc::affected(a),
