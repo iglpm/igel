@@ -5946,3 +5946,35 @@ fn tests_can_be_scheduled_one_batch_at_a_time_across_binaries() {
     let t = text(&out);
     assert!(t.contains("nope") && t.contains("1 failed"), "{t}");
 }
+
+#[cfg(unix)]
+#[test]
+fn resolution_moves_back_from_a_release_whose_dependency_does_not_exist() {
+    // The newest `b` needs a `c` that was never published; Cargo takes the
+    // older `b`.
+    let reg = local_registry(&[
+        ("b", "1.0.0", &[("c", "^1.0")]),
+        ("b", "1.1.0", &[("c", "^2.0")]),
+        ("c", "1.0.0", &[]),
+    ]);
+    let p = app_with(&reg, "b = \"1\"\n");
+    let out = p.ok(&["build"]);
+    assert_eq!(locked(&p), ["app 0.1.0", "b 1.0.0", "c 1.0.0"], "{out}");
+}
+
+#[cfg(unix)]
+#[test]
+fn an_impossible_version_choice_is_explained() {
+    let reg = local_registry(&[
+        ("a", "1.0.0", &[]),
+        ("a", "1.1.0", &[]),
+        ("b", "1.0.0", &[("a", "=1.1.0")]),
+    ]);
+    let p = app_with(&reg, "a = \"=1.0.0\"\nb = \"1\"\n");
+    let out = p.rune(&["build"]);
+    let t = text(&out);
+    // Cargo refuses; Rune explains, then builds with both versions.
+    assert!(t.contains("b 1.0.0 depends on a 1.1.0"), "{t}");
+    assert!(t.contains("side by side"), "{t}");
+    assert!(out.status.success(), "{t}");
+}

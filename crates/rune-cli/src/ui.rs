@@ -113,13 +113,55 @@ impl<'a> fmt::MakeWriter<'a> for ProgressAwareWriter {
 /// Installs the global tracing subscriber (`RUST_LOG` controls verbosity)
 /// and the network progress display.
 pub fn setup_logging() {
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn"));
-    fmt()
-        .with_env_filter(filter)
-        .with_target(false)
-        .with_writer(ProgressAwareWriter)
-        .init();
+    match EnvFilter::try_from_default_env() {
+        // Debugging: the full log format.
+        Ok(filter) => fmt()
+            .with_env_filter(filter)
+            .with_target(false)
+            .with_writer(ProgressAwareWriter)
+            .init(),
+        // Otherwise only warnings, which read like every other warning.
+        Err(_) => fmt()
+            .with_env_filter(EnvFilter::new("warn"))
+            .with_writer(ProgressAwareWriter)
+            .event_format(PlainWarnings)
+            .init(),
+    }
     rune_common::progress::set_sink(Box::new(NetProgress::default()));
+}
+
+/// Formats log events the way [`warn`] and [`error`] print.
+struct PlainWarnings;
+
+impl<S, N> tracing_subscriber::fmt::FormatEvent<S, N> for PlainWarnings
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+    N: for<'a> tracing_subscriber::fmt::FormatFields<'a> + 'static,
+{
+    fn format_event(
+        &self,
+        ctx: &tracing_subscriber::fmt::FmtContext<'_, S, N>,
+        mut writer: tracing_subscriber::fmt::format::Writer<'_>,
+        event: &tracing::Event<'_>,
+    ) -> std::fmt::Result {
+        let mut message = String::new();
+        ctx.field_format().format_fields(
+            tracing_subscriber::fmt::format::Writer::new(&mut message),
+            event,
+        )?;
+        let error = *event.metadata().level() == tracing::Level::ERROR;
+        let mut lines = message.lines();
+        let first = lines.next().unwrap_or_default();
+        if error {
+            writeln!(writer, "{} {first}", "✗".red().bold())?;
+        } else {
+            writeln!(writer, "{} {}", "!".yellow().bold(), first.yellow())?;
+        }
+        for line in lines {
+            writeln!(writer, "  {line}")?;
+        }
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
