@@ -885,6 +885,139 @@ fn resolved_from_lock(lock: &Lockfile) -> ResolvedGraph {
     }
 }
 
+/// The resolution recorded in `Rune.lock.bin`, when it was made from the
+/// current manifests, configuration and `Cargo.lock` (its fingerprint says
+/// so) and covers every dependency they declare: the whole graph, edges and
+/// feature tables included, rebuilt from the lockfile and the manifests.
+fn cached_resolution(ws: &Workspace) -> Option<(ResolvedGraph, Lockfile)> {
+    let _timer = phase("resolve (cached)");
+    let (lock, Some(stored)) =
+        LockfileManager::read_binary_with_fingerprint(&ws.root().join("Rune.lock.bin")).ok()?
+    else {
+        return None;
+    };
+    if lock.packages.is_empty() {
+        return None;
+    }
+    let mut locals = Locals::load(ws).ok()?;
+    if stored != with_cargo_lock(&resolution_inputs(ws, &locals), ws.root()) {
+        return None;
+    }
+    locals.extend_from_lock(ws, &lock).ok()?;
+    let uni = Universe::build(ws, &locals, &lock);
+    if !incomplete(&uni, &locals, &lock, &|_| true).is_empty() {
+        return None;
+    }
+    let mut packages = HashMap::new();
+    for idx in 0..uni.views.len() {
+        let view = &uni.views[idx];
+        let (source, checksum, features) = match uni.origin[idx] {
+            Origin::Registry => {
+                let lp = &lock.packages[uni.lock_pkg[idx]?];
+                (
+                    PackageSource::Registry(index_of_lock_source(lp.source.as_deref())),
+                    lp.checksum.clone(),
+                    lp.features.clone(),
+                )
+            }
+            Origin::Local(li) => {
+                let m = &locals.list[li];
+                let lp = lock.packages.iter().find(|p| {
+                    p.name == m.name
+                        && p.version == m.version.to_string()
+                        && !is_registry_source(p.source.as_deref())
+                });
+                let source = match &locals.git_of[li] {
+                    Some(co) => {
+                        // `git+URL?branch=x#commit`, as locked.
+                        let reference = lp
+                            .and_then(|p| p.source.as_deref())
+                            .and_then(|s| s.split_once('?'))
+                            .and_then(|(_, rest)| rest.split('#').next())
+                            .map(str::to_string);
+                        PackageSource::Git {
+                            url: co.url.clone(),
+                            reference,
+                            commit: co.commit.clone(),
+                        }
+                    }
+                    None => PackageSource::Path(m.dir.clone()),
+                };
+                (
+                    source,
+                    None,
+                    lp.map(|p| p.features.clone()).unwrap_or_default(),
+                )
+            }
+        };
+        // Only the edges the lockfile records: an optional dependency nothing
+        // turns on resolves to a package another one pulls in, but is no edge.
+        let recorded: Option<HashSet<&String>> = match uni.origin[idx] {
+            Origin::Registry => Some(
+                lock.packages[uni.lock_pkg[idx]?]
+                    .dependencies
+                    .iter()
+                    .collect(),
+            ),
+            Origin::Local(li) => {
+                let m = &locals.list[li];
+                lock.packages
+                    .iter()
+                    .find(|p| {
+                        p.name == m.name
+                            && p.version == m.version.to_string()
+                            && !is_registry_source(p.source.as_deref())
+                    })
+                    .map(|p| p.dependencies.iter().collect())
+            }
+        };
+        let dependencies = view
+            .deps
+            .iter()
+            .filter_map(|d| {
+                let t = d.resolved?;
+                if recorded.as_ref().is_some_and(|r| !r.contains(&uni.id[t])) {
+                    return None;
+                }
+                Some(rune_resolver::resolver::ResolvedDependencyRef {
+                    name: d.alias.clone(),
+                    req: format!("={}", uni.version[t]),
+                    kind: d.kind,
+                    optional: d.optional,
+                    features: d.features.clone(),
+                    default_features: d.default_features,
+                    package: d.renamed.then(|| uni.name[t].clone()),
+                    target: d.target.clone(),
+                    registry: None,
+                })
+            })
+            .collect();
+        packages.insert(
+            uni.id[idx].clone(),
+            ResolvedPackage {
+                name: uni.name[idx].clone(),
+                version: uni.version[idx].clone(),
+                source,
+                checksum,
+                dependencies,
+                features,
+                declared_features: view
+                    .features
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect(),
+            },
+        );
+    }
+    Some((
+        ResolvedGraph {
+            root_packages: ws.members.iter().map(|m| m.name.clone()).collect(),
+            packages,
+        },
+        lock,
+    ))
+}
+
 /// A request with no feature flags that selects every member — what
 /// commands like `update`, `fetch` and `tree` resolve against.
 pub fn whole_workspace_request<'a>(
@@ -923,6 +1056,35 @@ pub fn resolve_fresh(
 /// [`resolve_fresh`], preferring the given `(registry index, name, version)`s
 /// wherever a requirement allows them.
 pub fn resolve_fresh_with(
+    ws: &Workspace,
+    offline: bool,
+    existing: Option<&Lockfile>,
+    refresh: bool,
+    preferred: &[(String, String, semver::Version)],
+) -> Result<(ResolvedGraph, Lockfile)> {
+    // Nothing to refresh or prefer, and the lockfile on disk was made from
+    // exactly these manifests: it *is* the resolution (`tree`, `why`,
+    // `metadata`, `features` … need no resolver run).
+    // Only when seeded by exactly the lockfile on disk: a trimmed seed
+    // (`update -p foo`) or none (`generate-lockfile`) asks for a real
+    // resolution.
+    let from_disk = !refresh
+        && preferred.is_empty()
+        && LockfileManager::load_fast(ws.root()).as_ref() == existing;
+    if from_disk && let Some(cached) = cached_resolution(ws) {
+        return Ok(cached);
+    }
+    let (resolved, lock) = resolve_uncached(ws, offline, existing, refresh, preferred)?;
+    // Keep what was resolved from the lockfile on disk (as `cargo tree`
+    // updates `Cargo.lock`), so the next `tree`, `metadata` or build starts
+    // from it instead of resolving again.
+    if from_disk {
+        let _ = store_resolution(ws, &lock);
+    }
+    Ok((resolved, lock))
+}
+
+fn resolve_uncached(
     ws: &Workspace,
     offline: bool,
     existing: Option<&Lockfile>,

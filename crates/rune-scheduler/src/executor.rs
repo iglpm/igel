@@ -261,6 +261,7 @@ pub struct BuildExecutor {
     /// internal codegen threads and C compilers draw from one pool of
     /// `max_jobs` tokens instead of each assuming it owns the machine.
     jobserver: Option<jobserver::Client>,
+    tokens: Option<crate::tokens::JobTokens>,
     /// `build.frontend-threads`.
     frontend_threads: rune_common::settings::FrontendThreads,
     /// Cores on this machine.
@@ -273,6 +274,8 @@ impl BuildExecutor {
     /// Creates a new `BuildExecutor`.
     pub fn new(config: RuneConfig, profile: Profile, max_jobs: usize) -> Self {
         let (event_tx, event_rx) = unbounded();
+        let jobserver = jobserver::Client::new(max_jobs.max(1)).ok();
+        let tokens = jobserver.clone().map(crate::tokens::JobTokens::new);
         Self {
             config,
             profile,
@@ -283,7 +286,8 @@ impl BuildExecutor {
             force_rebuild: false,
             config_env: Vec::new(),
             color: false,
-            jobserver: jobserver::Client::new(max_jobs.max(1)).ok(),
+            jobserver,
+            tokens,
             frontend_threads: Default::default(),
             cpus: std::thread::available_parallelism().map_or(1, |n| n.get()),
             memory: rune_common::sysinfo::memory,
@@ -1426,6 +1430,7 @@ impl BuildExecutor {
             extra_env,
             color: self.color,
             jobserver: self.jobserver.clone(),
+            tokens: self.tokens.clone(),
             script_only: false,
             lock: None,
             lock_waited: false,
@@ -1467,6 +1472,7 @@ struct UnitJob {
     extra_env: Vec<(String, String)>,
     color: bool,
     jobserver: Option<jobserver::Client>,
+    tokens: Option<crate::tokens::JobTokens>,
     /// Only run (or restore) the unit's build script; its compilation is a
     /// separate job, started once its dependencies' metadata exists.
     script_only: bool,
@@ -1580,9 +1586,10 @@ impl UnitJob {
     }
 
     fn run(mut self) {
-        // Hold one jobserver token for as long as this unit runs; the compiler
-        // may borrow more for its own codegen threads while others are idle.
-        let token = self.jobserver.as_ref().and_then(|js| js.acquire().ok());
+        // Claim a core for as long as this unit runs, without waiting behind
+        // other compilers' codegen threads (see `tokens`); the compiler may
+        // borrow more for its own codegen while cores are idle.
+        let token = self.tokens.as_ref().map(|t| t.start());
         let start = Instant::now();
         // Held until the unit is stored (or, for a script step, handed back to
         // the scheduler for the compilation that follows).
