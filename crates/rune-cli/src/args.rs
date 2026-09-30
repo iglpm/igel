@@ -172,6 +172,12 @@ pub enum Commands {
     /// Manage binary and standard lockfiles
     #[command(subcommand)]
     Lockfile(LockfileCommands),
+    /// Manage Rune itself (updates and uninstallation)
+    #[command(name = "self", subcommand)]
+    Self_(SelfCommands),
+    /// Update Rune to the latest release (alias for `rune self update`)
+    #[command(name = "self-update", hide = true)]
+    SelfUpdate(SelfUpdateArgs),
 }
 
 /// Flags shared by every command that resolves and builds.
@@ -1182,6 +1188,60 @@ pub enum LockfileCommands {
     Migrate,
 }
 
+#[derive(Subcommand, Debug, Clone)]
+pub enum SelfCommands {
+    /// Update Rune to the latest (or a specified) release
+    #[command(after_help = crate::help::examples(&[
+        ("rune self update", "update to the latest release"),
+        ("rune self update --check", "check for newer releases without installing"),
+        ("rune self update --version v0.1.0", "install a specific release"),
+        ("rune self update --force", "reinstall even if already up to date"),
+    ]))]
+    Update(SelfUpdateArgs),
+
+    /// Uninstall Rune from the system
+    #[command(after_help = crate::help::examples(&[
+        ("rune self uninstall", "remove the rune binary"),
+        ("rune self uninstall --purge", "also remove cache and configuration (~/.rune)"),
+    ]))]
+    Uninstall(SelfUninstallArgs),
+}
+
+#[derive(Args, Debug, Clone, Default)]
+pub struct SelfUpdateArgs {
+    /// Update to a specific release version (e.g. `v0.2.0` or `0.2.0`)
+    #[arg(short = 'v', long)]
+    pub version: Option<String>,
+
+    /// Check if a newer version is available without installing it
+    #[arg(long)]
+    pub check: bool,
+
+    /// Force reinstallation even if already on the latest version
+    #[arg(short, long)]
+    pub force: bool,
+
+    /// Path to the binary to replace (defaults to currently executing binary)
+    #[arg(long)]
+    pub to: Option<PathBuf>,
+
+    /// GitHub repository to download from (defaults to `runepm/rune` or $RUNE_REPOSITORY)
+    #[arg(long)]
+    pub repo: Option<String>,
+}
+
+#[derive(Args, Debug, Clone, Default)]
+pub struct SelfUninstallArgs {
+    /// Also remove global cache and configuration (`~/.rune` or $RUNE_HOME)
+    #[arg(long)]
+    pub purge: bool,
+
+    /// Skip confirmation prompt
+    #[arg(short = 'y', long)]
+    pub yes: bool,
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1257,6 +1317,45 @@ mod tests {
     fn short_aliases() {
         for alias in ["b", "c", "t", "r"] {
             assert!(Cli::try_parse_from(["rune", alias]).is_ok(), "{alias}");
+        }
+    }
+
+    #[test]
+    fn self_commands_parse() {
+        let cli = Cli::try_parse_from(["rune", "self", "update"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Self_(SelfCommands::Update(_))
+        ));
+
+        let cli = Cli::try_parse_from(["rune", "self", "update", "--check"]).unwrap();
+        if let Commands::Self_(SelfCommands::Update(args)) = cli.command {
+            assert!(args.check);
+        } else {
+            panic!();
+        }
+
+        let cli = Cli::try_parse_from(["rune", "self", "update", "-v", "v0.2.0", "--force"]).unwrap();
+        if let Commands::Self_(SelfCommands::Update(args)) = cli.command {
+            assert_eq!(args.version.as_deref(), Some("v0.2.0"));
+            assert!(args.force);
+        } else {
+            panic!();
+        }
+
+        let cli = Cli::try_parse_from(["rune", "self-update", "--check"]).unwrap();
+        if let Commands::SelfUpdate(args) = cli.command {
+            assert!(args.check);
+        } else {
+            panic!();
+        }
+
+        let cli = Cli::try_parse_from(["rune", "self", "uninstall", "--purge", "-y"]).unwrap();
+        if let Commands::Self_(SelfCommands::Uninstall(args)) = cli.command {
+            assert!(args.purge);
+            assert!(args.yes);
+        } else {
+            panic!();
         }
     }
 }

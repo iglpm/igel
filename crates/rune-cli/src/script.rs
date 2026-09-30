@@ -31,7 +31,10 @@ pub struct Script {
 
 /// Splits a script into manifest and source.
 pub fn parse(text: &str) -> Result<Script, String> {
-    let lines: Vec<&str> = text.split('\n').collect();
+    let lines: Vec<&str> = text
+        .split('\n')
+        .map(|l| l.strip_suffix('\r').unwrap_or(l))
+        .collect();
     let mut i = 0;
     if lines
         .first()
@@ -258,4 +261,17 @@ mod tests {
                 .contains("invalid manifest")
         );
     }
+
+    #[test]
+    fn frontmatter_with_crlf_line_endings_parses_successfully() {
+        let text = "---cargo\r\n[dependencies]\r\naxum = \"0.7\"\r\ntokio = { version = \"1\", features = [\"full\"] }\r\n---\r\nfn main() {}\r\n";
+        let s = parse(text).unwrap();
+        assert_eq!(
+            s.manifest,
+            "[dependencies]\naxum = \"0.7\"\ntokio = { version = \"1\", features = [\"full\"] }"
+        );
+        let m = manifest(Path::new("main.rs"), &s.manifest).unwrap();
+        assert!(m.contains("axum"));
+    }
 }
+

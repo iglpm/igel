@@ -12,6 +12,7 @@ mod cmd_install;
 mod cmd_misc;
 mod cmd_publish;
 mod cmd_sbom;
+mod cmd_self;
 mod cmd_surface;
 mod cmd_test;
 mod cmd_unused;
@@ -140,6 +141,9 @@ fn main() {
         Commands::Affected(a) => cmd_misc::affected(a),
         Commands::Script(a) => cmd_misc::script(a),
         Commands::Lockfile(c) => cmd_misc::lockfile(c),
+        Commands::Self_(args::SelfCommands::Update(a)) => cmd_self::update(a),
+        Commands::Self_(args::SelfCommands::Uninstall(a)) => cmd_self::uninstall(a),
+        Commands::SelfUpdate(a) => cmd_self::update(a),
     };
 
     if let Err(err) = result {

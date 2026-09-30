@@ -48,9 +48,8 @@ filetime.workspace = true
 blake3.workspace = true
 mimalloc = { version = "0.1", default-features = false }
 rustc-demangle = "0.1"
+reqwest.workspace = true
+tempfile.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
-
-[dev-dependencies]
-tempfile.workspace = true
