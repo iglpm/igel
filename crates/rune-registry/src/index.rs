@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use thiserror::Error;
 use tracing::debug;
 
@@ -253,9 +253,7 @@ impl SparseIndexClient {
     pub fn fetch_crate(&self, name: &str) -> Result<CrateIndex> {
         let cached_file = self.cache_dir.join(Self::crate_index_path(name));
 
-        if let Ok(content) = fs::read_to_string(&cached_file)
-            && let Ok(index) = Self::parse_index_text(name, &content)
-        {
+        if let Some(index) = read_cached(name, &cached_file) {
             return Ok(index);
         }
 
@@ -279,10 +277,8 @@ impl SparseIndexClient {
         let etag_file = etag_path(&cached_file);
 
         if self.offline {
-            return match fs::read_to_string(&cached_file) {
-                Ok(content) => Self::parse_index_text(name, &content),
-                Err(_) => Err(IndexError::Offline(name.to_string())),
-            };
+            return read_cached(name, &cached_file)
+                .ok_or_else(|| IndexError::Offline(name.to_string()));
         }
 
         let url = format!("{}/{}", self.base_url, rel_path);
@@ -317,8 +313,8 @@ impl SparseIndexClient {
             Ok(resp) => {
                 let status = resp.status();
                 if status == reqwest::StatusCode::NOT_MODIFIED && have_cache {
-                    if let Ok(content) = fs::read_to_string(&cached_file) {
-                        return Self::parse_index_text(name, &content);
+                    if let Some(index) = read_cached(name, &cached_file) {
+                        return Ok(index);
                     }
                     IndexError::Config(format!("the cached index entry of `{name}` vanished"))
                 } else if status.is_success() {
@@ -375,9 +371,9 @@ impl SparseIndexClient {
         };
 
         // Fall back to the local cache if the network failed.
-        if let Ok(content) = fs::read_to_string(&cached_file) {
+        if let Some(index) = read_cached(name, &cached_file) {
             debug!("using the cached index entry of `{name}`: {failure}");
-            return Self::parse_index_text(name, &content);
+            return Ok(index);
         }
         Err(failure)
     }
@@ -407,6 +403,47 @@ impl SparseIndexClient {
             versions,
         })
     }
+}
+
+/// The cached index entry at `json`, parsed. A binary copy of the parsed
+/// records sits beside it (`<file>.rbin`), valid while the JSON file keeps
+/// its size and modification time: decoding it is several times faster than
+/// parsing the JSON again, which was most of an offline resolution.
+fn read_cached(name: &str, json: &Path) -> Option<CrateIndex> {
+    const MAGIC: &[u8; 8] = b"RUNEIDX1";
+    let meta = fs::metadata(json).ok()?;
+    let mtime = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |d| d.as_nanos() as u64);
+    let mut stamp = Vec::with_capacity(24);
+    stamp.extend_from_slice(MAGIC);
+    stamp.extend_from_slice(&meta.len().to_le_bytes());
+    stamp.extend_from_slice(&mtime.to_le_bytes());
+    let mut bin_path = json.as_os_str().to_owned();
+    bin_path.push(".rbin");
+    let bin_path = PathBuf::from(bin_path);
+    if let Ok(bytes) = fs::read(&bin_path)
+        && bytes.starts_with(&stamp)
+        && let Ok(versions) = bincode::deserialize::<Vec<IndexRecord>>(&bytes[stamp.len()..])
+    {
+        return Some(CrateIndex {
+            name: name.to_string(),
+            versions,
+        });
+    }
+    let text = fs::read_to_string(json).ok()?;
+    let index = SparseIndexClient::parse_index_text(name, &text).ok()?;
+    if let Ok(body) = bincode::serialize(&index.versions) {
+        let mut out = stamp;
+        out.extend_from_slice(&body);
+        let tmp = bin_path.with_extension(format!("rbin.{}.tmp", std::process::id()));
+        if fs::write(&tmp, &out).is_ok() {
+            let _ = fs::rename(&tmp, &bin_path);
+        }
+    }
+    Some(index)
 }
 
 /// A directory name for a registry's caches: readable host plus a hash of the

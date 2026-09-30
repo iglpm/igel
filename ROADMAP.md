@@ -1233,3 +1233,41 @@ Recording undeclared *reads* (hermeticity) is still open.
 tests on Linux and macOS, MSRV 1.89, self-host) and a release workflow for four
 targets. `Rune.lock.bin` is no longer committed (it is machine-specific).
 
+## 15. What changed in the audit, coverage and edge-case update (2026-09-30)
+
+**`rune audit`.** The RustSec database as OSV publishes it (one 3.5 MB zip,
+~2,900 documents: RustSec, GitHub and OSV reports for crates.io, among them
+`MAL-` malicious-package reports); GitHub copies of RustSec advisories are
+dropped by alias, withdrawn ones skipped. OSV range semantics (`introduced`,
+`fixed`, `last_affected`), CVSS 3.x base scores computed from the vector
+(GitHub's rating where there is none), paths from `rune why`'s search, fixes
+from the ranges, yanked releases from the cached index (only lines with
+`"yanked":true` are parsed). Cached audit: ~0.1 s. On Rune itself: no
+vulnerabilities, two unmaintained crates (bincode, number_prefix).
+
+**`rune coverage`.** Only workspace crates are instrumented (target role, not
+build scripts or proc-macros), so dependencies keep their store entries; the
+test runner gained a hook (`cmd_test::run_with`) for the flags and
+`LLVM_PROFILE_FILE`, and reports the executables it ran; LCOV is post-processed
+(demangled with `rustc-demangle`, one entry per function across test
+binaries); `llvm-cov show` demangles through a hidden `rune __demangle`.
+
+**Edge cases.** Three sweeps (~90 scenarios, compared with Cargo) found:
+a dependency cycle hung the build (the executor's early error never ended its
+event stream); a *cache-correctness* bug — build-script records were looked up
+by a base shared by every package of the same name and version and named files
+by absolute path, so a second project could be keyed by the first project's
+files and get its script output; `[patch."<git>"]` and `default-run` ignored;
+`--target` outputs in `target/debug/<triple>`; manifests Cargo rejects
+accepted; a signal-killed test binary unexplained; `metadata` without
+dependency data. All fixed with tests. Also verified: paths with spaces and
+Unicode, symlinked projects and sources, `kill -9` mid-build, concurrent
+`build`/`test`, a truncated store object, 200-member workspaces (no-op 46 ms),
+100 binaries, 10 MB of test output, invalid UTF-8, read-only sources.
+
+**Speed.** An offline resolution of the 469-package corpus spent ~40 % in
+glibc's allocator: mimalloc makes it ~35 % faster (340–470 → 220–275 ms, lock
+byte-identical); parsed index files are cached in binary beside the JSON.
+Everyday commands against Cargo on Rune's workspace: no-op build 60 vs 220 ms,
+check 65 vs 230, `test --no-run` 70 vs 250, tree 25 vs 200, metadata 90 vs 210.
+

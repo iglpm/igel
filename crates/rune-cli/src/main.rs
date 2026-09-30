@@ -33,6 +33,12 @@ mod ui;
 mod workspace;
 
 use clap::Parser;
+
+/// Most of what Rune does between compilers is small allocations (index
+/// records, keys, paths) on many threads, where glibc's allocator spent
+/// about 40 % of an offline resolution.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 use std::ffi::OsString;
 
 use args::{Cli, Commands};
