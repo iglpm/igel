@@ -146,6 +146,8 @@ impl RuneConfig {
         std::fs::create_dir_all(self.deps_dir(profile_name))?;
         std::fs::create_dir_all(self.profile_target_dir(profile_name).join("build"))?;
         std::fs::create_dir_all(self.cas_dir.join("objects"))?;
+        crate::fsutil::tag_cache_dir(&self.target_dir);
+        crate::fsutil::tag_cache_dir(&self.cas_dir);
         Ok(())
     }
 

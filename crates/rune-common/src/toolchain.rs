@@ -975,7 +975,7 @@ mod tests {
         assert_eq!(again.verbose_version, first.verbose_version);
         assert_eq!(starts(), 2, "a second probe must not start the compiler");
         // The toolchain is updated in place (`rustup update`): probe again.
-        std::thread::sleep(std::time::Duration::from_millis(1100));
+        // (The new library's size differs, so no waiting for the clock.)
         std::fs::write(
             dir.path().join("sysroot/lib/librustc_driver-abc.so"),
             "v2 is longer",

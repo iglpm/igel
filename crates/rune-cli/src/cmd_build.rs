@@ -344,20 +344,43 @@ fn default_bin(sess: &Session) -> Result<String> {
 }
 
 /// The runtime environment Cargo gives programs it runs.
+/// The `cargo` of the toolchain, if there is one.
+fn cargo_program() -> Option<&'static PathBuf> {
+    static CARGO: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    CARGO
+        .get_or_init(|| rune_common::toolchain::find_program(std::path::Path::new("cargo")))
+        .as_ref()
+}
+
 pub fn apply_run_env(
     cmd: &mut std::process::Command,
     member: &crate::workspace::Member,
     sess: &Session,
 ) {
+    let meta = &member.meta;
     cmd.env("CARGO_MANIFEST_DIR", &member.dir)
+        .env("CARGO_MANIFEST_PATH", &member.manifest_path)
         .env("CARGO_PKG_NAME", &member.name)
         .env("CARGO_PKG_VERSION", member.version.to_string())
         .env("CARGO_PKG_VERSION_MAJOR", member.version.major.to_string())
         .env("CARGO_PKG_VERSION_MINOR", member.version.minor.to_string())
         .env("CARGO_PKG_VERSION_PATCH", member.version.patch.to_string())
         .env("CARGO_PKG_VERSION_PRE", member.version.pre.as_str())
-        .env("CARGO_PKG_AUTHORS", &member.meta.authors)
-        .env("CARGO_PKG_DESCRIPTION", &member.meta.description);
+        .env("CARGO_PKG_AUTHORS", &meta.authors)
+        .env("CARGO_PKG_DESCRIPTION", &meta.description)
+        .env("CARGO_PKG_HOMEPAGE", &meta.homepage)
+        .env("CARGO_PKG_REPOSITORY", &meta.repository)
+        .env("CARGO_PKG_LICENSE", &meta.license)
+        .env("CARGO_PKG_LICENSE_FILE", &meta.license_file)
+        .env("CARGO_PKG_README", &meta.readme)
+        .env("CARGO_PKG_RUST_VERSION", &meta.rust_version);
+    // Tests that build fixtures run `$CARGO` (escargot, trybuild and the
+    // like), as Cargo sets it for them.
+    if std::env::var_os("CARGO").is_none()
+        && let Some(cargo) = cargo_program()
+    {
+        cmd.env("CARGO", cargo);
+    }
     for (k, v) in &sess.run_env {
         cmd.env(k, v);
     }

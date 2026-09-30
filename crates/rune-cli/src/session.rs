@@ -79,17 +79,8 @@ impl Session {
             None
         };
 
-        if let Some(dir) = &common.target_dir {
-            ws.config.target_dir = if dir.is_absolute() {
-                dir.clone()
-            } else {
-                std::env::current_dir()?.join(dir)
-            };
-        } else if let Some(dir) = std::env::var_os("RUNE_TARGET_DIR")
-            .or_else(|| std::env::var_os("CARGO_TARGET_DIR"))
-            .filter(|d| !d.is_empty())
-        {
-            ws.config.target_dir = std::env::current_dir()?.join(dir);
+        if let Some(dir) = target_dir_override(common)? {
+            ws.config.target_dir = dir;
         }
 
         let offline = common.offline || common.frozen || ws.config.settings.offline();
@@ -333,6 +324,26 @@ fn profile_by_name(ws: &Workspace, name: &str) -> Result<Profile> {
         other => other,
     };
     resolve_profile(effective, tables).map_err(|e| anyhow::anyhow!("{e}"))
+}
+
+/// The target directory `--target-dir`, `RUNE_TARGET_DIR` or
+/// `CARGO_TARGET_DIR` ask for, if any (else `build.target-dir` or
+/// `.rune/target`).
+pub fn target_dir_override(common: &CommonArgs) -> Result<Option<std::path::PathBuf>> {
+    if let Some(dir) = &common.target_dir {
+        return Ok(Some(if dir.is_absolute() {
+            dir.clone()
+        } else {
+            std::env::current_dir()?.join(dir)
+        }));
+    }
+    match std::env::var_os("RUNE_TARGET_DIR")
+        .or_else(|| std::env::var_os("CARGO_TARGET_DIR"))
+        .filter(|d| !d.is_empty())
+    {
+        Some(dir) => Ok(Some(std::env::current_dir()?.join(dir))),
+        None => Ok(None),
+    }
 }
 
 /// Runs the executor over `graph`, calling `on_event` on this thread for every

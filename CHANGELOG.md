@@ -16,6 +16,12 @@ All notable changes to Rune are recorded here. The format follows
 - `rune metadata` lists every package with its dependencies, targets and
   features, and resolve nodes with `deps`/`dep_kinds`, matching
   `cargo metadata` (ids included).
+- `rune test` shows a live line while tests run: binaries done, tests passed
+  so far (counted as they finish), and what is running with its progress and
+  time. `rune coverage` shows its merge and report steps.
+- `rune test --test-jobs N` / `test.jobs`: how many test binaries run at once.
+- Tests get `CARGO`, `CARGO_MANIFEST_PATH` and every `CARGO_PKG_*` variable at
+  run time, as Cargo sets them.
 
 ### Fixed
 - A dependency cycle made the build hang; it is now an error naming the cycle.
@@ -28,10 +34,30 @@ All notable changes to Rune are recorded here. The format follows
   nothing, `dep:` on a non-optional dependency, a feature a local dependency
   lacks, two members with one name, packages named `test`/`std`/`core`/….
 - A test binary killed by a signal says which signal.
+- Tests failed now and then when run again unchanged: test binaries ran side
+  by side, so tests in different binaries sharing a port, a file or a
+  database collided. They now run one at a time by default, as with Cargo,
+  while the build continues.
+- `rune test` waited until a process a test had started (a server it did not
+  stop) exited, as that process held the output pipe open.
+- A freshly linked test binary could fail to start with "text file busy".
+- A `rune build` or `rune test` sharing a target directory with a concurrent
+  one could put a read-only store file where the other's compiler was
+  writing, failing its build.
+- `rune coverage` and ordinary builds replaced each other's files (they share
+  file names); the instrumented build has its own directory now.
+- A target directory or store inside a package (`--target-dir out`, a CI's
+  `RUNE_HOME=$PWD/.cache`) counted as the package's source, so nothing was
+  ever cached. Both are marked with `CACHEDIR.TAG` and left out.
 
 ### Changed
 - Faster offline resolution (about 35 %): mimalloc as the allocator, and a
   binary copy of each parsed index file beside it.
+- Test results are printed as each binary finishes rather than in a fixed
+  order (reports keep the fixed order).
+- `rune coverage` merges and exports at the same time, and its own test
+  suite runs faster (Rune's: no fixed sleeps, a Nagle stall in a test server
+  gone).
 
 ## [0.1.0] - 2026-09-29
 

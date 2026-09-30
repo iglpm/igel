@@ -481,9 +481,21 @@ impl BuildExecutor {
                 .par_iter()
                 .filter_map(|&id| {
                     let unit = &graph.node(id).unit;
-                    let linked = cas
-                        .link_to(&unit_cas_keys[&id], &self.out_dir_for(unit))
-                        .ok()?;
+                    let key = &unit_cas_keys[&id];
+                    // Another `rune` sharing this target directory may be
+                    // compiling a unit with the same output files right now
+                    // (the same crate built with other flags, as `rune
+                    // coverage` does): putting the store's read-only copy in
+                    // place under its compiler fails that build. Such a unit
+                    // is left to the scheduler, which waits its turn and
+                    // then restores it.
+                    let path = unit_lock_path(&self.config, &self.profile, graph, id);
+                    let rune_common::fsutil::TryLock::Locked(_lock) =
+                        rune_common::fsutil::FileLock::try_exclusive(&path)
+                    else {
+                        return None;
+                    };
+                    let linked = cas.link_to(key, &self.out_dir_for(unit)).ok()?;
                     (!linked.is_empty()).then_some((id, linked))
                 })
                 .collect();

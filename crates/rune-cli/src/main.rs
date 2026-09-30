@@ -28,6 +28,7 @@ mod pager;
 mod script;
 mod session;
 mod test_cache;
+mod test_progress;
 mod test_report;
 mod ui;
 mod workspace;

@@ -409,6 +409,13 @@ pub struct TestArgs {
     /// binary (default: `test.schedule`, else `binaries`)
     #[arg(long, value_name = "HOW", value_parser = ["binaries", "tests"])]
     pub schedule: Option<String>,
+
+    /// How many test binaries run at once (default: `test.jobs`, else 1, as
+    /// with Cargo: tests in different binaries may share ports, files or a
+    /// database; with `--schedule tests`, one per core). Compilation of the
+    /// rest continues meanwhile either way
+    #[arg(long, value_name = "N")]
+    pub test_jobs: Option<usize>,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -791,6 +798,9 @@ pub struct CoverageArgs {
     /// Keep going when a test fails, and report what ran
     #[arg(long)]
     pub no_fail_fast: bool,
+    /// How many test binaries run at once (default: `test.jobs`, else 1)
+    #[arg(long, value_name = "N")]
+    pub test_jobs: Option<usize>,
     /// Arguments after `--` go to the test binaries
     #[arg(last = true, value_name = "ARGS")]
     pub test_args: Vec<String>,

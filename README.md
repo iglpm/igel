@@ -23,9 +23,12 @@ understands `.cargo/config.toml`.
   jobserver (each `rustc` borrows idle slots for its codegen threads), no new
   compilers while memory is short, and a build that left cores idle tells you
   which chain of crates held it back
-- **Pipelined test runner** — test binaries run the moment they link; retries
-  with flaky-test detection, JUnit and JSON reports; optionally batches of
-  tests scheduled across every binary at once
+- **Pipelined test runner** — the first test binary runs the moment it links,
+  while the rest still compile; a live line shows what runs and how many tests
+  passed so far; binaries run one at a time as with Cargo (tests sharing a
+  port or database stay reliable), or side by side with `--test-jobs`;
+  retries with flaky-test detection, JUnit and JSON reports; optionally
+  batches of tests scheduled across every binary at once
 - **Confined build-time code** — `build.sandbox` runs build scripts and
   proc-macros with no network and nothing writable outside the build
 
@@ -313,6 +316,7 @@ rune config unset build.release-rebuild-all
 | `net.offline` | `false` | Never touch the network. |
 | `test.doctests` | `true` | Run documentation tests in `rune test`. |
 | `test.cache` | `false` | Same as `rune test --cached`: remember passing test binaries (see below). |
+| `test.jobs` | `1` | How many test binaries (and doc-test runs) run at once; same as `rune test --test-jobs N`. More is faster, but tests in different binaries that share a port, a file or a database then fail now and then, which is why Cargo runs one at a time too. The build goes on meanwhile either way. |
 | `test.schedule` | `binaries` | `tests` (or `rune test --schedule tests`): each test binary's tests are split into batches, each its own process, scheduled across all binaries at once (like cargo-nextest). Tests then no longer share a process. |
 
 Each key maps to an environment variable, e.g. `RUNE_BUILD_RELEASE_REBUILD_ALL=1`.
@@ -635,7 +639,10 @@ first use). `--show-missing-lines`, `--lcov` (demangled names),
 `--json`, `--cobertura`, `--html`, `--fail-under 80`,
 `--ignore-filename-regex`; a failing test ends the run unless
 `--no-fail-fast`, which reports what ran. `cfg(coverage)` is set, as with
-cargo-llvm-cov.
+cargo-llvm-cov. The instrumented build lives in `<target>/coverage/build`, so
+`rune coverage` and `rune build`/`rune test` never replace each other's files
+and each stays warm; a profile cut short (a test binary killed mid-write) is
+left out with a warning rather than failing the report.
 
 ## Keeping the store small
 

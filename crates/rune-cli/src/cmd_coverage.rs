@@ -7,6 +7,11 @@
 //! `LLVM_PROFILE_FILE` pointing into `<target>/coverage`, and the profiles are
 //! merged and reported with the toolchain's own `llvm-profdata` and
 //! `llvm-cov` (the `llvm-tools` component, installed on first use).
+//!
+//! The instrumented build has a directory of its own, `<target>/coverage/
+//! build`: its crates have the same file names as the ordinary build's, and
+//! sharing one directory made each command replace the other's files (and
+//! a `rune test` running beside `rune coverage` fail).
 
 use anyhow::{Context, Result, bail};
 use colored::Colorize;
@@ -345,7 +350,10 @@ fn regex_escape(s: &str) -> String {
 }
 
 pub fn coverage(args: CoverageArgs) -> Result<()> {
-    let ws = Workspace::load(args.common.manifest_path.as_deref())?;
+    let mut ws = Workspace::load(args.common.manifest_path.as_deref())?;
+    if let Some(dir) = crate::session::target_dir_override(&args.common)? {
+        ws.config.target_dir = dir;
+    }
     let tools = find_tools(true)?;
     let dir = ws.config.target_dir.join("coverage");
     let profraw_dir = dir.join("profraw");
@@ -370,8 +378,10 @@ pub fn coverage(args: CoverageArgs) -> Result<()> {
                 .into_owned(),
         )],
     };
+    let mut common = args.common.clone();
+    common.target_dir = Some(dir.join("build"));
     let test_args = TestArgs {
-        common: args.common.clone(),
+        common,
         targets: args.targets.clone(),
         filter: args.filter.clone(),
         doc: false,
@@ -385,6 +395,7 @@ pub fn coverage(args: CoverageArgs) -> Result<()> {
         retries: 0,
         junit: None,
         schedule: Some("binaries".into()),
+        test_jobs: args.test_jobs,
     };
     let outcome = crate::cmd_test::run_with(test_args, Mode::Test, Some(&instrument))?;
     if outcome.failed && !args.no_fail_fast {
@@ -396,7 +407,8 @@ pub fn coverage(args: CoverageArgs) -> Result<()> {
         return Ok(());
     }
 
-    // Merge.
+    // Merge. A profile cut short (a test binary killed mid-write) is left
+    // out with a warning instead of failing the report.
     let profraws: Vec<PathBuf> = std::fs::read_dir(&profraw_dir)?
         .flatten()
         .map(|e| e.path())
@@ -406,17 +418,27 @@ pub fn coverage(args: CoverageArgs) -> Result<()> {
         bail!("the tests recorded no coverage (did any run?)");
     }
     let profdata = dir.join("rune.profdata");
+    let what = ui::plural(profraws.len(), "profile");
+    let activity = ui::Activity::start("merging", &what);
     let merged = Command::new(&tools.profdata)
-        .args(["merge", "-sparse", "-o"])
+        .args(["merge", "-sparse", "--failure-mode=all", "-o"])
         .arg(&profdata)
         .args(&profraws)
         .output()
         .context("running llvm-profdata")?;
+    let took = activity.elapsed();
+    activity.clear();
     if !merged.status.success() {
         bail!(
             "llvm-profdata merge failed: {}",
             String::from_utf8_lossy(&merged.stderr).trim()
         );
+    }
+    ui::action("merged", format!("{what} · {}", ui::secs(took).dimmed()));
+    for line in String::from_utf8_lossy(&merged.stderr).lines() {
+        if let Some(w) = line.trim().strip_prefix("warning: ") {
+            ui::warn(format!("a coverage profile was left out: {w}"));
+        }
     }
 
     // The programs whose coverage mappings describe the code.
@@ -452,12 +474,27 @@ pub fn coverage(args: CoverageArgs) -> Result<()> {
         Ok(out.stdout)
     };
 
-    let summary: serde_json::Value = serde_json::from_slice(&run(
-        llvm_cov("export", &["-format=text", "-summary-only"]),
-        "export",
-    )?)?;
-    let lcov = String::from_utf8(run(llvm_cov("export", &["-format=lcov"]), "export")?)
-        .unwrap_or_default();
+    // The summary and the per-line counts are separate exports; llvm-cov
+    // runs on one core, so both run at once.
+    let what = format!("on {}", ui::plural(objects.len(), "program"));
+    let activity = ui::Activity::start("reporting", &what);
+    let (summary, lcov) = std::thread::scope(|scope| {
+        let lcov = scope.spawn(|| run(llvm_cov("export", &["-format=lcov"]), "export"));
+        let summary = run(
+            llvm_cov("export", &["-format=text", "-summary-only"]),
+            "export",
+        );
+        (
+            summary,
+            lcov.join()
+                .unwrap_or_else(|_| Err(anyhow::anyhow!("llvm-cov export panicked"))),
+        )
+    });
+    let took = activity.elapsed();
+    activity.clear();
+    let summary: serde_json::Value = serde_json::from_slice(&summary?)?;
+    let lcov = String::from_utf8(lcov?).unwrap_or_default();
+    ui::action("reported", format!("{what} · {}", ui::secs(took).dimmed()));
     let lines = lcov_lines(&lcov);
 
     let root = ws.root();
@@ -525,6 +562,7 @@ pub fn coverage(args: CoverageArgs) -> Result<()> {
     if args.html {
         let out_dir = args.output_dir.clone().unwrap_or_else(|| dir.join("html"));
         let _ = std::fs::remove_dir_all(&out_dir);
+        let activity = ui::Activity::start("writing", "the HTML report");
         run(
             llvm_cov(
                 "show",
@@ -539,6 +577,7 @@ pub fn coverage(args: CoverageArgs) -> Result<()> {
             ),
             "show",
         )?;
+        activity.clear();
         ui::action("wrote", out_dir.join("index.html").display());
     }
 
