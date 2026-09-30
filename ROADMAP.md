@@ -567,7 +567,7 @@ and cache lookups for IDEs, Bazel-style wrappers and corporate tooling (see P17)
 ## 7. How to verify the current state
 
 ```bash
-cargo test --workspace                       # 465 tests, no network needed
+cargo test --workspace                       # 482 tests, no network needed
 cargo clippy --workspace --all-targets
 
 # Rune builds and tests itself against live crates.io (use a scratch copy
@@ -1233,3 +1233,91 @@ Recording undeclared *reads* (hermeticity) is still open.
 tests on Linux and macOS, MSRV 1.89, self-host) and a release workflow for four
 targets. `Rune.lock.bin` is no longer committed (it is machine-specific).
 
+## 15. What changed in the audit, coverage and edge-case update (2026-09-30)
+
+**`rune audit`.** The RustSec database as OSV publishes it (one 3.5 MB zip,
+~2,900 documents: RustSec, GitHub and OSV reports for crates.io, among them
+`MAL-` malicious-package reports); GitHub copies of RustSec advisories are
+dropped by alias, withdrawn ones skipped. OSV range semantics (`introduced`,
+`fixed`, `last_affected`), CVSS 3.x base scores computed from the vector
+(GitHub's rating where there is none), paths from `rune why`'s search, fixes
+from the ranges, yanked releases from the cached index (only lines with
+`"yanked":true` are parsed). Cached audit: ~0.1 s. On Rune itself: no
+vulnerabilities, two unmaintained crates (bincode, number_prefix).
+
+**`rune coverage`.** Only workspace crates are instrumented (target role, not
+build scripts or proc-macros), so dependencies keep their store entries; the
+test runner gained a hook (`cmd_test::run_with`) for the flags and
+`LLVM_PROFILE_FILE`, and reports the executables it ran; LCOV is post-processed
+(demangled with `rustc-demangle`, one entry per function across test
+binaries); `llvm-cov show` demangles through a hidden `rune __demangle`.
+
+**Edge cases.** Three sweeps (~90 scenarios, compared with Cargo) found:
+a dependency cycle hung the build (the executor's early error never ended its
+event stream); a *cache-correctness* bug — build-script records were looked up
+by a base shared by every package of the same name and version and named files
+by absolute path, so a second project could be keyed by the first project's
+files and get its script output; `[patch."<git>"]` and `default-run` ignored;
+`--target` outputs in `target/debug/<triple>`; manifests Cargo rejects
+accepted; a signal-killed test binary unexplained; `metadata` without
+dependency data. All fixed with tests. Also verified: paths with spaces and
+Unicode, symlinked projects and sources, `kill -9` mid-build, concurrent
+`build`/`test`, a truncated store object, 200-member workspaces (no-op 46 ms),
+100 binaries, 10 MB of test output, invalid UTF-8, read-only sources.
+
+**Speed.** An offline resolution of the 469-package corpus spent ~40 % in
+glibc's allocator: mimalloc makes it ~35 % faster (340–470 → 220–275 ms, lock
+byte-identical); parsed index files are cached in binary beside the JSON.
+Everyday commands against Cargo on Rune's workspace: no-op build 60 vs 220 ms,
+check 65 vs 230, `test --no-run` 70 vs 250, tree 25 vs 200, metadata 90 vs 210.
+
+
+## 16. What changed in the test-runner stability update (2026-09-30)
+
+**Why tests failed now and then.** Rune ran as many test binaries at once as
+it had compile jobs. Tests in different binaries that share something — a
+fixed port, a file, a database — then collided some of the time, and passed
+when run again. Reproduced with three integration tests binding one port:
+`cargo test` always passed, `rune test` failed about half the runs. Test
+binaries (and doc-test runs) now run one at a time, as with Cargo, while the
+build goes on; `--test-jobs N` / `test.jobs` opts into more, and
+`--schedule tests` keeps one batch per core (one binary's tests, which libtest
+runs in parallel anyway).
+
+**Other ways a run could fail or hang.**
+- A test that starts a process and leaves it running (a server) kept the
+  output pipe open, and `rune test` waited for that process. Output is now
+  streamed from reader threads; once the test binary exits, what is still in
+  the pipes is taken and the rest not waited for.
+- Starting a binary that had just been linked could fail with `ETXTBSY` if a
+  process forked in that instant; the start is retried briefly.
+- The store-restore pass did not take a unit's lock, so a second `rune` in the
+  same target directory could put a read-only store file where the first's
+  compiler was writing ("output file is not writeable"). Busy units are now
+  left to the scheduler, which waits its turn and restores them afterwards.
+- `rune coverage` builds the workspace's crates with other flags but the same
+  file names; it and ordinary builds replaced each other's files. The
+  instrumented build has its own directory (`<target>/coverage/build`), so
+  both stay warm and can run at once. `llvm-profdata` leaves out a truncated
+  profile (a killed test) with a warning instead of failing the report.
+- A target directory or store inside a package (`--target-dir out`, a CI's
+  `RUNE_HOME=$PWD/.cache`) was hashed as the package's sources, so every build
+  was a miss. Rune now tags both with `CACHEDIR.TAG` (as Cargo tags its target
+  directory) and the hasher skips tagged directories.
+- Tests get `CARGO`, `CARGO_MANIFEST_PATH` and all `CARGO_PKG_*` variables at
+  run time, as Cargo sets them (fixtures built through `$CARGO`, tests reading
+  `CARGO_PKG_REPOSITORY`).
+
+**Feedback.** A live line under the build's: binaries done, tests passed so
+far (counted from libtest's output as each test finishes), and what runs now
+with its own `done/total` and elapsed time. Results print as each binary
+finishes. `rune coverage` shows its merge and report steps with durations; the
+summary and LCOV exports run at once.
+
+**Rune's own suite.** Fixed sleeps that raced a loaded machine became waits
+for the event (`watch` waits for the first run's "waiting for changes"; a
+build-script ordering test has the slow script wait for the other's start);
+the CLI tests clear `RUNE_*`, `CARGO_TARGET_DIR` and flag variables from the
+environment; a fake HTTP server's header/body writes stalled on Nagle's
+algorithm (rune-cas tests 2.9 → 0.5 s); a probe test slept a second it did
+not need.

@@ -2,13 +2,16 @@
 //!
 //! Test binaries are nodes in the same build graph as everything else, so the
 //! scheduler builds them as soon as their dependencies are ready and this
-//! module starts each one **the moment it finishes linking** — while the rest
-//! of the graph is still compiling — instead of waiting for a full build first
-//! and then running test binaries one after another.
+//! module queues each one **the moment it finishes linking** — testing starts
+//! while the rest of the graph is still compiling, instead of after a full
+//! build.
 //!
-//! Output is printed in a fixed order (package, then library, binaries,
-//! integration tests, doctests) regardless of which binary happens to finish
-//! first, so a run's output is predictable and diffable.
+//! One test process runs at a time by default, as with Cargo (tests in
+//! different binaries may share ports, files or a database); `test.jobs`
+//! allows more. Each binary's result is printed as soon as it is in, with a
+//! live line below showing what runs and how many tests passed so far;
+//! reports (`--junit`, JSON) list binaries in a fixed order (package, then
+//! library, binaries, integration tests, doctests).
 
 use anyhow::{Result, bail};
 use colored::Colorize;
@@ -17,7 +20,7 @@ use rune_common::TargetKind;
 use rune_graph::NodeId;
 use rune_scheduler::PipelineEvent;
 use rune_scheduler::executor::out_dir_for;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -103,9 +106,37 @@ pub fn parse_counts(output: &str) -> Counts {
     total
 }
 
+/// How `rune coverage` changes a test run.
+pub struct Instrument {
+    /// Flags for the workspace's own crates (not dependencies, not build
+    /// scripts or proc-macros).
+    pub rustflags: Vec<String>,
+    /// Environment for every test program.
+    pub env: Vec<(String, String)>,
+}
+
+/// What a test run did.
+pub struct RunOutcome {
+    pub failed: bool,
+    /// Every program the run built from the workspace's crates: test
+    /// binaries, and the binaries tests may start.
+    pub executables: Vec<PathBuf>,
+}
+
 pub fn run(args: TestArgs, mode: Mode) -> Result<()> {
+    if run_with(args, mode, None)?.failed {
+        // Cargo exits with 101 when tests fail; scripts rely on that.
+        std::process::exit(101);
+    }
+    Ok(())
+}
+
+pub fn run_with(args: TestArgs, mode: Mode, instrument: Option<&Instrument>) -> Result<RunOutcome> {
     let bench = mode == Mode::Bench;
-    let sess = Session::new(&args.common, if bench { "bench" } else { "test" })?;
+    let mut sess = Session::new(&args.common, if bench { "bench" } else { "test" })?;
+    if let Some(i) = instrument {
+        sess.run_env = i.env.clone();
+    }
 
     let mut targets = selection(&args.targets);
     targets.doc_only = args.doc;
@@ -121,7 +152,7 @@ pub fn run(args: TestArgs, mode: Mode) -> Result<()> {
             || !targets.test.is_empty());
 
     warn_cross(&sess);
-    let plan = graph::plan(
+    let mut plan = graph::plan(
         &sess.ws,
         &Request {
             profile: &sess.profile,
@@ -136,6 +167,15 @@ pub fn run(args: TestArgs, mode: Mode) -> Result<()> {
             doctests: want_doctests,
         },
     )?;
+    if let Some(i) = instrument {
+        let ids: Vec<NodeId> = plan.graph.nodes().iter().map(|n| n.id).collect();
+        for id in ids {
+            let unit = &mut plan.graph.node_mut(id).unit;
+            if unit.ext.member && !unit.ext.for_host && !unit.is_build_script {
+                unit.ext.rustflags.extend(i.rustflags.iter().cloned());
+            }
+        }
+    }
     sess.ws.config.ensure_dirs(sess.profile.output_dir_name())?;
 
     // -- What will run, in output order.
@@ -169,7 +209,10 @@ pub fn run(args: TestArgs, mode: Mode) -> Result<()> {
     let total_slots = doc_base + plan.doc_tests.len();
     if total_slots == 0 {
         ui::warn("nothing to test in the selected packages");
-        return Ok(());
+        return Ok(RunOutcome {
+            failed: false,
+            executables: Vec::new(),
+        });
     }
 
     let by_node: HashMap<NodeId, usize> = runnables
@@ -237,7 +280,6 @@ pub fn run(args: TestArgs, mode: Mode) -> Result<()> {
         .unwrap_or_default(),
     );
 
-    let runner_count = sess.jobs.clamp(1, 64);
     // `--schedule tests`: binaries are split into batches of tests, which the
     // runners take from one queue. How many batches each binary was split
     // into, for the printer to put its results back together.
@@ -250,7 +292,21 @@ pub fn run(args: TestArgs, mode: Mode) -> Result<()> {
         anyhow::bail!("unknown test schedule `{schedule}`: expected `binaries` or `tests`");
     }
     let split = schedule == "tests" && !bench && splittable(&args.test_args);
+    // One test process at a time unless asked otherwise, as with Cargo: the
+    // tests of different binaries may share a port, a file or a database,
+    // and running two binaries at once made such suites fail now and then.
+    // The build goes on meanwhile, so the next binary is ready when the
+    // runner is. Split batches are one binary's tests, which libtest runs
+    // in parallel anyway.
+    let runner_count = args
+        .test_jobs
+        .or_else(|| sess.ws.config.settings.test_jobs())
+        .unwrap_or(if split { sess.jobs } else { 1 })
+        .clamp(1, 64);
+    let progress = crate::test_progress::TestProgress::new(total_slots, !sess.quiet && !sess.json);
+    let process_ids = std::sync::atomic::AtomicUsize::new(0);
     let parts_of: std::sync::Mutex<HashMap<usize, usize>> = Default::default();
+    let executables: std::cell::RefCell<Vec<PathBuf>> = Default::default();
     let build_result = std::thread::scope(|scope| -> Result<_> {
         // Runner threads.
         for _ in 0..runner_count {
@@ -263,6 +319,9 @@ pub fn run(args: TestArgs, mode: Mode) -> Result<()> {
             let args_ref = &args;
             let test_cas = &test_cas;
             let package_files = &package_files;
+            let progress = &progress;
+            let process_ids = &process_ids;
+            let labels = &labels;
             scope.spawn(move || {
                 while let Ok(job) = job_rx.recv() {
                     let order = match &job {
@@ -287,13 +346,17 @@ pub fn run(args: TestArgs, mode: Mode) -> Result<()> {
                             externs,
                             script,
                         } => {
+                            let id = process_ids.fetch_add(1, Ordering::Relaxed);
+                            progress.begin(id, &labels[order]);
                             let r = run_doctest(
                                 sess,
                                 &plan_ref.doc_tests[doc],
                                 &externs,
                                 &script,
                                 args_ref,
+                                &|line| progress.line(id, line),
                             );
+                            progress.end(id);
                             TestResult { order, ..r }
                         }
                         Job::Binary {
@@ -360,11 +423,22 @@ pub fn run(args: TestArgs, mode: Mode) -> Result<()> {
                                 .stdin(Stdio::null());
                             apply_run_env(&mut cmd, member, sess);
                             let t = Instant::now();
-                            match cmd.output() {
+                            let id = process_ids.fetch_add(1, Ordering::Relaxed);
+                            progress.begin(id, &labels[order]);
+                            let ran = run_streaming(&mut cmd, &|line| progress.line(id, line));
+                            progress.end(id);
+                            match ran {
                                 Ok(out) => {
-                                    let mut text =
-                                        String::from_utf8_lossy(&out.stdout).into_owned();
-                                    text.push_str(&String::from_utf8_lossy(&out.stderr));
+                                    let mut text = out.stdout;
+                                    text.push_str(&out.stderr);
+                                    if let Some(why) = killed_by(&out.status) {
+                                        // libtest never got to report: say
+                                        // what ended it, as Cargo does.
+                                        text.push_str(&format!(
+                                            "\nthe test binary was killed by {why} before it finished \
+                                             (a test aborted, overflowed its stack or was killed)\n"
+                                        ));
+                                    }
                                     let mut counts = parse_counts(&text);
                                     if let Some(b) = &batch {
                                         // Each batch reports the rest of the
@@ -396,10 +470,9 @@ pub fn run(args: TestArgs, mode: Mode) -> Result<()> {
                                                 .env("CARGO_TARGET_TMPDIR", &tmp)
                                                 .stdin(Stdio::null());
                                             apply_run_env(&mut again, member, sess);
-                                            let out = again.output().ok()?;
-                                            let mut text =
-                                                String::from_utf8_lossy(&out.stdout).into_owned();
-                                            text.push_str(&String::from_utf8_lossy(&out.stderr));
+                                            let out = run_streaming(&mut again, &|_| {}).ok()?;
+                                            let mut text = out.stdout;
+                                            text.push_str(&out.stderr);
                                             Some(text)
                                         });
                                         result.took = t.elapsed();
@@ -439,22 +512,24 @@ pub fn run(args: TestArgs, mode: Mode) -> Result<()> {
             });
         }
 
-        // Printer thread: emits results in `order`.
+        // Printer thread: prints each binary's result the moment it is in
+        // (a failure shows while the rest still runs); reports list them in
+        // `order`.
         let printer = {
             let res_rx = res_rx.clone();
             let parts_of = &parts_of;
             let labels = &labels;
+            let progress = &progress;
             let json = sess.json;
             scope.spawn(move || {
-                let mut pending: BTreeMap<usize, TestResult> = BTreeMap::new();
-                let mut next = 0usize;
+                let mut settled = 0usize;
                 let mut counts = Counts::default();
-                let mut failed: Vec<String> = Vec::new();
+                let mut failed: Vec<(usize, String)> = Vec::new();
                 let mut ran = 0usize;
-                let mut suites: Vec<crate::test_report::Suite> = Vec::new();
+                let mut suites: Vec<(usize, crate::test_report::Suite)> = Vec::new();
                 let mut flaky: Vec<String> = Vec::new();
                 let mut partial: HashMap<usize, (usize, TestResult)> = HashMap::new();
-                while next < total_slots {
+                while settled < total_slots {
                     let Ok(r) = res_rx.recv() else { break };
                     let parts = parts_of.lock().unwrap().get(&r.order).copied().unwrap_or(1);
                     let r = if parts > 1 {
@@ -471,45 +546,48 @@ pub fn run(args: TestArgs, mode: Mode) -> Result<()> {
                     } else {
                         r
                     };
-                    pending.insert(r.order, r);
-                    while let Some(r) = pending.remove(&next) {
-                        if !json {
-                            print_result(&labels[next], &r, verbose);
-                        }
-                        if !matches!(r.outcome, Outcome::Skipped) {
-                            ran += 1;
-                            let suite = suite_of(&labels[next], &r);
-                            if json {
-                                // One line per binary, after the build's
-                                // compiler messages, for tools.
-                                ui::out(serde_json::json!({
-                                    "reason": "test-suite-finished",
-                                    "suite": suite.name,
-                                    "outcome": match r.outcome {
-                                        Outcome::Passed => "passed",
-                                        Outcome::Cached => "cached",
-                                        Outcome::Failed => "failed",
-                                        Outcome::CompileFailed => "not-built",
-                                        Outcome::Skipped => "skipped",
-                                    },
-                                    "seconds": suite.seconds,
-                                    "passed": r.counts.passed,
-                                    "failed": r.counts.failed,
-                                    "ignored": r.counts.ignored,
-                                    "tests": suite.cases,
-                                    "error": suite.error,
-                                }));
-                            }
-                            suites.push(suite);
-                        }
-                        counts.add(r.counts);
-                        if matches!(r.outcome, Outcome::Failed | Outcome::CompileFailed) {
-                            failed.push(labels[next].clone());
-                        }
-                        flaky.extend(r.flaky.iter().map(|t| format!("{t} ({})", labels[next])));
-                        next += 1;
+                    settled += 1;
+                    progress.slot_done(r.counts);
+                    let label = &labels[r.order];
+                    if !json {
+                        print_result(label, &r, verbose);
                     }
+                    if !matches!(r.outcome, Outcome::Skipped) {
+                        ran += 1;
+                        let suite = suite_of(label, &r);
+                        if json {
+                            // One line per binary, after the build's
+                            // compiler messages, for tools.
+                            ui::out(serde_json::json!({
+                                "reason": "test-suite-finished",
+                                "suite": suite.name,
+                                "outcome": match r.outcome {
+                                    Outcome::Passed => "passed",
+                                    Outcome::Cached => "cached",
+                                    Outcome::Failed => "failed",
+                                    Outcome::CompileFailed => "not-built",
+                                    Outcome::Skipped => "skipped",
+                                },
+                                "seconds": suite.seconds,
+                                "passed": r.counts.passed,
+                                "failed": r.counts.failed,
+                                "ignored": r.counts.ignored,
+                                "tests": suite.cases,
+                                "error": suite.error,
+                            }));
+                        }
+                        suites.push((r.order, suite));
+                    }
+                    counts.add(r.counts);
+                    if matches!(r.outcome, Outcome::Failed | Outcome::CompileFailed) {
+                        failed.push((r.order, label.clone()));
+                    }
+                    flaky.extend(r.flaky.iter().map(|t| format!("{t} ({label})")));
                 }
+                suites.sort_by_key(|(order, _)| *order);
+                failed.sort();
+                let suites: Vec<_> = suites.into_iter().map(|(_, s)| s).collect();
+                let failed: Vec<_> = failed.into_iter().map(|(_, l)| l).collect();
                 (counts, failed, ran, suites, flaky)
             })
         };
@@ -522,6 +600,9 @@ pub fn run(args: TestArgs, mode: Mode) -> Result<()> {
             }
             let r = &runnables[idx];
             let exe = find_executable(artifacts, sess, plan, r);
+            if let Some(e) = &exe {
+                executables.borrow_mut().push(e.clone());
+            }
             match exe {
                 Some(exe) if !args.no_run => {
                     let batches = if split && r.harness {
@@ -756,6 +837,7 @@ pub fn run(args: TestArgs, mode: Mode) -> Result<()> {
         let (counts, failed, ran, suites, flaky) = printer
             .join()
             .map_err(|_| anyhow::anyhow!("printer panicked"))?;
+        progress.finish();
         counts_total = counts;
         failed_labels = failed;
         binaries_run = ran;
@@ -765,10 +847,19 @@ pub fn run(args: TestArgs, mode: Mode) -> Result<()> {
         Ok(build)
     })?;
 
-    let _ = build_result;
     if !built_ok {
         bail!("could not compile the test targets");
     }
+    let mut executables = executables.into_inner();
+    // The workspace's own programs, which tests may start.
+    for (id, paths) in &build_result.artifact_paths {
+        let unit = &plan.graph.node(*id).unit;
+        if unit.ext.member && !unit.ext.for_host && unit.crate_type == rune_common::CrateType::Bin {
+            executables.extend(paths.iter().filter(|p| is_program(p)).cloned());
+        }
+    }
+    executables.sort();
+    executables.dedup();
 
     let elapsed = start.elapsed().as_secs_f64();
     if let Some(path) = &args.junit {
@@ -812,11 +903,16 @@ pub fn run(args: TestArgs, mode: Mode) -> Result<()> {
             "{} passed · {} failed · {} ignored · {:.2}s",
             counts_total.passed, counts_total.failed, counts_total.ignored, elapsed
         ));
-        // Cargo exits with 101 when tests fail; scripts rely on that.
-        std::process::exit(101);
+        return Ok(RunOutcome {
+            failed: true,
+            executables,
+        });
     }
     if args.no_run {
-        return Ok(());
+        return Ok(RunOutcome {
+            failed: false,
+            executables,
+        });
     }
     ui::summary(format!(
         "{} passed{} · {} · {:.2}s",
@@ -833,7 +929,185 @@ pub fn run(args: TestArgs, mode: Mode) -> Result<()> {
         },
         elapsed
     ));
-    Ok(())
+    Ok(RunOutcome {
+        failed: false,
+        executables,
+    })
+}
+
+/// `signal 6 (SIGABRT)` when a process was killed by a signal.
+fn killed_by(status: &std::process::ExitStatus) -> Option<String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        let sig = status.signal()?;
+        let name = match sig {
+            libc::SIGABRT => "SIGABRT",
+            libc::SIGSEGV => "SIGSEGV",
+            libc::SIGKILL => "SIGKILL",
+            libc::SIGBUS => "SIGBUS",
+            libc::SIGILL => "SIGILL",
+            libc::SIGFPE => "SIGFPE",
+            libc::SIGTERM => "SIGTERM",
+            libc::SIGINT => "SIGINT",
+            _ => "",
+        };
+        Some(if name.is_empty() {
+            format!("signal {sig}")
+        } else {
+            format!("signal {sig} ({name})")
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = status;
+        None
+    }
+}
+
+/// What a test process printed and how it ended.
+struct Captured {
+    status: std::process::ExitStatus,
+    stdout: String,
+    stderr: String,
+}
+
+/// Runs `cmd` with its output captured, passing each line of its stdout to
+/// `on_line` as it is printed. Unlike `Command::output`, it returns soon
+/// after the process exits even when something the process started still
+/// holds the pipes open (a server a test did not stop): what arrives in the
+/// moment after the exit is kept, and the rest is not waited for.
+fn run_streaming(cmd: &mut Command, on_line: &dyn Fn(&str)) -> std::io::Result<Captured> {
+    use crossbeam_channel::RecvTimeoutError;
+    use std::io::{BufRead, Read};
+    enum Chunk {
+        Out(Vec<u8>),
+        Err(Vec<u8>),
+        Closed,
+    }
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = spawn_retrying(cmd)?;
+    let (tx, rx) = unbounded::<Chunk>();
+    if let Some(out) = child.stdout.take() {
+        let tx = tx.clone();
+        std::thread::spawn(move || {
+            let mut r = std::io::BufReader::new(out);
+            loop {
+                let mut line = Vec::new();
+                match r.read_until(b'\n', &mut line) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {
+                        if tx.send(Chunk::Out(line)).is_err() {
+                            return;
+                        }
+                    }
+                }
+            }
+            let _ = tx.send(Chunk::Closed);
+        });
+    } else {
+        let _ = tx.send(Chunk::Closed);
+    }
+    if let Some(mut err) = child.stderr.take() {
+        let tx = tx.clone();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 16 * 1024];
+            loop {
+                match err.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if tx.send(Chunk::Err(buf[..n].to_vec())).is_err() {
+                            return;
+                        }
+                    }
+                }
+            }
+            let _ = tx.send(Chunk::Closed);
+        });
+    } else {
+        let _ = tx.send(Chunk::Closed);
+    }
+    drop(tx);
+
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    let mut open = 2;
+    let mut exited: Option<(std::process::ExitStatus, Instant)> = None;
+    while open > 0 {
+        // Once the process is gone, only what is already in the pipes is
+        // still to come: stop at the first quiet half second.
+        let wait = if exited.is_some() {
+            Duration::from_millis(500)
+        } else {
+            Duration::from_millis(100)
+        };
+        match rx.recv_timeout(wait) {
+            Ok(Chunk::Out(line)) => {
+                on_line(&String::from_utf8_lossy(&line));
+                out.extend_from_slice(&line);
+            }
+            Ok(Chunk::Err(bytes)) => err.extend_from_slice(&bytes),
+            Ok(Chunk::Closed) => open -= 1,
+            Err(RecvTimeoutError::Timeout) if exited.is_some() => break,
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => break,
+        }
+        match exited {
+            None => {
+                if let Some(status) = child.try_wait()? {
+                    exited = Some((status, Instant::now()));
+                }
+            }
+            // Something the test started keeps printing: enough.
+            Some((_, at)) if at.elapsed() > Duration::from_secs(5) => break,
+            Some(_) => {}
+        }
+    }
+    let status = match exited {
+        Some((status, _)) => status,
+        None => child.wait()?,
+    };
+    Ok(Captured {
+        status,
+        stdout: String::from_utf8_lossy(&out).into_owned(),
+        stderr: String::from_utf8_lossy(&err).into_owned(),
+    })
+}
+
+/// `cmd.spawn()`, tried again for a moment while the executable is busy
+/// (`ETXTBSY`): a binary that just finished linking still is when a process
+/// forked in that instant holds it open until it execs.
+fn spawn_retrying(cmd: &mut Command) -> std::io::Result<std::process::Child> {
+    let mut delay = Duration::from_millis(10);
+    for _ in 0..8 {
+        match cmd.spawn() {
+            #[cfg(unix)]
+            Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) => {
+                std::thread::sleep(delay);
+                delay *= 2;
+            }
+            r => return r,
+        }
+    }
+    cmd.spawn()
+}
+
+/// A file a test can run: executable, and not a library or debug file.
+fn is_program(p: &std::path::Path) -> bool {
+    if matches!(
+        p.extension().and_then(|e| e.to_str()),
+        Some("rlib" | "rmeta" | "d" | "so" | "dylib" | "a" | "pdb" | "dSYM")
+    ) {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+    }
+    #[cfg(not(unix))]
+    {
+        p.extension().is_some_and(|e| e == "exe")
+    }
 }
 
 fn warn_cross(sess: &Session) {
@@ -908,12 +1182,13 @@ fn split_into_batches(
         }
         cmd.args(&args.test_args)
             .current_dir(&m.dir)
-            .stdin(Stdio::null())
-            .stderr(Stdio::null());
+            .stdin(Stdio::null());
         apply_run_env(&mut cmd, m, sess);
-        let out = cmd.output().ok().filter(|o| o.status.success())?;
+        let out = run_streaming(&mut cmd, &|_| {})
+            .ok()
+            .filter(|o| o.status.success())?;
         Some(
-            String::from_utf8_lossy(&out.stdout)
+            out.stdout
                 .lines()
                 .filter_map(|l| l.strip_suffix(": test"))
                 .map(str::to_string)
@@ -1303,6 +1578,7 @@ fn run_doctest(
     externs: &[(String, PathBuf)],
     script: &DocScript,
     args: &TestArgs,
+    on_line: &dyn Fn(&str),
 ) -> TestResult {
     let start = Instant::now();
     let member = &sess.ws.members[doc.member];
@@ -1362,10 +1638,10 @@ fn run_doctest(
     cmd.envs(script.env.iter().map(|(k, v)| (k, v)));
     cmd.stdin(Stdio::null());
 
-    match cmd.output() {
+    match run_streaming(&mut cmd, on_line) {
         Ok(out) => {
-            let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
-            text.push_str(&String::from_utf8_lossy(&out.stderr));
+            let mut text = out.stdout;
+            text.push_str(&out.stderr);
             let counts = parse_counts(&text);
             TestResult {
                 order: 0,

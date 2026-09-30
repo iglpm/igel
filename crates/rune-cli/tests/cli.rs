@@ -7,6 +7,32 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+/// The `rune` under test, with nothing from the environment it runs in that
+/// would change what it does: flags, another compiler, a target directory
+/// (`CARGO_TARGET_DIR` set in a shell or by CI moved every test's outputs),
+/// or `RUNE_*` settings.
+fn rune_command() -> Command {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_rune"));
+    for (key, _) in std::env::vars_os() {
+        let key = key.to_string_lossy();
+        if key.starts_with("RUNE_")
+            || matches!(
+                &*key,
+                "RUSTFLAGS"
+                    | "CARGO_ENCODED_RUSTFLAGS"
+                    | "RUSTDOCFLAGS"
+                    | "RUSTC"
+                    | "RUSTC_WRAPPER"
+                    | "CARGO_TARGET_DIR"
+                    | "CARGO_BUILD_TARGET"
+            )
+        {
+            cmd.env_remove(&*key);
+        }
+    }
+    cmd
+}
+
 struct Project {
     dir: tempfile::TempDir,
     /// Outside the project: files in a package directory are build inputs.
@@ -41,16 +67,11 @@ impl Project {
     }
 
     fn rune_in(&self, cwd: &Path, args: &[&str]) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_rune"))
+        rune_command()
             .args(args)
             .current_dir(cwd)
             .env("RUNE_HOME", self.home())
             .env("NO_COLOR", "1")
-            .env_remove("RUSTFLAGS")
-            .env_remove("CARGO_ENCODED_RUSTFLAGS")
-            .env_remove("RUSTC")
-            .env_remove("RUNE_BUILD_RELEASE_REBUILD_ALL")
-            .env_remove("CARGO_TARGET_DIR")
             .output()
             .unwrap()
     }
@@ -355,7 +376,7 @@ fn config_aliases_and_external_subcommands_work_like_cargos() {
         bin.path().display(),
         std::env::var("PATH").unwrap_or_default()
     );
-    let out = Command::new(env!("CARGO_BIN_EXE_rune"))
+    let out = rune_command()
         .args(["hello", "--flag", "x"])
         .current_dir(p.path())
         .env("RUNE_HOME", p.home())
@@ -1038,7 +1059,12 @@ fn cross_builds_use_a_target_directory_and_host_scripts() {
     let host = host_triple();
     let out = p.ok(&["build", "--target", &host]);
     assert!(out.contains("compiled"), "{out}");
-    let bin = p.path().join(".rune/target/debug").join(&host).join("demo");
+    let bin = p
+        .path()
+        .join(".rune/target")
+        .join(&host)
+        .join("debug")
+        .join("demo");
     assert!(bin.is_file(), "expected {}", bin.display());
     let run = Command::new(&bin).output().unwrap();
     let stdout = String::from_utf8_lossy(&run.stdout);
@@ -1092,9 +1118,15 @@ fn build_dependencies_get_their_own_features_and_are_not_linked_into_the_crate()
     let host = host_triple();
     let out = p.ok(&["build", "--target", &host]);
     assert!(out.contains("compiled"), "{out}");
-    let run = Command::new(p.path().join(".rune/target/debug").join(&host).join("app"))
-        .output()
-        .unwrap();
+    let run = Command::new(
+        p.path()
+            .join(".rune/target")
+            .join(&host)
+            .join("debug")
+            .join("app"),
+    )
+    .output()
+    .unwrap();
     assert!(
         String::from_utf8_lossy(&run.stdout).contains("build=true runtime=false"),
         "{}",
@@ -1145,9 +1177,15 @@ fn proc_macros_build_for_the_host_in_native_and_cross_builds() {
     assert!(p.ok(&["run"]).contains("answer=42"));
     let host = host_triple();
     p.ok(&["build", "--target", &host]);
-    let run = Command::new(p.path().join(".rune/target/debug").join(&host).join("app"))
-        .output()
-        .unwrap();
+    let run = Command::new(
+        p.path()
+            .join(".rune/target")
+            .join(&host)
+            .join("debug")
+            .join("app"),
+    )
+    .output()
+    .unwrap();
     assert!(String::from_utf8_lossy(&run.stdout).contains("answer=42"));
 }
 
@@ -1284,7 +1322,7 @@ fn rustc_wrappers_are_used_and_never_share_artifacts_with_unwrapped_builds() {
     assert!(!log.exists());
 
     let run = |p: &Project| {
-        let out = Command::new(env!("CARGO_BIN_EXE_rune"))
+        let out = rune_command()
             .args(["build"])
             .current_dir(p.path())
             .env("RUNE_HOME", p.home())
@@ -1637,7 +1675,7 @@ fn git_submodules_are_checked_out_and_part_of_the_source() {
     );
 
     let p = git_app(&format!("{{ git = {:?} }}", url(repo.path())));
-    let out = Command::new(env!("CARGO_BIN_EXE_rune"))
+    let out = rune_command()
         .args(["run"])
         .current_dir(p.path())
         .env("RUNE_HOME", p.home())
@@ -2669,7 +2707,7 @@ fn packages_are_published_installed_yanked_and_owned_through_a_registry_api() {
     // Credentials go to a CARGO_HOME of the test's own.
     let cargo_home = tempfile::tempdir().unwrap();
     let rune = |args: &[&str]| {
-        Command::new(env!("CARGO_BIN_EXE_rune"))
+        rune_command()
             .args(args)
             .current_dir(p.path())
             .env("RUNE_HOME", p.home())
@@ -2797,7 +2835,7 @@ fn registry_tokens_come_from_external_credential_providers() {
         ),
     );
     let cargo_home = tempfile::tempdir().unwrap();
-    let out = Command::new(env!("CARGO_BIN_EXE_rune"))
+    let out = rune_command()
         .args(["yank", "foo@1.0.0", "--registry", "mock"])
         .current_dir(p.path())
         .env("RUNE_HOME", p.home())
@@ -2895,7 +2933,7 @@ fn authenticated_alternative_registries_resolve_download_and_are_part_of_the_ide
     );
 
     // With a token from the environment, exactly as Cargo reads it.
-    let with_token = Command::new(env!("CARGO_BIN_EXE_rune"))
+    let with_token = rune_command()
         .args(["run"])
         .current_dir(p.path())
         .env("RUNE_HOME", p.home())
@@ -2935,7 +2973,7 @@ fn an_undefined_registry_is_an_error_not_a_fallback_to_crates_io() {
 
 /// Runs `rune run` with one extra environment variable (or none).
 fn run_with_env(p: &Project, var: &str, value: Option<&str>) -> String {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_rune"));
+    let mut cmd = rune_command();
     cmd.args(["run"])
         .current_dir(p.path())
         .env("RUNE_HOME", p.home())
@@ -3482,11 +3520,12 @@ fn an_unknown_message_format_is_rejected() {
 fn watch_runs_again_when_a_file_changes_and_shows_the_new_result() {
     use std::io::Read;
     use std::process::Stdio;
+    use std::sync::{Arc, Mutex};
     let p = Project::new();
     p.write("Cargo.toml", LIB_MANIFEST);
     p.write("src/lib.rs", "pub fn f() {}\n");
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_rune"))
+    let mut child = rune_command()
         .args(["watch", "--interval-ms", "50", "--max-runs", "2"])
         .current_dir(p.path())
         .env("RUNE_HOME", p.home())
@@ -3495,37 +3534,58 @@ fn watch_runs_again_when_a_file_changes_and_shows_the_new_result() {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
+    // Everything it prints, as it prints it.
+    let all = Arc::new(Mutex::new(String::new()));
+    let readers: Vec<_> = [
+        Box::new(child.stdout.take().unwrap()) as Box<dyn Read + Send>,
+        Box::new(child.stderr.take().unwrap()),
+    ]
+    .into_iter()
+    .map(|mut stream| {
+        let all = all.clone();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            while let Ok(n) = stream.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                all.lock()
+                    .unwrap()
+                    .push_str(&String::from_utf8_lossy(&buf[..n]));
+            }
+        })
+    })
+    .collect();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
 
-    // Wait for the first run to finish, then edit: the second run must see a
-    // new warning that the first did not have.
-    std::thread::sleep(std::time::Duration::from_millis(1500));
+    // Once the first run is over, edit: the second run must see a new
+    // warning that the first did not have. (Waiting for a fixed time instead
+    // failed on a loaded machine, where the first run took longer.)
+    while !all.lock().unwrap().contains("waiting for changes") {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the first run did not finish: {}",
+            all.lock().unwrap()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
     p.write(
         "src/lib.rs",
         "pub fn f() { let unused_in_second_run = 1; }\n",
     );
 
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     while child.try_wait().unwrap().is_none() {
         assert!(
             std::time::Instant::now() < deadline,
-            "watch did not run a second time"
+            "watch did not run a second time: {}",
+            all.lock().unwrap()
         );
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
-    let (mut out, mut err) = (String::new(), String::new());
-    child
-        .stdout
-        .take()
-        .unwrap()
-        .read_to_string(&mut out)
-        .unwrap();
-    child
-        .stderr
-        .take()
-        .unwrap()
-        .read_to_string(&mut err)
-        .unwrap();
-    let all = format!("{out}{err}");
+    for r in readers {
+        r.join().unwrap();
+    }
+    let all = all.lock().unwrap().clone();
     assert_eq!(all.matches("rune check").count(), 2, "{all}");
     assert!(all.contains("unused_in_second_run"), "{all}");
     assert!(all.contains("waiting for changes"), "{all}");
@@ -3706,7 +3766,7 @@ fn cached_tests_are_skipped_until_something_that_matters_changes() {
     let test = |args: &[&str]| -> (bool, String) {
         let mut all = vec!["test", "--no-doc"];
         all.extend_from_slice(args);
-        let out = Command::new(env!("CARGO_BIN_EXE_rune"))
+        let out = rune_command()
             .args(&all)
             .current_dir(p.path())
             .env("RUNE_HOME", p.home())
@@ -3764,7 +3824,7 @@ fn cached_tests_are_skipped_until_something_that_matters_changes() {
 }
 
 fn rune_with_env(p: &Project, args: &[&str], env: &[(&str, &std::ffi::OsStr)]) -> Output {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_rune"));
+    let mut cmd = rune_command();
     cmd.args(args)
         .current_dir(p.path())
         .env("RUNE_HOME", p.home())
@@ -4227,7 +4287,7 @@ fn stamps(path: &Path) -> std::collections::HashMap<String, u128> {
 #[test]
 fn a_build_script_runs_while_its_packages_dependencies_are_still_compiling() {
     // `app`'s script needs nothing from `slow` (an ordinary dependency), so it
-    // must not wait for `slow` — whose own script takes 1.5 s — to finish.
+    // must not wait for `slow`'s script to finish.
     let p = Project::new();
     p.write(
         "Cargo.toml",
@@ -4240,10 +4300,22 @@ fn a_build_script_runs_while_its_packages_dependencies_are_still_compiling() {
         "slow/Cargo.toml",
         "[package]\nname = \"slow\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
     );
-    p.write("slow/build.rs", &stamping_script("slow", 1500, ""));
+    // `slow`'s script ends only once `app`'s has started (or after a minute,
+    // which fails the test): a fixed delay raced the compilers on a loaded
+    // machine.
+    let slow_script = stamping_script("slow", 0, "").replace(
+        "    stamp(\"start\");\n",
+        "    stamp(\"start\");\n    \
+         let log = std::env::var(\"RUNE_T_STAMPS\").unwrap();\n    \
+         for _ in 0..600 {\n        \
+         if std::fs::read_to_string(&log).unwrap_or_default().contains(\"app start\") { break; }\n        \
+         std::thread::sleep(std::time::Duration::from_millis(100));\n    }\n",
+    );
+    assert!(slow_script.contains("app start"));
+    p.write("slow/build.rs", &slow_script);
     p.write("slow/src/lib.rs", "pub fn v() -> u32 { 1 }\n");
     let log = p.home().join("stamps.txt");
-    let out = Command::new(env!("CARGO_BIN_EXE_rune"))
+    let out = rune_command()
         .args(["build", "-j", "4"])
         .current_dir(p.path())
         .env("RUNE_HOME", p.home())
@@ -4338,7 +4410,7 @@ fn a_dependency_that_learns_an_outside_input_late_still_rekeys_its_dependents() 
     );
     let log = p.home().join("stamps.txt");
     let run = |mode: &str, args: &[&str]| {
-        let out = Command::new(env!("CARGO_BIN_EXE_rune"))
+        let out = rune_command()
             .args(args)
             .current_dir(p.path())
             .env("RUNE_HOME", p.home())
@@ -4822,7 +4894,7 @@ fn a_minimum_release_age_keeps_brand_new_releases_out_until_they_mature() {
     published(&reg, "b", "2.0.0", "2099-01-01T00:00:00Z");
     let p = app_with(&reg, "a = \"1\"\nb = \"2\"\n");
     let with_age = |args: &[&str]| {
-        let out = Command::new(env!("CARGO_BIN_EXE_rune"))
+        let out = rune_command()
             .args(args)
             .current_dir(p.path())
             .env("RUNE_HOME", p.home())
@@ -4956,7 +5028,7 @@ fn a_store_bundle_carries_a_build_to_a_fresh_machine() {
     let fresh = tempfile::tempdir().unwrap();
     std::fs::remove_dir_all(p.path().join(".rune")).unwrap();
     let rune = |args: &[&str]| {
-        let out = Command::new(env!("CARGO_BIN_EXE_rune"))
+        let out = rune_command()
             .args(args)
             .current_dir(p.path())
             .env("RUNE_HOME", fresh.path())
@@ -5062,7 +5134,7 @@ fn main() {{
 
 fn build_counting_runs(p: &Project) -> usize {
     let log = p.home().join("runs.log");
-    let out = Command::new(env!("CARGO_BIN_EXE_rune"))
+    let out = rune_command()
         .args(["build"])
         .current_dir(p.path())
         .env("RUNE_HOME", p.home())
@@ -5501,7 +5573,7 @@ fn a_cached_dependencys_script_output_still_reaches_rebuilt_dependents() {
     let fresh = tempfile::tempdir().unwrap();
     std::fs::remove_dir_all(p.path().join(".rune")).unwrap();
     let rune = |args: &[&str]| {
-        let out = Command::new(env!("CARGO_BIN_EXE_rune"))
+        let out = rune_command()
             .args(args)
             .current_dir(p.path())
             .env("RUNE_HOME", fresh.path())
@@ -6025,4 +6097,564 @@ fn main() {{
     assert!(out.contains("planted=false"), "{out}");
     assert!(out.contains("net_unreachable=true"), "{out}");
     assert!(!outside.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn audit_reports_advisories_for_locked_versions() {
+    let reg = local_registry(&[
+        ("smallvec", "1.6.0", &[]),
+        ("oldcrate", "0.3.1", &[]),
+        ("middle", "1.0.0", &[("smallvec", "^1.6")]),
+    ]);
+    let p = app_with(&reg, "middle = \"1\"\noldcrate = \"0.3\"\n");
+    p.ok(&["build"]);
+    let db = p.path().join("advisories");
+    std::fs::create_dir_all(&db).unwrap();
+    let advisory = |id: &str, aliases: &[&str], name: &str, events: &str, informational: &str| {
+        format!(
+            r#"{{"id":"{id}","aliases":{aliases:?},"summary":"Problem in {name}","details":"Details.",
+               "affected":[{{"package":{{"name":"{name}","ecosystem":"crates.io"}},
+               "ranges":[{{"type":"SEMVER","events":[{events}]}}],
+               "ecosystem_specific":{{"affects":{{"functions":["{name}::f"]}}}},
+               "database_specific":{{"informational":{informational}}}}}],
+               "severity":[{{"type":"CVSS_V3","score":"CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"}}]}}"#
+        )
+    };
+    let write = |file: &str, text: String| std::fs::write(db.join(file), text).unwrap();
+    write(
+        "RUSTSEC-2021-0003.json",
+        advisory(
+            "RUSTSEC-2021-0003",
+            &["GHSA-43w2-9j62-hq99"],
+            "smallvec",
+            r#"{"introduced":"1.0.0"},{"fixed":"1.6.1"}"#,
+            "null",
+        ),
+    );
+    // GitHub's copy of the same advisory is not reported twice.
+    write(
+        "GHSA-43w2-9j62-hq99.json",
+        advisory(
+            "GHSA-43w2-9j62-hq99",
+            &["RUSTSEC-2021-0003"],
+            "smallvec",
+            r#"{"introduced":"1.0.0"},{"fixed":"1.6.1"}"#,
+            "null",
+        ),
+    );
+    write(
+        "RUSTSEC-2020-0001.json",
+        advisory(
+            "RUSTSEC-2020-0001",
+            &[],
+            "oldcrate",
+            r#"{"introduced":"0"}"#,
+            "\"unmaintained\"",
+        ),
+    );
+    // Fixed before the locked version: not reported.
+    write(
+        "RUSTSEC-2019-0001.json",
+        advisory(
+            "RUSTSEC-2019-0001",
+            &[],
+            "smallvec",
+            r#"{"introduced":"0"},{"fixed":"1.0.0"}"#,
+            "null",
+        ),
+    );
+    let db_arg = db.to_str().unwrap();
+
+    let out = p.rune(&["audit", "--db", db_arg]);
+    let t = text(&out);
+    assert_eq!(out.status.code(), Some(1), "{t}");
+    assert!(
+        t.contains("smallvec 1.6.0 · RUSTSEC-2021-0003 · critical 9.8"),
+        "{t}"
+    );
+    assert!(
+        t.contains("app 0.1.0 → middle 1.0.0 → smallvec 1.6.0"),
+        "{t}"
+    );
+    assert!(t.contains("rune update smallvec --precise 1.6.1"), "{t}");
+    assert!(
+        t.contains("oldcrate 0.3.1 · RUSTSEC-2020-0001 · unmaintained"),
+        "{t}"
+    );
+    assert!(
+        !t.contains("GHSA-43w2") && !t.contains("RUSTSEC-2019-0001"),
+        "{t}"
+    );
+    assert!(t.contains("1 vulnerability found · 1 warning"), "{t}");
+
+    // Accepted: only the warning is left, which does not fail…
+    let out = p.rune(&["audit", "--db", db_arg, "--ignore", "RUSTSEC-2021-0003"]);
+    assert!(out.status.success(), "{}", text(&out));
+    // …unless warnings are denied.
+    let out = p.rune(&[
+        "audit",
+        "--db",
+        db_arg,
+        "--ignore",
+        "GHSA-43w2-9j62-hq99",
+        "--deny",
+        "unmaintained",
+    ]);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+    p.write("Rune.toml", "[audit]\nignore = \"RUSTSEC-2021-0003\"\n");
+    assert!(p.rune(&["audit", "--db", db_arg]).status.success());
+    p.write("Rune.toml", "");
+
+    let out = p.rune(&["audit", "--db", db_arg, "--format", "json"]);
+    let json: serde_json::Value =
+        serde_json::from_slice(&out.stdout).unwrap_or_else(|e| panic!("{e}: {}", text(&out)));
+    assert_eq!(json["vulnerabilities"]["count"], 1);
+    assert_eq!(
+        json["vulnerabilities"]["list"][0]["advisory"]["severity"],
+        "critical"
+    );
+    assert_eq!(
+        json["warnings"]["unmaintained"][0]["package"]["name"],
+        "oldcrate"
+    );
+}
+
+/// Whether the toolchain has llvm-cov (the `llvm-tools` component).
+fn have_llvm_tools() -> bool {
+    let sysroot = Command::new("rustc")
+        .args(["--print", "sysroot"])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default();
+    std::path::Path::new(&sysroot)
+        .join("lib/rustlib")
+        .join(host_triple())
+        .join("bin/llvm-cov")
+        .is_file()
+}
+
+#[test]
+fn coverage_counts_what_tests_run_including_programs_they_start() {
+    if !have_llvm_tools() {
+        eprintln!("skipped: no llvm-tools component");
+        return;
+    }
+    let p = Project::new();
+    p.write(
+        "Cargo.toml",
+        "[package]\nname = \"cov\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    p.write(
+        "src/lib.rs",
+        "pub fn used(x: i32) -> i32 {\n    if x > 0 {\n        x\n    } else {\n        -x\n    }\n}\n\npub fn unused() -> i32 {\n    42\n}\n",
+    );
+    p.write(
+        "src/main.rs",
+        "fn main() {\n    println!(\"{}\", cov::used(-3));\n}\n",
+    );
+    // The integration test runs the program; its coverage counts too.
+    p.write(
+        "tests/run.rs",
+        "#[test]\nfn runs() {\n    let out = std::process::Command::new(env!(\"CARGO_BIN_EXE_cov\")).output().unwrap();\n    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), \"3\");\n}\n",
+    );
+    let out = p.ok(&[
+        "coverage",
+        "--show-missing-lines",
+        "--lcov",
+        "-o",
+        "lcov.info",
+    ]);
+    assert!(out.contains("src/lib.rs"), "{out}");
+    assert!(out.contains("src/main.rs"), "{out}");
+    // `used` ran only through the program, with a negative number.
+    assert!(out.contains("not run: 3, 9-11"), "{out}");
+    let lcov = p.read("lcov.info");
+    assert!(lcov.contains("FNDA:1,cov::used"), "{lcov}");
+    assert!(lcov.contains("FNDA:0,cov::unused"), "{lcov}");
+
+    // A failing test: no report unless asked to keep going; the exit code
+    // is the test runner's.
+    p.write("tests/fail.rs", "#[test]\nfn fails() { panic!(\"no\") }\n");
+    let out = p.rune(&["coverage"]);
+    assert_eq!(out.status.code(), Some(101), "{}", text(&out));
+    assert!(!text(&out).contains("of lines covered"), "{}", text(&out));
+    let out = p.rune(&["coverage", "--no-fail-fast"]);
+    assert_eq!(out.status.code(), Some(101), "{}", text(&out));
+    assert!(text(&out).contains("of lines covered"), "{}", text(&out));
+    std::fs::remove_file(p.path().join("tests/fail.rs")).unwrap();
+
+    let out = p.rune(&["coverage", "--fail-under", "99"]);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+    assert!(text(&out).contains("is below the required 99 %"));
+    // The instrumented build has a directory of its own: the ordinary one
+    // is left alone, and plain builds are not instrumented afterwards.
+    assert!(p.path().join(".rune/target/coverage/build/debug").is_dir());
+    p.ok(&["build"]);
+    let scratch = tempfile::tempdir().unwrap();
+    let out = Command::new(p.path().join(".rune/target/debug/cov"))
+        .current_dir(scratch.path())
+        .env_remove("LLVM_PROFILE_FILE")
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "3");
+    assert!(
+        !scratch.path().join("default.profraw").exists(),
+        "the ordinary build is instrumented"
+    );
+}
+
+#[test]
+fn manifest_mistakes_cargo_refuses_are_refused_with_the_reason() {
+    // A dependency cycle is an error naming the cycle (it used to hang).
+    let p = Project::new();
+    p.write("Cargo.toml", "[workspace]\nmembers = [\"a\", \"b\"]\n");
+    p.write(
+        "a/Cargo.toml",
+        "[package]\nname = \"a\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[dependencies]\nb = { path = \"../b\" }\n",
+    );
+    p.write("a/src/lib.rs", "");
+    p.write(
+        "b/Cargo.toml",
+        "[package]\nname = \"b\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[dependencies]\na = { path = \"../a\" }\n",
+    );
+    p.write("b/src/lib.rs", "");
+    let out = p.rune(&["build"]);
+    assert!(!out.status.success());
+    assert!(
+        text(&out).contains("a v0.1.0 → b v0.1.0 → a v0.1.0"),
+        "{}",
+        text(&out)
+    );
+
+    // No library and no binary.
+    let p = Project::new();
+    p.write(
+        "Cargo.toml",
+        "[package]\nname = \"empty\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    let out = p.rune(&["build"]);
+    assert!(
+        text(&out).contains("no targets specified"),
+        "{}",
+        text(&out)
+    );
+
+    // A feature naming nothing.
+    p.write(
+        "Cargo.toml",
+        "[package]\nname = \"f\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[features]\ndefault = [\"nope\"]\n",
+    );
+    p.write("src/lib.rs", "");
+    let out = p.rune(&["build"]);
+    assert!(
+        text(&out).contains(
+            "feature `default` includes `nope` which is neither a dependency nor another feature"
+        ),
+        "{}",
+        text(&out)
+    );
+    // `dep:` on a dependency that is not optional.
+    p.write(
+        "Cargo.toml",
+        "[package]\nname = \"f\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[dependencies]\nx = { path = \"x\" }\n[features]\nextra = [\"dep:x\"]\n",
+    );
+    p.write(
+        "x/Cargo.toml",
+        "[package]\nname = \"x\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    p.write("x/src/lib.rs", "");
+    let out = p.rune(&["build"]);
+    assert!(
+        text(&out).contains("`x` is not an optional dependency"),
+        "{}",
+        text(&out)
+    );
+    // Optional dependencies (also target-specific ones) are fine.
+    p.write(
+        "Cargo.toml",
+        "[package]\nname = \"f\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[target.'cfg(unix)'.dependencies]\nx = { path = \"x\", optional = true }\n[features]\nextra = [\"dep:x\", \"x/std\"]\nplain = [\"x\"]\n",
+    );
+    p.write(
+        "x/Cargo.toml",
+        "[package]\nname = \"x\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[features]\nstd = []\n",
+    );
+    p.ok(&["build", "--features", "extra"]);
+    // …but not a feature of a dependency that it does not have.
+    p.write(
+        "x/Cargo.toml",
+        "[package]\nname = \"x\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    let out = p.rune(&["build", "--features", "extra"]);
+    assert!(
+        text(&out)
+            .contains("depends on `x` with feature `std`, but `x` does not have that feature"),
+        "{}",
+        text(&out)
+    );
+
+    // Two members with one name.
+    let p = Project::new();
+    p.write("Cargo.toml", "[workspace]\nmembers = [\"a\", \"b\"]\n");
+    for d in ["a", "b"] {
+        p.write(
+            &format!("{d}/Cargo.toml"),
+            "[package]\nname = \"same\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        );
+        p.write(&format!("{d}/src/lib.rs"), "");
+    }
+    let out = p.rune(&["build"]);
+    assert!(
+        text(&out).contains("two packages named `same`"),
+        "{}",
+        text(&out)
+    );
+
+    // Names of the standard library's crates.
+    let p = Project::new();
+    let out = p.rune(&["new", "test"]);
+    assert!(!out.status.success());
+    assert!(
+        text(&out).contains("built-in test library"),
+        "{}",
+        text(&out)
+    );
+}
+
+#[test]
+fn build_script_results_are_never_shared_between_different_packages() {
+    // Two unrelated projects with a package of the same name and version, in
+    // one store. Both scripts watch a file; each must be keyed by its own
+    // script and its own files, never by the record of the other's run.
+    let p = Project::new();
+    let manifest = "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n";
+    p.write("one/Cargo.toml", manifest);
+    p.write(
+        "one/build.rs",
+        "fn main(){ println!(\"cargo::rerun-if-changed=data.txt\"); println!(\"cargo::rustc-env=DATA={}\", std::fs::read_to_string(\"data.txt\").unwrap().trim()); }",
+    );
+    p.write("one/data.txt", "from one");
+    p.write(
+        "one/src/main.rs",
+        "fn main(){ println!(\"{}\", env!(\"DATA\")) }",
+    );
+    p.write("two/Cargo.toml", manifest);
+    p.write(
+        "two/build.rs",
+        "fn main(){ println!(\"cargo::rerun-if-env-changed=MY_VAR\"); println!(\"cargo::rustc-env=V=[{}]\", std::env::var(\"MY_VAR\").unwrap_or_default()); }",
+    );
+    p.write(
+        "two/src/main.rs",
+        "fn main(){ println!(\"{}\", env!(\"V\")) }",
+    );
+    let run = |dir: &str| {
+        let out = p.rune_in(&p.path().join(dir), &["run", "-q"]);
+        assert!(out.status.success(), "{dir}: {}", text(&out));
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    assert_eq!(run("one"), "from one");
+    assert_eq!(run("two"), "[]");
+
+    // The same script in a third checkout reads its own file.
+    for f in ["Cargo.toml", "build.rs", "src/main.rs"] {
+        p.write(&format!("three/{f}"), &p.read(&format!("one/{f}")));
+    }
+    p.write("three/data.txt", "from three");
+    assert_eq!(run("three"), "from three");
+    // …and one with the same file contents reuses the result.
+    for f in ["Cargo.toml", "build.rs", "src/main.rs", "data.txt"] {
+        p.write(&format!("four/{f}"), &p.read(&format!("one/{f}")));
+    }
+    assert_eq!(run("four"), "from one");
+}
+
+#[test]
+fn default_run_and_metadata_nodes_match_cargo() {
+    let p = Project::new();
+    p.write(
+        "Cargo.toml",
+        "[workspace]\nmembers = [\"app\", \"helper\"]\n",
+    );
+    p.write(
+        "app/Cargo.toml",
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\ndefault-run = \"second\"\n[dependencies]\nhelper = { path = \"../helper\" }\n",
+    );
+    p.write("app/src/bin/first.rs", "fn main(){ println!(\"first\") }");
+    p.write(
+        "app/src/bin/second.rs",
+        "fn main(){ println!(\"second {}\", helper::X) }",
+    );
+    p.write(
+        "helper/Cargo.toml",
+        "[package]\nname = \"helper\"\nversion = \"0.2.0\"\nedition = \"2021\"\n",
+    );
+    p.write("helper/src/lib.rs", "pub const X: u8 = 1;");
+    let out = p.rune_in(&p.path().join("app"), &["run", "-q"]);
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "second 1",
+        "{}",
+        text(&out)
+    );
+
+    let out = p.rune(&["metadata", "--format-version", "1"]);
+    let m: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let dir = p.path().canonicalize().unwrap();
+    let app_id = format!("path+file://{}/app#0.1.0", dir.display());
+    let helper_id = format!("path+file://{}/helper#0.2.0", dir.display());
+    let nodes = m["resolve"]["nodes"].as_array().unwrap();
+    assert_eq!(nodes.len(), 2, "{m}");
+    let app = nodes
+        .iter()
+        .find(|n| n["id"] == app_id.as_str())
+        .expect("app node");
+    assert_eq!(app["deps"][0]["name"], "helper");
+    assert_eq!(app["deps"][0]["pkg"], helper_id.as_str());
+    let pkg = m["packages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["name"] == "app")
+        .unwrap();
+    assert_eq!(pkg["default_run"], "second");
+    assert_eq!(pkg["targets"].as_array().unwrap().len(), 2);
+}
+
+// ---------------------------------------------------------------------------
+// Test runner stability
+// ---------------------------------------------------------------------------
+
+/// A package with three integration tests, each holding `lock` (a file in
+/// the package created exclusively) for a moment, as tests sharing a port
+/// or a database do: two binaries running at once fail.
+fn exclusive_tests_project() -> Project {
+    let p = Project::new();
+    p.write(
+        "Cargo.toml",
+        "[package]\nname = \"excl\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    p.write("src/lib.rs", "pub fn f() -> u8 { 1 }\n");
+    for name in ["a", "b", "c"] {
+        p.write(
+            &format!("tests/{name}.rs"),
+            &format!(
+                r#"#[test]
+fn holds_the_shared_resource() {{
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mine = dir.join("{name}.here");
+    std::fs::write(&mine, "").unwrap();
+    if std::env::var_os("EXCL_EXPECT_COMPANY").is_some() {{
+        // Another binary must start while this one runs (the first to start
+        // waits for it; the markers stay, so later ones pass at once).
+        let start = std::time::Instant::now();
+        while !["a", "b", "c"].iter().any(|o| *o != "{name}" && dir.join(format!("{{o}}.here")).exists()) {{
+            assert!(start.elapsed().as_secs() < 30, "no other test binary ran at the same time");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }}
+    }} else {{
+        let lock = dir.join("lock");
+        std::fs::OpenOptions::new().write(true).create_new(true).open(&lock)
+            .expect("another test binary holds the shared resource");
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        std::fs::remove_file(&lock).unwrap();
+        std::fs::remove_file(&mine).unwrap();
+    }}
+}}
+"#
+            ),
+        );
+    }
+    p
+}
+
+#[test]
+fn test_binaries_run_one_at_a_time_unless_asked_otherwise() {
+    let p = exclusive_tests_project();
+    // Several times: running binaries at once failed only now and then.
+    for _ in 0..3 {
+        let out = p.ok(&["test"]);
+        assert!(out.contains("3 passed"), "{out}");
+    }
+    // `--test-jobs` (or `test.jobs`) runs binaries side by side.
+    let forget = || {
+        for name in ["a", "b", "c"] {
+            let _ = std::fs::remove_file(p.path().join(format!("{name}.here")));
+        }
+    };
+    let out = rune_with_env(
+        &p,
+        &["test", "--test-jobs", "3"],
+        &[("EXCL_EXPECT_COMPANY", "1".as_ref())],
+    );
+    assert!(out.status.success(), "{}", text(&out));
+    forget();
+    p.ok(&["config", "set", "test.jobs", "2"]);
+    let out = rune_with_env(&p, &["test"], &[("EXCL_EXPECT_COMPANY", "1".as_ref())]);
+    assert!(out.status.success(), "{}", text(&out));
+}
+
+#[cfg(unix)]
+#[test]
+fn a_test_that_leaves_a_process_running_does_not_hold_up_the_run() {
+    // The child keeps the test binary's output open long after the binary
+    // is gone; waiting for the pipe to close would wait for it.
+    let p = Project::new();
+    p.write(
+        "Cargo.toml",
+        "[package]\nname = \"leak\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    p.write("src/lib.rs", "");
+    p.write(
+        "tests/server.rs",
+        "#[test]\nfn starts_a_server() {\n    std::process::Command::new(\"sleep\").arg(\"60\").spawn().unwrap();\n    println!(\"started\");\n}\n",
+    );
+    let start = std::time::Instant::now();
+    let out = p.ok(&["test"]);
+    assert!(out.contains("1 passed"), "{out}");
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(30),
+        "the run waited for the test's child: {:?}",
+        start.elapsed()
+    );
+}
+
+#[test]
+fn tests_see_the_package_environment_cargo_gives_them() {
+    let p = Project::new();
+    p.write(
+        "Cargo.toml",
+        "[package]\nname = \"envy\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\
+         repository = \"https://example.com/envy\"\nlicense = \"MIT\"\n",
+    );
+    p.write("src/lib.rs", "");
+    p.write(
+        "tests/env.rs",
+        r#"#[test]
+fn package_env() {
+    let var = |k: &str| std::env::var(k).unwrap_or_else(|_| panic!("{k} is not set"));
+    assert_eq!(var("CARGO_PKG_REPOSITORY"), "https://example.com/envy");
+    assert_eq!(var("CARGO_PKG_LICENSE"), "MIT");
+    assert!(var("CARGO_MANIFEST_PATH").ends_with("Cargo.toml"));
+    assert!(std::path::Path::new(&var("CARGO_TARGET_TMPDIR")).is_dir());
+}
+"#,
+    );
+    p.ok(&["test"]);
+}
+
+#[test]
+fn a_target_directory_or_store_inside_the_package_is_not_its_source() {
+    // Every build changed the files in `out/`, which counted as the
+    // package's sources: nothing was ever cached.
+    let p = lib_project();
+    p.ok(&["build", "--target-dir", "out"]);
+    let out = p.ok(&["build", "--target-dir", "out"]);
+    assert!(out.contains("0 compiled"), "{out}");
+    assert!(p.path().join("out/CACHEDIR.TAG").is_file());
+    // The same for a store kept in the project (a CI caching `RUNE_HOME`).
+    let home = p.path().join(".ci-home");
+    let out = rune_with_env(&p, &["build"], &[("RUNE_HOME", home.as_os_str())]);
+    assert!(out.status.success(), "{}", text(&out));
+    let out = rune_with_env(&p, &["build"], &[("RUNE_HOME", home.as_os_str())]);
+    assert!(text(&out).contains("0 compiled"), "{}", text(&out));
 }

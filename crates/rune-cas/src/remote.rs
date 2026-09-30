@@ -1110,6 +1110,7 @@ mod http_tests {
         exec: NameSet,
     ) {
         stream.set_nonblocking(false).unwrap();
+        stream.set_nodelay(true).ok();
         stream
             .set_read_timeout(Some(Duration::from_millis(200)))
             .ok();
@@ -1193,12 +1194,14 @@ mod http_tests {
             } else {
                 ""
             };
-            write!(
-                out,
-                "HTTP/1.1 {status}\r\ncontent-length: {claimed}\r\n{exec_line}\r\n"
-            )
-            .unwrap();
-            out.write_all(&payload).unwrap();
+            // One write: a header and a body sent separately wait out
+            // Nagle's algorithm against the client's delayed ACK, 40 ms a
+            // request.
+            let mut response =
+                format!("HTTP/1.1 {status}\r\ncontent-length: {claimed}\r\n{exec_line}\r\n")
+                    .into_bytes();
+            response.extend_from_slice(&payload);
+            out.write_all(&response).unwrap();
         }
     }
 

@@ -133,6 +133,30 @@ impl Patches {
     /// The patch for a dependency on `name` from `source`, if any. It is only
     /// *used* if the patched package's version satisfies `req` (checked by
     /// [`PatchEntry::locate`]).
+    /// The directory of the `[patch."<url>"]` entry for git dependency
+    /// `name`, when there is one whose version fits `req`.
+    pub fn git_patch_dir(
+        &self,
+        url: &str,
+        name: &str,
+        req: &VersionReq,
+    ) -> Result<Option<PathBuf>, String> {
+        let norm = |u: &str| {
+            u.trim_end_matches('/')
+                .trim_end_matches(".git")
+                .trim_start_matches("git+")
+                .to_string()
+        };
+        for e in self.entries.iter().filter(|e| {
+            e.name == name && matches!(&e.source, PatchSource::Git(s) if norm(s) == norm(url))
+        }) {
+            if let Some((dir, _)) = e.locate(req)? {
+                return Ok(Some(dir));
+            }
+        }
+        Ok(None)
+    }
+
     pub fn find(&self, name: &str, source: &PatchSource) -> Vec<&PatchEntry> {
         self.entries
             .iter()

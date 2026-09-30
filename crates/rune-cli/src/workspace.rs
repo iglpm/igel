@@ -34,6 +34,7 @@ impl Member {
             .unwrap_or_else(|| semver::Version::new(0, 0, 0));
         let edition = pkg.edition_in(ws).parse().unwrap_or(Edition::E2015);
         let meta = pkg.meta_in(ws);
+        validate(&manifest, &manifest_path)?;
         Ok(Self {
             dir: dir.to_path_buf(),
             manifest_path,
@@ -49,6 +50,70 @@ impl Member {
     pub fn id(&self) -> String {
         format!("{} {}", self.name, self.version)
     }
+}
+
+/// What Cargo refuses in a package manifest, refused the same way: a
+/// package without a library or binary, and features naming what does not
+/// exist.
+fn validate(manifest: &Manifest, path: &Path) -> Result<()> {
+    if manifest.lib.is_none() && manifest.bin.is_empty() {
+        bail!(
+            "failed to parse manifest at `{}`: no targets specified in the manifest; either \
+             src/lib.rs, src/main.rs, a [lib] section, or [[bin]] section must be present",
+            path.display()
+        );
+    }
+    // Every dependency, by the name the package uses, and whether optional.
+    let mut deps: std::collections::HashMap<&str, bool> = std::collections::HashMap::new();
+    for d in manifest.dependencies.values() {
+        let optional = deps.entry(d.name.as_str()).or_insert(false);
+        *optional |= d.spec.optional;
+    }
+    for t in manifest.target.values() {
+        for (name, v) in t
+            .dependencies
+            .iter()
+            .chain(&t.dev_dependencies)
+            .chain(&t.build_dependencies)
+        {
+            let opt = v.get("optional").and_then(|o| o.as_bool()).unwrap_or(false);
+            *deps.entry(name.as_str()).or_insert(false) |= opt;
+        }
+    }
+    let mut names: Vec<&String> = manifest.features.keys().collect();
+    names.sort();
+    for feature in names {
+        for entry in &manifest.features[feature] {
+            let problem = if let Some(dep) = entry.strip_prefix("dep:") {
+                match deps.get(dep) {
+                    Some(true) => None,
+                    Some(false) => Some(format!(
+                        "includes `{entry}`, but `{dep}` is not an optional dependency"
+                    )),
+                    None => Some(format!(
+                        "includes `{entry}`, but `{dep}` is not listed as a dependency"
+                    )),
+                }
+            } else if let Some((dep, _)) = entry.split_once('/') {
+                let dep = dep.trim_end_matches('?');
+                (!deps.contains_key(dep))
+                    .then(|| format!("includes `{entry}`, but `{dep}` is not a dependency"))
+            } else {
+                (!manifest.features.contains_key(entry.as_str())
+                    && deps.get(entry.as_str()) != Some(&true))
+                .then(|| {
+                    format!("includes `{entry}` which is neither a dependency nor another feature")
+                })
+            };
+            if let Some(p) = problem {
+                bail!(
+                    "failed to parse manifest at `{}`: feature `{feature}` {p}",
+                    path.display()
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 /// A loaded workspace: the root manifest, every member, and user settings.
@@ -156,6 +221,16 @@ impl Workspace {
             members.push(Member::load(d, ws_manifest)?);
         }
         members.sort_by(|a, b| a.dir.cmp(&b.dir));
+        for (i, a) in members.iter().enumerate() {
+            if let Some(b) = members[i + 1..].iter().find(|b| b.name == a.name) {
+                bail!(
+                    "two packages named `{}` in this workspace:\n- {}\n- {}",
+                    a.name,
+                    a.manifest_path.display(),
+                    b.manifest_path.display()
+                );
+            }
+        }
 
         let current = members.iter().position(|m| m.dir == start_dir);
         let patches = rune_resolver::Patches::collect(

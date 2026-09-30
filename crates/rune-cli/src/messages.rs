@@ -29,6 +29,15 @@ pub fn validate(format: &str) -> Result<(), String> {
 pub fn package_id(unit: &CompilationUnit) -> String {
     let (name, version) = (&unit.crate_id.name, &unit.crate_id.version);
     match &unit.crate_id.source {
+        // The name is left out when the directory already says it.
+        CrateSource::Local
+            if unit
+                .manifest_dir
+                .file_name()
+                .is_some_and(|n| n == name.as_str()) =>
+        {
+            format!("path+file://{}#{version}", unit.manifest_dir.display())
+        }
         CrateSource::Local => format!(
             "path+file://{}#{name}@{version}",
             unit.manifest_dir.display()

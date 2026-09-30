@@ -449,6 +449,35 @@ impl IndexClient {
         }
     }
 
+    /// The yanked versions of `name` known locally (a cached index entry is
+    /// not refreshed). Only the lines that say `"yanked":true` are parsed.
+    pub fn yanked_versions(&self, name: &str) -> Vec<String> {
+        if let IndexClient::Sparse(c) = self
+            && let Some(text) = c.cached_text(name)
+        {
+            return text
+                .lines()
+                .filter(|l| l.contains("\"yanked\":true"))
+                .filter_map(|l| {
+                    #[derive(serde::Deserialize)]
+                    struct Vers {
+                        vers: String,
+                    }
+                    serde_json::from_str::<Vers>(l).ok().map(|v| v.vers)
+                })
+                .collect();
+        }
+        self.fetch_crate(name)
+            .map(|i| {
+                i.versions
+                    .into_iter()
+                    .filter(|r| r.yanked)
+                    .map(|r| r.vers)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     pub fn fetch_many_with(
         &self,
         names: &[String],

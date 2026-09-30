@@ -49,6 +49,13 @@ pub fn validate_package_name(name: &str) -> Result<()> {
     if RUST_KEYWORDS.contains(&name.replace('-', "_").as_str()) {
         bail!("the name `{name}` cannot be used as a package name, it is a Rust keyword");
     }
+    let normalized = name.replace('-', "_");
+    if ["alloc", "core", "proc_macro", "std", "test"].contains(&normalized.as_str()) {
+        bail!(
+            "the name `{name}` cannot be used as a package name, it conflicts with Rust's \
+             built-in {normalized} library (`--name` picks another name for this directory)"
+        );
+    }
     Ok(())
 }
 

@@ -379,6 +379,20 @@ impl BuildExecutor {
 
     /// Executes the build graph.
     pub fn execute(&self, graph: &BuildGraph) -> RuneResult<BuildResult> {
+        let result = self.execute_graph(graph);
+        if result.is_err() {
+            // Whoever follows the events must learn that nothing more comes.
+            let _ = self.event_tx.send(PipelineEvent::AllComplete {
+                total_duration: Duration::ZERO,
+                cached: 0,
+                compiled: 0,
+                failed: 0,
+            });
+        }
+        result
+    }
+
+    fn execute_graph(&self, graph: &BuildGraph) -> RuneResult<BuildResult> {
         let start_time = Instant::now();
         let profile_dir_name = self.profile.output_dir_name();
         self.config
@@ -467,9 +481,21 @@ impl BuildExecutor {
                 .par_iter()
                 .filter_map(|&id| {
                     let unit = &graph.node(id).unit;
-                    let linked = cas
-                        .link_to(&unit_cas_keys[&id], &self.out_dir_for(unit))
-                        .ok()?;
+                    let key = &unit_cas_keys[&id];
+                    // Another `rune` sharing this target directory may be
+                    // compiling a unit with the same output files right now
+                    // (the same crate built with other flags, as `rune
+                    // coverage` does): putting the store's read-only copy in
+                    // place under its compiler fails that build. Such a unit
+                    // is left to the scheduler, which waits its turn and
+                    // then restores it.
+                    let path = unit_lock_path(&self.config, &self.profile, graph, id);
+                    let rune_common::fsutil::TryLock::Locked(_lock) =
+                        rune_common::fsutil::FileLock::try_exclusive(&path)
+                    else {
+                        return None;
+                    };
+                    let linked = cas.link_to(key, &self.out_dir_for(unit)).ok()?;
                     (!linked.is_empty()).then_some((id, linked))
                 })
                 .collect();
@@ -1243,7 +1269,12 @@ impl BuildExecutor {
             .cas
             .as_ref()
             .and_then(|c| c.get_value(&format!("{base}-script-record")));
-        let key = inputs::script_result_key(&base, record.as_ref(), || package_hash.clone());
+        let key = inputs::script_result_key_in(
+            &base,
+            record.as_ref(),
+            Some(&node.unit.manifest_dir),
+            || package_hash.clone(),
+        );
         (base, package_hash, key)
     }
 
@@ -2011,7 +2042,12 @@ impl UnitJob {
                     );
                     let _ = cas_store.put_value(&format!("{base}-script-record"), &record);
                     let package_hash = self.package_hash.clone();
-                    let key = inputs::script_result_key(base, Some(&record), || package_hash);
+                    let key = inputs::script_result_key_in(
+                        base,
+                        Some(&record),
+                        Some(&unit.manifest_dir),
+                        || package_hash,
+                    );
                     format!("{key}-buildscript")
                 }
                 None => format!("{store_key}-buildscript"),
@@ -2286,12 +2322,16 @@ pub fn out_dir_for(config: &RuneConfig, profile: &Profile, unit: &CompilationUni
 }
 
 /// Where a binary's friendly names (`target/debug/my-app`) live: the profile
-/// directory (under a per-target subdirectory when cross-compiling, as Cargo
-/// does), or its `examples/`.
+/// directory — `target/<triple>/debug/` with `--target`, as Cargo lays it
+/// out — or its `examples/`.
 pub fn bin_dir_for(config: &RuneConfig, profile: &Profile, unit: &CompilationUnit) -> PathBuf {
     let dir = profile.output_dir_name();
     let base = match &unit.target {
-        Some(t) => config.profile_target_dir(dir).join(target_dir_name(&t.0)),
+        Some(t) => {
+            let profile_dir = config.profile_target_dir(dir);
+            let name = profile_dir.file_name().unwrap_or_default().to_owned();
+            config.target_dir.join(target_dir_name(&t.0)).join(name)
+        }
         None => config.profile_target_dir(dir),
     };
     match unit.kind {
@@ -3207,6 +3247,11 @@ pub fn compute_script_base(
     if let Some(script) = &unit.build_script {
         let rel = script.strip_prefix(&unit.manifest_dir).unwrap_or(script);
         hb.update(rel.to_string_lossy().as_bytes());
+        // The script itself: two packages that agree on everything else (the
+        // same name and version in two projects) must not share a record of
+        // what the other's script read.
+        hb.update(b"\0script=");
+        hb.update(inputs::hash_path(script).as_bytes());
     }
     hb.finish_blake3()
 }

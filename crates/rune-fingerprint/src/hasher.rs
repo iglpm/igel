@@ -108,9 +108,10 @@ fn is_editor_dropping(name: &str) -> bool {
 /// those changing must invalidate the cache. So every regular file in the
 /// package is hashed, except:
 ///
-/// * known non-input directories (see [`IGNORED_DIRS`]) and editor droppings
-///   (swap and backup files) — but *not* hidden files or directories in
-///   general,
+/// * known non-input directories (see [`IGNORED_DIRS`]), directories tagged
+///   as caches (`CACHEDIR.TAG`: a target directory by another name) and
+///   editor droppings (swap and backup files) — but *not* hidden files or
+///   directories in general,
 /// * nested packages (a subdirectory with its own `Cargo.toml` is a different
 ///   crate with its own cache key — workspace members live in such directories),
 /// * lock files and `Rune.toml`, which don't affect compilation of this crate.
@@ -142,6 +143,11 @@ fn compute_package_hash_uncached(
             }
             let name = e.file_name().to_string_lossy();
             if IGNORED_DIRS.contains(&name.as_ref()) {
+                return false;
+            }
+            // A target directory or store by another name (`--target-dir
+            // out`, `RUNE_HOME=$PWD/.cache`): output, not source.
+            if e.path().join(rune_common::fsutil::CACHEDIR_TAG).is_file() {
                 return false;
             }
             // A nested package is not part of this one.

@@ -35,6 +35,26 @@ pub fn write_atomic(path: &Path, contents: &[u8]) -> io::Result<()> {
     fs::rename(&tmp, path)
 }
 
+/// The name of a [cache directory tag](https://bford.info/cachedir/).
+pub const CACHEDIR_TAG: &str = "CACHEDIR.TAG";
+
+/// Marks `dir` as a cache directory, as Cargo marks its target directory:
+/// backup tools skip it, and so does Rune when it hashes a package's files
+/// (a target directory or store that lives inside a package, `--target-dir
+/// out` or a CI's `RUNE_HOME=$PWD/.cache`, must not count as its source).
+pub fn tag_cache_dir(dir: &Path) {
+    let tag = dir.join(CACHEDIR_TAG);
+    if !tag.exists() {
+        let _ = fs::create_dir_all(dir);
+        let _ = fs::write(
+            tag,
+            "Signature: 8a477f597d28d172789f06886806bc55\n\
+             # This file is a cache directory tag created by rune.\n\
+             # For information about cache directory tags see https://bford.info/cachedir/\n",
+        );
+    }
+}
+
 /// Makes `dest` a hard link to `src` (or a copy, where linking is impossible),
 /// replacing whatever was there **atomically**: a reader that opens `dest` at
 /// any moment sees either the old file or the new one, never a missing file.

@@ -44,7 +44,10 @@ tar.workspace = true
 flate2.workspace = true
 glob.workspace = true
 walkdir.workspace = true
+filetime.workspace = true
 blake3.workspace = true
+mimalloc = { version = "0.1", default-features = false }
+rustc-demangle = "0.1"
 reqwest.workspace = true
 tempfile.workspace = true
 

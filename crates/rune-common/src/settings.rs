@@ -289,6 +289,23 @@ pub const KEYS: &[KeyDef] = &[
                       files outside the package.",
     },
     KeyDef {
+        name: "audit.ignore",
+        kind: ValueKind::Text,
+        default: "",
+        description: "Advisories `rune audit` accepts (comma-separated IDs, e.g. \
+                      `RUSTSEC-2023-0071`): reviewed, and not relevant to this project.",
+    },
+    KeyDef {
+        name: "test.jobs",
+        kind: ValueKind::Uint,
+        default: "1",
+        description: "How many test binaries `rune test` runs at once. 1 (the default) is \
+                      Cargo's behaviour and safe for tests that share ports, files or databases \
+                      across binaries; more finishes sooner when they don't. Each binary still \
+                      runs its own tests in parallel, and building continues meanwhile. With \
+                      `test.schedule = tests` the default is one per core.",
+    },
+    KeyDef {
         name: "test.schedule",
         kind: ValueKind::Text,
         default: "binaries",
@@ -637,6 +654,25 @@ impl Settings {
             Some((Value::Text(t), _)) => crate::time::parse_duration(t).filter(|s| *s > 0),
             _ => Some(7 * 86_400),
         }
+    }
+
+    /// `audit.ignore`: advisory IDs.
+    pub fn audit_ignore(&self) -> Vec<String> {
+        match self.values.get("audit.ignore") {
+            Some((Value::Text(t), _)) => t
+                .split([',', ' '])
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// `test.jobs`, when set.
+    pub fn test_jobs(&self) -> Option<usize> {
+        self.uint("test.jobs")
+            .map(|n| n as usize)
+            .filter(|n| *n > 0)
     }
 
     /// `test.schedule`, when set.

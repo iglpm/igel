@@ -148,6 +148,40 @@ fn send_with_retry_n(
     }
 }
 
+/// A downloaded file and its validator.
+pub struct Fetched {
+    pub body: Vec<u8>,
+    pub etag: Option<String>,
+}
+
+/// Downloads `url` unless it still matches `etag` (`None` then: not
+/// modified). With the process's network settings and retries.
+pub fn fetch_if_changed(url: &str, etag: Option<&str>) -> Result<Option<Fetched>, String> {
+    static CLIENT: LazyClient = LazyClient::new(|b| b.timeout(Duration::from_secs(120)));
+    let resp = send_with_retry(|| {
+        let r = CLIENT.get(url);
+        match etag {
+            Some(tag) => r.header(reqwest::header::IF_NONE_MATCH, tag),
+            None => r,
+        }
+    })
+    .map_err(|e| describe(&e))?;
+    let status = resp.status();
+    if status == reqwest::StatusCode::NOT_MODIFIED {
+        return Ok(None);
+    }
+    if !status.is_success() {
+        return Err(format!("{url} answered {status}"));
+    }
+    let etag = resp
+        .headers()
+        .get(reqwest::header::ETAG)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let body = resp.bytes().map_err(|e| describe(&e))?.to_vec();
+    Ok(Some(Fetched { body, etag }))
+}
+
 /// A one-line explanation of a failed request for users: the innermost cause
 /// (e.g. "invalid peer certificate: UnknownIssuer") plus, for certificate
 /// problems, how to trust a custom CA.
