@@ -2,7 +2,9 @@
 
 mod affected;
 mod args;
+mod cmd_audit;
 mod cmd_build;
+mod cmd_coverage;
 mod cmd_deps;
 mod cmd_explain;
 mod cmd_graph;
@@ -51,6 +53,12 @@ fn main() {
         let rest: Vec<OsString> = std::env::args_os().skip(2).collect();
         rune_common::sandbox::helper_main(&rest);
     }
+    // llvm-cov's demangler (`rune coverage --html`): mangled names in, one
+    // per line; readable names out.
+    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("__demangle")) {
+        cmd_coverage::demangle_stdin();
+        return;
+    }
     ui::setup_logging();
 
     let args = external::expand(std::env::args_os().collect());
@@ -90,6 +98,8 @@ fn main() {
         Commands::Upgrade(a) => cmd_upgrade::upgrade(a),
         Commands::Unused(a) => cmd_unused::unused(a),
         Commands::Sbom(a) => cmd_sbom::sbom(a),
+        Commands::Audit(a) => cmd_audit::audit(a),
+        Commands::Coverage(a) => cmd_coverage::coverage(*a),
         Commands::Tree(a) => cmd_deps::tree(a),
         Commands::Graph(a) => cmd_graph::graph(a),
         Commands::Why(a) => cmd_deps::why(a),

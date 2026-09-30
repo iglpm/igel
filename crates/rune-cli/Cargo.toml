@@ -44,7 +44,9 @@ tar.workspace = true
 flate2.workspace = true
 glob.workspace = true
 walkdir.workspace = true
+filetime.workspace = true
 blake3.workspace = true
+rustc-demangle = "0.1"
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true

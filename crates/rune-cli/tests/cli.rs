@@ -6026,3 +6026,195 @@ fn main() {{
     assert!(out.contains("net_unreachable=true"), "{out}");
     assert!(!outside.exists());
 }
+
+#[cfg(unix)]
+#[test]
+fn audit_reports_advisories_for_locked_versions() {
+    let reg = local_registry(&[
+        ("smallvec", "1.6.0", &[]),
+        ("oldcrate", "0.3.1", &[]),
+        ("middle", "1.0.0", &[("smallvec", "^1.6")]),
+    ]);
+    let p = app_with(&reg, "middle = \"1\"\noldcrate = \"0.3\"\n");
+    p.ok(&["build"]);
+    let db = p.path().join("advisories");
+    std::fs::create_dir_all(&db).unwrap();
+    let advisory = |id: &str, aliases: &[&str], name: &str, events: &str, informational: &str| {
+        format!(
+            r#"{{"id":"{id}","aliases":{aliases:?},"summary":"Problem in {name}","details":"Details.",
+               "affected":[{{"package":{{"name":"{name}","ecosystem":"crates.io"}},
+               "ranges":[{{"type":"SEMVER","events":[{events}]}}],
+               "ecosystem_specific":{{"affects":{{"functions":["{name}::f"]}}}},
+               "database_specific":{{"informational":{informational}}}}}],
+               "severity":[{{"type":"CVSS_V3","score":"CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"}}]}}"#
+        )
+    };
+    let write = |file: &str, text: String| std::fs::write(db.join(file), text).unwrap();
+    write(
+        "RUSTSEC-2021-0003.json",
+        advisory(
+            "RUSTSEC-2021-0003",
+            &["GHSA-43w2-9j62-hq99"],
+            "smallvec",
+            r#"{"introduced":"1.0.0"},{"fixed":"1.6.1"}"#,
+            "null",
+        ),
+    );
+    // GitHub's copy of the same advisory is not reported twice.
+    write(
+        "GHSA-43w2-9j62-hq99.json",
+        advisory(
+            "GHSA-43w2-9j62-hq99",
+            &["RUSTSEC-2021-0003"],
+            "smallvec",
+            r#"{"introduced":"1.0.0"},{"fixed":"1.6.1"}"#,
+            "null",
+        ),
+    );
+    write(
+        "RUSTSEC-2020-0001.json",
+        advisory(
+            "RUSTSEC-2020-0001",
+            &[],
+            "oldcrate",
+            r#"{"introduced":"0"}"#,
+            "\"unmaintained\"",
+        ),
+    );
+    // Fixed before the locked version: not reported.
+    write(
+        "RUSTSEC-2019-0001.json",
+        advisory(
+            "RUSTSEC-2019-0001",
+            &[],
+            "smallvec",
+            r#"{"introduced":"0"},{"fixed":"1.0.0"}"#,
+            "null",
+        ),
+    );
+    let db_arg = db.to_str().unwrap();
+
+    let out = p.rune(&["audit", "--db", db_arg]);
+    let t = text(&out);
+    assert_eq!(out.status.code(), Some(1), "{t}");
+    assert!(
+        t.contains("smallvec 1.6.0 · RUSTSEC-2021-0003 · critical 9.8"),
+        "{t}"
+    );
+    assert!(
+        t.contains("app 0.1.0 → middle 1.0.0 → smallvec 1.6.0"),
+        "{t}"
+    );
+    assert!(t.contains("rune update smallvec --precise 1.6.1"), "{t}");
+    assert!(
+        t.contains("oldcrate 0.3.1 · RUSTSEC-2020-0001 · unmaintained"),
+        "{t}"
+    );
+    assert!(
+        !t.contains("GHSA-43w2") && !t.contains("RUSTSEC-2019-0001"),
+        "{t}"
+    );
+    assert!(t.contains("1 vulnerability found · 1 warning"), "{t}");
+
+    // Accepted: only the warning is left, which does not fail…
+    let out = p.rune(&["audit", "--db", db_arg, "--ignore", "RUSTSEC-2021-0003"]);
+    assert!(out.status.success(), "{}", text(&out));
+    // …unless warnings are denied.
+    let out = p.rune(&[
+        "audit",
+        "--db",
+        db_arg,
+        "--ignore",
+        "GHSA-43w2-9j62-hq99",
+        "--deny",
+        "unmaintained",
+    ]);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+    p.write("Rune.toml", "[audit]\nignore = \"RUSTSEC-2021-0003\"\n");
+    assert!(p.rune(&["audit", "--db", db_arg]).status.success());
+    p.write("Rune.toml", "");
+
+    let out = p.rune(&["audit", "--db", db_arg, "--format", "json"]);
+    let json: serde_json::Value =
+        serde_json::from_slice(&out.stdout).unwrap_or_else(|e| panic!("{e}: {}", text(&out)));
+    assert_eq!(json["vulnerabilities"]["count"], 1);
+    assert_eq!(
+        json["vulnerabilities"]["list"][0]["advisory"]["severity"],
+        "critical"
+    );
+    assert_eq!(
+        json["warnings"]["unmaintained"][0]["package"]["name"],
+        "oldcrate"
+    );
+}
+
+/// Whether the toolchain has llvm-cov (the `llvm-tools` component).
+fn have_llvm_tools() -> bool {
+    let sysroot = Command::new("rustc")
+        .args(["--print", "sysroot"])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default();
+    std::path::Path::new(&sysroot)
+        .join("lib/rustlib")
+        .join(host_triple())
+        .join("bin/llvm-cov")
+        .is_file()
+}
+
+#[test]
+fn coverage_counts_what_tests_run_including_programs_they_start() {
+    if !have_llvm_tools() {
+        eprintln!("skipped: no llvm-tools component");
+        return;
+    }
+    let p = Project::new();
+    p.write(
+        "Cargo.toml",
+        "[package]\nname = \"cov\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    p.write(
+        "src/lib.rs",
+        "pub fn used(x: i32) -> i32 {\n    if x > 0 {\n        x\n    } else {\n        -x\n    }\n}\n\npub fn unused() -> i32 {\n    42\n}\n",
+    );
+    p.write(
+        "src/main.rs",
+        "fn main() {\n    println!(\"{}\", cov::used(-3));\n}\n",
+    );
+    // The integration test runs the program; its coverage counts too.
+    p.write(
+        "tests/run.rs",
+        "#[test]\nfn runs() {\n    let out = std::process::Command::new(env!(\"CARGO_BIN_EXE_cov\")).output().unwrap();\n    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), \"3\");\n}\n",
+    );
+    let out = p.ok(&[
+        "coverage",
+        "--show-missing-lines",
+        "--lcov",
+        "-o",
+        "lcov.info",
+    ]);
+    assert!(out.contains("src/lib.rs"), "{out}");
+    assert!(out.contains("src/main.rs"), "{out}");
+    // `used` ran only through the program, with a negative number.
+    assert!(out.contains("not run: 3, 9-11"), "{out}");
+    let lcov = p.read("lcov.info");
+    assert!(lcov.contains("FNDA:1,cov::used"), "{lcov}");
+    assert!(lcov.contains("FNDA:0,cov::unused"), "{lcov}");
+
+    // A failing test: no report unless asked to keep going; the exit code
+    // is the test runner's.
+    p.write("tests/fail.rs", "#[test]\nfn fails() { panic!(\"no\") }\n");
+    let out = p.rune(&["coverage"]);
+    assert_eq!(out.status.code(), Some(101), "{}", text(&out));
+    assert!(!text(&out).contains("of lines covered"), "{}", text(&out));
+    let out = p.rune(&["coverage", "--no-fail-fast"]);
+    assert_eq!(out.status.code(), Some(101), "{}", text(&out));
+    assert!(text(&out).contains("of lines covered"), "{}", text(&out));
+    std::fs::remove_file(p.path().join("tests/fail.rs")).unwrap();
+
+    let out = p.rune(&["coverage", "--fail-under", "99"]);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+    assert!(text(&out).contains("is below the required 99 %"));
+    // Plain builds are not instrumented afterwards.
+    p.ok(&["build"]);
+}

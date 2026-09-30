@@ -235,6 +235,11 @@ impl SparseIndexClient {
         }
     }
 
+    /// The cached index entry of `name`, as stored.
+    pub fn cached_text(&self, name: &str) -> Option<String> {
+        fs::read_to_string(self.cache_dir.join(Self::crate_index_path(name))).ok()
+    }
+
     /// Fetches the crate index, preferring the local cache.
     ///
     /// Mirrors Cargo's own behavior: the registry index is only queried over

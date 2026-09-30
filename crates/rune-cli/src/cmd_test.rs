@@ -103,9 +103,37 @@ pub fn parse_counts(output: &str) -> Counts {
     total
 }
 
+/// How `rune coverage` changes a test run.
+pub struct Instrument {
+    /// Flags for the workspace's own crates (not dependencies, not build
+    /// scripts or proc-macros).
+    pub rustflags: Vec<String>,
+    /// Environment for every test program.
+    pub env: Vec<(String, String)>,
+}
+
+/// What a test run did.
+pub struct RunOutcome {
+    pub failed: bool,
+    /// Every program the run built from the workspace's crates: test
+    /// binaries, and the binaries tests may start.
+    pub executables: Vec<PathBuf>,
+}
+
 pub fn run(args: TestArgs, mode: Mode) -> Result<()> {
+    if run_with(args, mode, None)?.failed {
+        // Cargo exits with 101 when tests fail; scripts rely on that.
+        std::process::exit(101);
+    }
+    Ok(())
+}
+
+pub fn run_with(args: TestArgs, mode: Mode, instrument: Option<&Instrument>) -> Result<RunOutcome> {
     let bench = mode == Mode::Bench;
-    let sess = Session::new(&args.common, if bench { "bench" } else { "test" })?;
+    let mut sess = Session::new(&args.common, if bench { "bench" } else { "test" })?;
+    if let Some(i) = instrument {
+        sess.run_env = i.env.clone();
+    }
 
     let mut targets = selection(&args.targets);
     targets.doc_only = args.doc;
@@ -121,7 +149,7 @@ pub fn run(args: TestArgs, mode: Mode) -> Result<()> {
             || !targets.test.is_empty());
 
     warn_cross(&sess);
-    let plan = graph::plan(
+    let mut plan = graph::plan(
         &sess.ws,
         &Request {
             profile: &sess.profile,
@@ -136,6 +164,15 @@ pub fn run(args: TestArgs, mode: Mode) -> Result<()> {
             doctests: want_doctests,
         },
     )?;
+    if let Some(i) = instrument {
+        let ids: Vec<NodeId> = plan.graph.nodes().iter().map(|n| n.id).collect();
+        for id in ids {
+            let unit = &mut plan.graph.node_mut(id).unit;
+            if unit.ext.member && !unit.ext.for_host && !unit.is_build_script {
+                unit.ext.rustflags.extend(i.rustflags.iter().cloned());
+            }
+        }
+    }
     sess.ws.config.ensure_dirs(sess.profile.output_dir_name())?;
 
     // -- What will run, in output order.
@@ -169,7 +206,10 @@ pub fn run(args: TestArgs, mode: Mode) -> Result<()> {
     let total_slots = doc_base + plan.doc_tests.len();
     if total_slots == 0 {
         ui::warn("nothing to test in the selected packages");
-        return Ok(());
+        return Ok(RunOutcome {
+            failed: false,
+            executables: Vec::new(),
+        });
     }
 
     let by_node: HashMap<NodeId, usize> = runnables
@@ -251,6 +291,7 @@ pub fn run(args: TestArgs, mode: Mode) -> Result<()> {
     }
     let split = schedule == "tests" && !bench && splittable(&args.test_args);
     let parts_of: std::sync::Mutex<HashMap<usize, usize>> = Default::default();
+    let executables: std::cell::RefCell<Vec<PathBuf>> = Default::default();
     let build_result = std::thread::scope(|scope| -> Result<_> {
         // Runner threads.
         for _ in 0..runner_count {
@@ -522,6 +563,9 @@ pub fn run(args: TestArgs, mode: Mode) -> Result<()> {
             }
             let r = &runnables[idx];
             let exe = find_executable(artifacts, sess, plan, r);
+            if let Some(e) = &exe {
+                executables.borrow_mut().push(e.clone());
+            }
             match exe {
                 Some(exe) if !args.no_run => {
                     let batches = if split && r.harness {
@@ -765,10 +809,19 @@ pub fn run(args: TestArgs, mode: Mode) -> Result<()> {
         Ok(build)
     })?;
 
-    let _ = build_result;
     if !built_ok {
         bail!("could not compile the test targets");
     }
+    let mut executables = executables.into_inner();
+    // The workspace's own programs, which tests may start.
+    for (id, paths) in &build_result.artifact_paths {
+        let unit = &plan.graph.node(*id).unit;
+        if unit.ext.member && !unit.ext.for_host && unit.crate_type == rune_common::CrateType::Bin {
+            executables.extend(paths.iter().filter(|p| is_program(p)).cloned());
+        }
+    }
+    executables.sort();
+    executables.dedup();
 
     let elapsed = start.elapsed().as_secs_f64();
     if let Some(path) = &args.junit {
@@ -812,11 +865,16 @@ pub fn run(args: TestArgs, mode: Mode) -> Result<()> {
             "{} passed · {} failed · {} ignored · {:.2}s",
             counts_total.passed, counts_total.failed, counts_total.ignored, elapsed
         ));
-        // Cargo exits with 101 when tests fail; scripts rely on that.
-        std::process::exit(101);
+        return Ok(RunOutcome {
+            failed: true,
+            executables,
+        });
     }
     if args.no_run {
-        return Ok(());
+        return Ok(RunOutcome {
+            failed: false,
+            executables,
+        });
     }
     ui::summary(format!(
         "{} passed{} · {} · {:.2}s",
@@ -833,7 +891,29 @@ pub fn run(args: TestArgs, mode: Mode) -> Result<()> {
         },
         elapsed
     ));
-    Ok(())
+    Ok(RunOutcome {
+        failed: false,
+        executables,
+    })
+}
+
+/// A file a test can run: executable, and not a library or debug file.
+fn is_program(p: &std::path::Path) -> bool {
+    if matches!(
+        p.extension().and_then(|e| e.to_str()),
+        Some("rlib" | "rmeta" | "d" | "so" | "dylib" | "a" | "pdb" | "dSYM")
+    ) {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+    }
+    #[cfg(not(unix))]
+    {
+        p.extension().is_some_and(|e| e == "exe")
+    }
 }
 
 fn warn_cross(sess: &Session) {

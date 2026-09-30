@@ -357,6 +357,9 @@ pub fn apply_run_env(
         .env("CARGO_PKG_VERSION_PRE", member.version.pre.as_str())
         .env("CARGO_PKG_AUTHORS", &member.meta.authors)
         .env("CARGO_PKG_DESCRIPTION", &member.meta.description);
+    for (k, v) in &sess.run_env {
+        cmd.env(k, v);
+    }
     // Where the program's dynamic libraries are, as Cargo sets it up: the
     // native libraries build scripts produced, `deps/` (dylib dependencies)
     // and the profile directory (the workspace's own cdylibs).

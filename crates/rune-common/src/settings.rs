@@ -289,6 +289,13 @@ pub const KEYS: &[KeyDef] = &[
                       files outside the package.",
     },
     KeyDef {
+        name: "audit.ignore",
+        kind: ValueKind::Text,
+        default: "",
+        description: "Advisories `rune audit` accepts (comma-separated IDs, e.g. \
+                      `RUSTSEC-2023-0071`): reviewed, and not relevant to this project.",
+    },
+    KeyDef {
         name: "test.schedule",
         kind: ValueKind::Text,
         default: "binaries",
@@ -636,6 +643,18 @@ impl Settings {
         match self.values.get("cas.compress-after") {
             Some((Value::Text(t), _)) => crate::time::parse_duration(t).filter(|s| *s > 0),
             _ => Some(7 * 86_400),
+        }
+    }
+
+    /// `audit.ignore`: advisory IDs.
+    pub fn audit_ignore(&self) -> Vec<String> {
+        match self.values.get("audit.ignore") {
+            Some((Value::Text(t), _)) => t
+                .split([',', ' '])
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect(),
+            _ => Vec::new(),
         }
     }
 

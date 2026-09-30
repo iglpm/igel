@@ -101,6 +101,12 @@ pub enum Commands {
     Unused(UnusedArgs),
     /// Write a software bill of materials (CycloneDX or SPDX JSON)
     Sbom(SbomArgs),
+    /// Check the locked dependencies for security advisories and yanked releases
+    #[command(after_help = crate::help::examples(&[("rune audit", "vulnerabilities, unmaintained and unsound crates, yanked releases"), ("rune audit --deny warnings", "also fail on the warnings (CI)"), ("rune audit --ignore RUSTSEC-2023-0071", "accept one advisory"), ("rune audit --format json", "for tools")]))]
+    Audit(AuditArgs),
+    /// Measure which code the tests run (source-based coverage)
+    #[command(after_help = crate::help::examples(&[("rune coverage", "run the tests, summarize coverage per file"), ("rune coverage --html", "browsable report in target/coverage/html"), ("rune coverage --lcov -o lcov.info", "for CI services and editors"), ("rune coverage --fail-under 80", "fail when line coverage is below 80 %")]))]
+    Coverage(Box<CoverageArgs>),
     /// Display the resolved dependency tree
     #[command(after_help = crate::help::examples(&[("rune tree", "the whole dependency tree"), ("rune tree --depth 1", "direct dependencies only"), ("rune tree -i syn", "what depends on syn"), ("rune tree -e features -i serde", "why each of serde's features is on")]))]
     Tree(TreeArgs),
@@ -713,6 +719,81 @@ pub struct GraphArgs {
     /// Write to this file instead of stdout
     #[arg(short = 'o', long, value_name = "FILE")]
     pub output: Option<PathBuf>,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct AuditArgs {
+    #[command(flatten)]
+    pub manifest: ManifestArgs,
+    /// Accept an advisory (repeatable; also `audit.ignore`)
+    #[arg(long, value_name = "ID")]
+    pub ignore: Vec<String>,
+    /// Also fail on these warnings (repeatable): `warnings` (all),
+    /// `unmaintained`, `unsound`, `notice`, `yanked`
+    #[arg(long, value_name = "KIND", value_parser = ["warnings", "unmaintained", "unsound", "notice", "yanked"])]
+    pub deny: Vec<String>,
+    /// Advisories from this zip or directory of OSV JSON files
+    #[arg(long, value_name = "PATH")]
+    pub db: Option<PathBuf>,
+    /// Use the cached advisory database without checking for updates
+    #[arg(long)]
+    pub no_fetch: bool,
+    /// Do not check for yanked releases
+    #[arg(long)]
+    pub no_yanked: bool,
+    /// `human` or `json`
+    #[arg(long, default_value = "human", value_parser = ["human", "json"])]
+    pub format: String,
+    /// Every path to each package, and the advisories' details
+    #[arg(short, long)]
+    pub verbose: bool,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct CoverageArgs {
+    #[command(flatten)]
+    pub common: CommonArgs,
+    #[command(flatten)]
+    pub targets: TargetArgs,
+    /// Only run tests whose names contain this
+    #[arg(value_name = "TESTNAME")]
+    pub filter: Option<String>,
+    /// Write an HTML report (to `<target>/coverage/html`, or `--output-dir`)
+    #[arg(long)]
+    pub html: bool,
+    /// Write an LCOV report (to `--output-path`, or `<target>/coverage/lcov.info`)
+    #[arg(long)]
+    pub lcov: bool,
+    /// Write llvm-cov's JSON export
+    #[arg(long)]
+    pub json: bool,
+    /// Write a Cobertura XML report
+    #[arg(long)]
+    pub cobertura: bool,
+    /// Where to write the LCOV/JSON/Cobertura report
+    #[arg(short = 'o', long, value_name = "PATH")]
+    pub output_path: Option<PathBuf>,
+    /// Where to write the HTML report
+    #[arg(long, value_name = "DIR")]
+    pub output_dir: Option<PathBuf>,
+    /// Show every line of the files that are not fully covered
+    #[arg(long)]
+    pub show_missing_lines: bool,
+    /// Fail when line coverage is below this percentage
+    #[arg(long, value_name = "PERCENT")]
+    pub fail_under: Option<f64>,
+    /// Leave files whose path matches this regular expression out of the report
+    #[arg(long, value_name = "REGEX")]
+    pub ignore_filename_regex: Option<String>,
+    /// Build and run the tests, but do not report (the profiles stay for a later report)
+    #[arg(long)]
+    pub no_report: bool,
+    /// Keep going when a test fails, and report what ran
+    #[arg(long)]
+    pub no_fail_fast: bool,
+    /// Arguments after `--` go to the test binaries
+    #[arg(last = true, value_name = "ARGS")]
+    pub test_args: Vec<String>,
 }
 
 #[derive(Args, Debug, Clone)]

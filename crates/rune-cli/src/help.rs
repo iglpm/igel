@@ -14,9 +14,12 @@ const EVERYDAY: &[(&str, &[&str])] = &[
     ("Build", &["build", "check", "run", "test", "watch"]),
     (
         "Dependencies",
-        &["add", "remove", "update", "outdated", "tree"],
+        &["add", "remove", "update", "outdated", "tree", "audit"],
     ),
-    ("Project", &["new", "fmt", "clippy", "doc", "clean"]),
+    (
+        "Project",
+        &["new", "fmt", "clippy", "doc", "coverage", "clean"],
+    ),
     ("Registry", &["search", "info", "install", "publish"]),
     ("Rune", &["doctor", "cas", "config"]),
 ];
@@ -30,12 +33,12 @@ const ALL: &[(&str, &[&str])] = &[
             "build", "check", "run", "test", "bench", "watch", "clean", "explain",
         ],
     ),
-    ("Code", &["fmt", "clippy", "fix", "doc"]),
+    ("Code", &["fmt", "clippy", "fix", "doc", "coverage"]),
     (
         "Dependencies",
         &[
             "add", "remove", "update", "outdated", "upgrade", "unused", "tree", "why", "features",
-            "graph", "fetch", "vendor",
+            "graph", "fetch", "vendor", "audit",
         ],
     ),
     (
@@ -124,6 +127,8 @@ fn short(name: &str) -> Option<&'static str> {
         "rustdoc" => "Document, passing extra flags to rustdoc",
         "metadata" => "Workspace and dependency metadata as JSON",
         "sbom" => "Write a software bill of materials",
+        "audit" => "Check dependencies for security advisories",
+        "coverage" => "Measure which code the tests run",
         "generate-lockfile" => "Resolve and write the lockfile",
         "lockfile" => "Export or migrate lockfiles",
         "locate-project" => "Print the manifest's path as JSON",
