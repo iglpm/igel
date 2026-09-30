@@ -129,6 +129,36 @@ impl BuildGraph {
         self.nodes.len()
     }
 
+    /// `a v0.1.0 → b v0.1.0 → a v0.1.0`: one cycle among the nodes a
+    /// topological sort could not place (those still waiting on a
+    /// dependency).
+    fn describe_cycle(&self, in_degrees: &[usize]) -> String {
+        let Some(start) = self.nodes.iter().find(|n| in_degrees[n.id.0] > 0) else {
+            return "a dependency cycle".to_string();
+        };
+        // Follow unplaced dependencies until a node repeats.
+        let mut path: Vec<NodeId> = vec![start.id];
+        loop {
+            let cur = &self.nodes[path[path.len() - 1].0];
+            let Some(&next) = cur.dependencies.iter().find(|d| in_degrees[d.0] > 0) else {
+                break;
+            };
+            if let Some(i) = path.iter().position(|p| *p == next) {
+                path.drain(..i);
+                path.push(next);
+                break;
+            }
+            path.push(next);
+        }
+        let name = |id: &NodeId| {
+            let u = &self.nodes[id.0].unit;
+            format!("{} v{}", u.crate_id.name, u.crate_id.version)
+        };
+        let mut names: Vec<String> = path.iter().map(name).collect();
+        names.dedup();
+        names.join(" → ")
+    }
+
     /// Performs a topological sort of the graph using Kahn's algorithm.
     /// Returns the nodes in a valid build order (dependencies before dependents).
     pub fn topological_sort(&self) -> Result<Vec<NodeId>, RuneError> {
@@ -157,9 +187,8 @@ impl BuildGraph {
         }
 
         if sorted.len() != self.nodes.len() {
-            // Cycle detected
             return Err(RuneError::DependencyCycle {
-                cycle: "Cycle detected in dependency graph".to_string(),
+                cycle: self.describe_cycle(&in_degrees),
             });
         }
 

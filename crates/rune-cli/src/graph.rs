@@ -2524,6 +2524,19 @@ pub fn plan(ws: &Workspace, req: &Request) -> Result<Plan> {
         &selected_units,
     );
     check_rust_versions(&uni, &locals, &reg, &res, req)?;
+    // A local package asking a local dependency for a feature it lacks
+    // (registry packages were checked when they were published).
+    if let Some((from, to, f)) = res.unknown_features.iter().find(|(from, to, _)| {
+        matches!(uni.origin[*from], Origin::Local(_)) && matches!(uni.origin[*to], Origin::Local(_))
+    }) {
+        bail!(
+            "package `{} v{}` depends on `{}` with feature `{f}`, but `{}` does not have that feature",
+            uni.name[*from],
+            uni.version[*from],
+            uni.name[*to],
+            uni.name[*to]
+        );
+    }
 
     let mut planner = Planner {
         ws,

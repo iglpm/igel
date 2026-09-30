@@ -379,6 +379,20 @@ impl BuildExecutor {
 
     /// Executes the build graph.
     pub fn execute(&self, graph: &BuildGraph) -> RuneResult<BuildResult> {
+        let result = self.execute_graph(graph);
+        if result.is_err() {
+            // Whoever follows the events must learn that nothing more comes.
+            let _ = self.event_tx.send(PipelineEvent::AllComplete {
+                total_duration: Duration::ZERO,
+                cached: 0,
+                compiled: 0,
+                failed: 0,
+            });
+        }
+        result
+    }
+
+    fn execute_graph(&self, graph: &BuildGraph) -> RuneResult<BuildResult> {
         let start_time = Instant::now();
         let profile_dir_name = self.profile.output_dir_name();
         self.config

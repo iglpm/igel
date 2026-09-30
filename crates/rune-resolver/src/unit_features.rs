@@ -92,6 +92,9 @@ pub struct FeatureResolution {
     /// Features per (package, for_host), sorted.
     pub features: BTreeMap<UnitRef, Vec<String>>,
     pub edges: Vec<Edge>,
+    /// `(package, dependency package, feature)`: a feature a package asked a
+    /// dependency for that the dependency does not have.
+    pub unknown_features: Vec<(usize, usize, String)>,
 }
 
 #[derive(Default)]
@@ -116,6 +119,14 @@ pub fn resolve(
     let mut states: BTreeMap<UnitRef, State> = BTreeMap::new();
     let mut queue: VecDeque<UnitRef> = VecDeque::new();
     let mut edges: BTreeSet<(UnitRef, UnitRef, usize)> = BTreeSet::new();
+    let mut unknown: BTreeSet<(usize, usize, String)> = BTreeSet::new();
+    let has_feature = |p: &PackageView, f: &str| {
+        f == "default"
+            || f.contains('/')
+            || f.starts_with("dep:")
+            || p.features.contains_key(f)
+            || p.deps.iter().any(|d| d.optional && d.alias == f)
+    };
 
     // Roots.
     let root_pkgs: BTreeSet<usize> = roots.iter().map(|r| r.package).collect();
@@ -194,6 +205,15 @@ pub fn resolve(
                     request(child_state, f);
                 }
             }
+            for f in dep
+                .features
+                .iter()
+                .chain(dep_features.get(&dep.alias).into_iter().flatten())
+            {
+                if !has_feature(&pkgs[target_pkg], f) {
+                    unknown.insert((pi, target_pkg, f.clone()));
+                }
+            }
             if is_new || signature(child_state) != before {
                 queue.push_back(child);
             }
@@ -214,6 +234,7 @@ pub fn resolve(
         .collect();
     FeatureResolution {
         features,
+        unknown_features: unknown.into_iter().collect(),
         edges: edges
             .into_iter()
             .map(|(from, to, dep)| Edge { from, to, dep })

@@ -6218,3 +6218,120 @@ fn coverage_counts_what_tests_run_including_programs_they_start() {
     // Plain builds are not instrumented afterwards.
     p.ok(&["build"]);
 }
+
+#[test]
+fn manifest_mistakes_cargo_refuses_are_refused_with_the_reason() {
+    // A dependency cycle is an error naming the cycle (it used to hang).
+    let p = Project::new();
+    p.write("Cargo.toml", "[workspace]\nmembers = [\"a\", \"b\"]\n");
+    p.write(
+        "a/Cargo.toml",
+        "[package]\nname = \"a\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[dependencies]\nb = { path = \"../b\" }\n",
+    );
+    p.write("a/src/lib.rs", "");
+    p.write(
+        "b/Cargo.toml",
+        "[package]\nname = \"b\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[dependencies]\na = { path = \"../a\" }\n",
+    );
+    p.write("b/src/lib.rs", "");
+    let out = p.rune(&["build"]);
+    assert!(!out.status.success());
+    assert!(
+        text(&out).contains("a v0.1.0 → b v0.1.0 → a v0.1.0"),
+        "{}",
+        text(&out)
+    );
+
+    // No library and no binary.
+    let p = Project::new();
+    p.write(
+        "Cargo.toml",
+        "[package]\nname = \"empty\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    let out = p.rune(&["build"]);
+    assert!(
+        text(&out).contains("no targets specified"),
+        "{}",
+        text(&out)
+    );
+
+    // A feature naming nothing.
+    p.write(
+        "Cargo.toml",
+        "[package]\nname = \"f\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[features]\ndefault = [\"nope\"]\n",
+    );
+    p.write("src/lib.rs", "");
+    let out = p.rune(&["build"]);
+    assert!(
+        text(&out).contains(
+            "feature `default` includes `nope` which is neither a dependency nor another feature"
+        ),
+        "{}",
+        text(&out)
+    );
+    // `dep:` on a dependency that is not optional.
+    p.write(
+        "Cargo.toml",
+        "[package]\nname = \"f\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[dependencies]\nx = { path = \"x\" }\n[features]\nextra = [\"dep:x\"]\n",
+    );
+    p.write(
+        "x/Cargo.toml",
+        "[package]\nname = \"x\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    p.write("x/src/lib.rs", "");
+    let out = p.rune(&["build"]);
+    assert!(
+        text(&out).contains("`x` is not an optional dependency"),
+        "{}",
+        text(&out)
+    );
+    // Optional dependencies (also target-specific ones) are fine.
+    p.write(
+        "Cargo.toml",
+        "[package]\nname = \"f\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[target.'cfg(unix)'.dependencies]\nx = { path = \"x\", optional = true }\n[features]\nextra = [\"dep:x\", \"x/std\"]\nplain = [\"x\"]\n",
+    );
+    p.write(
+        "x/Cargo.toml",
+        "[package]\nname = \"x\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[features]\nstd = []\n",
+    );
+    p.ok(&["build", "--features", "extra"]);
+    // …but not a feature of a dependency that it does not have.
+    p.write(
+        "x/Cargo.toml",
+        "[package]\nname = \"x\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    let out = p.rune(&["build", "--features", "extra"]);
+    assert!(
+        text(&out)
+            .contains("depends on `x` with feature `std`, but `x` does not have that feature"),
+        "{}",
+        text(&out)
+    );
+
+    // Two members with one name.
+    let p = Project::new();
+    p.write("Cargo.toml", "[workspace]\nmembers = [\"a\", \"b\"]\n");
+    for d in ["a", "b"] {
+        p.write(
+            &format!("{d}/Cargo.toml"),
+            "[package]\nname = \"same\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        );
+        p.write(&format!("{d}/src/lib.rs"), "");
+    }
+    let out = p.rune(&["build"]);
+    assert!(
+        text(&out).contains("two packages named `same`"),
+        "{}",
+        text(&out)
+    );
+
+    // Names of the standard library's crates.
+    let p = Project::new();
+    let out = p.rune(&["new", "test"]);
+    assert!(!out.status.success());
+    assert!(
+        text(&out).contains("built-in test library"),
+        "{}",
+        text(&out)
+    );
+}
