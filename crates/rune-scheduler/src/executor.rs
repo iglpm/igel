@@ -2310,12 +2310,16 @@ pub fn out_dir_for(config: &RuneConfig, profile: &Profile, unit: &CompilationUni
 }
 
 /// Where a binary's friendly names (`target/debug/my-app`) live: the profile
-/// directory (under a per-target subdirectory when cross-compiling, as Cargo
-/// does), or its `examples/`.
+/// directory — `target/<triple>/debug/` with `--target`, as Cargo lays it
+/// out — or its `examples/`.
 pub fn bin_dir_for(config: &RuneConfig, profile: &Profile, unit: &CompilationUnit) -> PathBuf {
     let dir = profile.output_dir_name();
     let base = match &unit.target {
-        Some(t) => config.profile_target_dir(dir).join(target_dir_name(&t.0)),
+        Some(t) => {
+            let profile_dir = config.profile_target_dir(dir);
+            let name = profile_dir.file_name().unwrap_or_default().to_owned();
+            config.target_dir.join(target_dir_name(&t.0)).join(name)
+        }
         None => config.profile_target_dir(dir),
     };
     match unit.kind {

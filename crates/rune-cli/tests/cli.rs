@@ -1038,7 +1038,12 @@ fn cross_builds_use_a_target_directory_and_host_scripts() {
     let host = host_triple();
     let out = p.ok(&["build", "--target", &host]);
     assert!(out.contains("compiled"), "{out}");
-    let bin = p.path().join(".rune/target/debug").join(&host).join("demo");
+    let bin = p
+        .path()
+        .join(".rune/target")
+        .join(&host)
+        .join("debug")
+        .join("demo");
     assert!(bin.is_file(), "expected {}", bin.display());
     let run = Command::new(&bin).output().unwrap();
     let stdout = String::from_utf8_lossy(&run.stdout);
@@ -1092,9 +1097,15 @@ fn build_dependencies_get_their_own_features_and_are_not_linked_into_the_crate()
     let host = host_triple();
     let out = p.ok(&["build", "--target", &host]);
     assert!(out.contains("compiled"), "{out}");
-    let run = Command::new(p.path().join(".rune/target/debug").join(&host).join("app"))
-        .output()
-        .unwrap();
+    let run = Command::new(
+        p.path()
+            .join(".rune/target")
+            .join(&host)
+            .join("debug")
+            .join("app"),
+    )
+    .output()
+    .unwrap();
     assert!(
         String::from_utf8_lossy(&run.stdout).contains("build=true runtime=false"),
         "{}",
@@ -1145,9 +1156,15 @@ fn proc_macros_build_for_the_host_in_native_and_cross_builds() {
     assert!(p.ok(&["run"]).contains("answer=42"));
     let host = host_triple();
     p.ok(&["build", "--target", &host]);
-    let run = Command::new(p.path().join(".rune/target/debug").join(&host).join("app"))
-        .output()
-        .unwrap();
+    let run = Command::new(
+        p.path()
+            .join(".rune/target")
+            .join(&host)
+            .join("debug")
+            .join("app"),
+    )
+    .output()
+    .unwrap();
     assert!(String::from_utf8_lossy(&run.stdout).contains("answer=42"));
 }
 
