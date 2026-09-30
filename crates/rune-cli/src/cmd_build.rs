@@ -310,13 +310,14 @@ fn default_bin(sess: &Session) -> Result<String> {
     let mut bins: Vec<(String, Option<String>)> = Vec::new();
     for &mi in &sess.selected {
         let m = &sess.ws.members[mi];
-        let default_run = m
-            .manifest
-            .package
-            .as_ref()
-            .and_then(|p| p.extra.get("default-run"))
-            .and_then(|v| v.as_str())
-            .map(str::to_string);
+        let default_run = m.manifest.package.as_ref().and_then(|p| {
+            p.default_run.clone().or_else(|| {
+                p.extra
+                    .get("default-run")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+            })
+        });
         for b in &m.manifest.bin {
             if let Some(name) = &b.name {
                 bins.push((name.clone(), default_run.clone()));

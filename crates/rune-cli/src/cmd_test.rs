@@ -406,6 +406,14 @@ pub fn run_with(args: TestArgs, mode: Mode, instrument: Option<&Instrument>) -> 
                                     let mut text =
                                         String::from_utf8_lossy(&out.stdout).into_owned();
                                     text.push_str(&String::from_utf8_lossy(&out.stderr));
+                                    if let Some(why) = killed_by(&out.status) {
+                                        // libtest never got to report: say
+                                        // what ended it, as Cargo does.
+                                        text.push_str(&format!(
+                                            "\nthe test binary was killed by {why} before it finished \
+                                             (a test aborted, overflowed its stack or was killed)\n"
+                                        ));
+                                    }
                                     let mut counts = parse_counts(&text);
                                     if let Some(b) = &batch {
                                         // Each batch reports the rest of the
@@ -895,6 +903,36 @@ pub fn run_with(args: TestArgs, mode: Mode, instrument: Option<&Instrument>) -> 
         failed: false,
         executables,
     })
+}
+
+/// `signal 6 (SIGABRT)` when a process was killed by a signal.
+fn killed_by(status: &std::process::ExitStatus) -> Option<String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        let sig = status.signal()?;
+        let name = match sig {
+            libc::SIGABRT => "SIGABRT",
+            libc::SIGSEGV => "SIGSEGV",
+            libc::SIGKILL => "SIGKILL",
+            libc::SIGBUS => "SIGBUS",
+            libc::SIGILL => "SIGILL",
+            libc::SIGFPE => "SIGFPE",
+            libc::SIGTERM => "SIGTERM",
+            libc::SIGINT => "SIGINT",
+            _ => "",
+        };
+        Some(if name.is_empty() {
+            format!("signal {sig}")
+        } else {
+            format!("signal {sig} ({name})")
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = status;
+        None
+    }
 }
 
 /// A file a test can run: executable, and not a library or debug file.

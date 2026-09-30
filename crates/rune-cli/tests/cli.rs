@@ -6335,3 +6335,102 @@ fn manifest_mistakes_cargo_refuses_are_refused_with_the_reason() {
         text(&out)
     );
 }
+
+#[test]
+fn build_script_results_are_never_shared_between_different_packages() {
+    // Two unrelated projects with a package of the same name and version, in
+    // one store. Both scripts watch a file; each must be keyed by its own
+    // script and its own files, never by the record of the other's run.
+    let p = Project::new();
+    let manifest = "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n";
+    p.write("one/Cargo.toml", manifest);
+    p.write(
+        "one/build.rs",
+        "fn main(){ println!(\"cargo::rerun-if-changed=data.txt\"); println!(\"cargo::rustc-env=DATA={}\", std::fs::read_to_string(\"data.txt\").unwrap().trim()); }",
+    );
+    p.write("one/data.txt", "from one");
+    p.write(
+        "one/src/main.rs",
+        "fn main(){ println!(\"{}\", env!(\"DATA\")) }",
+    );
+    p.write("two/Cargo.toml", manifest);
+    p.write(
+        "two/build.rs",
+        "fn main(){ println!(\"cargo::rerun-if-env-changed=MY_VAR\"); println!(\"cargo::rustc-env=V=[{}]\", std::env::var(\"MY_VAR\").unwrap_or_default()); }",
+    );
+    p.write(
+        "two/src/main.rs",
+        "fn main(){ println!(\"{}\", env!(\"V\")) }",
+    );
+    let run = |dir: &str| {
+        let out = p.rune_in(&p.path().join(dir), &["run", "-q"]);
+        assert!(out.status.success(), "{dir}: {}", text(&out));
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    assert_eq!(run("one"), "from one");
+    assert_eq!(run("two"), "[]");
+
+    // The same script in a third checkout reads its own file.
+    for f in ["Cargo.toml", "build.rs", "src/main.rs"] {
+        p.write(&format!("three/{f}"), &p.read(&format!("one/{f}")));
+    }
+    p.write("three/data.txt", "from three");
+    assert_eq!(run("three"), "from three");
+    // …and one with the same file contents reuses the result.
+    for f in ["Cargo.toml", "build.rs", "src/main.rs", "data.txt"] {
+        p.write(&format!("four/{f}"), &p.read(&format!("one/{f}")));
+    }
+    assert_eq!(run("four"), "from one");
+}
+
+#[test]
+fn default_run_and_metadata_nodes_match_cargo() {
+    let p = Project::new();
+    p.write(
+        "Cargo.toml",
+        "[workspace]\nmembers = [\"app\", \"helper\"]\n",
+    );
+    p.write(
+        "app/Cargo.toml",
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\ndefault-run = \"second\"\n[dependencies]\nhelper = { path = \"../helper\" }\n",
+    );
+    p.write("app/src/bin/first.rs", "fn main(){ println!(\"first\") }");
+    p.write(
+        "app/src/bin/second.rs",
+        "fn main(){ println!(\"second {}\", helper::X) }",
+    );
+    p.write(
+        "helper/Cargo.toml",
+        "[package]\nname = \"helper\"\nversion = \"0.2.0\"\nedition = \"2021\"\n",
+    );
+    p.write("helper/src/lib.rs", "pub const X: u8 = 1;");
+    let out = p.rune_in(&p.path().join("app"), &["run", "-q"]);
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "second 1",
+        "{}",
+        text(&out)
+    );
+
+    let out = p.rune(&["metadata", "--format-version", "1"]);
+    let m: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let dir = p.path().canonicalize().unwrap();
+    let app_id = format!("path+file://{}/app#0.1.0", dir.display());
+    let helper_id = format!("path+file://{}/helper#0.2.0", dir.display());
+    let nodes = m["resolve"]["nodes"].as_array().unwrap();
+    assert_eq!(nodes.len(), 2, "{m}");
+    let app = nodes
+        .iter()
+        .find(|n| n["id"] == app_id.as_str())
+        .expect("app node");
+    assert_eq!(app["deps"][0]["name"], "helper");
+    assert_eq!(app["deps"][0]["pkg"], helper_id.as_str());
+    let pkg = m["packages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["name"] == "app")
+        .unwrap();
+    assert_eq!(pkg["default_run"], "second");
+    assert_eq!(pkg["targets"].as_array().unwrap().len(), 2);
+}

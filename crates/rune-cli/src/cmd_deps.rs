@@ -1040,146 +1040,158 @@ pub fn metadata(args: MetadataArgs) -> Result<()> {
     let (ws, offline) = load(&args.manifest)?;
     let root = ws.root().display().to_string();
 
-    let member_id = |m: &crate::workspace::Member| {
-        format!("path+file://{}#{}@{}", m.dir.display(), m.name, m.version)
-    };
-    let target_json = |name: &str,
-                       kind: &str,
-                       crate_types: Vec<String>,
-                       path: &std::path::Path,
-                       edition: &str| {
-        serde_json::json!({
-            "kind": [kind],
-            "crate_types": crate_types,
-            "name": name,
-            "src_path": path.display().to_string(),
-            "edition": edition,
-            "doc": true, "doctest": kind == "lib", "test": true,
-        })
-    };
+    let member_id = |m: &crate::workspace::Member| path_id(&m.dir, &m.name, &m.version);
 
     let mut packages = Vec::new();
-    for m in &ws.members {
-        let mut targets = Vec::new();
-        if let Some(lib) = &m.manifest.lib {
-            let kind = if lib.proc_macro { "proc-macro" } else { "lib" };
-            targets.push(target_json(
-                lib.name.as_deref().unwrap_or(&m.name),
-                kind,
-                vec![kind.to_string()],
-                &m.dir.join(
-                    lib.path
-                        .as_deref()
-                        .unwrap_or(std::path::Path::new("src/lib.rs")),
-                ),
-                m.edition.as_str(),
-            ));
-        }
-        for (kind, list) in [
-            ("bin", &m.manifest.bin),
-            ("example", &m.manifest.example),
-            ("test", &m.manifest.test),
-            ("bench", &m.manifest.bench),
-        ] {
-            for t in list {
-                targets.push(target_json(
-                    t.name.as_deref().unwrap_or(""),
-                    kind,
-                    vec![if kind == "example" { "bin" } else { kind }.to_string()],
-                    &m.dir
-                        .join(t.path.as_deref().unwrap_or(std::path::Path::new(""))),
-                    m.edition.as_str(),
-                ));
-            }
-        }
-        let deps: Vec<_> = {
-            let mut v: Vec<_> = m.manifest.dependencies.values().collect();
-            v.sort_by(|a, b| (&a.name, a.kind as u8).cmp(&(&b.name, b.kind as u8)));
-            v.into_iter()
-                .map(|d| {
-                    serde_json::json!({
-                        "name": d.name,
-                        "req": d.spec.version.as_ref().map(|v| v.to_string()).unwrap_or_else(|| "*".into()),
-                        "kind": match d.kind {
-                            rune_manifest::DependencyKind::Normal => serde_json::Value::Null,
-                            rune_manifest::DependencyKind::Dev => "dev".into(),
-                            rune_manifest::DependencyKind::Build => "build".into(),
-                        },
-                        "optional": d.spec.optional,
-                        "uses_default_features": d.spec.default_features,
-                        "features": d.spec.features,
-                        "target": d.target,
-                        "path": d.spec.path.as_ref().map(|p| p.display().to_string()),
-                    })
-                })
-                .collect()
-        };
-        packages.push(serde_json::json!({
-            "name": m.name,
-            "version": m.version.to_string(),
-            "id": member_id(m),
-            "source": serde_json::Value::Null,
-            "description": m.meta.description,
-            "license": m.meta.license,
-            "dependencies": deps,
-            "targets": targets,
-            "features": m.manifest.features,
-            "manifest_path": m.manifest_path.display().to_string(),
-            "edition": m.edition.as_str(),
-            "authors": m.meta.authors.split(':').filter(|s| !s.is_empty()).collect::<Vec<_>>(),
-        }));
-    }
-
     let mut resolve = serde_json::Value::Null;
-    if !args.no_deps {
+    if args.no_deps {
+        for m in &ws.members {
+            packages.push(metadata_package(m, &member_id(m), None));
+        }
+    } else {
         let existing = LockfileManager::load_fast(ws.root());
-        let (resolved, _) = graph::resolve_fresh(&ws, offline, existing.as_ref(), false)?;
-        let reg = rune_registry::CrateDownloader::default_downloader().offline(true);
-        let mut nodes = Vec::new();
-        let mut pkgs: Vec<_> = resolved
+        let (resolved, lock) = graph::resolve_fresh(&ws, offline, existing.as_ref(), false)?;
+        let reg_dl = rune_registry::CrateDownloader::default_downloader().offline(true);
+        // Every package of the resolution, with its manifest where it is on
+        // disk (a registry crate once downloaded, a git checkout, a path).
+        let mut entries: Vec<(
+            &rune_resolver::ResolvedPackage,
+            String,
+            Option<crate::workspace::Member>,
+        )> = resolved
             .packages
             .values()
-            .filter(|p| p.source.is_registry())
-            .collect();
-        pkgs.sort_by(|a, b| (&a.name, &a.version).cmp(&(&b.name, &b.version)));
-        for p in pkgs {
-            let id = format!(
-                "registry+https://github.com/rust-lang/crates.io-index#{}@{}",
-                p.name, p.version
-            );
-            let manifest_path = reg
-                .download_and_extract(&p.name, &p.version.to_string(), p.checksum.as_deref())
-                .ok()
-                .map(|d| d.join("Cargo.toml").display().to_string());
-            packages.push(serde_json::json!({
-                "name": p.name,
-                "version": p.version.to_string(),
-                "id": id,
-                "source": "registry+https://github.com/rust-lang/crates.io-index",
-                "dependencies": [],
-                "targets": [],
-                "features": {},
-                "manifest_path": manifest_path,
-            }));
-            let deps: Vec<String> = p
-                .dependencies
-                .iter()
-                .filter_map(|d| {
-                    resolved
-                        .find_matching(d.package.as_deref().unwrap_or(&d.name), &d.req)
-                        .map(|t| {
-                            format!(
-                                "registry+https://github.com/rust-lang/crates.io-index#{}@{}",
-                                t.name, t.version
+            .map(|p| {
+                let (id, dir) = match &p.source {
+                    rune_resolver::PackageSource::Path(d) => {
+                        (path_id(d, &p.name, &p.version), Some(d.clone()))
+                    }
+                    rune_resolver::PackageSource::Registry(_) => {
+                        let src = p.source.lock_source().unwrap_or_default();
+                        let dir = reg_dl
+                            .download_and_extract(
+                                &p.name,
+                                &p.version.to_string(),
+                                p.checksum.as_deref(),
                             )
-                        })
-                })
-                .collect();
+                            .ok();
+                        (format!("{src}#{}@{}", p.name, p.version), dir)
+                    }
+                    rune_resolver::PackageSource::Git { url, reference, .. } => {
+                        let src = match reference {
+                            Some(r) => format!("git+{url}?{r}"),
+                            None => format!("git+{url}"),
+                        };
+                        (format!("{src}#{}@{}", p.name, p.version), None)
+                    }
+                };
+                let member = ws
+                    .members
+                    .iter()
+                    .find(|m| Some(&m.dir) == dir.as_ref())
+                    .cloned()
+                    .or_else(|| {
+                        dir.as_ref()
+                            .and_then(|d| crate::workspace::Member::load(d, None).ok())
+                    });
+                let id = match &member {
+                    Some(m) if ws.members.iter().any(|w| w.dir == m.dir) => member_id(m),
+                    _ => id,
+                };
+                (p, id, member)
+            })
+            .collect();
+        entries.sort_by(|a, b| (&a.0.name, &a.0.version).cmp(&(&b.0.name, &b.0.version)));
+
+        let mut nodes = Vec::new();
+        for (p, id, member) in &entries {
+            let src = p.source.lock_source();
+            match member {
+                Some(m) => packages.push(metadata_package(m, id, src.as_deref())),
+                None => packages.push(serde_json::json!({
+                    "name": p.name,
+                    "version": p.version.to_string(),
+                    "id": id,
+                    "source": src,
+                    "dependencies": [],
+                    "targets": [],
+                    "features": p.declared_features,
+                    "manifest_path": serde_json::Value::Null,
+                })),
+            }
+            // The locked edges, with the name the package uses for each.
+            let locked = lock.packages.iter().find(|l| {
+                l.name == p.name && l.version == p.version.to_string() && l.source == src
+            });
+            let mut deps = Vec::new();
+            let mut dep_ids = Vec::new();
+            for d in locked
+                .map(|l| l.dependencies.as_slice())
+                .unwrap_or_default()
+            {
+                let mut parts = d.split(' ');
+                let name = parts.next().unwrap_or_default();
+                let target = match parts.next() {
+                    Some(v) => entries
+                        .iter()
+                        .find(|(q, _, _)| q.name == name && q.version.to_string() == v),
+                    None => entries.iter().find(|(q, _, _)| q.name == name),
+                };
+                let Some((tp, tid, tm)) = target else {
+                    continue;
+                };
+                dep_ids.push((*tid).clone());
+                let lib_name = tm
+                    .as_ref()
+                    .and_then(|m| m.manifest.lib.as_ref())
+                    .and_then(|l| l.name.clone())
+                    .unwrap_or_else(|| tp.name.clone());
+                let mut extern_name = lib_name.replace('-', "_");
+                let mut kinds = Vec::new();
+                if let Some(m) = member {
+                    for dep in m.manifest.dependencies.values() {
+                        let real = dep.spec.package.as_deref().unwrap_or(&dep.name);
+                        if real != tp.name {
+                            continue;
+                        }
+                        if dep.spec.package.is_some() {
+                            extern_name = dep.name.replace('-', "_");
+                        }
+                        kinds.push(serde_json::json!({
+                            "kind": match dep.kind {
+                                rune_manifest::DependencyKind::Normal => serde_json::Value::Null,
+                                rune_manifest::DependencyKind::Dev => "dev".into(),
+                                rune_manifest::DependencyKind::Build => "build".into(),
+                            },
+                            "target": dep.target,
+                        }));
+                    }
+                }
+                if kinds.is_empty() {
+                    kinds.push(serde_json::json!({ "kind": null, "target": null }));
+                }
+                deps.push(serde_json::json!({
+                    "name": extern_name,
+                    "pkg": tid,
+                    "dep_kinds": kinds,
+                }));
+            }
+            dep_ids.sort();
+            dep_ids.dedup();
             nodes.push(serde_json::json!({
-                "id": id, "dependencies": deps, "features": p.features,
+                "id": id,
+                "dependencies": dep_ids,
+                "deps": deps,
+                "features": p.features,
             }));
         }
-        resolve = serde_json::json!({ "nodes": nodes, "root": serde_json::Value::Null });
+        let root_id = ws
+            .root_manifest
+            .package
+            .as_ref()
+            .and_then(|_| ws.members.iter().find(|m| m.dir == ws.root()))
+            .map(member_id);
+        resolve = serde_json::json!({ "nodes": nodes, "root": root_id });
     }
 
     let out = serde_json::json!({
@@ -1195,6 +1207,144 @@ pub fn metadata(args: MetadataArgs) -> Result<()> {
     println!("{}", serde_json::to_string(&out)?);
     let _ = Settings::default();
     Ok(())
+}
+
+/// Cargo's package id of a local package: `path+file:///w/foo#0.1.0`, with
+/// the name spelled out when the directory is named differently.
+fn path_id(dir: &std::path::Path, name: &str, version: &semver::Version) -> String {
+    if dir.file_name().is_some_and(|n| n == name) {
+        format!("path+file://{}#{version}", dir.display())
+    } else {
+        format!("path+file://{}#{name}@{version}", dir.display())
+    }
+}
+
+/// One package as `cargo metadata` describes it.
+fn metadata_package(
+    m: &crate::workspace::Member,
+    id: &str,
+    source: Option<&str>,
+) -> serde_json::Value {
+    let target_json = |name: &str,
+                       kind: &str,
+                       crate_types: Vec<String>,
+                       path: &std::path::Path,
+                       required: &[String]| {
+        serde_json::json!({
+            "kind": [kind],
+            "crate_types": crate_types,
+            "name": name,
+            "src_path": path.display().to_string(),
+            "edition": m.edition.as_str(),
+            "doc": kind == "lib" || kind == "proc-macro" || kind == "bin",
+            "doctest": kind == "lib" || kind == "proc-macro",
+            "test": kind != "example",
+            "required-features": required,
+        })
+    };
+    let mut targets = Vec::new();
+    if let Some(lib) = &m.manifest.lib {
+        let kind = if lib.proc_macro { "proc-macro" } else { "lib" };
+        targets.push(target_json(
+            lib.name.as_deref().unwrap_or(&m.name.replace('-', "_")),
+            kind,
+            vec![kind.to_string()],
+            &m.dir.join(
+                lib.path
+                    .as_deref()
+                    .unwrap_or(std::path::Path::new("src/lib.rs")),
+            ),
+            &[],
+        ));
+    }
+    for (kind, list) in [
+        ("bin", &m.manifest.bin),
+        ("example", &m.manifest.example),
+        ("test", &m.manifest.test),
+        ("bench", &m.manifest.bench),
+    ] {
+        for t in list {
+            targets.push(target_json(
+                t.name.as_deref().unwrap_or(""),
+                kind,
+                vec![if kind == "example" { "bin" } else { kind }.to_string()],
+                &m.dir
+                    .join(t.path.as_deref().unwrap_or(std::path::Path::new(""))),
+                &t.required_features,
+            ));
+        }
+    }
+    if let Some(script) = m
+        .manifest
+        .package
+        .as_ref()
+        .and_then(|p| p.resolve_build_script(&m.dir))
+    {
+        targets.push(target_json(
+            "build-script-build",
+            "custom-build",
+            vec!["bin".into()],
+            &script,
+            &[],
+        ));
+    }
+    let mut deps: Vec<_> = m.manifest.dependencies.values().collect();
+    deps.sort_by(|a, b| (&a.name, a.kind as u8).cmp(&(&b.name, b.kind as u8)));
+    let deps: Vec<_> = deps
+        .into_iter()
+        .map(|d| {
+            serde_json::json!({
+                "name": d.spec.package.as_deref().unwrap_or(&d.name),
+                "rename": d.spec.package.as_ref().map(|_| d.name.clone()),
+                "source": if d.spec.path.is_some() {
+                    serde_json::Value::Null
+                } else if let Some(g) = &d.spec.git {
+                    format!("git+{g}").into()
+                } else {
+                    "registry+https://github.com/rust-lang/crates.io-index".into()
+                },
+                "req": d.spec.version.as_ref().map(|v| v.to_string()).unwrap_or_else(|| "*".into()),
+                "kind": match d.kind {
+                    rune_manifest::DependencyKind::Normal => serde_json::Value::Null,
+                    rune_manifest::DependencyKind::Dev => "dev".into(),
+                    rune_manifest::DependencyKind::Build => "build".into(),
+                },
+                "optional": d.spec.optional,
+                "uses_default_features": d.spec.default_features,
+                "features": d.spec.features,
+                "target": d.target,
+                "registry": d.spec.registry,
+                "path": d.spec.path.as_ref().map(|p| p.display().to_string()),
+            })
+        })
+        .collect();
+    let pkg = m.manifest.package.as_ref();
+    let text = |s: &str| (!s.is_empty()).then(|| s.to_string());
+    serde_json::json!({
+        "name": m.name,
+        "version": m.version.to_string(),
+        "id": id,
+        "source": source,
+        "description": text(&m.meta.description),
+        "license": text(&m.meta.license),
+        "license_file": text(&m.meta.license_file),
+        "repository": text(&m.meta.repository),
+        "homepage": text(&m.meta.homepage),
+        "readme": text(&m.meta.readme),
+        "rust_version": text(&m.meta.rust_version),
+        "dependencies": deps,
+        "targets": targets,
+        "features": m.manifest.features,
+        "manifest_path": m.manifest_path.display().to_string(),
+        "edition": m.edition.as_str(),
+        "links": pkg.and_then(|p| p.extra.get("links")).and_then(|v| v.as_str()),
+        "default_run": pkg.and_then(|p| p.default_run.clone()),
+        "metadata": pkg.and_then(|p| p.extra.get("metadata")).map(|v| serde_json::to_value(v).unwrap_or_default()),
+        "authors": m.meta.authors.split(':').filter(|s| !s.is_empty()).collect::<Vec<_>>(),
+        "categories": [],
+        "keywords": [],
+        "publish": serde_json::Value::Null,
+    })
 }
 
 // ---------------------------------------------------------------------------

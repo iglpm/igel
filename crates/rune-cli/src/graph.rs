@@ -259,6 +259,17 @@ impl Locals {
                     // dependency are only fetched if something activates them,
                     // which the resolver decides.
                     let real = spec.package.clone().unwrap_or(name);
+                    let req = spec.version.clone().unwrap_or(semver::VersionReq::STAR);
+                    if let Some(dir) = ws
+                        .patches
+                        .git_patch_dir(url, &real, &req)
+                        .map_err(|e| anyhow::anyhow!("{e}"))?
+                    {
+                        let dir = dir.canonicalize().unwrap_or(dir);
+                        let git = rune_registry::git::locate_dir(&dir);
+                        this.add(dir, git)?;
+                        continue;
+                    }
                     let reference = rune_registry::git::GitRef::from_spec(
                         spec.branch.as_deref(),
                         spec.tag.as_deref(),
@@ -1892,6 +1903,16 @@ fn local_view(
             let spec = locals.spec_for(ws, li, dep);
             let resolved = if let Some(path) = &spec.path {
                 let dir = path.canonicalize().unwrap_or_else(|_| path.clone());
+                locals.by_dir.get(&dir).copied()
+            } else if let Some(url) = &spec.git
+                && let Ok(Some(dir)) = ws.patches.git_patch_dir(
+                    url,
+                    spec.package.as_deref().unwrap_or(&dep.name),
+                    spec.version.as_ref().unwrap_or(&semver::VersionReq::STAR),
+                )
+            {
+                // `[patch."<url>"]` replaces the repository.
+                let dir = dir.canonicalize().unwrap_or(dir);
                 locals.by_dir.get(&dir).copied()
             } else if let Some(url) = &spec.git {
                 // Already checked out when the locals were loaded.

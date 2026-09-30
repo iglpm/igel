@@ -1315,7 +1315,14 @@ fn resolve_one_queue_item(
                     let child_local_dir = if let Some(p) = &spec.path {
                         Some(p.clone())
                     } else if let (Some(url), false) = (&spec.git, spec.optional) {
-                        Some(git_package_dir(&spec, url, &actual_pkg_name)?)
+                        match resolver
+                            .patches
+                            .git_patch_dir(url, &actual_pkg_name, &dep_req)
+                            .map_err(ResolverError::Manifest)?
+                        {
+                            Some(dir) => Some(dir),
+                            None => Some(git_package_dir(&spec, url, &actual_pkg_name)?),
+                        }
                     } else {
                         None
                     };

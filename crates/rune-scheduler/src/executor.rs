@@ -1257,7 +1257,12 @@ impl BuildExecutor {
             .cas
             .as_ref()
             .and_then(|c| c.get_value(&format!("{base}-script-record")));
-        let key = inputs::script_result_key(&base, record.as_ref(), || package_hash.clone());
+        let key = inputs::script_result_key_in(
+            &base,
+            record.as_ref(),
+            Some(&node.unit.manifest_dir),
+            || package_hash.clone(),
+        );
         (base, package_hash, key)
     }
 
@@ -2025,7 +2030,12 @@ impl UnitJob {
                     );
                     let _ = cas_store.put_value(&format!("{base}-script-record"), &record);
                     let package_hash = self.package_hash.clone();
-                    let key = inputs::script_result_key(base, Some(&record), || package_hash);
+                    let key = inputs::script_result_key_in(
+                        base,
+                        Some(&record),
+                        Some(&unit.manifest_dir),
+                        || package_hash,
+                    );
                     format!("{key}-buildscript")
                 }
                 None => format!("{store_key}-buildscript"),
@@ -3221,6 +3231,11 @@ pub fn compute_script_base(
     if let Some(script) = &unit.build_script {
         let rel = script.strip_prefix(&unit.manifest_dir).unwrap_or(script);
         hb.update(rel.to_string_lossy().as_bytes());
+        // The script itself: two packages that agree on everything else (the
+        // same name and version in two projects) must not share a record of
+        // what the other's script read.
+        hb.update(b"\0script=");
+        hb.update(inputs::hash_path(script).as_bytes());
     }
     hb.finish_blake3()
 }

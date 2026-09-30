@@ -58,6 +58,13 @@ impl DeclaredInputs {
 
     /// The current value of every declared input, as one hash.
     pub fn fingerprint(&self) -> String {
+        self.fingerprint_in(None)
+    }
+
+    /// Like [`Self::fingerprint`], with relative paths read below `root`
+    /// (the package they belong to) and hashed under their relative name, so
+    /// the same package in another checkout gets the same key.
+    pub fn fingerprint_in(&self, root: Option<&Path>) -> String {
         let mut hb = HashBuilder::new();
         for name in &self.env {
             hb.update(b"\0env=");
@@ -74,7 +81,10 @@ impl DeclaredInputs {
         for path in &self.files {
             hb.update(b"\0file=");
             hb.update(path.to_string_lossy().as_bytes());
-            hb.update(hash_path(path).as_bytes());
+            match root {
+                Some(r) if path.is_relative() => hb.update(hash_path(&r.join(path)).as_bytes()),
+                _ => hb.update(hash_path(path).as_bytes()),
+            }
         }
         for path in &self.native {
             hb.update(b"\0native=");
@@ -123,6 +133,15 @@ pub fn script_record(
         }
     }
     inputs.files.extend(sources.iter().cloned());
+    // Files of the package itself are recorded relative to it: the record is
+    // shared by every package with the same script base (another checkout, or
+    // another project with a package of the same name), and each must be keyed
+    // by its own files — never by the absolute paths of the one that ran first.
+    for f in &mut inputs.files {
+        if let Ok(rel) = f.strip_prefix(manifest_dir) {
+            *f = rel.to_path_buf();
+        }
+    }
     inputs.merge(DeclaredInputs::default());
     ScriptRecord {
         inputs,
@@ -142,16 +161,37 @@ pub fn script_result_key(
     record: Option<&ScriptRecord>,
     package_hash: impl FnOnce() -> String,
 ) -> String {
-    match record {
-        Some(r) if r.watches_files => {
-            effective_key(&format!("{base}\0watched"), Some(&r.inputs), true)
+    script_result_key_in(base, record, None, package_hash)
+}
+
+/// [`script_result_key`] for the package in `manifest_dir`, whose files the
+/// record names relative to it.
+pub fn script_result_key_in(
+    base: &str,
+    record: Option<&ScriptRecord>,
+    manifest_dir: Option<&Path>,
+    package_hash: impl FnOnce() -> String,
+) -> String {
+    let keyed = |base: &str, inputs: Option<&DeclaredInputs>| -> String {
+        let declared = inputs.filter(|i| !i.is_empty());
+        let mut hb = HashBuilder::new();
+        hb.update(base.as_bytes());
+        if let Some(inputs) = declared {
+            hb.update(b"\0inputs=");
+            hb.update(inputs.fingerprint_in(manifest_dir).as_bytes());
         }
+        hb.update(b"\0native-tools=");
+        hb.update(native_tools_identity().as_bytes());
+        hb.finish_blake3()
+    };
+    match record {
+        Some(r) if r.watches_files => keyed(&format!("{base}\0watched"), Some(&r.inputs)),
         _ => {
             let mut hb = HashBuilder::new();
             hb.update(base.as_bytes());
             hb.update(b"\0package=");
             hb.update(package_hash().as_bytes());
-            effective_key(&hb.finish_blake3(), record.map(|r| &r.inputs), true)
+            keyed(&hb.finish_blake3(), record.map(|r| &r.inputs))
         }
     }
 }
@@ -198,7 +238,7 @@ pub fn effective_key(
 }
 
 /// Content hash of a file, or of every file below a directory (sorted).
-fn hash_path(path: &Path) -> String {
+pub(crate) fn hash_path(path: &Path) -> String {
     match std::fs::metadata(path) {
         Ok(m) if m.is_file() => rune_common::hash::xxhash3_file(path)
             .map(|h| format!("{h:016x}"))
@@ -495,13 +535,18 @@ mod tests {
         };
         let record = script_record(&out, dir.path(), &dir.path().join("out"), &[]);
         assert!(record.watches_files);
-        let a = script_result_key("base", Some(&record), || "package v1".into());
-        let b = script_result_key("base", Some(&record), || "package v2".into());
+        let a = script_result_key_in("base", Some(&record), Some(dir.path()), || {
+            "package v1".into()
+        });
+        let b = script_result_key_in("base", Some(&record), Some(dir.path()), || {
+            "package v2".into()
+        });
         assert_eq!(a, b, "other files of the package do not matter");
         std::fs::write(&build_rs, "fn main() { println!(); }").unwrap();
         assert_ne!(
             a,
-            script_result_key("base", Some(&record), || "package v2".into())
+            script_result_key_in("base", Some(&record), Some(dir.path()), || "package v2"
+                .into())
         );
 
         // Without `rerun-if-changed`, every file of the package counts.
