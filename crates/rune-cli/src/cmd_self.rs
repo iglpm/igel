@@ -17,9 +17,9 @@ pub fn update(args: SelfUpdateArgs) -> Result<()> {
     let current_exe = match args.to {
         Some(to) => to,
         None => std::env::current_exe()
-            .context("cannot determine current executable path")?
-            .canonicalize()
-            .unwrap_or_else(|_| std::env::current_exe().unwrap()),
+            .ok()
+            .and_then(|p| rune_common::fsutil::canonicalize(&p).ok())
+            .unwrap_or_else(|| std::env::current_exe().unwrap()),
     };
 
     let repo = args
@@ -213,9 +213,9 @@ pub fn update(args: SelfUpdateArgs) -> Result<()> {
 /// Uninstalls the Rune binary from the system.
 pub fn uninstall(args: SelfUninstallArgs) -> Result<()> {
     let current_exe = std::env::current_exe()
-        .context("cannot determine current executable path")?
-        .canonicalize()
-        .unwrap_or_else(|_| std::env::current_exe().unwrap());
+        .ok()
+        .and_then(|p| rune_common::fsutil::canonicalize(&p).ok())
+        .unwrap_or_else(|| std::env::current_exe().unwrap());
 
     if !args.yes {
         print!(
@@ -273,7 +273,10 @@ pub fn uninstall(args: SelfUninstallArgs) -> Result<()> {
 }
 
 /// Resolves the latest release tag and download base URL.
-fn resolve_latest_release(client: &reqwest::blocking::Client, repo: &str) -> Result<(String, String)> {
+fn resolve_latest_release(
+    client: &reqwest::blocking::Client,
+    repo: &str,
+) -> Result<(String, String)> {
     let api_url = format!("https://api.github.com/repos/{repo}/releases/latest");
     if let Ok(resp) = client
         .get(&api_url)
@@ -334,7 +337,10 @@ fn current_target() -> Result<String> {
 
 /// Recursively searches for a file by name.
 fn find_file_recursively(dir: &Path, file_name: &str) -> Option<PathBuf> {
-    for entry in walkdir::WalkDir::new(dir).into_iter().filter_map(|e| e.ok()) {
+    for entry in walkdir::WalkDir::new(dir)
+        .into_iter()
+        .filter_map(|e| e.ok())
+    {
         if entry.file_name() == file_name && entry.file_type().is_file() {
             return Some(entry.into_path());
         }
@@ -352,8 +358,12 @@ fn replace_executable(src: &Path, dst: &Path) -> Result<()> {
     {
         use std::os::unix::fs::PermissionsExt;
         let staging = parent.join(format!(".rune-update-{}.tmp", std::process::id()));
-        std::fs::copy(src, &staging)
-            .with_context(|| format!("cannot copy new binary to staging path `{}`", staging.display()))?;
+        std::fs::copy(src, &staging).with_context(|| {
+            format!(
+                "cannot copy new binary to staging path `{}`",
+                staging.display()
+            )
+        })?;
 
         std::fs::set_permissions(&staging, std::fs::Permissions::from_mode(0o755)).ok();
 
@@ -375,12 +385,21 @@ fn replace_executable(src: &Path, dst: &Path) -> Result<()> {
         let backup = parent.join(format!(".rune-old-{pid}.exe"));
         let staging = parent.join(format!(".rune-new-{pid}.exe"));
 
-        std::fs::copy(src, &staging)
-            .with_context(|| format!("cannot copy new binary to staging path `{}`", staging.display()))?;
+        std::fs::copy(src, &staging).with_context(|| {
+            format!(
+                "cannot copy new binary to staging path `{}`",
+                staging.display()
+            )
+        })?;
 
         if dst.exists() {
-            std::fs::rename(dst, &backup)
-                .with_context(|| format!("cannot rename active executable `{}` to backup `{}`", dst.display(), backup.display()))?;
+            std::fs::rename(dst, &backup).with_context(|| {
+                format!(
+                    "cannot rename active executable `{}` to backup `{}`",
+                    dst.display(),
+                    backup.display()
+                )
+            })?;
         }
 
         if let Err(e) = std::fs::rename(&staging, dst) {
@@ -388,7 +407,8 @@ fn replace_executable(src: &Path, dst: &Path) -> Result<()> {
                 let _ = std::fs::rename(&backup, dst);
             }
             let _ = std::fs::remove_file(&staging);
-            return Err(e).with_context(|| format!("failed to install new binary to `{}`", dst.display()));
+            return Err(e)
+                .with_context(|| format!("failed to install new binary to `{}`", dst.display()));
         }
 
         let _ = std::fs::remove_file(&backup);

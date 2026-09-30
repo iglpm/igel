@@ -191,7 +191,7 @@ impl PatchEntry {
         };
         let manifest = Manifest::from_path(&rune_common::manifest_file::manifest_in(&dir))
             .map_err(|e| format!("patch `{}`: {e}", self.name))?;
-        let canon = dir.canonicalize().unwrap_or_else(|_| dir.clone());
+        let canon = rune_common::fsutil::canonicalize(&dir).unwrap_or_else(|_| dir.clone());
         let enclosing = rune_manifest::find_enclosing_workspace(&canon, &manifest);
         let ws: Option<&WorkspaceManifest> = enclosing.as_ref().map(|(_, w)| w);
         let version = manifest

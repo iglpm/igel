@@ -355,7 +355,7 @@ pub fn from_script_output(
                 if file.exists() {
                     inputs
                         .native
-                        .push(std::fs::canonicalize(&file).unwrap_or(file));
+                        .push(rune_common::fsutil::canonicalize(&file).unwrap_or(file));
                     found = true;
                 }
             }
@@ -400,7 +400,8 @@ pub fn reads_manifest(dep_info: &Path, manifest: &Path, base: &Path) -> bool {
     let Ok(text) = std::fs::read_to_string(dep_info) else {
         return false;
     };
-    let wanted = std::fs::canonicalize(manifest).unwrap_or_else(|_| manifest.to_path_buf());
+    let wanted =
+        rune_common::fsutil::canonicalize(manifest).unwrap_or_else(|_| manifest.to_path_buf());
     text.lines()
         .filter(|l| !l.starts_with('#'))
         .flat_map(|l| l.split_whitespace())
@@ -408,7 +409,7 @@ pub fn reads_manifest(dep_info: &Path, manifest: &Path, base: &Path) -> bool {
         .filter(|t| t.ends_with("Cargo.toml") || t.ends_with("Rune.toml"))
         .any(|t| {
             let p = base.join(t);
-            std::fs::canonicalize(&p).unwrap_or(p) == wanted
+            rune_common::fsutil::canonicalize(&p).unwrap_or(p) == wanted
         })
 }
 
@@ -487,7 +488,8 @@ pub fn native_tools_identity() -> &'static str {
 /// the SDK are fingerprinted too — by path, size and mtime, without starting
 /// `xcrun` (which would cost every build tens of milliseconds).
 fn apple_developer_identity(developer_dir: &Path, sdkroot: Option<&Path>) -> String {
-    let canonical = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let canonical =
+        |p: &Path| rune_common::fsutil::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
     let mut out = format!("DEVELOPER_DIR={}\n", canonical(developer_dir).display());
     for clang in [
         "usr/bin/clang",

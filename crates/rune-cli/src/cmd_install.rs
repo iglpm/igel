@@ -42,7 +42,7 @@ pub fn install(args: InstallArgs) -> Result<()> {
         Some(url) => install_from_git(&args, url, &root),
         None => {
             let path = args.path.clone().unwrap_or_else(|| PathBuf::from("."));
-            let dir = std::fs::canonicalize(&path)
+            let dir = rune_common::fsutil::canonicalize(&path)
                 .with_context(|| format!("`{}` does not exist", path.display()))?;
             let manifest = rune_common::manifest_file::manifest_in(&dir);
             let name = package_name(&manifest)?;

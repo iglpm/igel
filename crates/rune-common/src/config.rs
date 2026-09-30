@@ -49,7 +49,7 @@ impl RuneConfig {
     /// - `.rune/fingerprints/`
     /// - `~/.rune/cas/objects/`
     pub fn new(project_root: impl Into<PathBuf>) -> Self {
-        let project_root = project_root.into();
+        let project_root = crate::fsutil::simplified(&project_root.into()).to_path_buf();
         let rune_dir = project_root.join(".rune");
         let target_dir = rune_dir.join("target");
         let fingerprint_dir = rune_dir.join("fingerprints");
@@ -62,6 +62,7 @@ impl RuneConfig {
             Some(home) => PathBuf::from(home).join("cas"),
             None => cas_dir,
         };
+        let cas_dir = crate::fsutil::simplified(&cas_dir).to_path_buf();
 
         Self {
             project_root,
@@ -78,10 +79,10 @@ impl RuneConfig {
     /// take effect on the paths and job count carried by this config.
     pub fn with_settings(mut self, settings: Settings) -> Self {
         if let Some(dir) = settings.target_dir() {
-            self.target_dir = dir;
+            self.target_dir = crate::fsutil::simplified(&dir).to_path_buf();
         }
         if let Some(dir) = settings.cas_dir() {
-            self.cas_dir = dir;
+            self.cas_dir = crate::fsutil::simplified(&dir).to_path_buf();
         }
         if let Some(jobs) = settings.jobs() {
             self.jobs = jobs;

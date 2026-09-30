@@ -1077,6 +1077,7 @@ fn run_streaming(cmd: &mut Command, on_line: &dyn Fn(&str)) -> std::io::Result<C
 /// (`ETXTBSY`): a binary that just finished linking still is when a process
 /// forked in that instant holds it open until it execs.
 fn spawn_retrying(cmd: &mut Command) -> std::io::Result<std::process::Child> {
+    #[cfg(unix)]
     let mut delay = Duration::from_millis(10);
     for _ in 0..8 {
         match cmd.spawn() {

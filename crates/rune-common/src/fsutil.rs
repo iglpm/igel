@@ -12,6 +12,8 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+pub use dunce::{canonicalize, simplified};
+
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// A name next to `dest` that no other process or thread will pick.

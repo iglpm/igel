@@ -1258,7 +1258,7 @@ fn resolve_one_queue_item(
             // A package inherits from *its own* workspace — the one it is a
             // member of — which for a path dependency next door or a git
             // repository is not the project being built.
-            let canon = dir.canonicalize().unwrap_or_else(|_| dir.clone());
+            let canon = rune_common::fsutil::canonicalize(&dir).unwrap_or_else(|_| dir.clone());
             let enclosing = rune_manifest::find_enclosing_workspace(&canon, &manifest);
             let ws_ref = enclosing.as_ref().map(|(_, w)| w).or(workspace);
             let ws_root: PathBuf = enclosing
