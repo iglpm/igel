@@ -294,16 +294,17 @@ impl CrateDownloader {
                 debug!("Downloading crate {} from {}", crate_folder_name, url);
                 use rune_common::progress::{CountingReader, Event, emit};
                 emit(Event::DownloadStarted { name, version });
-                struct Finished<'a>(&'a str, &'a str);
+                struct Finished<'a>(&'a str, &'a str, bool);
                 impl Drop for Finished<'_> {
                     fn drop(&mut self) {
                         emit(Event::DownloadFinished {
                             name: self.0,
                             version: self.1,
+                            ok: self.2,
                         });
                     }
                 }
-                let _finished = Finished(name, version);
+                let mut finished = Finished(name, version, false);
 
                 // Stream into a temp file and rename, so an interrupted download
                 // can never be mistaken for a complete tarball later. A
@@ -354,6 +355,7 @@ impl CrateDownloader {
                     }
                 }
                 fs::rename(&tmp_tarball, &tarball_path)?;
+                finished.2 = true;
             }
         }
 

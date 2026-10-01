@@ -20,8 +20,12 @@ pub enum Event<'a> {
     DownloadStarted { name: &'a str, version: &'a str },
     /// `bytes` more bytes of some archive arrived.
     DownloadBytes { bytes: u64 },
-    /// An archive was downloaded, verified and unpacked (or failed).
-    DownloadFinished { name: &'a str, version: &'a str },
+    /// An archive's download ended: fetched (`ok`) or failed.
+    DownloadFinished {
+        name: &'a str,
+        version: &'a str,
+        ok: bool,
+    },
 }
 
 /// Receives [`Event`]s.

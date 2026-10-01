@@ -197,7 +197,33 @@ fn hint_for(err: &anyhow::Error) -> Option<String> {
         }
     }
     let text = format!("{err:#}");
-    (text.contains("No space left on device") || text.contains("os error 28")).then(disk_full_hint)
+    if text.contains("No space left on device") || text.contains("os error 28") {
+        return Some(disk_full_hint());
+    }
+    let network = [
+        "error sending request",
+        "tcp connect error",
+        "dns error",
+        "Connection refused",
+        "connection reset",
+        "operation timed out",
+        "tunnel error",
+        "invalid peer certificate",
+        "UnknownIssuer",
+    ];
+    if network.iter().any(|n| text.contains(n)) {
+        let certificate = text.contains("certificate") || text.contains("UnknownIssuer");
+        return Some(if certificate {
+            "the server's TLS certificate is not trusted here: behind a proxy that inspects \
+             traffic, point `http.cainfo` (or `SSL_CERT_FILE`) at its CA bundle"
+                .to_string()
+        } else {
+            "the network could not be reached: check the connection and any proxy \
+             (`HTTPS_PROXY`, `http.proxy`); `--offline` builds with what is already downloaded"
+                .to_string()
+        });
+    }
+    None
 }
 
 fn disk_full_hint() -> String {

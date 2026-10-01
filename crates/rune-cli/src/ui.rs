@@ -268,6 +268,12 @@ pub fn summary(message: impl Display) {
     err(format!("{} {}", "✓".green().bold(), message));
 }
 
+/// A summary that is the command's result (a test run's verdict): printed
+/// under `--quiet` too, which only silences the steps that led to it.
+pub fn result(message: impl Display) {
+    err(format!("{} {}", "✓".green().bold(), message));
+}
+
 /// Advice after a summary: something the user may want to know or change,
 /// not a problem (on stderr, like every status line).
 pub fn hint(message: impl Display) {
@@ -475,6 +481,8 @@ struct Downloads {
     started: Option<Instant>,
     /// In flight, in start order (shown while they download).
     active: Vec<String>,
+    /// Downloads that failed (the error is reported by whoever asked).
+    failed: usize,
 }
 
 impl rune_common::progress::Sink for NetProgress {
@@ -519,24 +527,30 @@ impl rune_common::progress::Sink for NetProgress {
                 d.bytes += bytes;
                 d.redraw();
             }
-            Event::DownloadFinished { name, version } => {
+            Event::DownloadFinished { name, version, ok } => {
                 let mut d = self.downloads.lock().unwrap_or_else(|e| e.into_inner());
                 let label = format!("{name} {version}");
                 d.active.retain(|a| *a != label);
                 d.done += 1;
+                if !ok {
+                    d.failed += 1;
+                }
                 if let Some(bar) = &d.bar {
                     bar.set_position(d.done as u64);
                 }
                 d.redraw();
                 if d.done >= d.total && d.total > 0 {
                     let took = d.started.map(|s| s.elapsed()).unwrap_or_default();
-                    let (n, size) = (d.done, d.bytes);
+                    let (n, size, failed) = (d.done, d.bytes, d.failed);
                     if let Some(bar) = d.bar.take() {
                         bar.finish_and_clear();
                         multi_progress().remove(&bar);
                     }
                     *d = Downloads::default();
                     drop(d);
+                    if failed > 0 {
+                        return;
+                    }
                     action(
                         "downloaded",
                         format!(
