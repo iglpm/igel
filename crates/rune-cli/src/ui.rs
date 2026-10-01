@@ -51,8 +51,17 @@ pub enum Stream {
 
 /// Writes `text` (one or more complete lines, each ending in `\n`) with the
 /// progress display suspended.
+/// Whether the last text printed ended with a blank line (see `blank_line`).
+static ENDS_BLANK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 pub fn emit(stream: Stream, text: &str) {
     let _guard = OUTPUT.lock().unwrap_or_else(|e| e.into_inner());
+    if !text.is_empty() {
+        ENDS_BLANK.store(
+            text == "\n" || text.ends_with("\n\n"),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
     multi_progress().suspend(|| {
         let _ = match stream {
             Stream::Out => {
@@ -70,6 +79,14 @@ pub fn emit(stream: Stream, text: &str) {
 /// A line on stdout (what a command produces), above any progress display.
 pub fn out(line: impl Display) {
     emit(Stream::Out, &format!("{line}\n"));
+}
+
+/// An empty line on stderr to set what follows apart, unless the output
+/// already ends with one.
+pub fn blank_line() {
+    if !ENDS_BLANK.load(std::sync::atomic::Ordering::Relaxed) {
+        err("");
+    }
 }
 
 /// A line on stderr (status), above any progress display.

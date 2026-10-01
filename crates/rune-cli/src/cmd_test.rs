@@ -178,6 +178,15 @@ pub fn run_with(args: TestArgs, mode: Mode, instrument: Option<&Instrument>) -> 
     }
     sess.ws.config.ensure_dirs(sess.profile.output_dir_name())?;
 
+    // What failed last time (for `--failed`, and updated after this run).
+    let failures_path = sess.config().fingerprint_dir.join("test-failures.json");
+    let mut failures = load_failures(&failures_path);
+    let rerun = if args.failed && !bench {
+        narrow_to_failures(&sess, &mut plan, &failures, args.filter.as_deref())
+    } else {
+        HashMap::new()
+    };
+
     // -- What will run, in output order.
     let mut runnables: Vec<Runnable> = plan
         .requested
@@ -259,11 +268,7 @@ pub fn run_with(args: TestArgs, mode: Mode, instrument: Option<&Instrument>) -> 
     let labels: Vec<String> = runnables
         .iter()
         .map(|r| r.label.clone())
-        .chain(
-            plan.doc_tests
-                .iter()
-                .map(|d| format!("{} (doc-tests)", sess.ws.members[d.member].name)),
-        )
+        .chain(plan.doc_tests.iter().map(|d| doc_label(&sess, d)))
         .collect();
 
     // `--cached`: remembered passes, keyed by everything Rune can see.
@@ -414,7 +419,7 @@ pub fn run_with(args: TestArgs, mode: Mode, instrument: Option<&Instrument>) -> 
                             batch,
                         } => {
                             let run_args: Vec<String> = match &batch {
-                                Some(b) => batch_args(args_ref, &b.tests),
+                                Some(b) => batch_args(args_ref, b),
                                 None => libtest_args.clone(),
                             };
                             let libtest_args = &run_args;
@@ -551,10 +556,10 @@ pub fn run_with(args: TestArgs, mode: Mode, instrument: Option<&Instrument>) -> 
                                         counts.failed =
                                             n(Status::Failed) + unfinished.len().max(1) as u64;
                                     }
-                                    if let Some(b) = &batch {
+                                    if let Some(f) = batch.as_ref().and_then(|b| b.filtered) {
                                         // Each batch reports the rest of the
                                         // binary as filtered out.
-                                        counts.filtered = b.filtered;
+                                        counts.filtered = f;
                                     }
                                     let mut result = TestResult {
                                         order,
@@ -717,10 +722,17 @@ pub fn run_with(args: TestArgs, mode: Mode, instrument: Option<&Instrument>) -> 
             }
             match exe {
                 Some(exe) if !args.no_run => {
-                    let batches = if split && r.harness {
-                        split_into_batches(sess, &exe, r.member, &args, runner_count)
-                    } else {
-                        Vec::new()
+                    let batches = match rerun.get(&r.label) {
+                        // `--failed`: the tests that failed, by exact name.
+                        Some(tests) if r.harness => vec![Batch {
+                            tests: tests.clone(),
+                            filtered: None,
+                            shared: false,
+                        }],
+                        _ if split && r.harness => {
+                            split_into_batches(sess, &exe, r.member, &args, runner_count)
+                        }
+                        _ => Vec::new(),
                     };
                     if batches.len() > 1 {
                         parts_of.lock().unwrap().insert(r.order, batches.len());
@@ -994,6 +1006,14 @@ pub fn run_with(args: TestArgs, mode: Mode, instrument: Option<&Instrument>) -> 
     if learned && let Ok(text) = serde_json::to_string(&run_times) {
         let _ = rune_common::fsutil::write_atomic(&times_path, text.as_bytes());
     }
+    if !bench && !args.no_run {
+        // Whether every test of a binary that ran had the chance to: then a
+        // remembered test it no longer has is gone.
+        let complete = args.filter.is_none() && (args.failed || args.test_args.is_empty());
+        if record_failures(&mut failures, &report_suites, complete) {
+            save_failures(&failures_path, &failures);
+        }
+    }
     if let Some(path) = &args.junit {
         std::fs::write(path, crate::test_report::junit(&report_suites))
             .map_err(|e| anyhow::anyhow!("cannot write {}: {e}", path.display()))?;
@@ -1021,7 +1041,7 @@ pub fn run_with(args: TestArgs, mode: Mode, instrument: Option<&Instrument>) -> 
         ));
     }
     if !failed_labels.is_empty() {
-        ui::err("");
+        ui::blank_line();
         ui::error(format!(
             "{} failed: {}",
             if failed_labels.len() == 1 {
@@ -1039,6 +1059,9 @@ pub fn run_with(args: TestArgs, mode: Mode, instrument: Option<&Instrument>) -> 
             )
             .dimmed()
         ));
+        if !args.failed && !bench && instrument.is_none() {
+            ui::hint("`rune test --failed` runs only what failed");
+        }
         return Ok(RunOutcome {
             failed: true,
             executables,
@@ -1354,8 +1377,139 @@ fn label_for(sess: &Session, r: &Requested) -> String {
 struct Batch {
     tests: Vec<String>,
     /// What the binary's own summary would call "filtered out", reported by
-    /// the first batch only (so the parts add up to the whole binary).
-    filtered: u64,
+    /// the first batch only (so the parts add up to the whole binary). `None`:
+    /// as the binary reports it.
+    filtered: Option<u64>,
+    /// One of many processes of one binary sharing the cores (`--schedule
+    /// tests`), rather than the binary's only process (`--failed`).
+    shared: bool,
+}
+
+/// The tests that failed and have not passed since, by test binary (its
+/// label): what `--failed` runs. An empty list stands for the whole binary
+/// (it crashed, timed out or did not build without naming a failed test).
+type Failures = std::collections::BTreeMap<String, Vec<String>>;
+
+fn load_failures(path: &std::path::Path) -> Failures {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default()
+}
+
+fn save_failures(path: &std::path::Path, failures: &Failures) {
+    if failures.is_empty() {
+        let _ = std::fs::remove_file(path);
+    } else if let Ok(text) = serde_json::to_string(failures) {
+        let _ = rune_common::fsutil::write_atomic(path, text.as_bytes());
+    }
+}
+
+/// Folds a run's results into what is remembered as failing: a test that
+/// passed is forgotten, one that failed remembered. With `complete` (every
+/// test of a binary that ran had the chance to), a remembered test the
+/// binary no longer has is forgotten too. Returns whether anything changed.
+fn record_failures(
+    failures: &mut Failures,
+    suites: &[crate::test_report::Suite],
+    complete: bool,
+) -> bool {
+    use crate::test_report::Status;
+    let before = failures.clone();
+    for s in suites {
+        if s.error.is_some() {
+            failures.insert(s.name.clone(), Vec::new());
+            continue;
+        }
+        // A binary remembered as failing as a whole ran again: its tests now
+        // say what failed.
+        let mut names = failures.remove(&s.name).unwrap_or_default();
+        names.retain(|n| match s.cases.iter().find(|c| &c.name == n) {
+            Some(c) => c.status != Status::Passed,
+            None => !complete,
+        });
+        for c in s.cases.iter().filter(|c| c.status == Status::Failed) {
+            if !names.contains(&c.name) {
+                names.push(c.name.clone());
+            }
+        }
+        if !names.is_empty() {
+            failures.insert(s.name.clone(), names);
+        }
+    }
+    *failures != before
+}
+
+fn doc_label(sess: &Session, d: &DocTest) -> String {
+    format!("{} (doc-tests)", sess.ws.members[d.member].name)
+}
+
+/// `--failed`: narrows the plan to the test binaries and doc tests that
+/// failed last time, and what they need (with their packages' programs,
+/// which tests may start). Returns the tests to run by name, per binary
+/// label; a binary not listed runs whole. Nothing remembered (or nothing in
+/// the selected packages): everything runs.
+fn narrow_to_failures(
+    sess: &Session,
+    plan: &mut Plan,
+    failures: &Failures,
+    filter: Option<&str>,
+) -> HashMap<String, Vec<String>> {
+    let wanted =
+        |r: &Requested| is_runnable(r, false) && failures.contains_key(&label_for(sess, r));
+    let wanted_doc = |d: &DocTest| failures.contains_key(&doc_label(sess, d));
+    if !plan.requested.iter().any(wanted) && !plan.doc_tests.iter().any(wanted_doc) {
+        ui::hint("nothing failed last time: running every test");
+        return HashMap::new();
+    }
+    let members: std::collections::HashSet<usize> = plan
+        .requested
+        .iter()
+        .filter(|r| wanted(r))
+        .map(|r| r.member)
+        .chain(
+            plan.doc_tests
+                .iter()
+                .filter(|d| wanted_doc(d))
+                .map(|d| d.member),
+        )
+        .collect();
+    plan.requested.retain(|r| {
+        wanted(r)
+            || (members.contains(&r.member)
+                && !is_runnable(r, false)
+                && matches!(r.kind, TargetKind::Bin | TargetKind::Example))
+    });
+    plan.doc_tests.retain(wanted_doc);
+    let mut roots: Vec<NodeId> = plan.requested.iter().map(|r| r.node).collect();
+    for d in &plan.doc_tests {
+        roots.extend(d.externs.iter().map(|(_, n)| *n));
+    }
+    let (graph, map) = plan.graph.subgraph(&roots);
+    for r in &mut plan.requested {
+        r.node = map[&r.node];
+    }
+    for d in &mut plan.doc_tests {
+        for (_, n) in &mut d.externs {
+            if let Some(&new) = map.get(n) {
+                *n = new;
+            }
+        }
+    }
+    plan.graph = graph;
+
+    let mut rerun = HashMap::new();
+    for r in plan.requested.iter().filter(|r| is_runnable(r, false)) {
+        let label = label_for(sess, r);
+        let mut names = failures.get(&label).cloned().unwrap_or_default();
+        if let Some(f) = filter {
+            names.retain(|n| n.contains(f));
+        }
+        if !names.is_empty() {
+            rerun.insert(label, names);
+        }
+    }
+    rerun
 }
 
 /// Libtest arguments `--schedule tests` knows how to carry over to a batch;
@@ -1423,17 +1577,21 @@ fn split_into_batches(
         .enumerate()
         .map(|(i, chunk)| Batch {
             tests: chunk.to_vec(),
-            filtered: if i == 0 { filtered } else { 0 },
+            filtered: Some(if i == 0 { filtered } else { 0 }),
+            shared: true,
         })
         .collect()
 }
 
 /// The arguments that run exactly `tests` of a harness binary.
-fn batch_args(args: &TestArgs, tests: &[String]) -> Vec<String> {
+fn batch_args(args: &TestArgs, batch: &Batch) -> Vec<String> {
     let mut out = vec!["--exact".to_string()];
-    // Each batch is one of many processes sharing the cores.
-    out.push("--test-threads".into());
-    out.push(args.test_threads.unwrap_or(1).to_string());
+    // A batch that is one of many processes sharing the cores runs its tests
+    // one at a time.
+    if let Some(n) = args.test_threads.or(batch.shared.then_some(1)) {
+        out.push("--test-threads".into());
+        out.push(n.to_string());
+    }
     let mut it = args.test_args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -1444,7 +1602,7 @@ fn batch_args(args: &TestArgs, tests: &[String]) -> Vec<String> {
             _ => out.push(a.clone()),
         }
     }
-    out.extend(tests.iter().cloned());
+    out.extend(batch.tests.iter().cloned());
     out
 }
 
@@ -1642,17 +1800,26 @@ fn print_result(label: &str, r: &TestResult, verbose: bool) {
                 ),
             );
             if verbose && !r.output.is_empty() {
-                ui::out(&r.output);
+                print_output(&r.output);
             }
         }
         Outcome::Failed => {
             ui::error(format!("FAILED {} · {}", label.bold(), took));
-            ui::out(&r.output);
+            print_output(&r.output);
         }
         Outcome::CompileFailed => {
             ui::error(format!("could not build {}: {}", label.bold(), r.output));
         }
         Outcome::Skipped => {}
+    }
+}
+
+/// A test binary's output, followed by exactly one blank line (libtest ends
+/// its own with a varying number).
+fn print_output(output: &str) {
+    let text = output.trim_end();
+    if !text.is_empty() {
+        ui::out(format!("{text}\n"));
     }
 }
 
@@ -1885,6 +2052,63 @@ fn run_doctest(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn suite(
+        name: &str,
+        cases: &[(&str, crate::test_report::Status)],
+    ) -> crate::test_report::Suite {
+        crate::test_report::Suite {
+            name: name.into(),
+            seconds: 0.1,
+            error: None,
+            cases: cases
+                .iter()
+                .map(|(n, status)| crate::test_report::Case {
+                    name: n.to_string(),
+                    status: *status,
+                    output: String::new(),
+                    flaky: false,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn failures_are_remembered_until_they_pass() {
+        use crate::test_report::Status::{Failed, Passed};
+        let mut f = Failures::new();
+        assert!(record_failures(
+            &mut f,
+            &[
+                suite("a", &[("x", Failed), ("y", Passed)]),
+                suite("b", &[("z", Passed)])
+            ],
+            true,
+        ));
+        assert_eq!(f.get("a"), Some(&vec!["x".to_string()]));
+        assert!(!f.contains_key("b"));
+        // A filtered run that did not include `x` keeps it.
+        assert!(!record_failures(
+            &mut f,
+            &[suite("a", &[("y", Passed)])],
+            false
+        ));
+        assert_eq!(f.get("a"), Some(&vec!["x".to_string()]));
+        // A complete run without `x` (renamed or deleted) forgets it.
+        assert!(record_failures(
+            &mut f,
+            &[suite("a", &[("y", Passed)])],
+            true
+        ));
+        assert!(f.is_empty());
+        // A binary that failed without a failing test is remembered whole.
+        let mut crashed = suite("c", &[]);
+        crashed.error = Some("signal 11".into());
+        record_failures(&mut f, &[crashed], true);
+        assert_eq!(f.get("c"), Some(&Vec::new()));
+        record_failures(&mut f, &[suite("c", &[("t", Passed)])], true);
+        assert!(f.is_empty());
+    }
 
     #[test]
     fn parses_libtest_summary() {

@@ -42,6 +42,7 @@ rune unused [--fix]            # dependencies the compiler says a package never 
 rune sbom -o bom.json          # CycloneDX 1.5 (or --format spdx) of what the workspace ships
 rune tree --exec-surface       # every crate that runs code at build time, and who brings it in
 
+rune test --failed             # only the tests that failed last time
 rune test --retries 2 --junit report.xml   # flaky tests reported, not failed; CI test report
 rune cas export -o ci.tar.gz --for build --for test   # the store entries a CI run needs, as one file
 rune cas import ci.tar.gz      # (verified: nothing unchecked enters the store)

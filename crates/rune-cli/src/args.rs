@@ -401,6 +401,11 @@ pub struct TestArgs {
     #[arg(last = true, value_name = "ARGS")]
     pub test_args: Vec<String>,
 
+    /// Run only the tests that failed in the last run (every test when none
+    /// did): the test binaries they are in, by exact name
+    #[arg(long)]
+    pub failed: bool,
+
     /// Run a failed test binary's failed tests again, up to N times; a test
     /// that then passes is reported as flaky instead of failing the run
     #[arg(long, value_name = "N", default_value_t = 0)]

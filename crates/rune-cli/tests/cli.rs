@@ -5018,6 +5018,59 @@ mod tests {
 }
 
 #[test]
+fn failed_runs_only_what_failed_last_time() {
+    let p = Project::new();
+    p.write("Cargo.toml", LIB_MANIFEST);
+    let lib = r#"pub fn one() -> u32 { 1 }
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn solid() { assert_eq!(super::one(), 1); }
+    #[test]
+    fn broken() { assert_eq!(super::one(), 2); }
+    #[test]
+    fn also_broken() { assert_eq!(super::one(), 3); }
+}
+"#;
+    p.write("src/lib.rs", lib);
+    p.write("tests/other.rs", "#[test]\nfn elsewhere() {}\n");
+    let out = p.rune(&["test", "--no-fail-fast"]);
+    assert_eq!(out.status.code(), Some(101));
+    assert!(text(&out).contains("rune test --failed"), "{}", text(&out));
+
+    // Only the failed tests run, by exact name; the other binary not at all.
+    let out = p.rune(&["test", "--failed"]);
+    let msg = text(&out);
+    assert_eq!(out.status.code(), Some(101), "{msg}");
+    assert!(msg.contains("0 passed; 2 failed"), "{msg}");
+    assert!(!msg.contains("other"), "{msg}");
+
+    // A fixed test passes once, then is forgotten; the rest still runs.
+    p.write(
+        "src/lib.rs",
+        &lib.replace("super::one(), 2", "super::one(), 1"),
+    );
+    let msg = text(&p.rune(&["test", "--failed"]));
+    assert!(msg.contains("1 passed; 1 failed"), "{msg}");
+    let msg = text(&p.rune(&["test", "--failed"]));
+    assert!(msg.contains("0 passed; 1 failed"), "{msg}");
+    assert!(!msg.contains("test tests::broken "), "{msg}");
+
+    // All fixed: nothing is remembered, and `--failed` runs everything.
+    p.write(
+        "src/lib.rs",
+        &lib.replace("super::one(), 2", "super::one(), 1")
+            .replace("super::one(), 3", "super::one(), 1"),
+    );
+    assert!(p.rune(&["test", "--failed"]).status.success());
+    let out = p.rune(&["test", "--failed"]);
+    let msg = text(&out);
+    assert!(out.status.success(), "{msg}");
+    assert!(msg.contains("nothing failed last time"), "{msg}");
+    assert!(msg.contains("4 passed"), "{msg}");
+}
+
+#[test]
 fn test_results_are_json_lines_with_message_format_json() {
     let p = lib_project();
     let out = p.rune(&["test", "--message-format", "json"]);

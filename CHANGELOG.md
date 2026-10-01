@@ -32,6 +32,9 @@ The first stable release. Changes since the 0.1.0 preview:
 - `rune test` shows a live line while tests run: binaries done, tests passed
   so far (counted as they finish), and what is running with its progress and
   time. `rune coverage` shows its merge and report steps.
+- `rune test --failed`: builds and runs only the tests that failed last
+  time, by exact name; repeated, it narrows down to what is still broken,
+  and runs everything once nothing is. A failed run points to it.
 - `rune test --test-jobs N` / `test.jobs`: how many test binaries run at once.
 - `rune test --timeout 10m` / `test.timeout`: a test binary that runs longer
   is stopped and reported as failed, naming the tests that had not finished,
@@ -50,6 +53,7 @@ The first stable release. Changes since the 0.1.0 preview:
 - TOML errors in manifests print once, naming the file once.
 - Doc tests run after the test binaries, as with Cargo: run first, a failing
   doc test could stop the run before a failing unit test was reported.
+- A failed test binary's output is followed by one blank line, not three.
 - `rune test -q` prints the result line; a binary killed by a signal counts as
   a failed test; a failed download no longer reports "downloaded".
 - A crash (a bug in Rune) prints what happened and where to report it.

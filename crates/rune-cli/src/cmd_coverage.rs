@@ -393,6 +393,7 @@ pub fn coverage(args: CoverageArgs) -> Result<()> {
         cached: Some(false),
         test_args: args.test_args.clone(),
         retries: 0,
+        failed: false,
         junit: None,
         schedule: Some("binaries".into()),
         test_jobs: args.test_jobs,

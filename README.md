@@ -68,6 +68,8 @@ same compiler). Run it on your own project:
 - **Stable by default.** Test binaries run one at a time as with Cargo, so
   tests that share a port or a database don't fail at random. Opt into
   parallel binaries with `--test-jobs`.
+- **Fix, then re-run just what failed**: `rune test --failed` builds and runs
+  only the failing tests until none are left.
 - **Built in:** timeouts for hung tests, retries with flaky-test detection,
   JUnit reports, cached test results (`--cached`: 8 s → 0.26 s when nothing
   changed), nextest-style scheduling of tests across binaries, and **code

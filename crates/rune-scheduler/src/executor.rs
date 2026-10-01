@@ -3598,13 +3598,14 @@ mod tests {
         let path = config.fingerprint_dir.join("timings.json");
         let mut timings: HashMap<String, f64> =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        // (The timings file may be shared with real builds, under RUNE_HOME.)
-        let ours = |k: &str| {
-            k.ends_with(" rss")
-                && ["one ", "two ", "three ", "four "]
-                    .iter()
-                    .any(|n| k.starts_with(n))
-        };
+        // (The timings file also holds the machine-wide ones, of real builds
+        // and other tests: packages named `two` among them.)
+        let our_keys: HashSet<String> = graph
+            .nodes()
+            .iter()
+            .map(|n| format!("{} rss", Timings::key(&n.unit, &Profile::dev())))
+            .collect();
+        let ours = |k: &str| our_keys.contains(k);
         let peaks: Vec<&String> = timings.keys().filter(|k| ours(k)).collect();
         assert_eq!(peaks.len(), 4, "{timings:?}");
         assert!(
