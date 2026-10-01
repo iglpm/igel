@@ -1378,3 +1378,36 @@ time, a doc-test run (ready long before the binaries link) ran first, so its
 failure stopped the run before a failing unit test was ever reported; doc
 tests now run after the binaries, as in Cargo. `rune test -q` printed nothing
 at all; it now prints the result. Rune's own warm `rune test`: 29–31 s.
+
+## 19. What changed with rune-bench (2026-10-01)
+
+**rune-bench** (`bench/`) measures Rune against Cargo in 17 scenarios —
+startup, cold builds, no-op builds, rebuilds after an edit, cache reuse,
+tests, inspection commands, disk and memory — on generated workspaces or a
+copy of any project, with JSON/Markdown/HTML reports and a regression check
+(`rune-bench compare`). Verdicts are noise-aware: two sets of runs whose
+ranges overlap and whose difference is within their spread are a tie.
+
+**Results.** Quick suite (2 and 25 crates): 2.6× faster overall; fresh
+checkout 32–39×, branch switch 5–15×, running tests 4–7×, no-op commands
+1.4–2.8×; cold builds and rebuilds after an edit on par (confirmed with more
+runs: every edit scenario within noise, the 2-crate cold build 1.2× faster).
+Rune's own workspace: a fresh checkout restores in 0.18 s where Cargo
+rebuilds for 84 s; `tree` 8.3×, `metadata` 3.3×, rebuilding after editing
+`rune-cli` 3.1 s against 3.6 s.
+
+**What the measuring found.** Rayon's idle workers spun on two-item loops,
+making quick commands erratic (sequential below a threshold now). Writing a
+file into a package — a log, notes, a new integration test — rebuilt the
+package's library and everything above it, because a local crate was keyed
+by every file of its package: 21 of 26 crates for a new file in the bottom
+crate of the medium workspace, where Cargo rebuilds nothing. Crates without
+a build script are now keyed by the files rustc read for them (§ caching).
+
+**Also.** `rune test --failed` re-runs only the tests that failed; mistyped
+commands get a "did you mean"; the install scripts take `--version 2027.0`,
+pick the native build under Rosetta and refuse musl with how to build from
+source; the Intel macOS release builds on a supported runner image; the
+Windows CI job runs a smoke test (new, add, build, run, test with doc tests,
+fresh-checkout restore). Windows is otherwise still untested beyond that
+smoke test (G6).
