@@ -185,6 +185,35 @@ fn compute_package_hash_uncached(
     hash_files(package_dir, files, cache)
 }
 
+/// One file's content hash, reused from `cache` while its modification time
+/// and size are unchanged; `None` when it does not exist (or is not a file).
+pub fn file_hash(path: &Path, cache: &mut FingerprintCache) -> Option<u64> {
+    let meta = std::fs::metadata(path).ok().filter(|m| m.is_file())?;
+    let mtime = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let size = meta.len();
+    let hash = match cache
+        .files
+        .get(path)
+        .filter(|c| mtime != 0 && c.mtime == mtime && c.size == size)
+    {
+        Some(c) => c.hash,
+        None => xxhash3_file(path).ok()?,
+    };
+    cache.mark_visited(path);
+    cache.record(FileEntry {
+        path: path.to_path_buf(),
+        mtime,
+        size,
+        hash,
+    });
+    Some(hash)
+}
+
 /// Computes a hash of all `.rs` files under `source_root`.
 ///
 /// Kept for callers that want just a source-tree hash; see
@@ -219,38 +248,42 @@ fn hash_files(
     // Stat + (if changed) hash every file in parallel. `cache` is only read
     // here; results are folded back in sequentially below.
     let cache_ref: &FingerprintCache = cache;
-    let hashed: Vec<FileEntry> = files
-        .into_par_iter()
-        .map(|path| {
-            let (mtime, size) = std::fs::metadata(&path)
-                .ok()
-                .map(|m| {
-                    let mtime = m
-                        .modified()
-                        .ok()
-                        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                        .map(|d| d.as_nanos() as u64)
-                        .unwrap_or(0);
-                    (mtime, m.len())
-                })
-                .unwrap_or((0, 0));
+    let one = |path: PathBuf| {
+        let (mtime, size) = std::fs::metadata(&path)
+            .ok()
+            .map(|m| {
+                let mtime = m
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                    .map(|d| d.as_nanos() as u64)
+                    .unwrap_or(0);
+                (mtime, m.len())
+            })
+            .unwrap_or((0, 0));
 
-            let cached = cache_ref
-                .files
-                .get(&path)
-                .filter(|c| mtime != 0 && c.mtime == mtime && c.size == size);
-            let hash = match cached {
-                Some(c) => c.hash,
-                None => xxhash3_file(&path).unwrap_or(0),
-            };
-            FileEntry {
-                path,
-                mtime,
-                size,
-                hash,
-            }
-        })
-        .collect();
+        let cached = cache_ref
+            .files
+            .get(&path)
+            .filter(|c| mtime != 0 && c.mtime == mtime && c.size == size);
+        let hash = match cached {
+            Some(c) => c.hash,
+            None => xxhash3_file(&path).unwrap_or(0),
+        };
+        FileEntry {
+            path,
+            mtime,
+            size,
+            hash,
+        }
+    };
+    // A thread pool costs more than it saves on a small package (and its
+    // idle workers spin, making a quick command's time erratic).
+    let hashed: Vec<FileEntry> = if files.len() < 64 {
+        files.into_iter().map(one).collect()
+    } else {
+        files.into_par_iter().map(one).collect()
+    };
 
     let mut hb = HashBuilder::new();
     for entry in hashed {

@@ -13,9 +13,13 @@ always safe; the first stable release is 2027.0.0.
 The first stable release. Changes since the 0.1.0 preview:
 
 ### Added
+- `rune-bench` (in `bench/`): benchmarks Rune against Cargo on generated
+  workspaces or a copy of any project — startup, cold builds, no-op builds,
+  rebuilds after edits, cache reuse, tests, inspection commands, disk and
+  memory — with JSON, Markdown and HTML reports and a regression check.
 - `rune doctor` checks free disk space and memory per parallel job.
-- "Did you mean" for misspelled `-p` packages; a test filter that matches
-  nothing says so.
+- "Did you mean" for misspelled `-p` packages and commands (`rune buidl`); a
+  test filter that matches nothing says so.
 - `rune audit`: RustSec/OSV advisories (vulnerabilities with CVSS scores,
   unmaintained, unsound, malicious) and yanked releases in the lockfile, with
   the dependency path and the fix; cached database, `--deny`, `--ignore`,
@@ -28,6 +32,9 @@ The first stable release. Changes since the 0.1.0 preview:
 - `rune test` shows a live line while tests run: binaries done, tests passed
   so far (counted as they finish), and what is running with its progress and
   time. `rune coverage` shows its merge and report steps.
+- `rune test --failed`: builds and runs only the tests that failed last
+  time, by exact name; repeated, it narrows down to what is still broken,
+  and runs everything once nothing is. A failed run points to it.
 - `rune test --test-jobs N` / `test.jobs`: how many test binaries run at once.
 - `rune test --timeout 10m` / `test.timeout`: a test binary that runs longer
   is stopped and reported as failed, naming the tests that had not finished,
@@ -38,6 +45,10 @@ The first stable release. Changes since the 0.1.0 preview:
   run time, as Cargo sets them.
 
 ### Fixed
+- A lockfile pinning a release newer than the registry index cached on the
+  machine (after `cargo update`, or a teammate's commit) was quietly
+  re-resolved to an older release, rewriting `Cargo.lock`; Rune now fetches
+  the index as Cargo does (offline, it says so instead).
 - Clear messages instead of low-level errors: no Rust toolchain (or a
   `rustup` without a default toolchain), a full disk (rustc and linkers crash
   with a bus error there; Rune now names the cause, and warns before a build
@@ -46,11 +57,26 @@ The first stable release. Changes since the 0.1.0 preview:
 - TOML errors in manifests print once, naming the file once.
 - Doc tests run after the test binaries, as with Cargo: run first, a failing
   doc test could stop the run before a failing unit test was reported.
+- `rune watch` no longer restarts forever when a run writes into the project
+  (a JUnit report, logs, test snapshots): changes to files git ignores don't
+  count. It says which file set off a run.
+- A credential helper (`cargo:libsecret`, an external provider) that exits
+  before reading its input is an error, instead of silently ending
+  `rune login`/`publish` with SIGPIPE.
+- Building Rune itself with Cargo recompiled `rune-cli` on every build in a
+  clone without `.git/packed-refs` (its build script watched the missing
+  file); in a worktree it watched the wrong refs.
+- A failed test binary's output is followed by one blank line, not three.
 - `rune test -q` prints the result line; a binary killed by a signal counts as
   a failed test; a failed download no longer reports "downloaded".
 - A crash (a bug in Rune) prints what happened and where to report it.
 - Rune compiles cleanly for Windows (two Unix-only assumptions); CI checks
   Windows and runs on pushes to `master`.
+- The install scripts take `--version 2027.0` (not only the full tag), say
+  what is wrong with a bad option, install the native build under Rosetta,
+  refuse musl-based Linux (the builds need glibc) with how to build from
+  source, show the `PATH` line for the user's shell, and replace a running
+  `rune` safely. The Intel macOS release builds on a supported runner image.
 - `rune self uninstall --purge` refuses to delete a `RUNE_HOME` that is the
   home directory, a file system root, or holds nothing of Rune's.
 - `rune self update` uses Rune's network settings (CA bundles, proxy) and no
@@ -82,6 +108,24 @@ The first stable release. Changes since the 0.1.0 preview:
   ever cached. Both are marked with `CACHEDIR.TAG` and left out.
 
 ### Changed
+- A crate of the project is keyed by the files rustc read for it (its
+  modules, `include_str!`/`include_bytes!` files), recorded after it
+  compiles, instead of by every file of its package. Editing an integration
+  test, a README or a doc, or a log file appearing in a package no longer
+  recompiles the package's library and everything that depends on it (in a
+  25-crate workspace, a new file in the bottom crate rebuilt 21 crates; now
+  none). A crate with a build script is keyed by what it read and its
+  script's result, so editing `tests/` of a package whose build script
+  embeds the git commit (or generates code from a watched file) no longer
+  rebuilds its library either.
+- Quick commands on small projects no longer start a thread pool for two or
+  three items of work: its spinning workers made their time erratic.
+- Less work when nothing changed, measured on a 73-crate workspace (no-op
+  `check`/`build`/`test --no-run`: 32/39/37 ms, Cargo 65/93/88 ms): unit keys
+  are hashed once instead of twice (the per-part breakdown for `rune
+  explain` is only worked out for units whose key changed), plain workspace
+  member paths are not expanded as globs (which stat every directory from
+  the file system root down), and canonical paths are remembered.
 - The README is a short introduction; the reference documentation moved to
   `docs/` (installation, commands, compatibility, settings, testing, caching,
   CI, supply chain, …). Install with `curl -fsSL https://runepm.com/install.sh | sh`.

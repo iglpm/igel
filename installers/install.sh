@@ -2,7 +2,7 @@
 # Installs the latest (or a given) release of Rune.
 #
 #   curl -fsSL https://runepm.com/install.sh | sh
-#   curl -fsSL https://runepm.com/install.sh | sh -s -- --version v2027.0.0 --to ~/.local/bin
+#   curl -fsSL https://runepm.com/install.sh | sh -s -- --version 2027.0 --to ~/.local/bin
 #
 # Downloads the release archive for this machine from GitHub, checks it
 # against its published SHA-256, and puts `rune` in ~/.rune/bin (or --to).
@@ -12,74 +12,150 @@ REPO="runepm/rune"
 VERSION="${RUNE_VERSION:-latest}"
 DEST="${RUNE_INSTALL_DIR:-$HOME/.rune/bin}"
 
-say() { printf '\033[1;35m▸\033[0m %s\n' "$*"; }
-die() { printf '\033[1;31m✗\033[0m %s\n' "$*" >&2; exit 1; }
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+    say() { printf '\033[1;35m▸\033[0m %s\n' "$*"; }
+else
+    say() { printf '▸ %s\n' "$*"; }
+fi
+if [ -t 2 ] && [ -z "${NO_COLOR:-}" ]; then
+    die() { printf '\033[1;31m✗\033[0m %s\n' "$*" >&2; exit 1; }
+else
+    die() { printf '✗ %s\n' "$*" >&2; exit 1; }
+fi
+
+usage() {
+    cat <<'EOF'
+Installs Rune.
+
+  curl -fsSL https://runepm.com/install.sh | sh -s -- [options]
+
+Options:
+  --version <v>  a release, e.g. 2027.0 or v2027.0.1 (default: the latest)
+  --to <dir>     where to put `rune` (default: ~/.rune/bin)
+  -h, --help     this text
+
+RUNE_VERSION and RUNE_INSTALL_DIR do the same; RUNE_DOWNLOAD_BASE points
+at a mirror holding the release files.
+EOF
+}
 
 while [ $# -gt 0 ]; do
     case "$1" in
-        --version) VERSION="$2"; shift 2 ;;
-        --to) DEST="$2"; shift 2 ;;
-        -h|--help)
-            sed -n '2,8p' "$0" 2>/dev/null || true
-            exit 0 ;;
-        *) die "unknown option: $1" ;;
+        --version|--to)
+            [ $# -ge 2 ] || die "$1 needs a value (see --help)"
+            if [ "$1" = "--version" ]; then VERSION="$2"; else DEST="$2"; fi
+            shift 2 ;;
+        --version=*) VERSION="${1#*=}"; shift ;;
+        --to=*) DEST="${1#*=}"; shift ;;
+        -h|--help) usage; exit 0 ;;
+        *) die "unknown option: $1 (see --help)" ;;
     esac
 done
 
+# `2027.0`, `v2027.0` and `v2027.0.0` all name release tag `v2027.0.0`.
+if [ "$VERSION" != "latest" ]; then
+    v="${VERSION#v}"
+    case "$v" in
+        *[!0-9.]*|.*|*.|*..*|"") die "not a release version: $VERSION (e.g. 2027.0 or 2027.0.1)" ;;
+    esac
+    case "$v" in
+        *.*.*) ;;
+        *.*) v="$v.0" ;;
+        *) v="$v.0.0" ;;
+    esac
+    VERSION="v$v"
+fi
+
 case "$(uname -s)" in
-    Linux) os="unknown-linux-gnu" ;;
+    Linux)
+        os="unknown-linux-gnu"
+        # The Linux builds link glibc dynamically.
+        if ldd --version 2>&1 | grep -qi musl; then
+            die "no prebuilt Rune for musl-based Linux (e.g. Alpine) yet; build it with: cargo install --locked --git https://github.com/$REPO rune-cli"
+        fi
+        ;;
     Darwin) os="apple-darwin" ;;
-    *) die "no prebuilt Rune for $(uname -s); build it with: cargo install --git https://github.com/$REPO rune-cli" ;;
+    MINGW*|MSYS*|CYGWIN*)
+        die "on Windows, install from PowerShell: irm https://runepm.com/install.ps1 | iex" ;;
+    *) die "no prebuilt Rune for $(uname -s); build it with: cargo install --locked --git https://github.com/$REPO rune-cli" ;;
 esac
 case "$(uname -m)" in
     x86_64|amd64) arch="x86_64" ;;
     arm64|aarch64) arch="aarch64" ;;
-    *) die "no prebuilt Rune for $(uname -m)" ;;
+    *) die "no prebuilt Rune for $(uname -m); build it with: cargo install --locked --git https://github.com/$REPO rune-cli" ;;
 esac
+# A shell running under Rosetta on Apple silicon reports x86_64: install the
+# native build.
+if [ "$os" = "apple-darwin" ] && [ "$arch" = "x86_64" ] \
+    && [ "$(sysctl -n sysctl.proc_translated 2>/dev/null || echo 0)" = "1" ]; then
+    arch="aarch64"
+fi
 target="$arch-$os"
 archive="rune-$target.tar.gz"
 
 if [ -n "${RUNE_DOWNLOAD_BASE:-}" ]; then
     # A mirror holding the release files.
-    base="$RUNE_DOWNLOAD_BASE"
+    base="${RUNE_DOWNLOAD_BASE%/}"
 elif [ "$VERSION" = "latest" ]; then
     base="https://github.com/$REPO/releases/latest/download"
 else
     base="https://github.com/$REPO/releases/download/$VERSION"
 fi
 
+# HTTPS only, redirects included (a mirror may be plain HTTP or a file://).
+proto="=https"
+[ -z "${RUNE_DOWNLOAD_BASE:-}" ] || proto="all"
 if command -v curl >/dev/null 2>&1; then
-    fetch() { curl -fsSL --retry 3 -o "$2" "$1"; }
+    fetch() { curl -fsSL --proto "$proto" --proto-redir "$proto" --retry 3 -o "$2" "$1"; }
 elif command -v wget >/dev/null 2>&1; then
     fetch() { wget -q -O "$2" "$1"; }
 else
     die "curl or wget is needed"
 fi
+if command -v sha256sum >/dev/null 2>&1; then
+    sha256() { sha256sum "$1" | cut -d ' ' -f 1; }
+elif command -v shasum >/dev/null 2>&1; then
+    sha256() { shasum -a 256 "$1" | cut -d ' ' -f 1; }
+else
+    die "sha256sum or shasum is needed to check the download"
+fi
+command -v tar >/dev/null 2>&1 || die "tar is needed"
 
-tmp="$(mktemp -d)"
+tmp="$(mktemp -d 2>/dev/null || mktemp -d -t rune-install)"
 trap 'rm -rf "$tmp"' EXIT
 
 say "downloading Rune ($VERSION, $target)"
-fetch "$base/$archive" "$tmp/$archive" || die "download failed: $base/$archive"
-fetch "$base/$archive.sha256" "$tmp/$archive.sha256" || die "checksum download failed"
+if ! fetch "$base/$archive" "$tmp/$archive"; then
+    if [ "$VERSION" = "latest" ] || [ -n "${RUNE_DOWNLOAD_BASE:-}" ]; then
+        die "download failed: $base/$archive"
+    fi
+    die "download failed: $base/$archive (is $VERSION a release? see https://github.com/$REPO/releases)"
+fi
+fetch "$base/$archive.sha256" "$tmp/$archive.sha256" || die "checksum download failed: $base/$archive.sha256"
 
 expected="$(cut -d ' ' -f 1 < "$tmp/$archive.sha256")"
-if command -v sha256sum >/dev/null 2>&1; then
-    actual="$(sha256sum "$tmp/$archive" | cut -d ' ' -f 1)"
-else
-    actual="$(shasum -a 256 "$tmp/$archive" | cut -d ' ' -f 1)"
-fi
+actual="$(sha256 "$tmp/$archive")"
 [ "$expected" = "$actual" ] || die "checksum mismatch: expected $expected, got $actual"
 
 tar -xzf "$tmp/$archive" -C "$tmp"
-mkdir -p "$DEST"
-install -m 755 "$tmp/rune-$target/rune" "$DEST/rune"
+mkdir -p "$DEST" || die "cannot create $DEST (pick another place with --to)"
+# Replace the file rather than overwrite it in place: a running `rune` keeps
+# its old copy.
+cp "$tmp/rune-$target/rune" "$DEST/.rune.new" || die "cannot write to $DEST (pick another place with --to)"
+chmod 755 "$DEST/.rune.new"
+mv -f "$DEST/.rune.new" "$DEST/rune"
 say "installed $("$DEST/rune" --version) to $DEST/rune"
 
 case ":$PATH:" in
     *":$DEST:"*) ;;
     *)
-        say "add it to your PATH, e.g.:"
-        printf '    echo '\''export PATH="%s:$PATH"'\'' >> ~/.profile\n' "$DEST"
+        say "add it to your PATH:"
+        case "${SHELL:-}" in
+            */fish) printf '    fish_add_path %s\n' "$DEST" ;;
+            */zsh) printf '    echo '\''export PATH="%s:$PATH"'\'' >> ~/.zshrc\n' "$DEST" ;;
+            */bash) printf '    echo '\''export PATH="%s:$PATH"'\'' >> ~/.bashrc\n' "$DEST" ;;
+            *) printf '    echo '\''export PATH="%s:$PATH"'\'' >> ~/.profile\n' "$DEST" ;;
+        esac
+        say "then open a new terminal, or run: export PATH=\"$DEST:\$PATH\""
         ;;
 esac

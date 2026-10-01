@@ -81,6 +81,16 @@ fn main() {
             help::show_clap(&e);
             return;
         }
+        Err(e) if e.kind() == clap::error::ErrorKind::InvalidSubcommand => unknown_command(&e),
+        // Usage errors in Rune's own style (`✗ …`), clap's text otherwise.
+        Err(e)
+            if e.use_stderr()
+                && e.kind() != clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand =>
+        {
+            let text = e.render().to_string();
+            ui::error(text.strip_prefix("error: ").unwrap_or(&text).trim_end());
+            std::process::exit(e.exit_code())
+        }
         Err(e) => e.exit(),
     };
     rune_common::cargo_config::set_cli_overrides(cli.config_overrides.clone());
@@ -178,6 +188,32 @@ fn render_error(err: &anyhow::Error) -> String {
         out.push_str(part);
     }
     out
+}
+
+/// `rune buidl`: Rune's own error line and the nearest commands (not the
+/// one-letter aliases clap would also offer).
+fn unknown_command(e: &clap::Error) -> ! {
+    use clap::error::{ContextKind, ContextValue};
+    let Some(ContextValue::String(name)) = e.get(ContextKind::InvalidSubcommand) else {
+        e.exit()
+    };
+    let near: Vec<String> = match e.get(ContextKind::SuggestedSubcommand) {
+        Some(ContextValue::String(s)) => vec![s.clone()],
+        Some(ContextValue::Strings(v)) => v.clone(),
+        _ => Vec::new(),
+    }
+    .into_iter()
+    .filter(|s| s.len() > 1)
+    .map(|s| format!("`rune {s}`"))
+    .collect();
+    ui::error(format_args!("no such command: `{name}`"));
+    match near.as_slice() {
+        [] => {}
+        [one] => ui::hint(format_args!("did you mean {one}?")),
+        many => ui::hint(format_args!("did you mean one of {}?", many.join(", "))),
+    }
+    ui::hint("`rune help` lists the commands");
+    std::process::exit(e.exit_code())
 }
 
 /// What to do about an error the machine caused, not the project.

@@ -10,10 +10,9 @@
 use crate::args::WatchArgs;
 use crate::ui;
 use anyhow::{Context, Result};
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command};
+use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 /// Directories that never contain sources.
@@ -27,6 +26,10 @@ const IGNORED_DIRS: &[&str] = &[
     ".idea",
     ".vscode",
 ];
+
+/// Every relevant file's size and modification time, by path.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct State(BTreeMap<PathBuf, (u64, u128)>);
 
 /// Decides what counts as a change.
 pub struct Snapshot {
@@ -42,9 +45,9 @@ impl Snapshot {
         }
     }
 
-    /// A fingerprint of every relevant file's path, size and modification time.
-    pub fn signature(&self) -> u64 {
-        let mut entries: Vec<(PathBuf, u64, u128)> = Vec::new();
+    /// The project's files now.
+    pub fn state(&self) -> State {
+        let mut entries = BTreeMap::new();
         let mut stack = vec![self.root.clone()];
         while let Some(dir) = stack.pop() {
             let Ok(read) = std::fs::read_dir(&dir) else {
@@ -72,14 +75,80 @@ impl Snapshot {
                         .ok()
                         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                         .map_or(0, |d| d.as_nanos());
-                    entries.push((path, meta.len(), mtime));
+                    entries.insert(path, (meta.len(), mtime));
                 }
             }
         }
-        entries.sort();
-        let mut h = DefaultHasher::new();
-        entries.hash(&mut h);
-        h.finish()
+        State(entries)
+    }
+
+    /// The files that differ between `base` and `now` and matter: new,
+    /// changed or removed, except those git ignores (output a run writes —
+    /// reports, logs, snapshots — so a run that writes them does not set off
+    /// the next one).
+    pub fn changes(&self, base: &State, now: &State) -> Vec<PathBuf> {
+        if base == now {
+            return Vec::new();
+        }
+        let mut changed: Vec<PathBuf> = now
+            .0
+            .iter()
+            .filter(|(p, v)| base.0.get(*p) != Some(*v))
+            .map(|(p, _)| p.clone())
+            .chain(base.0.keys().filter(|p| !now.0.contains_key(*p)).cloned())
+            .collect();
+        let ignored = git_ignored(&self.root, &changed);
+        changed.retain(|p| !ignored.contains(p));
+        changed
+    }
+}
+
+/// Which of `paths` (below `root`) git ignores; none outside a repository or
+/// without git.
+fn git_ignored(root: &Path, paths: &[PathBuf]) -> HashSet<PathBuf> {
+    let in_repository = root.ancestors().any(|d| d.join(".git").exists());
+    if !in_repository || paths.is_empty() {
+        return HashSet::new();
+    }
+    let mut ignored = HashSet::new();
+    // As arguments, not on stdin: git stops reading early when the directory
+    // is not a repository after all, and writing to it then would raise a
+    // SIGPIPE, which ends Rune (it lets the signal stop it, for `| head`).
+    for chunk in paths.chunks(256) {
+        let Ok(out) = Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(["-c", "core.quotePath=false", "check-ignore", "--"])
+            .args(chunk.iter().map(|p| p.strip_prefix(root).unwrap_or(p)))
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+        else {
+            return HashSet::new();
+        };
+        // 0: some are ignored; 1: none are; anything else: an error.
+        if !out.status.success() {
+            continue;
+        }
+        ignored.extend(
+            String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .filter(|l| !l.is_empty())
+                .map(|l| root.join(l)),
+        );
+    }
+    ignored
+}
+
+/// `src/lib.rs`, or `src/lib.rs and 3 more`.
+fn describe(root: &Path, changed: &[PathBuf]) -> String {
+    let first = changed
+        .first()
+        .map(|p| p.strip_prefix(root).unwrap_or(p).display().to_string())
+        .unwrap_or_default();
+    match changed.len() {
+        0 | 1 => first,
+        n => format!("{first} and {} more", n - 1),
     }
 }
 
@@ -110,8 +179,8 @@ enum Outcome {
     Finished {
         ok: bool,
     },
-    /// Files changed while it ran; it was stopped.
-    Interrupted,
+    /// These files changed while it ran; it was stopped.
+    Interrupted(Vec<PathBuf>),
 }
 
 pub fn watch(args: WatchArgs) -> Result<()> {
@@ -133,14 +202,14 @@ pub fn watch(args: WatchArgs) -> Result<()> {
 
     let mut runs = 0u32;
     loop {
-        let before = snapshot.signature();
+        let mut before = snapshot.state();
         if args.clear {
             print!("\x1b[2J\x1b[H");
         }
         let started = Instant::now();
-        let outcome = run_round(&exe, &commands, &root, &snapshot, before, interval)?;
+        let outcome = run_round(&exe, &commands, &root, &snapshot, &mut before, interval)?;
         runs += 1;
-        match outcome {
+        match &outcome {
             Outcome::Finished { ok: true } => ui::summary(format!(
                 "finished in {:.2}s · waiting for changes",
                 started.elapsed().as_secs_f64()
@@ -149,13 +218,18 @@ pub fn watch(args: WatchArgs) -> Result<()> {
                 "failed after {:.2}s · waiting for changes",
                 started.elapsed().as_secs_f64()
             )),
-            Outcome::Interrupted => ui::action("restarting", "files changed"),
+            Outcome::Interrupted(changed) => ui::action(
+                "restarting",
+                format!("{} changed", describe(&root, changed)),
+            ),
         }
         if args.max_runs.is_some_and(|max| runs >= max) {
             return Ok(());
         }
-        if !matches!(outcome, Outcome::Interrupted) {
-            wait_for_change(&snapshot, snapshot.signature(), interval);
+        if !matches!(outcome, Outcome::Interrupted(_)) {
+            // What the run wrote itself is where waiting starts from.
+            let changed = wait_for_change(&snapshot, snapshot.state(), interval);
+            ui::action("changed", describe(&root, &changed));
         }
         // Editors save in bursts (write, rename, chmod); let it settle.
         settle(&snapshot, interval);
@@ -163,13 +237,14 @@ pub fn watch(args: WatchArgs) -> Result<()> {
 }
 
 /// Runs the commands in order, stopping at the first failure — or as soon as the
-/// files change, so a stale run is not waited for.
+/// files change, so a stale run is not waited for. Changes that do not matter
+/// (see [`Snapshot::changes`]) move `baseline` along.
 fn run_round(
     exe: &Path,
     commands: &[Vec<String>],
     root: &Path,
     snapshot: &Snapshot,
-    baseline: u64,
+    baseline: &mut State,
     interval: Duration,
 ) -> Result<Outcome> {
     for command in commands {
@@ -189,11 +264,14 @@ fn run_round(
             }
             if last_poll.elapsed() >= interval {
                 last_poll = Instant::now();
-                if snapshot.signature() != baseline {
+                let now = snapshot.state();
+                let changed = snapshot.changes(baseline, &now);
+                if !changed.is_empty() {
                     let _ = child.kill();
                     let _ = child.wait();
-                    return Ok(Outcome::Interrupted);
+                    return Ok(Outcome::Interrupted(changed));
                 }
+                *baseline = now;
             }
             std::thread::sleep(Duration::from_millis(20));
         }
@@ -201,18 +279,25 @@ fn run_round(
     Ok(Outcome::Finished { ok: true })
 }
 
-fn wait_for_change(snapshot: &Snapshot, baseline: u64, interval: Duration) {
-    while snapshot.signature() == baseline {
+/// Waits for a change that matters; returns the files.
+fn wait_for_change(snapshot: &Snapshot, mut baseline: State, interval: Duration) -> Vec<PathBuf> {
+    loop {
         std::thread::sleep(interval);
+        let now = snapshot.state();
+        let changed = snapshot.changes(&baseline, &now);
+        if !changed.is_empty() {
+            return changed;
+        }
+        baseline = now;
     }
 }
 
 /// Returns once the files have stopped changing for one interval.
 fn settle(snapshot: &Snapshot, interval: Duration) {
-    let mut last = snapshot.signature();
+    let mut last = snapshot.state();
     loop {
         std::thread::sleep(interval.min(Duration::from_millis(150)));
-        let now = snapshot.signature();
+        let now = snapshot.state();
         if now == last {
             return;
         }
@@ -232,8 +317,8 @@ mod tests {
         dir
     }
 
-    fn sig(dir: &tempfile::TempDir) -> u64 {
-        Snapshot::new(dir.path(), vec![]).signature()
+    fn sig(dir: &tempfile::TempDir) -> State {
+        Snapshot::new(dir.path(), vec![]).state()
     }
 
     #[test]
@@ -282,9 +367,9 @@ mod tests {
         let out = p.path().join("out");
         std::fs::create_dir_all(&out).unwrap();
         let snap = Snapshot::new(p.path(), vec![out.clone()]);
-        let base = snap.signature();
+        let base = snap.state();
         std::fs::write(out.join("artifact"), "x").unwrap();
-        assert_eq!(base, snap.signature());
+        assert_eq!(base, snap.state());
     }
 
     #[test]
@@ -306,10 +391,39 @@ mod tests {
             p.path(),
             vec![p.path().join("generated"), p.path().join("out.txt")],
         );
-        let base = snap.signature();
+        let base = snap.state();
         std::fs::write(p.path().join("generated/x.rs"), "x").unwrap();
         std::fs::write(p.path().join("out.txt"), "2222").unwrap();
-        assert_eq!(base, snap.signature());
+        assert_eq!(base, snap.state());
+    }
+
+    #[test]
+    fn changes_to_files_git_ignores_do_not_matter() {
+        let p = project();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(p.path())
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        };
+        if !git(&["init", "-q"]) {
+            return; // no git here
+        }
+        std::fs::write(p.path().join(".gitignore"), "*.log\nreports/\n").unwrap();
+        let snap = Snapshot::new(p.path(), vec![]);
+        let base = snap.state();
+        std::fs::create_dir_all(p.path().join("reports")).unwrap();
+        std::fs::write(p.path().join("reports/junit.xml"), "x").unwrap();
+        std::fs::write(p.path().join("test.log"), "x").unwrap();
+        let now = snap.state();
+        assert_ne!(base, now);
+        assert!(snap.changes(&base, &now).is_empty());
+        std::fs::write(p.path().join("src/lib.rs"), "fn b() {}").unwrap();
+        let changed = snap.changes(&base, &snap.state());
+        assert_eq!(changed, [p.path().join("src/lib.rs")]);
+        assert_eq!(describe(p.path(), &changed), "src/lib.rs");
     }
 
     #[test]

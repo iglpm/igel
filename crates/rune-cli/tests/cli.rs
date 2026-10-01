@@ -206,6 +206,54 @@ fn second_build_is_fully_cached_and_edits_recompile_only_what_changed() {
 }
 
 #[test]
+fn only_files_a_crate_read_rebuild_it() {
+    let p = Project::new();
+    p.write(
+        "Cargo.toml",
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\
+         [dependencies]\nbase = { path = \"base\" }\n[workspace]\n",
+    );
+    p.write("src/lib.rs", "pub fn v() -> &'static str { base::DATA }\n");
+    p.write(
+        "base/Cargo.toml",
+        "[package]\nname = \"base\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    p.write(
+        "base/src/lib.rs",
+        "mod m;\npub use m::f;\npub const DATA: &str = include_str!(\"../data.txt\");\n\
+         pub const SHARED: &str = include_str!(\"../../shared.txt\");\n",
+    );
+    p.write("base/src/m.rs", "pub fn f() {}\n");
+    p.write("base/data.txt", "one");
+    p.write("shared.txt", "s1");
+    let out = p.ok(&["build"]);
+    assert!(out.contains("2 compiled"), "{out}");
+
+    // Files no crate read — notes, a log, an integration test, the README —
+    // compile nothing, as with Cargo.
+    p.write("base/NOTES.md", "notes");
+    p.write("base/build.log", "log");
+    p.write("base/tests/it.rs", "#[test]\nfn t() {}\n");
+    p.write("README.md", "readme");
+    let out = p.ok(&["build"]);
+    assert!(out.contains("0 compiled · 2 cached"), "{out}");
+
+    // What it read, in its package or beside it, does (and its dependents).
+    p.write("base/data.txt", "two");
+    assert!(p.ok(&["build"]).contains("2 compiled"));
+    p.write("shared.txt", "s2");
+    assert!(p.ok(&["build"]).contains("2 compiled"));
+    p.write("base/src/m.rs", "pub fn f() { }\n");
+    assert!(p.ok(&["build"]).contains("2 compiled"));
+    assert!(p.ok(&["build"]).contains("0 compiled · 2 cached"));
+
+    // A fresh checkout finds everything again by the files it read.
+    std::fs::remove_dir_all(p.path().join(".rune")).unwrap();
+    let out = p.ok(&["build"]);
+    assert!(out.contains("0 compiled · 2 cached"), "{out}");
+}
+
+#[test]
 fn binaries_compile_in_deps_and_only_their_names_appear_in_the_profile_dir() {
     let p = Project::new();
     p.write("Cargo.toml", LIB_MANIFEST);
@@ -2695,6 +2743,64 @@ fn serve_publishing_registry(
 
 #[cfg(unix)]
 #[test]
+fn a_locked_release_newer_than_the_cached_index_is_fetched_not_downgraded() {
+    let (port, state) = serve_publishing_registry("unused");
+    let add = |version: &str| -> String {
+        let (bytes, sum) = make_crate("stale", version, "pub fn v() {}\n");
+        let mut st = state.lock().unwrap();
+        st.index
+            .entry("stale".into())
+            .or_default()
+            .push(serde_json::json!({
+                "name": "stale", "vers": version, "deps": [], "cksum": sum,
+                "features": {}, "yanked": false,
+            }));
+        st.crates.insert(("stale".into(), version.into()), bytes);
+        sum
+    };
+    let old_sum = add("1.0.0");
+    let p = Project::new();
+    p.write(
+        "Cargo.toml",
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\
+         [dependencies]\nstale = { version = \"1\", registry = \"mock\" }\n",
+    );
+    p.write("src/main.rs", "fn main() {}\n");
+    p.write(
+        ".cargo/config.toml",
+        &format!("[registries.mock]\nindex = \"sparse+http://127.0.0.1:{port}/\"\n"),
+    );
+    // The index is cached here with 1.0.0 only.
+    p.ok(&["build"]);
+    assert!(p.read("Cargo.lock").contains("version = \"1.0.0\""));
+
+    // Another tool (`cargo update`) moved the lockfile to a newer release.
+    let new_sum = add("1.0.1");
+    let lock = p
+        .read("Cargo.lock")
+        .replace("version = \"1.0.0\"", "version = \"1.0.1\"")
+        .replace(&old_sum, &new_sum);
+    p.write("Cargo.lock", &lock);
+    p.ok(&["build"]);
+    let lock = p.read("Cargo.lock");
+    assert!(lock.contains("version = \"1.0.1\""), "{lock}");
+
+    // Offline, a pinned release the cache does not know is an error with
+    // what to do, not a quiet downgrade.
+    let new_sum = add("1.0.2");
+    p.write(
+        "Cargo.lock",
+        &lock
+            .replace("version = \"1.0.1\"", "version = \"1.0.2\"")
+            .replace(&old_sum, &new_sum),
+    );
+    let out = p.rune(&["build", "--offline"]);
+    assert!(!out.status.success());
+    assert!(text(&out).contains("without `--offline`"), "{}", text(&out));
+}
+
+#[cfg(unix)]
+#[test]
 fn packages_are_published_installed_yanked_and_owned_through_a_registry_api() {
     let (port, state) = serve_publishing_registry("tok-123");
     let p = Project::new();
@@ -5018,6 +5124,59 @@ mod tests {
 }
 
 #[test]
+fn failed_runs_only_what_failed_last_time() {
+    let p = Project::new();
+    p.write("Cargo.toml", LIB_MANIFEST);
+    let lib = r#"pub fn one() -> u32 { 1 }
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn solid() { assert_eq!(super::one(), 1); }
+    #[test]
+    fn broken() { assert_eq!(super::one(), 2); }
+    #[test]
+    fn also_broken() { assert_eq!(super::one(), 3); }
+}
+"#;
+    p.write("src/lib.rs", lib);
+    p.write("tests/other.rs", "#[test]\nfn elsewhere() {}\n");
+    let out = p.rune(&["test", "--no-fail-fast"]);
+    assert_eq!(out.status.code(), Some(101));
+    assert!(text(&out).contains("rune test --failed"), "{}", text(&out));
+
+    // Only the failed tests run, by exact name; the other binary not at all.
+    let out = p.rune(&["test", "--failed"]);
+    let msg = text(&out);
+    assert_eq!(out.status.code(), Some(101), "{msg}");
+    assert!(msg.contains("0 passed; 2 failed"), "{msg}");
+    assert!(!msg.contains("other"), "{msg}");
+
+    // A fixed test passes once, then is forgotten; the rest still runs.
+    p.write(
+        "src/lib.rs",
+        &lib.replace("super::one(), 2", "super::one(), 1"),
+    );
+    let msg = text(&p.rune(&["test", "--failed"]));
+    assert!(msg.contains("1 passed; 1 failed"), "{msg}");
+    let msg = text(&p.rune(&["test", "--failed"]));
+    assert!(msg.contains("0 passed; 1 failed"), "{msg}");
+    assert!(!msg.contains("test tests::broken "), "{msg}");
+
+    // All fixed: nothing is remembered, and `--failed` runs everything.
+    p.write(
+        "src/lib.rs",
+        &lib.replace("super::one(), 2", "super::one(), 1")
+            .replace("super::one(), 3", "super::one(), 1"),
+    );
+    assert!(p.rune(&["test", "--failed"]).status.success());
+    let out = p.rune(&["test", "--failed"]);
+    let msg = text(&out);
+    assert!(out.status.success(), "{msg}");
+    assert!(msg.contains("nothing failed last time"), "{msg}");
+    assert!(msg.contains("4 passed"), "{msg}");
+}
+
+#[test]
 fn test_results_are_json_lines_with_message_format_json() {
     let p = lib_project();
     let out = p.rune(&["test", "--message-format", "json"]);
@@ -6758,4 +6917,21 @@ fn doc_tests_run_after_the_test_binaries_and_quiet_still_shows_the_result() {
     let out = p.ok(&["test", "-q"]);
     assert!(out.contains("2 passed"), "{out}");
     assert!(!out.contains("ok order"), "{out}");
+}
+
+#[test]
+fn a_mistyped_command_suggests_the_real_one() {
+    let out = rune_command().arg("buidl").output().unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("no such command: `buidl`"), "{err}");
+    assert!(err.contains("did you mean `rune build`?"), "{err}");
+    // Not the one-letter alias clap would also offer.
+    assert!(!err.contains("`rune b`"), "{err}");
+
+    let out = rune_command().args(["build", "--relase"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.starts_with("✗ unexpected argument '--relase'"), "{err}");
+    assert!(err.contains("'--release'"), "{err}");
 }

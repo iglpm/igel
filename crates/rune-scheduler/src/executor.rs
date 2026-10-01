@@ -490,28 +490,32 @@ impl BuildExecutor {
         // whether those dependencies were restored or will be rebuilt.
         if let Some(cas) = self.cas.as_ref().filter(|_| !self.force_rebuild) {
             let _timer = rune_common::timing::phase("cas restore");
-            let restored: Vec<(NodeId, Vec<PathBuf>)> = topo
-                .par_iter()
-                .filter_map(|&id| {
-                    let unit = &graph.node(id).unit;
-                    let key = &unit_cas_keys[&id];
-                    // Another `rune` sharing this target directory may be
-                    // compiling a unit with the same output files right now
-                    // (the same crate built with other flags, as `rune
-                    // coverage` does): putting the store's read-only copy in
-                    // place under its compiler fails that build. Such a unit
-                    // is left to the scheduler, which waits its turn and
-                    // then restores it.
-                    let path = unit_lock_path(&self.config, &self.profile, graph, id);
-                    let rune_common::fsutil::TryLock::Locked(_lock) =
-                        rune_common::fsutil::FileLock::try_exclusive(&path)
-                    else {
-                        return None;
-                    };
-                    let linked = cas.link_to(key, &self.out_dir_for(unit)).ok()?;
-                    (!linked.is_empty()).then_some((id, linked))
-                })
-                .collect();
+            let restore = |&id: &NodeId| -> Option<(NodeId, Vec<PathBuf>)> {
+                let unit = &graph.node(id).unit;
+                let key = &unit_cas_keys[&id];
+                // Another `rune` sharing this target directory may be
+                // compiling a unit with the same output files right now
+                // (the same crate built with other flags, as `rune
+                // coverage` does): putting the store's read-only copy in
+                // place under its compiler fails that build. Such a unit
+                // is left to the scheduler, which waits its turn and
+                // then restores it.
+                let path = unit_lock_path(&self.config, &self.profile, graph, id);
+                let rune_common::fsutil::TryLock::Locked(_lock) =
+                    rune_common::fsutil::FileLock::try_exclusive(&path)
+                else {
+                    return None;
+                };
+                let linked = cas.link_to(key, &self.out_dir_for(unit)).ok()?;
+                (!linked.is_empty()).then_some((id, linked))
+            };
+            // In parallel only where it pays: a small graph's restores are
+            // quicker than starting (and spinning down) a thread pool.
+            let restored: Vec<(NodeId, Vec<PathBuf>)> = if topo.len() < 48 {
+                topo.iter().filter_map(restore).collect()
+            } else {
+                topo.par_iter().filter_map(restore).collect()
+            };
 
             for (id, linked) in restored {
                 let unit = &graph.node(id).unit;
@@ -827,6 +831,7 @@ impl BuildExecutor {
                         node_id,
                         &unit_base_keys[&node_id],
                         &unit_cas_keys[&node_id],
+                        dep_keys_of(graph, node_id, &unit_cas_keys),
                         &artifact_paths,
                         &metadata_paths,
                         &build_script_outputs,
@@ -850,6 +855,15 @@ impl BuildExecutor {
                     if !script_only {
                         job.frontend_threads =
                             self.frontend_threads_for(in_flight.len(), ready_count - index - 1);
+                        // (After its script step: the script's record is the
+                        // one its result was stored under.)
+                        job.read_script = self.read_mode(
+                            graph,
+                            node_id,
+                            &unit_cas_keys,
+                            &mut source_cache,
+                            false,
+                        );
                     }
                     job_threads.push(std::thread::spawn(move || job.run()));
                 }
@@ -1120,13 +1134,90 @@ impl BuildExecutor {
             &node.unit
         };
         let dep_keys = dep_keys_of(graph, id, keys);
-        let base = compute_unit_cas_key(unit, &self.profile, &dep_keys, source_cache);
+        let read = self.read_record(graph, id, unit, keys, source_cache);
+        let base = compute_unit_key_from(
+            unit,
+            &self.profile,
+            &dep_keys,
+            source_cache,
+            read.as_ref().map(|(r, s)| (r, s.as_deref())),
+        );
         let recorded: Option<DeclaredInputs> = self
             .cas
             .as_ref()
             .and_then(|c| c.get_value(&format!("{base}-inputs")));
         let key = effective_key(&base, recorded.as_ref(), unit.build_script.is_some());
         (base, key)
+    }
+
+    /// Whether a unit can be keyed by the files it read (see
+    /// [`inputs::ReadRecord`]), and with which build script result:
+    /// `Some(None)` for a local crate without a build script, `Some(Some(key))`
+    /// for one compiled with its package's script's result `key`. `None`: it
+    /// is keyed by every file of its package — not a local crate, or its
+    /// script receives `DEP_*` values (known only once its dependencies'
+    /// scripts ran).
+    fn read_mode(
+        &self,
+        graph: &BuildGraph,
+        id: NodeId,
+        keys: &HashMap<NodeId, String>,
+        source_cache: &mut rune_fingerprint::FingerprintCache,
+        as_full_build: bool,
+    ) -> Option<Option<String>> {
+        let node = graph.node(id);
+        let unit = &node.unit;
+        if unit.crate_id.source != CrateSource::Local {
+            return None;
+        }
+        let owner = match &unit.ext.script_owner {
+            Some(owner) => node
+                .dependencies
+                .iter()
+                .copied()
+                .find(|d| script_key(&graph.node(*d).unit) == *owner)?,
+            None if unit.build_script.is_some() => id,
+            None => return Some(None),
+        };
+        let owner_node = graph.node(owner);
+        if owner_node
+            .dependencies
+            .iter()
+            .any(|d| graph.node(*d).unit.links.is_some())
+        {
+            return None;
+        }
+        // `rune check` looking for a build's result keys it as the build did:
+        // with the script result of the full build's unit.
+        let full;
+        let owner_unit = if as_full_build && owner_node.unit.check_only {
+            full = CompilationUnit {
+                check_only: false,
+                ..owner_node.unit.clone()
+            };
+            &full
+        } else {
+            &owner_node.unit
+        };
+        let (_, _, key) = self.script_keys_of(graph, owner, owner_unit, keys, &[], source_cache);
+        Some(Some(key))
+    }
+
+    /// The files a local crate read when it was last compiled, if recorded,
+    /// with its build script result (see [`Self::read_mode`]).
+    fn read_record(
+        &self,
+        graph: &BuildGraph,
+        id: NodeId,
+        unit: &CompilationUnit,
+        keys: &HashMap<NodeId, String>,
+        source_cache: &mut rune_fingerprint::FingerprintCache,
+    ) -> Option<(inputs::ReadRecord, Option<String>)> {
+        let as_full_build = unit.check_only != graph.node(id).unit.check_only;
+        let script = self.read_mode(graph, id, keys, source_cache, as_full_build)?;
+        let key = read_record_key(unit, source_cache)?;
+        let record = self.cas.as_ref()?.get_value(&format!("{key}-read"))?;
+        Some((record, script))
     }
 
     /// What a unit's key is made of now (see [`UnitIdentity`]), given its
@@ -1140,7 +1231,14 @@ impl BuildExecutor {
     ) -> UnitIdentity {
         let unit = &graph.node(id).unit;
         let dep_keys = dep_keys_of(graph, id, keys);
-        let mut identity = compute_unit_identity(unit, &self.profile, &dep_keys, source_cache);
+        let read = self.read_record(graph, id, unit, keys, source_cache);
+        let mut identity = compute_unit_identity_from(
+            unit,
+            &self.profile,
+            &dep_keys,
+            source_cache,
+            read.as_ref().map(|(r, s)| (r, s.as_deref())),
+        );
         let recorded: Option<DeclaredInputs> = self
             .cas
             .as_ref()
@@ -1209,6 +1307,9 @@ impl BuildExecutor {
                 format!("{base}-inputs"),
             ]);
             let unit = &graph.node(id).unit;
+            if let Some(read) = read_record_key(unit, &mut source_cache) {
+                out.push(format!("{read}-read"));
+            }
             if unit.build_script.is_some() && unit.ext.script_owner.is_none() {
                 let mut dep_metadata = Vec::new();
                 for d in &graph.node(id).dependencies {
@@ -1249,6 +1350,21 @@ impl BuildExecutor {
         dep_metadata: &[(String, String, String)],
         source_cache: &mut rune_fingerprint::FingerprintCache,
     ) -> (String, String, String) {
+        let unit = &graph.node(id).unit;
+        self.script_keys_of(graph, id, unit, keys, dep_metadata, source_cache)
+    }
+
+    /// [`Self::script_keys`] for `unit` in the place of node `id`'s (the full
+    /// build's unit where the graph has a `check` one).
+    fn script_keys_of(
+        &self,
+        graph: &BuildGraph,
+        id: NodeId,
+        unit: &CompilationUnit,
+        keys: &HashMap<NodeId, String>,
+        dep_metadata: &[(String, String, String)],
+        source_cache: &mut rune_fingerprint::FingerprintCache,
+    ) -> (String, String, String) {
         let node = graph.node(id);
         let build_dep_keys: Vec<(String, String)> = node
             .build_dependencies
@@ -1267,14 +1383,14 @@ impl BuildExecutor {
             })
             .collect();
         let base = compute_script_base(
-            &node.unit,
+            unit,
             &self.profile,
             &build_dep_keys,
             dep_metadata,
             source_cache,
         );
-        let package_hash = if node.unit.crate_id.source == CrateSource::Local {
-            rune_fingerprint::hasher::compute_package_hash(&node.unit.manifest_dir, source_cache)
+        let package_hash = if unit.crate_id.source == CrateSource::Local {
+            rune_fingerprint::hasher::compute_package_hash(&unit.manifest_dir, source_cache)
                 .unwrap_or_default()
         } else {
             String::new()
@@ -1283,12 +1399,10 @@ impl BuildExecutor {
             .cas
             .as_ref()
             .and_then(|c| c.get_value(&format!("{base}-script-record")));
-        let key = inputs::script_result_key_in(
-            &base,
-            record.as_ref(),
-            Some(&node.unit.manifest_dir),
-            || package_hash.clone(),
-        );
+        let key =
+            inputs::script_result_key_in(&base, record.as_ref(), Some(&unit.manifest_dir), || {
+                package_hash.clone()
+            });
         (base, package_hash, key)
     }
 
@@ -1312,11 +1426,20 @@ impl BuildExecutor {
             if !built(id) {
                 continue;
             }
+            // The same key is the same identity: nothing to work out again
+            // (every unit of a build where nothing changed).
+            let label = unit_label(&graph.node(id).unit, &self.profile);
+            if keys
+                .get(&id)
+                .is_some_and(|k| all.get(&label).is_some_and(|saved| saved.key == *k))
+            {
+                continue;
+            }
             let mut identity = self.unit_identity(graph, id, keys, source_cache);
             if let Some(key) = keys.get(&id) {
                 identity.key = key.clone();
             }
-            all.insert(unit_label(&graph.node(id).unit, &self.profile), identity);
+            all.insert(label, identity);
         }
         if all != before
             && let Ok(text) = serde_json::to_string(&all)
@@ -1372,6 +1495,7 @@ impl BuildExecutor {
         node_id: NodeId,
         base_key: &str,
         cas_key: &str,
+        dep_keys: Vec<(String, String)>,
         artifact_paths: &HashMap<NodeId, Vec<PathBuf>>,
         metadata_paths: &HashMap<NodeId, PathBuf>,
         build_script_outputs: &HashMap<NodeId, BuildScriptOutput>,
@@ -1504,6 +1628,7 @@ impl BuildExecutor {
             dep_metadata,
             base_key: base_key.to_string(),
             cas_key: cas_key.to_string(),
+            dep_keys,
             build_output: match &unit_owner_key {
                 // A unit that shares its package's build script takes the
                 // output of the unit that ran it.
@@ -1535,6 +1660,7 @@ impl BuildExecutor {
             script_base: None,
             script_cache_key: None,
             package_hash: String::new(),
+            read_script: None,
         }
     }
 }
@@ -1552,6 +1678,8 @@ struct UnitJob {
     /// The key the unit was scheduled under (may be updated as it learns
     /// about external inputs).
     cas_key: String,
+    /// Its dependencies' keys, to key it again by the files it read.
+    dep_keys: Vec<(String, String)>,
     build_output: Option<BuildScriptOutput>,
     /// Link search paths from the build scripts of the unit's dependencies.
     dep_link_search: Vec<(Option<String>, PathBuf)>,
@@ -1586,6 +1714,9 @@ struct UnitJob {
     script_cache_key: Option<String>,
     /// The package's source hash (for a script that watches no files).
     package_hash: String,
+    /// Whether the unit is keyed by the files it read, and with which build
+    /// script result (see [`BuildExecutor::read_mode`]).
+    read_script: Option<Option<String>>,
 }
 
 impl UnitJob {
@@ -1622,10 +1753,25 @@ impl UnitJob {
         let Some(cas) = &self.cas else { return false };
         let unit = &self.unit;
         let has_script = unit.build_script.is_some();
-        // The other process may have learned external inputs (which change the
-        // key the unit is stored under) that we did not know about.
-        let recorded: Option<DeclaredInputs> = cas.get_value(&format!("{}-inputs", self.base_key));
-        let key = effective_key(&self.base_key, recorded.as_ref(), has_script);
+        // The other process may have learned which files the unit reads and
+        // what it depends on outside itself (which change the key the unit
+        // is stored under), which we did not know about.
+        let mut base = self.base_key.clone();
+        let mut files = rune_fingerprint::FingerprintCache::new();
+        if let Some(script) = &self.read_script
+            && let Some(read) = read_record_key(unit, &mut files)
+            && let Some(record) = cas.get_value::<inputs::ReadRecord>(&format!("{read}-read"))
+        {
+            base = compute_unit_key_from(
+                unit,
+                &self.profile,
+                &self.dep_keys,
+                &mut files,
+                Some((&record, script.as_deref())),
+            );
+        }
+        let recorded: Option<DeclaredInputs> = cas.get_value(&format!("{base}-inputs"));
+        let key = effective_key(&base, recorded.as_ref(), has_script);
         let out_dir = out_dir_for(&self.config, &self.profile, unit);
         let Ok(linked) = cas.link_to(&key, &out_dir) else {
             return false;
@@ -1764,8 +1910,16 @@ impl UnitJob {
         // change theirs, and the compilation that follows keys the unit again
         // (with the same script output) once they are settled.
         let script_only = self.script_only;
-        let bump = |declared: &DeclaredInputs, store_key: &mut String| {
-            let key = effective_key(&self.base_key, Some(declared), has_script);
+        // The unit's key before external inputs: what it was scheduled under,
+        // until the compiler says which files it read.
+        let mut base_key = self.base_key.clone();
+        let read_key = self
+            .read_script
+            .as_ref()
+            .and_then(|_| read_record_key(unit, &mut rune_fingerprint::FingerprintCache::new()));
+        let mut read_record: Option<inputs::ReadRecord> = None;
+        let bump = |base_key: &str, declared: &DeclaredInputs, store_key: &mut String| {
+            let key = effective_key(base_key, Some(declared), has_script);
             if key != *store_key {
                 *store_key = key.clone();
                 if !script_only {
@@ -2042,7 +2196,7 @@ impl UnitJob {
                 &unit.manifest_dir,
                 &script_out_dir,
             ));
-            bump(&declared, &mut store_key);
+            bump(&base_key, &declared, &mut store_key);
         }
         if let (Some(out), Some(cas_store)) = (&script_ran, &self.cas) {
             let key = match &self.script_base {
@@ -2150,6 +2304,30 @@ impl UnitJob {
         let mut sent_metadata = false;
         let result = invoker.invoke_streaming(cmd, &mut |artifact| match artifact.emit.as_str() {
             "dep-info" => {
+                let mut moved = false;
+                // Keyed by exactly the files it read from now on (and found
+                // again by them next time; see `ReadRecord`).
+                if read_key.is_some() {
+                    let record = inputs::ReadRecord::from_dep_info(
+                        &artifact.artifact,
+                        rune_common::fsutil::simplified(&self.config.project_root),
+                        &unit.manifest_dir,
+                        &self.config.target_dir,
+                    );
+                    let script = self.read_script.clone().flatten();
+                    let base = compute_unit_key_from(
+                        unit,
+                        profile,
+                        &self.dep_keys,
+                        &mut rune_fingerprint::FingerprintCache::new(),
+                        Some((&record, script.as_deref())),
+                    );
+                    read_record = Some(record);
+                    if base != base_key {
+                        base_key = base;
+                        moved = true;
+                    }
+                }
                 let reads = inputs::env_reads_from_dep_info(&artifact.artifact, &provided);
                 let manifest = rune_common::manifest_file::manifest_in(&unit.manifest_dir);
                 let read_manifest = inputs::reads_manifest(
@@ -2167,7 +2345,10 @@ impl UnitJob {
                         },
                         ..Default::default()
                     });
-                    bump(&declared, &mut store_key);
+                    moved = true;
+                }
+                if moved {
+                    bump(&base_key, &declared, &mut store_key);
                 }
             }
             "metadata" if !sent_metadata => {
@@ -2245,8 +2426,12 @@ impl UnitJob {
                     // Remember what this unit depends on outside itself, so
                     // the next lookup keys on the current values of those.
                     if !declared.is_empty() {
-                        let _ =
-                            cas_store.put_value(&format!("{}-inputs", self.base_key), &declared);
+                        let _ = cas_store.put_value(&format!("{base_key}-inputs"), &declared);
+                    }
+                    // And which of its files it read, which the next lookup
+                    // keys on instead of every file of the package.
+                    if let (Some(key), Some(record)) = (&read_key, &read_record) {
+                        let _ = cas_store.put_value(&format!("{key}-read"), record);
                     }
                     // The script's result under the key the unit is finally
                     // stored under, which is what a later cache hit restores
@@ -2595,13 +2780,15 @@ impl Timings {
             .into_iter()
             .filter(|d| !self.source_bytes.contains_key(d))
             .collect();
-        let sizes: Vec<(PathBuf, u64)> = todo
-            .into_par_iter()
-            .map(|d| {
-                let bytes = rust_source_bytes(&d);
-                (d, bytes)
-            })
-            .collect();
+        let measure = |d: PathBuf| {
+            let bytes = rust_source_bytes(&d);
+            (d, bytes)
+        };
+        let sizes: Vec<(PathBuf, u64)> = if todo.len() < 8 {
+            todo.into_iter().map(measure).collect()
+        } else {
+            todo.into_par_iter().map(measure).collect()
+        };
         self.source_bytes.extend(sizes);
     }
 
@@ -3202,7 +3389,15 @@ pub fn compute_unit_cas_key(
     dep_keys: &[(String, String)],
     source_cache: &mut rune_fingerprint::FingerprintCache,
 ) -> String {
-    compute_unit_identity(unit, profile, dep_keys, source_cache).key
+    identity_with(
+        unit,
+        profile,
+        dep_keys,
+        source_cache,
+        Sources::Package,
+        false,
+    )
+    .key
 }
 
 /// What a unit's key is made of, part by part: what `rune explain` compares
@@ -3217,19 +3412,25 @@ pub struct UnitIdentity {
     pub files: std::collections::BTreeMap<String, String>,
 }
 
-/// Feeds the key hasher exactly as before, and a hasher per named part.
+/// Feeds the key hasher exactly as before, and — when the parts are wanted
+/// (`rune explain`'s records) — a hasher per named part.
 struct KeyRecorder {
     key: rune_common::hash::HashBuilder,
-    parts: std::collections::BTreeMap<String, rune_common::hash::HashBuilder>,
+    parts: Option<std::collections::BTreeMap<String, rune_common::hash::HashBuilder>>,
 }
 
 impl KeyRecorder {
     fn update(&mut self, part: &str, bytes: &[u8]) {
         self.key.update(bytes);
-        self.parts
-            .entry(part.to_string())
-            .or_default()
-            .update(bytes);
+        let Some(parts) = &mut self.parts else { return };
+        match parts.get_mut(part) {
+            Some(hasher) => hasher.update(bytes),
+            None => {
+                let mut hasher = rune_common::hash::HashBuilder::new();
+                hasher.update(bytes);
+                parts.insert(part.to_string(), hasher);
+            }
+        }
     }
 }
 
@@ -3240,7 +3441,87 @@ pub fn compute_unit_identity(
     dep_keys: &[(String, String)],
     source_cache: &mut rune_fingerprint::FingerprintCache,
 ) -> UnitIdentity {
-    identity_with(unit, profile, dep_keys, source_cache, true)
+    identity_with(
+        unit,
+        profile,
+        dep_keys,
+        source_cache,
+        Sources::Package,
+        true,
+    )
+}
+
+/// [`compute_unit_identity`] keyed by the files a local crate read when it
+/// was last compiled, when they are known (see [`inputs::ReadRecord`]), and
+/// by the key of its build script's result if it has one.
+pub fn compute_unit_identity_from(
+    unit: &CompilationUnit,
+    profile: &Profile,
+    dep_keys: &[(String, String)],
+    source_cache: &mut rune_fingerprint::FingerprintCache,
+    read: Option<(&inputs::ReadRecord, Option<&str>)>,
+) -> UnitIdentity {
+    let sources = match read {
+        Some((record, script)) => Sources::Read(record, script),
+        None => Sources::Package,
+    };
+    identity_with(unit, profile, dep_keys, source_cache, sources, true)
+}
+
+/// The key alone of [`compute_unit_identity_from`] (without the parts it
+/// is made of, which only `rune explain`'s records need).
+pub fn compute_unit_key_from(
+    unit: &CompilationUnit,
+    profile: &Profile,
+    dep_keys: &[(String, String)],
+    source_cache: &mut rune_fingerprint::FingerprintCache,
+    read: Option<(&inputs::ReadRecord, Option<&str>)>,
+) -> String {
+    let sources = match read {
+        Some((record, script)) => Sources::Read(record, script),
+        None => Sources::Package,
+    };
+    identity_with(unit, profile, dep_keys, source_cache, sources, false).key
+}
+
+/// Where the files a local crate read are recorded (`<this>-read`). Keyed
+/// by the crate's configuration and its root file's contents, so each
+/// version of the root keeps its record. A record that does not fit only
+/// costs a miss: a stored result's key names the files it read and their
+/// contents.
+pub fn read_record_key(
+    unit: &CompilationUnit,
+    source_cache: &mut rune_fingerprint::FingerprintCache,
+) -> Option<String> {
+    if unit.crate_id.source != CrateSource::Local {
+        return None;
+    }
+    let root = rune_fingerprint::hasher::file_hash(&unit.source_root, source_cache)?;
+    let mut hb = rune_common::hash::HashBuilder::new();
+    hb.update(b"read-record\0");
+    hb.update(unit.metadata_hash().as_bytes());
+    hb.update(b"\0");
+    hb.update(unit.crate_id.name.as_bytes());
+    hb.update(b"\0");
+    let rel_root = unit
+        .source_root
+        .strip_prefix(&unit.manifest_dir)
+        .unwrap_or(&unit.source_root);
+    hb.update(rel_root.to_string_lossy().as_bytes());
+    hb.update(&root.to_le_bytes());
+    Some(hb.finish_blake3())
+}
+
+/// Which of a local package's files a unit's key covers.
+enum Sources<'a> {
+    /// None (a build script result's base: the script says what it read).
+    None,
+    /// Every file of the package (nothing is known about what it reads).
+    Package,
+    /// The files it read when it was last compiled, and the key of the build
+    /// script result it compiles with (whose output — generated code in
+    /// `OUT_DIR`, cfgs, environment — the files do not cover).
+    Read(&'a inputs::ReadRecord, Option<&'a str>),
 }
 
 /// The base key of a unit's *build script result*: the unit's configuration
@@ -3258,7 +3539,7 @@ pub fn compute_script_base(
     for (links, k, v) in dep_metadata {
         deps.push((format!("dep-metadata:{links}:{k}"), v.clone()));
     }
-    let identity = identity_with(unit, profile, &deps, source_cache, false);
+    let identity = identity_with(unit, profile, &deps, source_cache, Sources::None, false);
     let mut hb = rune_common::hash::HashBuilder::new();
     hb.update(b"build-script-result\0");
     hb.update(identity.key.as_bytes());
@@ -3279,11 +3560,12 @@ fn identity_with(
     profile: &Profile,
     dep_keys: &[(String, String)],
     source_cache: &mut rune_fingerprint::FingerprintCache,
-    include_sources: bool,
+    sources: Sources,
+    with_parts: bool,
 ) -> UnitIdentity {
     let mut hb = KeyRecorder {
         key: rune_common::hash::HashBuilder::new(),
-        parts: Default::default(),
+        parts: with_parts.then(Default::default),
     };
     const UNIT: &str = "unit (features, crate type, edition, target)";
     hb.update(UNIT, unit.metadata_hash().as_bytes());
@@ -3373,18 +3655,43 @@ fn identity_with(
     }
 
     let mut files = std::collections::BTreeMap::new();
-    if unit.crate_id.source == CrateSource::Local && include_sources {
+    if unit.crate_id.source == CrateSource::Local && !matches!(sources, Sources::None) {
         // Where the crate root lives is an input too (`[lib] path = ...`).
         let rel_root = unit
             .source_root
             .strip_prefix(&unit.manifest_dir)
             .unwrap_or(&unit.source_root);
         hb.update("crate root", rel_root.to_string_lossy().as_bytes());
-        let package_hash =
-            rune_fingerprint::hasher::compute_package_hash(&unit.manifest_dir, source_cache)
-                .unwrap_or_default();
-        hb.update("sources", package_hash.as_bytes());
-        files.extend(source_cache.package_file_hashes(&unit.manifest_dir));
+        if let Sources::Read(record, script) = sources {
+            // The result of its build script: what it generated, set and
+            // linked follows from that.
+            if let Some(script) = script {
+                hb.update("build script result", b"script=");
+                hb.update("build script result", script.as_bytes());
+            }
+            // Exactly the files it read, by name and contents ("missing" for
+            // one that is gone).
+            hb.update("sources", b"read\0");
+            for (name, path) in record.paths(&unit.manifest_dir) {
+                let hash = rune_fingerprint::hasher::file_hash(&path, source_cache)
+                    .map_or_else(|| "missing".to_string(), |h| format!("{h:016x}"));
+                hb.update("sources", name.as_bytes());
+                hb.update("sources", b"=");
+                hb.update("sources", hash.as_bytes());
+                hb.update("sources", b"\0");
+                if with_parts {
+                    files.insert(name, hash);
+                }
+            }
+        } else {
+            let package_hash =
+                rune_fingerprint::hasher::compute_package_hash(&unit.manifest_dir, source_cache)
+                    .unwrap_or_default();
+            hb.update("sources", package_hash.as_bytes());
+            if with_parts {
+                files.extend(source_cache.package_file_hashes(&unit.manifest_dir));
+            }
+        }
         // A build script (or crate root) can live outside the package
         // directory (`build = "../shared/build.rs"`), where the walk above
         // doesn't see it.
@@ -3424,6 +3731,7 @@ fn identity_with(
         key: hb.key.finish_blake3(),
         parts: hb
             .parts
+            .unwrap_or_default()
             .into_iter()
             .map(|(k, v)| (k, v.finish_blake3()))
             .collect(),
@@ -3592,13 +3900,14 @@ mod tests {
         let path = config.fingerprint_dir.join("timings.json");
         let mut timings: HashMap<String, f64> =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        // (The timings file may be shared with real builds, under RUNE_HOME.)
-        let ours = |k: &str| {
-            k.ends_with(" rss")
-                && ["one ", "two ", "three ", "four "]
-                    .iter()
-                    .any(|n| k.starts_with(n))
-        };
+        // (The timings file also holds the machine-wide ones, of real builds
+        // and other tests: packages named `two` among them.)
+        let our_keys: HashSet<String> = graph
+            .nodes()
+            .iter()
+            .map(|n| format!("{} rss", Timings::key(&n.unit, &Profile::dev())))
+            .collect();
+        let ours = |k: &str| our_keys.contains(k);
         let peaks: Vec<&String> = timings.keys().filter(|k| ours(k)).collect();
         assert_eq!(peaks.len(), 4, "{timings:?}");
         assert!(

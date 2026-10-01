@@ -15,6 +15,11 @@ use crate::lockfile::{LockDecl, LockPackage, Lockfile};
 pub enum ResolverError {
     #[error("Failed to find compatible version for `{name}` matching `{req}`")]
     NoMatchingVersion { name: String, req: String },
+    #[error(
+        "the lockfile pins `{name}` {version}, which the registry index cached on this \
+         machine does not list yet (run once without `--offline` to update it)"
+    )]
+    LockedVersionNotCached { name: String, version: String },
     #[error(transparent)]
     Registry(#[from] rune_registry::index::IndexError),
     #[error("Manifest parse error: {0}")]
@@ -1462,11 +1467,31 @@ fn resolve_one_queue_item(
             .filter_map(|p| Version::parse(&p.version).ok())
             .filter(|v| req.matches(v) && !excluded(v))
             .max();
-        if let Some(ver) = pinned
-            && let Ok(index) = resolver.get_or_fetch_index(&registry, &name)
-            && let Some(rec) = index.get_version(&ver.to_string())
-        {
-            chosen_record = Some(rec.clone());
+        if let Some(ver) = pinned {
+            let key = (registry.clone(), name.clone());
+            let lookup = |resolver: &mut DependencyResolver| {
+                resolver
+                    .get_or_fetch_index(&registry, &name)
+                    .ok()
+                    .and_then(|index| index.get_version(&ver.to_string()).cloned())
+            };
+            let mut found = lookup(resolver);
+            if found.is_none() && !resolver.refresh && !resolver.offline {
+                // The index cached here predates the locked release (another
+                // tool updated the lockfile): ask the registry, as Cargo
+                // would, rather than settle on an older release.
+                resolver.cached_indices.remove(&key);
+                resolver.refresh = true;
+                found = lookup(resolver);
+                resolver.refresh = false;
+            }
+            if found.is_none() && resolver.offline {
+                return Err(ResolverError::LockedVersionNotCached {
+                    name,
+                    version: ver.to_string(),
+                });
+            }
+            chosen_record = found;
         }
     }
 

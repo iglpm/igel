@@ -171,12 +171,10 @@ pub fn store(provider: &Provider, registry: &Registry, token: &str) -> Result<bo
                 .stdin(Stdio::piped())
                 .spawn()
                 .map_err(|e| format!("`cargo:libsecret` needs `secret-tool`: {e}"))?;
-            child
-                .stdin
-                .take()
-                .ok_or("no stdin")?
-                .write_all(token.as_bytes())
-                .map_err(|e| e.to_string())?;
+            let mut stdin = child.stdin.take().ok_or("no stdin")?;
+            rune_common::sysinfo::without_sigpipe(|| stdin.write_all(token.as_bytes()))
+                .map_err(|e| format!("`secret-tool store` stopped reading: {e}"))?;
+            drop(stdin);
             if !child.wait().map_err(|e| e.to_string())?.success() {
                 return Err("`secret-tool store` failed".into());
             }
@@ -287,7 +285,8 @@ fn external(
     if let (Some(obj), Some(extra)) = (req.as_object_mut(), request.as_object()) {
         obj.extend(extra.clone());
     }
-    writeln!(stdin, "{req}").map_err(|e| format!("credential provider `{prog}`: {e}"))?;
+    rune_common::sysinfo::without_sigpipe(|| writeln!(stdin, "{req}"))
+        .map_err(|e| format!("credential provider `{prog}`: {e}"))?;
     let mut line = String::new();
     stdout
         .read_line(&mut line)

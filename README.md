@@ -34,12 +34,20 @@ $ rune build
 
 | On Rune's own workspace (249 packages) | Rune | Cargo |
 | --- | ---: | ---: |
-| Nothing changed: `build` | **56 ms** | 220 ms |
-| Nothing changed: `check` | **57 ms** | 230 ms |
-| Nothing changed: `test --no-run` | **66 ms** | 250 ms |
-| `tree` | **23 ms** | 163 ms |
+| Nothing changed: `build` | **53 ms** | 225 ms |
+| Nothing changed: `check` | **64 ms** | 234 ms |
+| Nothing changed: `test --no-run` | **56 ms** | 272 ms |
+| `tree` | **9 ms** | 184 ms |
 | Full build from scratch | **112.5 s** | 122.8 s |
 | Fresh machine, shared cache | **0.65 s** | full rebuild |
+
+On a generated 25-crate workspace, [`rune-bench`](bench/README.md) measures a
+fresh checkout at **108×** Cargo's speed, switching back to a branch at **34×**,
+running the tests at **9×**, and Rune **2.8× faster** overall across 32
+measurements (cold builds and rebuilds after an edit are on par: both run the
+same compiler). On Rune's own workspace, a fresh checkout takes 0.18 s where
+Cargo rebuilds for 84 s. Run it on your own project:
+`rune-bench run --project path/to/it`.
 
 - **Nothing is compiled twice.** Every crate is stored under a key that
   describes everything that went into it — compiler, flags, features,
@@ -61,6 +69,8 @@ $ rune build
 - **Stable by default.** Test binaries run one at a time as with Cargo, so
   tests that share a port or a database don't fail at random. Opt into
   parallel binaries with `--test-jobs`.
+- **Fix, then re-run just what failed**: `rune test --failed` builds and runs
+  only the failing tests until none are left.
 - **Built in:** timeouts for hung tests, retries with flaky-test detection,
   JUnit reports, cached test results (`--cached`: 8 s → 0.26 s when nothing
   changed), nextest-style scheduling of tests across binaries, and **code

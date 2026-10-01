@@ -59,7 +59,10 @@ build). There is no eviction on a shared *directory*; Cairn evicts by last use.
 ## Watching and selective CI
 
 `rune watch` re-runs commands (`-x check`, by default) when files change, killing
-and restarting one that is still running. `rune affected --since <rev>` prints the
+and restarting one that is still running, and says which file changed. Files git
+ignores don't count — a JUnit report, logs or snapshots a run writes itself would
+otherwise restart it forever — and neither do the build directory, editor swap
+files or the paths given with `-i`. `rune affected --since <rev>` prints the
 workspace packages a diff can influence — the packages owning changed files and
 everything that depends on them; `--format args` gives `-p a -p b` for
 `rune test $(rune affected --since origin/main --format args)`. A change to

@@ -49,6 +49,7 @@ as soon as it is in; a failure shows while the rest still runs.
 rune test                          # unit, integration and doc tests
 rune test parse -- --nocapture     # a filter, and arguments for the test binaries
 rune test --no-fail-fast           # run every binary even after a failure
+rune test --failed                 # only the tests that failed last time
 rune test --retries 2              # re-run failed tests; ones that pass are reported as flaky
 rune test --junit report.xml       # a JUnit report for CI
 rune test --timeout 10m            # stop a test binary that hangs
@@ -68,6 +69,16 @@ and splits them into batches, each its own process, scheduled across all
 binaries at once — like cargo-nextest. A suite dominated by one large binary
 finishes sooner; the price is that tests no longer share a process (a test
 that relies on another's global state in the same binary may notice).
+
+## Re-running what failed
+
+Rune remembers which tests failed (per project and profile). `rune test
+--failed` builds and runs only the binaries those tests are in, and only
+those tests, by exact name — the edit-and-retry loop while fixing a test,
+without the rest of the suite. A test that passes is forgotten, so repeating
+`--failed` narrows down to what is still broken; once nothing failed, it runs
+every test. A binary that crashed or did not build runs whole. A filter
+(`rune test --failed parse`) narrows the remembered tests further.
 
 ## Flaky tests
 

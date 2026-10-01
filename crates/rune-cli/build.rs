@@ -27,19 +27,26 @@ fn main() {
         .or_else(|| git(&["rev-parse", "--short=9", "HEAD"]));
     let date = git(&["log", "-1", "--format=%cs"]);
     if let Some(git_dir) = git(&["rev-parse", "--absolute-git-dir"]) {
-        // A new commit or checkout changes the version string.
+        // A new commit or checkout changes the version string. Only files
+        // that exist are watched: Cargo treats a missing one as changed on
+        // every build (no `packed-refs` in a fresh clone, a branch whose ref
+        // is packed), which rebuilt Rune every time.
         let git_dir = Path::new(&git_dir);
-        println!("cargo::rerun-if-changed={}", git_dir.join("HEAD").display());
+        // Branch refs live in the main repository's directory, not a
+        // worktree's.
+        let common = git(&["rev-parse", "--path-format=absolute", "--git-common-dir"])
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| git_dir.to_path_buf());
+        let watch = |path: std::path::PathBuf| {
+            if path.is_file() {
+                println!("cargo::rerun-if-changed={}", path.display());
+            }
+        };
+        watch(git_dir.join("HEAD"));
         if let Some(head_ref) = git(&["symbolic-ref", "-q", "HEAD"]) {
-            println!(
-                "cargo::rerun-if-changed={}",
-                git_dir.join(head_ref).display()
-            );
+            watch(common.join(head_ref));
         }
-        println!(
-            "cargo::rerun-if-changed={}",
-            git_dir.join("packed-refs").display()
-        );
+        watch(common.join("packed-refs"));
     }
     let long = match (&commit, &date) {
         (Some(c), Some(d)) => format!("{version} ({c} {d})"),

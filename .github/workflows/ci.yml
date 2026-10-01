@@ -50,6 +50,46 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo build --release -p rune-cli
       - run: ./target/release/rune.exe --version
+      - name: Smoke test (new, add, build, run, test, cached rebuild)
+        shell: bash
+        run: |
+          set -eux
+          rune="$PWD/target/release/rune.exe"
+          export RUNE_HOME="$RUNNER_TEMP/rune-home"
+          cd "$RUNNER_TEMP"
+          "$rune" new smoke
+          cd smoke
+          "$rune" add itoa
+          cat > src/lib.rs <<'EOF'
+          /// Formats a number.
+          ///
+          /// ```
+          /// assert_eq!(smoke::fmt(42), "42");
+          /// ```
+          pub fn fmt(n: u32) -> String {
+              itoa::Buffer::new().format(n).to_string()
+          }
+
+          #[test]
+          fn formats() {
+              assert_eq!(fmt(12), "12");
+          }
+          EOF
+          cat > src/main.rs <<'EOF'
+          fn main() {
+              println!("{}", smoke::fmt(7));
+          }
+          EOF
+          "$rune" build
+          test "$("$rune" run -q)" = "7"
+          test -f .rune/target/debug/smoke.exe
+          "$rune" test 2>&1 | tee test.log
+          grep -q "doc-tests" test.log
+          "$rune" check
+          # A fresh checkout restores everything from the store.
+          rm -rf .rune
+          "$rune" build 2>&1 | tee build.log
+          grep -q "0 compiled" build.log
 
   msrv:
     runs-on: ubuntu-latest
@@ -69,3 +109,24 @@ jobs:
       - run: cargo build --release -p rune-cli
       - run: ./target/release/rune build --release
       - run: ./target/release/rune test --no-doc -p rune-resolver -p rune-cas
+
+  bench:
+    # A short benchmark against Cargo on every change: keeps rune-bench
+    # working and leaves the report as an artifact (shared runners are too
+    # noisy to gate on; use `rune-bench compare` on a quiet machine for that).
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release -p rune-cli -p rune-bench
+      - run: >
+          ./target/release/rune-bench run --workload tiny --workload medium
+          --runs 3 --runs-heavy 2 --rune target/release/rune --out bench-results
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rune-bench-report
+          path: |
+            bench-results/report.html
+            bench-results/report.md
+            bench-results/results.json
