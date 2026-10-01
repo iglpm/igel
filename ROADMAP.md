@@ -70,7 +70,7 @@ normalized content.
 captured stderr; `cargo::error`; one run per package shared by all its units;
 `links` conflict detection; immutable-source enforcement.
 
-**Cache correctness** — complete unit identity (see the README), external
+**Cache correctness** — complete unit identity (see docs/caching.md), external
 inputs learned from build scripts and `env!`, native toolchain identity,
 compiler + wrappers identity, immutable read-only atomic CAS objects verified on
 every hit, warnings replayed on hits.
@@ -159,7 +159,7 @@ where crates.io has published newer releases than the ones pinned).
 | 52 | Verification | ✅ | Key + recorded sizes on every hit; `cas.verify` re-hashes. |
 | 53 | Object layout | ✅ | `objects/<xx>/<key>/{manifest.json,artifacts,tree/,value.json}` (sharded; not literally `sha256/`). |
 | 54 | Build result structure | 🟡 | Manifest stores key, package, artifacts; the identity *breakdown* (compiler/target/profile/…) is not recorded for inspection (M4). |
-| 55 | Complete unit key | ✅ | See the README; every listed component is present. |
+| 55 | Complete unit key | ✅ | See docs/caching.md; every listed component is present. |
 | 56 | Recursive keys | ✅ | |
 | 57 | Diagnostics as part of result | 🟡 | See §33. |
 | 58 | Rustdoc | 🟡 | `rune doc` uses the toolchain's rustdoc/flags/target and skips crates whose identity (unit key + rustdoc + flags) is unchanged. Docs are not stored in the shared CAS. |
@@ -304,7 +304,7 @@ split into separate locks).
 - *Done:* (a) concurrency tests (6 parallel builds; interleaved check/build);
   (b) no global lock — per-unit locks so two processes wanting the same unit wait
   for one compile and the others proceed; (c) `--message-format json` and the
-  rust-analyzer setting in the README (format tested, live rust-analyzer not yet).
+  rust-analyzer setting in docs/editor-integration.md (format tested, live rust-analyzer not yet).
 
 **P4 — Linking is slow and always from scratch; debuginfo is expensive.** The
 survey measured 2–30 % faster edit cycles from `debug = "line-tables-only"`, yet
