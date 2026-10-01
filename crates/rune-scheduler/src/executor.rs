@@ -855,6 +855,15 @@ impl BuildExecutor {
                     if !script_only {
                         job.frontend_threads =
                             self.frontend_threads_for(in_flight.len(), ready_count - index - 1);
+                        // (After its script step: the script's record is the
+                        // one its result was stored under.)
+                        job.read_script = self.read_mode(
+                            graph,
+                            node_id,
+                            &unit_cas_keys,
+                            &mut source_cache,
+                            false,
+                        );
                     }
                     job_threads.push(std::thread::spawn(move || job.run()));
                 }
@@ -1125,10 +1134,15 @@ impl BuildExecutor {
             &node.unit
         };
         let dep_keys = dep_keys_of(graph, id, keys);
-        let read = self.read_record(unit, source_cache);
-        let base =
-            compute_unit_identity_from(unit, &self.profile, &dep_keys, source_cache, read.as_ref())
-                .key;
+        let read = self.read_record(graph, id, unit, keys, source_cache);
+        let base = compute_unit_identity_from(
+            unit,
+            &self.profile,
+            &dep_keys,
+            source_cache,
+            read.as_ref().map(|(r, s)| (r, s.as_deref())),
+        )
+        .key;
         let recorded: Option<DeclaredInputs> = self
             .cas
             .as_ref()
@@ -1137,14 +1151,74 @@ impl BuildExecutor {
         (base, key)
     }
 
-    /// The files a local crate read when it was last compiled, if recorded.
+    /// Whether a unit can be keyed by the files it read (see
+    /// [`inputs::ReadRecord`]), and with which build script result:
+    /// `Some(None)` for a local crate without a build script, `Some(Some(key))`
+    /// for one compiled with its package's script's result `key`. `None`: it
+    /// is keyed by every file of its package — not a local crate, or its
+    /// script receives `DEP_*` values (known only once its dependencies'
+    /// scripts ran).
+    fn read_mode(
+        &self,
+        graph: &BuildGraph,
+        id: NodeId,
+        keys: &HashMap<NodeId, String>,
+        source_cache: &mut rune_fingerprint::FingerprintCache,
+        as_full_build: bool,
+    ) -> Option<Option<String>> {
+        let node = graph.node(id);
+        let unit = &node.unit;
+        if unit.crate_id.source != CrateSource::Local {
+            return None;
+        }
+        let owner = match &unit.ext.script_owner {
+            Some(owner) => node
+                .dependencies
+                .iter()
+                .copied()
+                .find(|d| script_key(&graph.node(*d).unit) == *owner)?,
+            None if unit.build_script.is_some() => id,
+            None => return Some(None),
+        };
+        let owner_node = graph.node(owner);
+        if owner_node
+            .dependencies
+            .iter()
+            .any(|d| graph.node(*d).unit.links.is_some())
+        {
+            return None;
+        }
+        // `rune check` looking for a build's result keys it as the build did:
+        // with the script result of the full build's unit.
+        let full;
+        let owner_unit = if as_full_build && owner_node.unit.check_only {
+            full = CompilationUnit {
+                check_only: false,
+                ..owner_node.unit.clone()
+            };
+            &full
+        } else {
+            &owner_node.unit
+        };
+        let (_, _, key) = self.script_keys_of(graph, owner, owner_unit, keys, &[], source_cache);
+        Some(Some(key))
+    }
+
+    /// The files a local crate read when it was last compiled, if recorded,
+    /// with its build script result (see [`Self::read_mode`]).
     fn read_record(
         &self,
+        graph: &BuildGraph,
+        id: NodeId,
         unit: &CompilationUnit,
+        keys: &HashMap<NodeId, String>,
         source_cache: &mut rune_fingerprint::FingerprintCache,
-    ) -> Option<inputs::ReadRecord> {
+    ) -> Option<(inputs::ReadRecord, Option<String>)> {
+        let as_full_build = unit.check_only != graph.node(id).unit.check_only;
+        let script = self.read_mode(graph, id, keys, source_cache, as_full_build)?;
         let key = read_record_key(unit, source_cache)?;
-        self.cas.as_ref()?.get_value(&format!("{key}-read"))
+        let record = self.cas.as_ref()?.get_value(&format!("{key}-read"))?;
+        Some((record, script))
     }
 
     /// What a unit's key is made of now (see [`UnitIdentity`]), given its
@@ -1158,9 +1232,14 @@ impl BuildExecutor {
     ) -> UnitIdentity {
         let unit = &graph.node(id).unit;
         let dep_keys = dep_keys_of(graph, id, keys);
-        let read = self.read_record(unit, source_cache);
-        let mut identity =
-            compute_unit_identity_from(unit, &self.profile, &dep_keys, source_cache, read.as_ref());
+        let read = self.read_record(graph, id, unit, keys, source_cache);
+        let mut identity = compute_unit_identity_from(
+            unit,
+            &self.profile,
+            &dep_keys,
+            source_cache,
+            read.as_ref().map(|(r, s)| (r, s.as_deref())),
+        );
         let recorded: Option<DeclaredInputs> = self
             .cas
             .as_ref()
@@ -1272,6 +1351,21 @@ impl BuildExecutor {
         dep_metadata: &[(String, String, String)],
         source_cache: &mut rune_fingerprint::FingerprintCache,
     ) -> (String, String, String) {
+        let unit = &graph.node(id).unit;
+        self.script_keys_of(graph, id, unit, keys, dep_metadata, source_cache)
+    }
+
+    /// [`Self::script_keys`] for `unit` in the place of node `id`'s (the full
+    /// build's unit where the graph has a `check` one).
+    fn script_keys_of(
+        &self,
+        graph: &BuildGraph,
+        id: NodeId,
+        unit: &CompilationUnit,
+        keys: &HashMap<NodeId, String>,
+        dep_metadata: &[(String, String, String)],
+        source_cache: &mut rune_fingerprint::FingerprintCache,
+    ) -> (String, String, String) {
         let node = graph.node(id);
         let build_dep_keys: Vec<(String, String)> = node
             .build_dependencies
@@ -1290,14 +1384,14 @@ impl BuildExecutor {
             })
             .collect();
         let base = compute_script_base(
-            &node.unit,
+            unit,
             &self.profile,
             &build_dep_keys,
             dep_metadata,
             source_cache,
         );
-        let package_hash = if node.unit.crate_id.source == CrateSource::Local {
-            rune_fingerprint::hasher::compute_package_hash(&node.unit.manifest_dir, source_cache)
+        let package_hash = if unit.crate_id.source == CrateSource::Local {
+            rune_fingerprint::hasher::compute_package_hash(&unit.manifest_dir, source_cache)
                 .unwrap_or_default()
         } else {
             String::new()
@@ -1306,12 +1400,10 @@ impl BuildExecutor {
             .cas
             .as_ref()
             .and_then(|c| c.get_value(&format!("{base}-script-record")));
-        let key = inputs::script_result_key_in(
-            &base,
-            record.as_ref(),
-            Some(&node.unit.manifest_dir),
-            || package_hash.clone(),
-        );
+        let key =
+            inputs::script_result_key_in(&base, record.as_ref(), Some(&unit.manifest_dir), || {
+                package_hash.clone()
+            });
         (base, package_hash, key)
     }
 
@@ -1560,6 +1652,7 @@ impl BuildExecutor {
             script_base: None,
             script_cache_key: None,
             package_hash: String::new(),
+            read_script: None,
         }
     }
 }
@@ -1613,6 +1706,9 @@ struct UnitJob {
     script_cache_key: Option<String>,
     /// The package's source hash (for a script that watches no files).
     package_hash: String,
+    /// Whether the unit is keyed by the files it read, and with which build
+    /// script result (see [`BuildExecutor::read_mode`]).
+    read_script: Option<Option<String>>,
 }
 
 impl UnitJob {
@@ -1654,7 +1750,8 @@ impl UnitJob {
         // is stored under), which we did not know about.
         let mut base = self.base_key.clone();
         let mut files = rune_fingerprint::FingerprintCache::new();
-        if let Some(read) = read_record_key(unit, &mut files)
+        if let Some(script) = &self.read_script
+            && let Some(read) = read_record_key(unit, &mut files)
             && let Some(record) = cas.get_value::<inputs::ReadRecord>(&format!("{read}-read"))
         {
             base = compute_unit_identity_from(
@@ -1662,7 +1759,7 @@ impl UnitJob {
                 &self.profile,
                 &self.dep_keys,
                 &mut files,
-                Some(&record),
+                Some((&record, script.as_deref())),
             )
             .key;
         }
@@ -1809,7 +1906,10 @@ impl UnitJob {
         // The unit's key before external inputs: what it was scheduled under,
         // until the compiler says which files it read.
         let mut base_key = self.base_key.clone();
-        let read_key = read_record_key(unit, &mut rune_fingerprint::FingerprintCache::new());
+        let read_key = self
+            .read_script
+            .as_ref()
+            .and_then(|_| read_record_key(unit, &mut rune_fingerprint::FingerprintCache::new()));
         let mut read_record: Option<inputs::ReadRecord> = None;
         let bump = |base_key: &str, declared: &DeclaredInputs, store_key: &mut String| {
             let key = effective_key(base_key, Some(declared), has_script);
@@ -2205,13 +2305,15 @@ impl UnitJob {
                         &artifact.artifact,
                         rune_common::fsutil::simplified(&self.config.project_root),
                         &unit.manifest_dir,
+                        &self.config.target_dir,
                     );
+                    let script = self.read_script.clone().flatten();
                     let base = compute_unit_identity_from(
                         unit,
                         profile,
                         &self.dep_keys,
                         &mut rune_fingerprint::FingerprintCache::new(),
-                        Some(&record),
+                        Some((&record, script.as_deref())),
                     )
                     .key;
                     read_record = Some(record);
@@ -3323,35 +3425,32 @@ pub fn compute_unit_identity(
 }
 
 /// [`compute_unit_identity`] keyed by the files a local crate read when it
-/// was last compiled, when they are known (see [`inputs::ReadRecord`]).
+/// was last compiled, when they are known (see [`inputs::ReadRecord`]), and
+/// by the key of its build script's result if it has one.
 pub fn compute_unit_identity_from(
     unit: &CompilationUnit,
     profile: &Profile,
     dep_keys: &[(String, String)],
     source_cache: &mut rune_fingerprint::FingerprintCache,
-    read: Option<&inputs::ReadRecord>,
+    read: Option<(&inputs::ReadRecord, Option<&str>)>,
 ) -> UnitIdentity {
     let sources = match read {
-        Some(record) => Sources::Read(record),
+        Some((record, script)) => Sources::Read(record, script),
         None => Sources::Package,
     };
     identity_with(unit, profile, dep_keys, source_cache, sources)
 }
 
-/// Where the files a local crate read are recorded (`<this>-read`), for a
-/// crate whose key can follow them: one without a build script, whose
-/// generated code could change while its own files do not. Keyed by the
-/// crate's configuration and its root file's contents, so each version of
-/// the root keeps its record. A record that does not fit only costs a miss:
-/// a stored result's key names the files it read and their contents.
+/// Where the files a local crate read are recorded (`<this>-read`). Keyed
+/// by the crate's configuration and its root file's contents, so each
+/// version of the root keeps its record. A record that does not fit only
+/// costs a miss: a stored result's key names the files it read and their
+/// contents.
 pub fn read_record_key(
     unit: &CompilationUnit,
     source_cache: &mut rune_fingerprint::FingerprintCache,
 ) -> Option<String> {
-    if unit.crate_id.source != CrateSource::Local
-        || unit.build_script.is_some()
-        || unit.ext.script_owner.is_some()
-    {
+    if unit.crate_id.source != CrateSource::Local {
         return None;
     }
     let root = rune_fingerprint::hasher::file_hash(&unit.source_root, source_cache)?;
@@ -3376,8 +3475,10 @@ enum Sources<'a> {
     None,
     /// Every file of the package (nothing is known about what it reads).
     Package,
-    /// The files it read when it was last compiled.
-    Read(&'a inputs::ReadRecord),
+    /// The files it read when it was last compiled, and the key of the build
+    /// script result it compiles with (whose output — generated code in
+    /// `OUT_DIR`, cfgs, environment — the files do not cover).
+    Read(&'a inputs::ReadRecord, Option<&'a str>),
 }
 
 /// The base key of a unit's *build script result*: the unit's configuration
@@ -3517,7 +3618,13 @@ fn identity_with(
             .strip_prefix(&unit.manifest_dir)
             .unwrap_or(&unit.source_root);
         hb.update("crate root", rel_root.to_string_lossy().as_bytes());
-        if let Sources::Read(record) = sources {
+        if let Sources::Read(record, script) = sources {
+            // The result of its build script: what it generated, set and
+            // linked follows from that.
+            if let Some(script) = script {
+                hb.update("build script result", b"script=");
+                hb.update("build script result", script.as_bytes());
+            }
             // Exactly the files it read, by name and contents ("missing" for
             // one that is gone).
             hb.update("sources", b"read\0");

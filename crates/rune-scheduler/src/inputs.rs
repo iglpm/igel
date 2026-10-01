@@ -213,11 +213,21 @@ pub struct ReadRecord {
 impl ReadRecord {
     /// The record of a dep-info file written by a rustc that ran in `cwd`
     /// (which its relative paths are relative to), for the package in
-    /// `manifest_dir`.
-    pub fn from_dep_info(dep_info: &Path, cwd: &Path, manifest_dir: &Path) -> Self {
+    /// `manifest_dir`. Files below `target_dir` (code a build script
+    /// generated into `OUT_DIR`) are left out: the script's result covers
+    /// them.
+    pub fn from_dep_info(
+        dep_info: &Path,
+        cwd: &Path,
+        manifest_dir: &Path,
+        target_dir: &Path,
+    ) -> Self {
+        let target_dir = normalize(&cwd.join(target_dir));
         let mut files: Vec<PathBuf> = dep_info_sources(dep_info)
             .into_iter()
-            .map(|f| relative_to(&cwd.join(f), manifest_dir))
+            .map(|f| normalize(&cwd.join(f)))
+            .filter(|f| !f.starts_with(&target_dir))
+            .map(|f| relative_to(&f, manifest_dir))
             .collect();
         files.sort();
         files.dedup();
@@ -640,7 +650,7 @@ mod tests {
              # env-dep:X=1\n",
         )
         .unwrap();
-        let record = ReadRecord::from_dep_info(&d, &p("/w"), &p("/w/pkg"));
+        let record = ReadRecord::from_dep_info(&d, &p("/w"), &p("/w/pkg"), &p("/w/.rune/target"));
         // (`/w/../elsewhere` shares nothing with `/w/pkg` but the root.)
         assert_eq!(
             record.files,

@@ -198,7 +198,10 @@ mod tests {
         // (`wait` would close its stdin: take it first.)
         let mut stdin = child.stdin.take().unwrap();
         child.wait().unwrap();
-        let err = without_sigpipe(|| stdin.write_all(&[0; 1 << 16]).and_then(|_| stdin.flush()));
+        // More than a pipe holds: a process another test forks meanwhile may
+        // hold the reading end for a moment, and the write must outlast it.
+        let data = vec![0u8; 1 << 20];
+        let err = without_sigpipe(|| stdin.write_all(&data).and_then(|_| stdin.flush()));
         assert_eq!(err.unwrap_err().kind(), std::io::ErrorKind::BrokenPipe);
         // Still alive, and the signal was taken: nothing arrives later.
         // SAFETY: as above.

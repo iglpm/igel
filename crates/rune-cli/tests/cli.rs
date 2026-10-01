@@ -2743,6 +2743,64 @@ fn serve_publishing_registry(
 
 #[cfg(unix)]
 #[test]
+fn a_locked_release_newer_than_the_cached_index_is_fetched_not_downgraded() {
+    let (port, state) = serve_publishing_registry("unused");
+    let add = |version: &str| -> String {
+        let (bytes, sum) = make_crate("stale", version, "pub fn v() {}\n");
+        let mut st = state.lock().unwrap();
+        st.index
+            .entry("stale".into())
+            .or_default()
+            .push(serde_json::json!({
+                "name": "stale", "vers": version, "deps": [], "cksum": sum,
+                "features": {}, "yanked": false,
+            }));
+        st.crates.insert(("stale".into(), version.into()), bytes);
+        sum
+    };
+    let old_sum = add("1.0.0");
+    let p = Project::new();
+    p.write(
+        "Cargo.toml",
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\
+         [dependencies]\nstale = { version = \"1\", registry = \"mock\" }\n",
+    );
+    p.write("src/main.rs", "fn main() {}\n");
+    p.write(
+        ".cargo/config.toml",
+        &format!("[registries.mock]\nindex = \"sparse+http://127.0.0.1:{port}/\"\n"),
+    );
+    // The index is cached here with 1.0.0 only.
+    p.ok(&["build"]);
+    assert!(p.read("Cargo.lock").contains("version = \"1.0.0\""));
+
+    // Another tool (`cargo update`) moved the lockfile to a newer release.
+    let new_sum = add("1.0.1");
+    let lock = p
+        .read("Cargo.lock")
+        .replace("version = \"1.0.0\"", "version = \"1.0.1\"")
+        .replace(&old_sum, &new_sum);
+    p.write("Cargo.lock", &lock);
+    p.ok(&["build"]);
+    let lock = p.read("Cargo.lock");
+    assert!(lock.contains("version = \"1.0.1\""), "{lock}");
+
+    // Offline, a pinned release the cache does not know is an error with
+    // what to do, not a quiet downgrade.
+    let new_sum = add("1.0.2");
+    p.write(
+        "Cargo.lock",
+        &lock
+            .replace("version = \"1.0.1\"", "version = \"1.0.2\"")
+            .replace(&old_sum, &new_sum),
+    );
+    let out = p.rune(&["build", "--offline"]);
+    assert!(!out.status.success());
+    assert!(text(&out).contains("without `--offline`"), "{}", text(&out));
+}
+
+#[cfg(unix)]
+#[test]
 fn packages_are_published_installed_yanked_and_owned_through_a_registry_api() {
     let (port, state) = serve_publishing_registry("tok-123");
     let p = Project::new();

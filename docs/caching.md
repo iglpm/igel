@@ -34,8 +34,14 @@ UnitKey = hash(
   nothing (as with Cargo); editing a module compiles that crate and what
   depends on it. The record belongs to the crate root's contents, so going
   back to an earlier version finds that version's record (and its artifact).
-  A crate with a build script, and one compiled for the first time, is keyed
-  by every file of its package instead — every file except `.rune/`,
+  A crate with a build script is keyed by the files it read *and* its
+  script's result key: the script reruns (and the crate recompiles) when a
+  file it watches (`rerun-if-changed`) changes — or, for a script that
+  declares nothing, any file of the package, as in Cargo. Code the script
+  generates into `OUT_DIR` follows from its result, so it is not recorded
+  as read. A crate compiled for the first time, and one whose script gets
+  `DEP_*` values from a `links` dependency, is keyed by every file of its
+  package instead — every file except `.rune/`,
   `target/`, directories tagged as caches (`CACHEDIR.TAG`, which Rune writes
   into every target directory and store), VCS and tool directories, editor
   droppings, nested packages, lock files, `Rune.toml`, and `Cargo.toml`

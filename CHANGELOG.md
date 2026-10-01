@@ -45,6 +45,10 @@ The first stable release. Changes since the 0.1.0 preview:
   run time, as Cargo sets them.
 
 ### Fixed
+- A lockfile pinning a release newer than the registry index cached on the
+  machine (after `cargo update`, or a teammate's commit) was quietly
+  re-resolved to an older release, rewriting `Cargo.lock`; Rune now fetches
+  the index as Cargo does (offline, it says so instead).
 - Clear messages instead of low-level errors: no Rust toolchain (or a
   `rustup` without a default toolchain), a full disk (rustc and linkers crash
   with a bus error there; Rune now names the cause, and warns before a build
@@ -107,7 +111,10 @@ The first stable release. Changes since the 0.1.0 preview:
   test, a README or a doc, or a log file appearing in a package no longer
   recompiles the package's library and everything that depends on it (in a
   25-crate workspace, a new file in the bottom crate rebuilt 21 crates; now
-  none). Crates with a build script keep the package-wide key.
+  none). A crate with a build script is keyed by what it read and its
+  script's result, so editing `tests/` of a package whose build script
+  embeds the git commit (or generates code from a watched file) no longer
+  rebuilds its library either.
 - Quick commands on small projects no longer start a thread pool for two or
   three items of work: its spinning workers made their time erratic.
 - The README is a short introduction; the reference documentation moved to
