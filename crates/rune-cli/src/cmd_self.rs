@@ -44,11 +44,7 @@ pub fn update(args: SelfUpdateArgs) -> Result<()> {
         let tag = args.version.unwrap_or_else(|| "latest".to_string());
         (tag, base.trim_end_matches('/').to_string())
     } else if let Some(ver) = args.version {
-        let tag = if ver.starts_with('v') || ver == "latest" {
-            ver
-        } else {
-            format!("v{ver}")
-        };
+        let tag = release_tag(&ver);
         let base = if tag == "latest" {
             format!("https://github.com/{repo}/releases/latest/download")
         } else {
@@ -341,6 +337,22 @@ fn resolve_latest_release(
     Ok(("latest".to_string(), base))
 }
 
+/// The release tag for what a user typed: `2027.1` and `2027.1.0` are both
+/// `v2027.1.0`; `latest` and full tags stay as they are.
+fn release_tag(version: &str) -> String {
+    if version == "latest" {
+        return version.to_string();
+    }
+    let bare = version.trim_start_matches('v');
+    let parts = bare.split('.').count();
+    let full = if parts == 2 && !bare.contains('-') {
+        format!("{bare}.0")
+    } else {
+        bare.to_string()
+    };
+    format!("v{full}")
+}
+
 /// Detects the target triple for the current machine.
 fn current_target() -> Result<String> {
     let build_target = env!("RUNE_BUILD_TARGET");
@@ -455,6 +467,14 @@ fn replace_executable(src: &Path, dst: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn short_versions_name_full_release_tags() {
+        assert_eq!(release_tag("2027.1"), "v2027.1.0");
+        assert_eq!(release_tag("2027.1.2"), "v2027.1.2");
+        assert_eq!(release_tag("v2027.0.0"), "v2027.0.0");
+        assert_eq!(release_tag("latest"), "latest");
+    }
 
     #[test]
     fn purge_only_deletes_a_directory_rune_made() {

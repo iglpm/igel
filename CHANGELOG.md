@@ -1,10 +1,16 @@
 # Changelog
 
 All notable changes to Rune are recorded here. The format follows
-[Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
-[Semantic Versioning](https://semver.org/).
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [Unreleased]
+Versions are `YEAR.MINOR.PATCH`: the year of the release line, a minor
+release for new features, a patch release for fixes. Within a year's line
+releases are compatible (semver-style), so `rune self update` within it is
+always safe; the first stable release is 2027.0.0.
+
+## [2027.0.0] - Unreleased
+
+The first stable release. Changes since the 0.1.0 preview:
 
 ### Added
 - `rune audit`: RustSec/OSV advisories (vulnerabilities with CVSS scores,
@@ -80,7 +86,7 @@ All notable changes to Rune are recorded here. The format follows
 
 ## [0.1.0] - 2026-09-29
 
-The first release: a Cargo-compatible build system and package manager for
+The preview release: a Cargo-compatible build system and package manager for
 Rust that builds with `rustc` directly and reuses compiled artifacts through
 a content-addressable store.
 

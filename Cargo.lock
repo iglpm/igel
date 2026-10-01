@@ -1242,7 +1242,7 @@ dependencies = [
 
 [[package]]
 name = "rune-cas"
-version = "0.1.0"
+version = "2027.0.0"
 dependencies = [
  "blake3",
  "filetime",
@@ -1264,7 +1264,7 @@ dependencies = [
 
 [[package]]
 name = "rune-cli"
-version = "0.1.0"
+version = "2027.0.0"
 dependencies = [
  "anyhow",
  "blake3",
@@ -1305,7 +1305,7 @@ dependencies = [
 
 [[package]]
 name = "rune-common"
-version = "0.1.0"
+version = "2027.0.0"
 dependencies = [
  "blake3",
  "dunce",
@@ -1324,7 +1324,7 @@ dependencies = [
 
 [[package]]
 name = "rune-compiler"
-version = "0.1.0"
+version = "2027.0.0"
 dependencies = [
  "libc",
  "rune-common",
@@ -1336,7 +1336,7 @@ dependencies = [
 
 [[package]]
 name = "rune-fingerprint"
-version = "0.1.0"
+version = "2027.0.0"
 dependencies = [
  "rayon",
  "rune-common",
@@ -1349,7 +1349,7 @@ dependencies = [
 
 [[package]]
 name = "rune-graph"
-version = "0.1.0"
+version = "2027.0.0"
 dependencies = [
  "rune-common",
  "semver",
@@ -1357,7 +1357,7 @@ dependencies = [
 
 [[package]]
 name = "rune-manifest"
-version = "0.1.0"
+version = "2027.0.0"
 dependencies = [
  "glob",
  "rune-common",
@@ -1370,7 +1370,7 @@ dependencies = [
 
 [[package]]
 name = "rune-registry"
-version = "0.1.0"
+version = "2027.0.0"
 dependencies = [
  "bincode",
  "blake3",
@@ -1390,7 +1390,7 @@ dependencies = [
 
 [[package]]
 name = "rune-resolver"
-version = "0.1.0"
+version = "2027.0.0"
 dependencies = [
  "bincode",
  "cfg-expr",
@@ -1409,7 +1409,7 @@ dependencies = [
 
 [[package]]
 name = "rune-scheduler"
-version = "0.1.0"
+version = "2027.0.0"
 dependencies = [
  "console",
  "crossbeam-channel",

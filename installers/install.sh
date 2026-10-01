@@ -2,7 +2,7 @@
 # Installs the latest (or a given) release of Rune.
 #
 #   curl -fsSL https://runepm.com/install.sh | sh
-#   curl -fsSL https://runepm.com/install.sh | sh -s -- --version v0.1.0 --to ~/.local/bin
+#   curl -fsSL https://runepm.com/install.sh | sh -s -- --version v2027.0.0 --to ~/.local/bin
 #
 # Downloads the release archive for this machine from GitHub, checks it
 # against its published SHA-256, and puts `rune` in ~/.rune/bin (or --to).

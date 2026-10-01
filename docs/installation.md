@@ -22,7 +22,7 @@ if it is not there yet.
 Options, passed after `sh -s --`:
 
 ```bash
-curl -fsSL https://runepm.com/install.sh | sh -s -- --version v0.1.0   # a given release
+curl -fsSL https://runepm.com/install.sh | sh -s -- --version v2027.0.0   # a given release
 curl -fsSL https://runepm.com/install.sh | sh -s -- --to ~/.local/bin  # another directory
 ```
 
@@ -74,7 +74,7 @@ itself up (see [caching](caching.md#keeping-the-store-small)).
 ```bash
 rune self update            # to the latest release
 rune self update --check    # only say whether there is a newer one
-rune self update --version v0.2.0
+rune self update --version v2027.1.0
 ```
 
 ## Uninstalling

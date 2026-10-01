@@ -1204,7 +1204,7 @@ pub enum SelfCommands {
     #[command(after_help = crate::help::examples(&[
         ("rune self update", "update to the latest release"),
         ("rune self update --check", "check for newer releases without installing"),
-        ("rune self update --version v0.1.0", "install a specific release"),
+        ("rune self update --version v2027.0.0", "install a specific release"),
         ("rune self update --force", "reinstall even if already up to date"),
     ]))]
     Update(SelfUpdateArgs),
@@ -1219,7 +1219,7 @@ pub enum SelfCommands {
 
 #[derive(Args, Debug, Clone, Default)]
 pub struct SelfUpdateArgs {
-    /// Update to a specific release version (e.g. `v0.2.0` or `0.2.0`)
+    /// Update to a specific release (e.g. `v2027.1.0`, `2027.1.0` or `2027.1`)
     #[arg(short = 'v', long)]
     pub version: Option<String>,
 
