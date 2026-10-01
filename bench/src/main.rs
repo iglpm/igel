@@ -37,7 +37,7 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Run the benchmarks and write results.json, report.md and report.html
-    Run(RunArgs),
+    Run(Box<RunArgs>),
     /// Render a results file again
     Report {
         results: PathBuf,
@@ -130,7 +130,7 @@ struct RunArgs {
 fn main() {
     let cli = Cli::parse();
     let result = match cli.command {
-        Command::Run(a) => run(a),
+        Command::Run(a) => run(*a),
         Command::Report { results, format } => load(&results).map(|r| {
             print!("{}", render(&r, format));
         }),

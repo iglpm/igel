@@ -144,7 +144,8 @@ pub fn dir_size(dir: &std::path::Path) -> u64 {
 pub fn dirs_size(dirs: &[&std::path::Path]) -> u64 {
     #[cfg(unix)]
     use std::os::unix::fs::MetadataExt;
-    let mut seen = std::collections::HashSet::new();
+    // (Windows: no inode numbers on stable, so links count once per path.)
+    let mut seen: std::collections::HashSet<(u64, u64)> = std::collections::HashSet::new();
     let mut total = 0;
     for entry in dirs
         .iter()
