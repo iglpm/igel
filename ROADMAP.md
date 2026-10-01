@@ -1417,6 +1417,16 @@ writing to a child process that exited killed Rune silently with SIGPIPE
 (`rune login` with a failing credential helper; fixed). Cross-target clippy
 found `rune-bench` did not compile for Windows.
 
+**Profiling no-op builds.** On the 73-crate workload (callgrind, strace):
+unit keys were hashed twice per build (once more with a per-part breakdown
+for `rune explain`), explicit workspace members went through glob (two
+stats of every directory from `/` down, per member) and the same absolute
+paths were canonicalized hundreds of times. No-op `check`/`build`/`test
+--no-run` there: 32/39/37 ms against Cargo's 65/93/88 ms. Measuring Rune's
+own workspace against Cargo also showed Cargo rebuilding `rune-cli` on
+every run: its build script watched a `.git/packed-refs` the clone did not
+have (fixed).
+
 **Also.** `rune test --failed` re-runs only the tests that failed; mistyped
 commands get a "did you mean"; the install scripts take `--version 2027.0`,
 pick the native build under Rosetta and refuse musl with how to build from
