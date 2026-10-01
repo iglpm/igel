@@ -41,7 +41,7 @@ pub fn run(
         let mut ctxs: Vec<Ctx> = Vec::new();
         for t in tools {
             let root = cfg.work.join(&w.name).join(&t.name);
-            let _ = std::fs::remove_dir_all(&root);
+            crate::tool::remove(&root)?;
             let dir = root.join("src");
             w.materialize(&dir)?;
             ctxs.push(Ctx {

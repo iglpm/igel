@@ -263,6 +263,30 @@ fn run(a: RunArgs) -> Result<()> {
         .clone()
         .unwrap_or_else(|| PathBuf::from("rune-bench-results").join(timestamp()));
     std::fs::create_dir_all(&out)?;
+    // Each tool builds its own copy of every workload: a disk filling up
+    // half-way turns the rest of the run into failures.
+    let need: u64 = workloads
+        .iter()
+        .map(|w| match (&w.source, w.name.as_str()) {
+            // A guess: a mid-sized project's dev build is a few GiB per tool.
+            (workload::Source::Project(_), _) => 8 << 30,
+            (_, "large") => 12 << 30,
+            (_, "medium") => 3 << 30,
+            _ => 1 << 30,
+        })
+        .max()
+        .unwrap_or(1 << 30);
+    if let Some(free) = free_bytes(&out)
+        && free < need
+    {
+        bail!(
+            "only {} free where the results go ({}); this run needs about {} \
+             (pick another place with --out)",
+            stats::bytes(free as f64),
+            out.display(),
+            stats::bytes(need as f64)
+        );
+    }
     let cfg = runner::Config {
         runs_heavy: a.runs_heavy.unwrap_or(if full { 5 } else { 3 }).max(1),
         runs_light: a.runs.unwrap_or(if full { 15 } else { 5 }).max(1),
@@ -309,8 +333,10 @@ fn run(a: RunArgs) -> Result<()> {
         },
     );
     workload::forget_pristine();
-    if !a.keep_work {
-        let _ = std::fs::remove_dir_all(&cfg.work);
+    if !a.keep_work
+        && let Err(e) = tool::remove(&cfg.work)
+    {
+        eprintln!("  ! could not remove {}: {e:#}", cfg.work.display());
     }
     ran?;
     write(&results)?;
@@ -377,6 +403,24 @@ fn meta(
             })
             .collect(),
     }
+}
+
+/// Bytes free on the file system holding `path`.
+fn free_bytes(path: &Path) -> Option<u64> {
+    let out = std::process::Command::new("df")
+        .args(["-Pk"])
+        .arg(path)
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let kib: u64 = text
+        .lines()
+        .nth(1)?
+        .split_whitespace()
+        .nth(3)?
+        .parse()
+        .ok()?;
+    Some(kib * 1024)
 }
 
 fn memory() -> Option<u64> {

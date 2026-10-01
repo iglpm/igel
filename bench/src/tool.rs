@@ -132,7 +132,8 @@ impl Tool {
     }
 }
 
-fn remove(path: &Path) -> Result<()> {
+/// Removes a directory tree, read-only files (Rune's store) included.
+pub fn remove(path: &Path) -> Result<()> {
     match std::fs::remove_dir_all(path) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
