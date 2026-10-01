@@ -27,6 +27,8 @@ struct Running {
     total: u64,
     done: u64,
     failed: u64,
+    /// Tests libtest says have run for over a minute, still unfinished.
+    slow: Vec<String>,
 }
 
 #[derive(Default)]
@@ -134,6 +136,7 @@ impl TestProgress {
                 total: 0,
                 done: 0,
                 failed: 0,
+                slow: Vec::new(),
             },
         );
         self.show();
@@ -157,11 +160,21 @@ impl TestProgress {
             {
                 r.total += n;
                 changed = true;
-            } else if line.starts_with("test ") && line.contains(" ... ") {
+            } else if let Some((name, _)) = line
+                .strip_prefix("test ")
+                .filter(|rest| rest.ends_with(" seconds"))
+                .and_then(|rest| rest.rsplit_once(" has been running for over "))
+            {
+                r.slow.push(name.to_string());
+                changed = true;
+            } else if let Some(rest) = line.strip_prefix("test ")
+                && let Some((name, _)) = rest.split_once(" ... ")
+            {
                 r.done += 1;
                 if line.ends_with("FAILED") {
                     r.failed += 1;
                 }
+                r.slow.retain(|s| s != name);
                 changed = true;
             }
         }
@@ -246,6 +259,13 @@ fn message(bar: &ProgressBar, state: &Mutex<State>) -> String {
             if secs >= 2 {
                 s.push_str(&format!(" {secs}s"));
             }
+            if let Some(first) = r.slow.first() {
+                s.push_str(&format!(" (slow: {first}"));
+                if r.slow.len() > 1 {
+                    s.push_str(&format!(" +{}", r.slow.len() - 1));
+                }
+                s.push(')');
+            }
             s
         })
         .collect();
@@ -285,6 +305,7 @@ mod tests {
             "test b ... FAILED\n",
             "test c ... ignored, slow\n",
             "some output of a test\n",
+            "test d has been running for over 60 seconds\n",
         ] {
             p.line(1, l);
         }
@@ -292,7 +313,13 @@ mod tests {
             let st = p.lock();
             let r = &st.running[&1];
             assert_eq!((r.total, r.done, r.failed), (3, 3, 1));
+            assert_eq!(r.slow, ["d"]);
         }
+        p.line(1, "test d ... ok\n");
+        assert!(
+            p.lock().running[&1].slow.is_empty(),
+            "a slow test that finished"
+        );
         p.end(1);
         p.slot_done(Counts {
             passed: 1,
