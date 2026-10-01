@@ -25,14 +25,17 @@ pub fn update(args: SelfUpdateArgs) -> Result<()> {
     let repo = args
         .repo
         .as_deref()
-        .or_else(|| option_env!("RUNE_REPOSITORY"))
+        .or(option_env!("RUNE_REPOSITORY"))
         .unwrap_or("runepm/rune");
 
-    let client = reqwest::blocking::Client::builder()
-        .user_agent(format!("rune/{}", current_version))
-        .timeout(std::time::Duration::from_secs(30))
-        .build()
-        .context("failed to initialize HTTP client")?;
+    // Rune's own network settings (CA bundles, proxy, `http.*`); a whole
+    // release must fit in the timeout on a slow connection.
+    let client = rune_registry::http::client(
+        reqwest::blocking::Client::builder()
+            .user_agent(format!("rune/{current_version}"))
+            .connect_timeout(std::time::Duration::from_secs(15))
+            .timeout(std::time::Duration::from_secs(600)),
+    );
 
     let download_base_env = std::env::var("RUNE_DOWNLOAD_BASE").ok();
 
@@ -61,20 +64,20 @@ pub fn update(args: SelfUpdateArgs) -> Result<()> {
 
     // Check version if target tag has a semver format
     let clean_tag = target_tag.trim_start_matches('v');
-    if let Ok(target_semver) = semver::Version::parse(clean_tag) {
-        if let Ok(curr_semver) = semver::Version::parse(current_version) {
-            if target_semver <= curr_semver && !args.force {
-                if args.check {
-                    ui::action("ok", format!("rune is up to date (v{current_version})"));
-                } else {
-                    ui::action(
-                        "ok",
-                        format!("rune is already up to date (v{current_version})"),
-                    );
-                }
-                return Ok(());
-            }
+    if let Ok(target_semver) = semver::Version::parse(clean_tag)
+        && let Ok(curr_semver) = semver::Version::parse(current_version)
+        && target_semver <= curr_semver
+        && !args.force
+    {
+        if args.check {
+            ui::action("ok", format!("rune is up to date (v{current_version})"));
+        } else {
+            ui::action(
+                "ok",
+                format!("rune is already up to date (v{current_version})"),
+            );
         }
+        return Ok(());
     }
 
     if args.check {
@@ -82,7 +85,7 @@ pub fn update(args: SelfUpdateArgs) -> Result<()> {
             "update",
             format!("a newer release is available: {target_tag} (current: v{current_version})"),
         );
-        ui::out("run `rune self update` to install it");
+        ui::hint("run `rune self update` to install it");
         return Ok(());
     }
 
@@ -240,15 +243,15 @@ pub fn uninstall(args: SelfUninstallArgs) -> Result<()> {
     }
 
     // Purge configuration and cache if requested
+    let rune_home = rune_common::settings::rune_home();
     if args.purge {
-        let rune_home = std::env::var("RUNE_HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| {
-                home::home_dir()
-                    .map(|h| h.join(".rune"))
-                    .unwrap_or_default()
-            });
-
+        if rune_home.exists() && !looks_like_rune_home(&rune_home) {
+            bail!(
+                "not removing `{}`: it does not look like Rune's own directory \
+                 (check RUNE_HOME); remove what you want gone by hand",
+                rune_home.display()
+            );
+        }
         if rune_home.exists() {
             std::fs::remove_dir_all(&rune_home).with_context(|| {
                 format!(
@@ -263,8 +266,11 @@ pub fn uninstall(args: SelfUninstallArgs) -> Result<()> {
         }
     } else {
         ui::action(
-            "preserved",
-            "global cache and configuration kept (~/.rune; use --purge to remove)",
+            "kept",
+            format!(
+                "the store, caches and settings in {} (`--purge` removes them)",
+                rune_home.display()
+            ),
         );
     }
 
@@ -272,22 +278,48 @@ pub fn uninstall(args: SelfUninstallArgs) -> Result<()> {
     Ok(())
 }
 
+/// Whether `dir` is a directory `--purge` may delete: one Rune made (it
+/// holds Rune's store, caches or settings), and never the home directory or
+/// a file system root, whatever `RUNE_HOME` says.
+fn looks_like_rune_home(dir: &Path) -> bool {
+    let canonical = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+    if canonical.parent().is_none() {
+        return false;
+    }
+    if let Some(home) = home::home_dir()
+        && canonical == home.canonicalize().unwrap_or(home)
+    {
+        return false;
+    }
+    [
+        "cas",
+        "registry",
+        "cache",
+        "config.toml",
+        "bin",
+        "git",
+        "advisory-db",
+    ]
+    .iter()
+    .any(|entry| canonical.join(entry).exists())
+}
+
 /// Resolves the latest release tag and download base URL.
-fn resolve_latest_release(client: &reqwest::blocking::Client, repo: &str) -> Result<(String, String)> {
+fn resolve_latest_release(
+    client: &reqwest::blocking::Client,
+    repo: &str,
+) -> Result<(String, String)> {
     let api_url = format!("https://api.github.com/repos/{repo}/releases/latest");
     if let Ok(resp) = client
         .get(&api_url)
         .header(reqwest::header::ACCEPT, "application/vnd.github.v3+json")
         .send()
+        && resp.status().is_success()
+        && let Ok(json) = resp.json::<serde_json::Value>()
+        && let Some(tag) = json.get("tag_name").and_then(|v| v.as_str())
     {
-        if resp.status().is_success() {
-            if let Ok(json) = resp.json::<serde_json::Value>() {
-                if let Some(tag) = json.get("tag_name").and_then(|v| v.as_str()) {
-                    let base = format!("https://github.com/{repo}/releases/download/{tag}");
-                    return Ok((tag.to_string(), base));
-                }
-            }
-        }
+        let base = format!("https://github.com/{repo}/releases/download/{tag}");
+        return Ok((tag.to_string(), base));
     }
 
     // Fallback: check redirect location of releases/latest
@@ -334,7 +366,10 @@ fn current_target() -> Result<String> {
 
 /// Recursively searches for a file by name.
 fn find_file_recursively(dir: &Path, file_name: &str) -> Option<PathBuf> {
-    for entry in walkdir::WalkDir::new(dir).into_iter().filter_map(|e| e.ok()) {
+    for entry in walkdir::WalkDir::new(dir)
+        .into_iter()
+        .filter_map(|e| e.ok())
+    {
         if entry.file_name() == file_name && entry.file_type().is_file() {
             return Some(entry.into_path());
         }
@@ -352,8 +387,12 @@ fn replace_executable(src: &Path, dst: &Path) -> Result<()> {
     {
         use std::os::unix::fs::PermissionsExt;
         let staging = parent.join(format!(".rune-update-{}.tmp", std::process::id()));
-        std::fs::copy(src, &staging)
-            .with_context(|| format!("cannot copy new binary to staging path `{}`", staging.display()))?;
+        std::fs::copy(src, &staging).with_context(|| {
+            format!(
+                "cannot copy new binary to staging path `{}`",
+                staging.display()
+            )
+        })?;
 
         std::fs::set_permissions(&staging, std::fs::Permissions::from_mode(0o755)).ok();
 
@@ -375,12 +414,21 @@ fn replace_executable(src: &Path, dst: &Path) -> Result<()> {
         let backup = parent.join(format!(".rune-old-{pid}.exe"));
         let staging = parent.join(format!(".rune-new-{pid}.exe"));
 
-        std::fs::copy(src, &staging)
-            .with_context(|| format!("cannot copy new binary to staging path `{}`", staging.display()))?;
+        std::fs::copy(src, &staging).with_context(|| {
+            format!(
+                "cannot copy new binary to staging path `{}`",
+                staging.display()
+            )
+        })?;
 
         if dst.exists() {
-            std::fs::rename(dst, &backup)
-                .with_context(|| format!("cannot rename active executable `{}` to backup `{}`", dst.display(), backup.display()))?;
+            std::fs::rename(dst, &backup).with_context(|| {
+                format!(
+                    "cannot rename active executable `{}` to backup `{}`",
+                    dst.display(),
+                    backup.display()
+                )
+            })?;
         }
 
         if let Err(e) = std::fs::rename(&staging, dst) {
@@ -388,7 +436,8 @@ fn replace_executable(src: &Path, dst: &Path) -> Result<()> {
                 let _ = std::fs::rename(&backup, dst);
             }
             let _ = std::fs::remove_file(&staging);
-            return Err(e).with_context(|| format!("failed to install new binary to `{}`", dst.display()));
+            return Err(e)
+                .with_context(|| format!("failed to install new binary to `{}`", dst.display()));
         }
 
         let _ = std::fs::remove_file(&backup);
@@ -401,4 +450,21 @@ fn replace_executable(src: &Path, dst: &Path) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn purge_only_deletes_a_directory_rune_made() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!looks_like_rune_home(dir.path()), "an empty directory");
+        std::fs::create_dir(dir.path().join("cas")).unwrap();
+        assert!(looks_like_rune_home(dir.path()));
+        assert!(!looks_like_rune_home(Path::new("/")));
+        if let Some(home) = home::home_dir() {
+            assert!(!looks_like_rune_home(&home), "the home directory");
+        }
+    }
 }

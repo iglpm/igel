@@ -24,6 +24,10 @@ All notable changes to Rune are recorded here. The format follows
   run time, as Cargo sets them.
 
 ### Fixed
+- `rune self uninstall --purge` refuses to delete a `RUNE_HOME` that is the
+  home directory, a file system root, or holds nothing of Rune's.
+- `rune self update` uses Rune's network settings (CA bundles, proxy) and no
+  longer gives up on a slow download after 30 seconds.
 - A dependency cycle made the build hang; it is now an error naming the cycle.
 - A build script could be served another project's script output when both
   had a package of the same name and version (script records named files by

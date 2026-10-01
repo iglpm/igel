@@ -1241,7 +1241,6 @@ pub struct SelfUninstallArgs {
     pub yes: bool,
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1335,7 +1334,8 @@ mod tests {
             panic!();
         }
 
-        let cli = Cli::try_parse_from(["rune", "self", "update", "-v", "v0.2.0", "--force"]).unwrap();
+        let cli =
+            Cli::try_parse_from(["rune", "self", "update", "-v", "v0.2.0", "--force"]).unwrap();
         if let Commands::Self_(SelfCommands::Update(args)) = cli.command {
             assert_eq!(args.version.as_deref(), Some("v0.2.0"));
             assert!(args.force);
