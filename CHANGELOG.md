@@ -20,10 +20,21 @@ All notable changes to Rune are recorded here. The format follows
   so far (counted as they finish), and what is running with its progress and
   time. `rune coverage` shows its merge and report steps.
 - `rune test --test-jobs N` / `test.jobs`: how many test binaries run at once.
+- `rune test --timeout 10m` / `test.timeout`: a test binary that runs longer
+  is stopped and reported as failed, naming the tests that had not finished,
+  so a hung test cannot hang a CI job.
+- The live test line names tests libtest reports as running for over a
+  minute.
 - Tests get `CARGO`, `CARGO_MANIFEST_PATH` and every `CARGO_PKG_*` variable at
   run time, as Cargo sets them.
 
 ### Fixed
+- Rune compiles cleanly for Windows (two Unix-only assumptions); CI checks
+  Windows and runs on pushes to `master`.
+- `rune self uninstall --purge` refuses to delete a `RUNE_HOME` that is the
+  home directory, a file system root, or holds nothing of Rune's.
+- `rune self update` uses Rune's network settings (CA bundles, proxy) and no
+  longer gives up on a slow download after 30 seconds.
 - A dependency cycle made the build hang; it is now an error naming the cycle.
 - A build script could be served another project's script output when both
   had a package of the same name and version (script records named files by
@@ -51,6 +62,14 @@ All notable changes to Rune are recorded here. The format follows
   ever cached. Both are marked with `CACHEDIR.TAG` and left out.
 
 ### Changed
+- The README is a short introduction; the reference documentation moved to
+  `docs/` (installation, commands, compatibility, settings, testing, caching,
+  CI, supply chain, …). Install with `curl -fsSL https://runepm.com/install.sh | sh`.
+- Compiler probes are shared by every project and checkout that selects the
+  same toolchain, and the host's cfg is asked for alongside them: a first
+  command in a new project or on a fresh CI machine starts fewer compilers.
+- `rune test` builds first the test binaries that ran longest last time (and
+  the programs their tests start), so the long ones start earlier.
 - Faster offline resolution (about 35 %): mimalloc as the allocator, and a
   binary copy of each parsed index file beside it.
 - Test results are printed as each binary finishes rather than in a fixed

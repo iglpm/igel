@@ -422,6 +422,12 @@ pub struct TestArgs {
     /// rest continues meanwhile either way
     #[arg(long, value_name = "N")]
     pub test_jobs: Option<usize>,
+
+    /// Stop a test binary (or doc-test run) that runs longer than this
+    /// (`90s`, `10m`; default: `test.timeout`, else no limit) and report it
+    /// as failed, instead of hanging the run
+    #[arg(long, value_name = "DURATION")]
+    pub timeout: Option<String>,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -807,6 +813,10 @@ pub struct CoverageArgs {
     /// How many test binaries run at once (default: `test.jobs`, else 1)
     #[arg(long, value_name = "N")]
     pub test_jobs: Option<usize>,
+    /// Stop a test binary that runs longer than this (`10m`; default:
+    /// `test.timeout`, else no limit)
+    #[arg(long, value_name = "DURATION")]
+    pub timeout: Option<String>,
     /// Arguments after `--` go to the test binaries
     #[arg(last = true, value_name = "ARGS")]
     pub test_args: Vec<String>,

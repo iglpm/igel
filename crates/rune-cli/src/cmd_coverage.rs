@@ -396,6 +396,7 @@ pub fn coverage(args: CoverageArgs) -> Result<()> {
         junit: None,
         schedule: Some("binaries".into()),
         test_jobs: args.test_jobs,
+        timeout: args.timeout.clone(),
     };
     let outcome = crate::cmd_test::run_with(test_args, Mode::Test, Some(&instrument))?;
     if outcome.failed && !args.no_fail_fast {

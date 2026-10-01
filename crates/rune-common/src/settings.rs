@@ -306,6 +306,14 @@ pub const KEYS: &[KeyDef] = &[
                       `test.schedule = tests` the default is one per core.",
     },
     KeyDef {
+        name: "test.timeout",
+        kind: ValueKind::Duration,
+        default: "0",
+        description: "Stop a test binary (or doc-test run) that runs longer than this (`90s`, \
+                      `10m`) and report it as failed, so a hung test cannot hang the run or a CI \
+                      job. `0` (the default, as with Cargo): no limit.",
+    },
+    KeyDef {
         name: "test.schedule",
         kind: ValueKind::Text,
         default: "binaries",
@@ -673,6 +681,14 @@ impl Settings {
         self.uint("test.jobs")
             .map(|n| n as usize)
             .filter(|n| *n > 0)
+    }
+
+    /// `test.timeout` in seconds, when set and not `0`.
+    pub fn test_timeout(&self) -> Option<u64> {
+        match self.values.get("test.timeout") {
+            Some((Value::Text(t), _)) => crate::time::parse_duration(t).filter(|s| *s > 0),
+            _ => None,
+        }
     }
 
     /// `test.schedule`, when set.

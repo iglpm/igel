@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [master, main]
   pull_request:
 
 permissions:
@@ -37,6 +37,19 @@ jobs:
       - if: runner.os == 'macOS'
         run: brew install lld
       - run: cargo test --workspace
+
+  windows:
+    # Release binaries are built for Windows: keep the code compiling there.
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo build --release -p rune-cli
+      - run: ./target/release/rune.exe --version
 
   msrv:
     runs-on: ubuntu-latest

@@ -488,15 +488,43 @@ impl ProbeCache {
         let rustup_home = std::env::var_os("RUSTUP_HOME")
             .map(PathBuf::from)
             .or_else(|| home::home_dir().map(|h| h.join(".rustup")));
+        let cwd = std::env::current_dir().ok();
         if let Some(settings) = rustup_home.map(|h| h.join("settings.toml"))
-            && let Ok(text) = std::fs::read(&settings)
+            && let Ok(text) = std::fs::read_to_string(&settings)
         {
             hb.update(b"\0settings=");
-            hb.update(&text);
+            hb.update(text.as_bytes());
+            // A `rustup override` for this directory or one above it.
+            if let (Some(cwd), Ok(parsed)) = (&cwd, text.parse::<toml::Table>())
+                && let Some(overrides) = parsed.get("overrides").and_then(|o| o.as_table())
+                && let Some((dir, toolchain)) = overrides
+                    .iter()
+                    .filter(|(dir, _)| cwd.starts_with(dir.as_str()))
+                    .max_by_key(|(dir, _)| dir.len())
+            {
+                hb.update(b"\0override=");
+                hb.update(dir.as_bytes());
+                hb.update(b"=");
+                hb.update(toolchain.to_string().as_bytes());
+            }
         }
-        if let Ok(cwd) = std::env::current_dir() {
-            hb.update(b"\0cwd=");
-            hb.update(cwd.to_string_lossy().as_bytes());
+        // Which toolchain a proxy picks in this directory: an override (above)
+        // or the nearest `rust-toolchain(.toml)`. Not the directory itself, so
+        // every project and checkout without either shares the probe.
+        if let Some(cwd) = &cwd {
+            for dir in cwd.ancestors() {
+                let file = ["rust-toolchain.toml", "rust-toolchain"]
+                    .iter()
+                    .map(|n| dir.join(n))
+                    .find(|f| f.is_file());
+                if let Some(file) = file {
+                    hb.update(b"\0toolchain-file=");
+                    hb.update(file.to_string_lossy().as_bytes());
+                    hb.update(b"\0");
+                    hb.update(&std::fs::read(&file).unwrap_or_default());
+                    break;
+                }
+            }
         }
         hb.finish_blake3()
     }
@@ -531,10 +559,17 @@ impl ProbeCache {
                 .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
                 .unwrap_or_default()
         };
-        let (verbose_version, sysroot) = std::thread::scope(|s| {
+        // The host's cfg set too: nearly every command needs it next, and
+        // asking now, beside the other two, saves a compiler start in a row.
+        let (verbose_version, sysroot, host_cfg) = std::thread::scope(|s| {
             let sysroot = s.spawn(|| ask(&["--print", "sysroot"]));
+            let cfg = s.spawn(|| ask(&["--print=cfg"]));
             let vv = ask(&["-vV"]);
-            (vv, sysroot.join().unwrap_or_default())
+            (
+                vv,
+                sysroot.join().unwrap_or_default(),
+                cfg.join().unwrap_or_default(),
+            )
         });
         let mut probe = Probe {
             key: key.clone(),
@@ -555,6 +590,18 @@ impl ProbeCache {
                 && old.files == probe.files
             {
                 probe.cfg = old.cfg.clone();
+            }
+            // Filed as `TargetInfo::query` asks for the host without flags.
+            if let Some(host) = probe
+                .verbose_version
+                .lines()
+                .find_map(|l| l.strip_prefix("host: "))
+                && !host_cfg.is_empty()
+            {
+                probe
+                    .cfg
+                    .entry(format!("{}||", host.trim()))
+                    .or_insert(host_cfg);
             }
             all.insert(key, probe.clone());
             // Bounded: projects come and go, toolchains get updated.
@@ -946,6 +993,7 @@ mod tests {
                 "#!/bin/sh\necho x >> {count}\ncase \"$1\" in\n\
                  -vV) printf 'rustc 1.2.3\\nhost: x86_64-unknown-linux-gnu\\nrelease: 1.2.3\\n' ;;\n\
                  --print) echo {sysroot} ;;\n\
+                 --print=cfg) echo unix ;;\n\
                  esac\n",
                 count = count.display(),
                 sysroot = sysroot.display()
@@ -970,10 +1018,17 @@ mod tests {
         let first = cache.probe(&rustc);
         assert_eq!(first.verbose_version.lines().last(), Some("release: 1.2.3"));
         assert!(first.sysroot.ends_with("sysroot"));
-        assert_eq!(starts(), 2, "-vV and --print sysroot");
+        assert_eq!(starts(), 3, "-vV, --print sysroot and the host's cfg");
+        assert_eq!(
+            cache
+                .cfg(&first.key, "x86_64-unknown-linux-gnu||")
+                .as_deref(),
+            Some("unix"),
+            "the host's cfg is remembered with the probe"
+        );
         let again = cache.probe(&rustc);
         assert_eq!(again.verbose_version, first.verbose_version);
-        assert_eq!(starts(), 2, "a second probe must not start the compiler");
+        assert_eq!(starts(), 3, "a second probe must not start the compiler");
         // The toolchain is updated in place (`rustup update`): probe again.
         // (The new library's size differs, so no waiting for the clock.)
         std::fs::write(
@@ -982,7 +1037,7 @@ mod tests {
         )
         .unwrap();
         cache.probe(&rustc);
-        assert_eq!(starts(), 4);
+        assert_eq!(starts(), 6);
     }
 
     #[test]

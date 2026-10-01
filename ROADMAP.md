@@ -70,7 +70,7 @@ normalized content.
 captured stderr; `cargo::error`; one run per package shared by all its units;
 `links` conflict detection; immutable-source enforcement.
 
-**Cache correctness** — complete unit identity (see the README), external
+**Cache correctness** — complete unit identity (see docs/caching.md), external
 inputs learned from build scripts and `env!`, native toolchain identity,
 compiler + wrappers identity, immutable read-only atomic CAS objects verified on
 every hit, warnings replayed on hits.
@@ -159,7 +159,7 @@ where crates.io has published newer releases than the ones pinned).
 | 52 | Verification | ✅ | Key + recorded sizes on every hit; `cas.verify` re-hashes. |
 | 53 | Object layout | ✅ | `objects/<xx>/<key>/{manifest.json,artifacts,tree/,value.json}` (sharded; not literally `sha256/`). |
 | 54 | Build result structure | 🟡 | Manifest stores key, package, artifacts; the identity *breakdown* (compiler/target/profile/…) is not recorded for inspection (M4). |
-| 55 | Complete unit key | ✅ | See the README; every listed component is present. |
+| 55 | Complete unit key | ✅ | See docs/caching.md; every listed component is present. |
 | 56 | Recursive keys | ✅ | |
 | 57 | Diagnostics as part of result | 🟡 | See §33. |
 | 58 | Rustdoc | 🟡 | `rune doc` uses the toolchain's rustdoc/flags/target and skips crates whose identity (unit key + rustdoc + flags) is unchanged. Docs are not stored in the shared CAS. |
@@ -304,7 +304,7 @@ split into separate locks).
 - *Done:* (a) concurrency tests (6 parallel builds; interleaved check/build);
   (b) no global lock — per-unit locks so two processes wanting the same unit wait
   for one compile and the others proceed; (c) `--message-format json` and the
-  rust-analyzer setting in the README (format tested, live rust-analyzer not yet).
+  rust-analyzer setting in docs/editor-integration.md (format tested, live rust-analyzer not yet).
 
 **P4 — Linking is slow and always from scratch; debuginfo is expensive.** The
 survey measured 2–30 % faster edit cycles from `debug = "line-tables-only"`, yet
@@ -1321,3 +1321,35 @@ the CLI tests clear `RUNE_*`, `CARGO_TARGET_DIR` and flag variables from the
 environment; a fake HTTP server's header/body writes stalled on Nagle's
 algorithm (rune-cas tests 2.9 → 0.5 s); a probe test slept a second it did
 not need.
+
+## 17. What changed in the docs, cold-start and timeout update (2026-10-01)
+
+**Documentation.** The README is now an introduction (what Rune does,
+measured against Cargo, install from runepm.com); the reference moved to
+`docs/`, one page per topic, with outdated statements corrected (the resolver
+does use PubGrub; `rune audit` is built in).
+
+**Cold starts.** A fresh `RUNE_HOME` used to start the compiler three times
+in a row before anything was built (`-vV`, `--print sysroot`, then the host's
+`--print=cfg`); the third now runs beside the other two. Probes were also
+keyed by the working directory, so every new project and checkout probed
+again; they are now keyed by what selects the toolchain (a `rustup override`
+covering the directory, the nearest `rust-toolchain` file). Rune's own CLI
+suite seeds each test's home with one shared probe: 29–30 s → 25–27 s.
+
+**Test scheduling.** `rune test` records each binary's run time
+(`.rune/fingerprints/test-times.json`) and hands it to the scheduler as work
+that follows the unit, so the binaries a run waits longest on — and the
+programs their package's tests start — are built first.
+
+**Timeouts.** `rune test --timeout 10m` / `test.timeout` stops a test binary
+or doc-test run that runs longer, counts what finished, and names the tests
+that never reported (the binary's `--list` minus the finished ones). libtest's
+"has been running for over 60 seconds" warnings show in the live line.
+
+**Release hygiene.** Rune type-checks for `x86_64-pc-windows-msvc` (checked
+here with a stub C compiler; two Unix-only assumptions fixed); CI gains a
+Windows job and now runs on pushes to `master`, the default branch.
+`rune self uninstall --purge` refuses to delete a `RUNE_HOME` that is the home
+directory, a root, or holds nothing of Rune's; `rune self update` uses Rune's
+network settings and tolerates slow downloads.

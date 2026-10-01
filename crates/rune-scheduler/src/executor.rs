@@ -272,6 +272,9 @@ pub struct BuildExecutor {
     memory: fn() -> Option<rune_common::sysinfo::Memory>,
     /// `build.sandbox`: compilers and build scripts run confined.
     sandbox: Option<std::sync::Arc<SandboxPolicy>>,
+    /// Seconds of work that follow a unit once it is built (a test binary's
+    /// run): scheduling counts them as part of its path.
+    extra_costs: HashMap<NodeId, f64>,
 }
 
 /// How build-time code is confined (see `rune_common::sandbox`).
@@ -304,7 +307,17 @@ impl BuildExecutor {
             sandbox: None,
             cpus: std::thread::available_parallelism().map_or(1, |n| n.get()),
             memory: rune_common::sysinfo::memory,
+            extra_costs: HashMap::new(),
         }
+    }
+
+    /// Work that waits on units once they are built, in seconds: `rune test`
+    /// passes how long each test binary ran last time, so the binary a run
+    /// will wait longest on is built first and starts while the rest still
+    /// compile.
+    pub fn with_extra_costs(mut self, costs: HashMap<NodeId, f64>) -> Self {
+        self.extra_costs = costs;
+        self
     }
 
     /// Replaces how the machine's memory is read (tests).
@@ -583,6 +596,7 @@ impl BuildExecutor {
                         0.0
                     } else {
                         timings.estimate(&node.unit, &self.profile)
+                            + self.extra_costs.get(&node.id).copied().unwrap_or(0.0)
                     }
                 },
                 |dep, dependent, dep_cost| {

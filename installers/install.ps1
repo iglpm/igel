@@ -8,10 +8,10 @@
     it to ~/.rune/bin (or a custom directory).
 
 .EXAMPLE
-    irm https://raw.githubusercontent.com/runepm/rune/main/installers/install.ps1 | iex
+    irm https://runepm.com/install.ps1 | iex
 
 .EXAMPLE
-    & ([scriptblock]::Create((irm https://raw.githubusercontent.com/runepm/rune/main/installers/install.ps1))) -Version v0.1.0 -To "C:\Tools\Rune"
+    & ([scriptblock]::Create((irm https://runepm.com/install.ps1))) -Version v0.1.0 -To "C:\Tools\Rune"
 #>
 
 [CmdletBinding()]

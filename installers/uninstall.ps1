@@ -8,10 +8,10 @@
     Also cleans up the User PATH environment variable if necessary.
 
 .EXAMPLE
-    irm https://raw.githubusercontent.com/runepm/rune/main/installers/uninstall.ps1 | iex
+    irm https://runepm.com/uninstall.ps1 | iex
 
 .EXAMPLE
-    & ([scriptblock]::Create((irm https://raw.githubusercontent.com/runepm/rune/main/installers/uninstall.ps1))) -Purge -Yes
+    & ([scriptblock]::Create((irm https://runepm.com/uninstall.ps1))) -Purge -Yes
 #>
 
 [CmdletBinding()]

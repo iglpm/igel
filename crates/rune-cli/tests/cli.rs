@@ -39,11 +39,45 @@ struct Project {
     home_dir: tempfile::TempDir,
 }
 
+/// What `rune` learned about the compiler (`rustc -vV`, the sysroot, the
+/// host's cfg), asked once for the whole suite: every project starts with a
+/// fresh `RUNE_HOME`, and asking again in each cost a few compiler starts per
+/// test.
+fn compiler_probes() -> Option<&'static [u8]> {
+    static PROBES: std::sync::OnceLock<Option<Vec<u8>>> = std::sync::OnceLock::new();
+    PROBES
+        .get_or_init(|| {
+            let home = tempfile::tempdir().ok()?;
+            let project = tempfile::tempdir().ok()?;
+            std::fs::write(
+                project.path().join("Cargo.toml"),
+                "[package]\nname = \"probe\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+            )
+            .ok()?;
+            std::fs::create_dir_all(project.path().join("src")).ok()?;
+            std::fs::write(project.path().join("src/lib.rs"), "").ok()?;
+            rune_command()
+                .arg("check")
+                .current_dir(project.path())
+                .env("RUNE_HOME", home.path())
+                .output()
+                .ok()?;
+            std::fs::read(home.path().join("cache/toolchains.json")).ok()
+        })
+        .as_deref()
+}
+
 impl Project {
     fn new() -> Self {
+        let home_dir = tempfile::tempdir().unwrap();
+        if let Some(probes) = compiler_probes() {
+            let cache = home_dir.path().join("cache");
+            std::fs::create_dir_all(&cache).unwrap();
+            std::fs::write(cache.join("toolchains.json"), probes).unwrap();
+        }
         Self {
             dir: tempfile::tempdir().unwrap(),
-            home_dir: tempfile::tempdir().unwrap(),
+            home_dir,
         }
     }
 
@@ -6657,4 +6691,40 @@ fn a_target_directory_or_store_inside_the_package_is_not_its_source() {
     assert!(out.status.success(), "{}", text(&out));
     let out = rune_with_env(&p, &["build"], &[("RUNE_HOME", home.as_os_str())]);
     assert!(text(&out).contains("0 compiled"), "{}", text(&out));
+}
+
+#[test]
+fn a_hung_test_is_stopped_by_the_timeout_and_named() {
+    let p = Project::new();
+    p.write(
+        "Cargo.toml",
+        "[package]\nname = \"hang\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    p.write("src/lib.rs", "");
+    p.write(
+        "tests/h.rs",
+        "#[test]\nfn quick() {}\n#[test]\nfn hangs() { std::thread::sleep(std::time::Duration::from_secs(120)); }\n",
+    );
+    let start = std::time::Instant::now();
+    let out = p.rune(&["test", "--timeout", "2s"]);
+    let all = text(&out);
+    assert_eq!(out.status.code(), Some(101), "{all}");
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(60),
+        "{all}"
+    );
+    assert!(all.contains("ran longer than the timeout"), "{all}");
+    assert!(all.contains("still running or not started: hangs"), "{all}");
+    assert!(all.contains("1 passed · 1 failed"), "{all}");
+
+    // The same from the setting; a bad duration is an error, not "no limit".
+    p.ok(&["config", "set", "test.timeout", "2s"]);
+    let out = p.rune(&["test"]);
+    assert_eq!(out.status.code(), Some(101), "{}", text(&out));
+    let out = p.rune(&["test", "--timeout", "soon"]);
+    assert!(
+        text(&out).contains("invalid --timeout `soon`"),
+        "{}",
+        text(&out)
+    );
 }

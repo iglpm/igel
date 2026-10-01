@@ -1,8 +1,8 @@
 #!/bin/sh
 # Uninstalls Rune.
 #
-#   curl -fsSL https://raw.githubusercontent.com/runepm/rune/main/installers/uninstall.sh | sh
-#   curl -fsSL .../uninstall.sh | sh -s -- --from ~/.local/bin --purge
+#   curl -fsSL https://runepm.com/uninstall.sh | sh
+#   curl -fsSL https://runepm.com/uninstall.sh | sh -s -- --from ~/.local/bin --purge
 #
 # Removes the `rune` binary from ~/.rune/bin (or --from). Pass --purge to also
 # remove Rune's cache and configuration directory (~/.rune).
