@@ -30,7 +30,7 @@ end (`--keep-work` keeps them).
 | Cold build | `cold-build`, `cold-check`, `cold-release` | No build output and no cache: a new machine, a CI runner without a cache |
 | Disk | `disk` | Bytes after a cold build (Rune: project output plus its store, hard links counted once) |
 | Nothing changed | `noop-build`, `noop-check`, `noop-test` | The cost of finding out there is nothing to do |
-| After an edit | `edit-leaf`, `edit-core`, `edit-leaf-check`, `edit-leaf-test`, `edit-unread` | The edit-compile(-test) loop, at the top and the bottom of the dependency graph; and a file no crate reads (notes, a log) changing in the bottom crate |
+| After an edit | `edit-leaf`, `edit-core`, `edit-leaf-check`, `edit-leaf-test`, `edit-test`, `edit-unread` | The edit-compile(-test) loop, at the top and the bottom of the dependency graph; an integration test of a package with a build script; and a file no crate reads (notes, a log) changing in the bottom crate |
 | Caching | `fresh-checkout`, `branch-switch` | Same code built before on this machine: a second worktree, `git clean`, switching branches back and forth |
 | Tests | `test-run` | Running every test binary when they are built |
 | Inspection | `metadata`, `tree`, `lockfile` | What IDEs and tools ask; resolving from scratch |

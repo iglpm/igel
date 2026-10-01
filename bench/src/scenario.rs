@@ -21,6 +21,7 @@ pub enum Needs {
     Nothing,
     LeafEdit,
     CoreEdit,
+    TestEdit,
 }
 
 pub struct Scenario {
@@ -267,6 +268,19 @@ pub fn all() -> Vec<Scenario> {
             args: &["test"],
             prepare: |ctx, _| setup(ctx, &["test", "--no-run"]),
             before: |ctx, w, _| edit(ctx, w.leaf_edit.as_deref(), fresh_edit()),
+        },
+        Scenario {
+            id: "edit-test",
+            category: "After an edit",
+            title: "test after editing an integration test",
+            about: "Fixing a test: only that test needs compiling (its package has a build script).",
+            kind: Kind::Time,
+            heavy: false,
+            full_only: false,
+            needs: Needs::TestEdit,
+            args: &["test"],
+            prepare: |ctx, _| setup(ctx, &["test", "--no-run"]),
+            before: |ctx, w, _| edit(ctx, w.test_edit.as_deref(), fresh_edit()),
         },
         Scenario {
             id: "edit-unread",
