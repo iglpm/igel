@@ -16,7 +16,11 @@ cargo build --release -p rune-cli -p rune-bench
 Results go to `./rune-bench-results/<date-time>/`: `results.json` (every run),
 `report.md` and `report.html` (tables, per-scenario charts, CPU time, peak
 memory). They are rewritten after each workload, so an interrupted run keeps
-what it measured.
+what it measured. Each tool builds its own copy of every workload, so a run
+needs free disk space where the results go — about 3 GiB for the quick
+suite, 12 GiB for `large`, 8 GiB for a mid-sized `--project` — and stops up
+front, saying so, when there is not enough. The copies are removed at the
+end (`--keep-work` keeps them).
 
 ## What is measured
 

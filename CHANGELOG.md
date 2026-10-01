@@ -18,8 +18,8 @@ The first stable release. Changes since the 0.1.0 preview:
   rebuilds after edits, cache reuse, tests, inspection commands, disk and
   memory — with JSON, Markdown and HTML reports and a regression check.
 - `rune doctor` checks free disk space and memory per parallel job.
-- "Did you mean" for misspelled `-p` packages; a test filter that matches
-  nothing says so.
+- "Did you mean" for misspelled `-p` packages and commands (`rune buidl`); a
+  test filter that matches nothing says so.
 - `rune audit`: RustSec/OSV advisories (vulnerabilities with CVSS scores,
   unmaintained, unsound, malicious) and yanked releases in the lockfile, with
   the dependency path and the fix; cached database, `--deny`, `--ignore`,

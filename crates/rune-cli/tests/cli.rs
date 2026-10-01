@@ -6759,3 +6759,20 @@ fn doc_tests_run_after_the_test_binaries_and_quiet_still_shows_the_result() {
     assert!(out.contains("2 passed"), "{out}");
     assert!(!out.contains("ok order"), "{out}");
 }
+
+#[test]
+fn a_mistyped_command_suggests_the_real_one() {
+    let out = rune_command().arg("buidl").output().unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("no such command: `buidl`"), "{err}");
+    assert!(err.contains("did you mean `rune build`?"), "{err}");
+    // Not the one-letter alias clap would also offer.
+    assert!(!err.contains("`rune b`"), "{err}");
+
+    let out = rune_command().args(["build", "--relase"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.starts_with("✗ unexpected argument '--relase'"), "{err}");
+    assert!(err.contains("'--release'"), "{err}");
+}

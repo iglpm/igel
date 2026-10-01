@@ -20,7 +20,7 @@ edition = "2024"
 license = "MIT OR Apache-2.0"
 rust-version = "1.89"
 repository = "https://github.com/runepm/rune"
-homepage = "https://github.com/runepm/rune"
+homepage = "https://runepm.com"
 
 [workspace.dependencies]
 # Serialization
