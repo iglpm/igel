@@ -98,6 +98,10 @@ struct RunArgs {
     /// edit-the-core and branch-switch scenarios
     #[arg(long, value_name = "FILE")]
     edit_core: Option<PathBuf>,
+    /// For --project: an integration test edited by the edit-test scenario
+    /// (default: the first of `tests/*.rs`)
+    #[arg(long, value_name = "FILE")]
+    edit_test: Option<PathBuf>,
     /// The rune binary (default: `rune` on PATH, else ./target/release/rune)
     #[arg(long)]
     rune: Option<PathBuf>,
@@ -221,6 +225,7 @@ fn run(a: RunArgs) -> Result<()> {
             p,
             a.edit_leaf.clone(),
             a.edit_core.clone(),
+            a.edit_test.clone(),
         )?);
     }
     if a.project.is_none() || !a.workloads.is_empty() {

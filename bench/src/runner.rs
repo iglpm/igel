@@ -61,6 +61,10 @@ pub fn run(
                     .core_edit
                     .is_none()
                     .then_some("a core file to edit (--edit-core)"),
+                Needs::TestEdit => w
+                    .test_edit
+                    .is_none()
+                    .then_some("integration test to edit (--edit-test)"),
             };
             if let Some(why) = missing {
                 eprintln!("  · {:<16} skipped: the workload names no {why}", s.id);

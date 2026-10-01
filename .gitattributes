@@ -1,0 +1,7 @@
+# Line endings are LF in the repository and in every checkout, whatever
+# `core.autocrlf` says: the install scripts are piped into `sh`, where a
+# carriage return breaks them (`set -eu\r`).
+* text=auto eol=lf
+*.bin binary
+*.crate binary
+*.png binary
