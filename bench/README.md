@@ -84,8 +84,11 @@ rune-bench compare before/results.json after/results.json --threshold 10
 ```
 
 `compare` lists every measurement of Rune that changed and exits 1 when one
-got slower by more than the threshold *and* by more than the runs' own noise
-(twice their coefficient of variation): usable as a CI gate. `--tool cargo`
-compares Cargo's numbers instead (a check that the machine itself did not
-change). `rune-bench report results.json --format html|markdown|terminal`
+got slower by more than the threshold, by more than the runs' own noise
+(twice their coefficient of variation) *and* in every run (no new run as
+fast as the slowest old one): usable as a CI gate. Cargo, measured in the
+same runs, is the control: the "vs cargo" column is Rune's change once
+Cargo's own change is taken out, and that is what is judged, so a machine
+that is busier the second time does not read as a regression. `--tool
+cargo` compares Cargo's numbers instead. `rune-bench report results.json --format html|markdown|terminal`
 renders a results file again.
