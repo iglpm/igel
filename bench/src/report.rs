@@ -426,10 +426,16 @@ ul.env {{ padding-left:18px; color:var(--muted); font-size:13px; }}
 pub fn compare(old: &Results, new: &Results, tool: &str, threshold: f64) -> (String, usize) {
     let mut out = String::new();
     let mut regressions = 0;
+    let control_tool = if tool == "cargo" { "rune" } else { "cargo" };
     let _ = writeln!(
         out,
-        "  {:<12} {:<18} {:>12} {:>12} {:>9}",
-        "workload", "scenario", "before", "after", "change"
+        "  {:<12} {:<18} {:>12} {:>12} {:>9} {:>10}",
+        "workload",
+        "scenario",
+        "before",
+        "after",
+        "change",
+        format!("vs {control_tool}")
     );
     for n in new.measurements.iter().filter(|m| m.tool == tool) {
         let Some(o) = old.find(&n.workload, &n.scenario, tool) else {
@@ -438,24 +444,39 @@ pub fn compare(old: &Results, new: &Results, tool: &str, threshold: f64) -> (Str
         if o.summary.n == 0 || n.summary.n == 0 || o.summary.median <= 0.0 {
             continue;
         }
-        let change = n.summary.median / o.summary.median - 1.0;
+        let ratio = n.summary.median / o.summary.median;
+        // The other tool, measured in the same runs, says how much the
+        // machine itself changed between them (another load, another CPU).
+        let control = old
+            .find(&n.workload, &n.scenario, control_tool)
+            .zip(new.find(&n.workload, &n.scenario, control_tool))
+            .filter(|(co, cn)| co.summary.median > 0.0 && cn.summary.n > 0)
+            .map(|(co, cn)| cn.summary.median / co.summary.median);
+        let change = ratio / control.unwrap_or(1.0) - 1.0;
         let noise = noise(&o.summary).max(noise(&n.summary));
-        let flag = if change > threshold.max(noise) {
+        // Every run slower than every earlier one, not just the middle one:
+        // with three runs a side, a median moves by more than this by chance.
+        let apart = |a: &Summary, b: &Summary| a.max < b.min;
+        let flag = if change > threshold.max(noise) && apart(&o.summary, &n.summary) {
             regressions += 1;
             "  ✗ slower"
-        } else if change < -threshold.max(noise) {
+        } else if change < -threshold.max(noise) && apart(&n.summary, &o.summary) {
             "  ✓ faster"
         } else {
             ""
         };
+        let versus = match control {
+            Some(_) => format!("{:>+9.1} %", change * 100.0),
+            None => format!("{:>11}", "-"),
+        };
         let _ = writeln!(
             out,
-            "  {:<12} {:<18} {:>12} {:>12} {:>+8.1} %{flag}",
+            "  {:<12} {:<18} {:>12} {:>12} {:>+8.1} % {versus}{flag}",
             n.workload,
             n.scenario,
             value(o),
             value(n),
-            change * 100.0
+            (ratio - 1.0) * 100.0
         );
     }
     (out, regressions)
@@ -539,5 +560,30 @@ mod tests {
         let noisy_old = results(vec![m("w", "noop", "rune", &[0.7, 1.0, 1.3])]);
         let (_, n) = compare(&noisy_old, &slower, "rune", 0.10);
         assert_eq!(n, 0, "within the old run's own spread");
+        // A slower median whose runs overlap the earlier ones is not one.
+        let overlapping = results(vec![m("w", "noop", "rune", &[1.05, 1.3, 1.31])]);
+        let (_, n) = compare(&old, &overlapping, "rune", 0.10);
+        assert_eq!(n, 1, "{:?}", Summary::of(&[1.05, 1.3, 1.31]));
+        let old_spread = results(vec![m("w", "noop", "rune", &[0.9, 1.0, 1.1])]);
+        let (_, n) = compare(&old_spread, &overlapping, "rune", 0.10);
+        assert_eq!(n, 0, "the runs overlap");
+    }
+
+    #[test]
+    fn a_machine_that_got_slower_for_both_tools_is_not_a_regression() {
+        let old = results(vec![
+            m("w", "build", "rune", &[1.0, 1.0, 1.0]),
+            m("w", "build", "cargo", &[2.0, 2.0, 2.0]),
+        ]);
+        let busier = results(vec![
+            m("w", "build", "rune", &[1.3, 1.3, 1.3]),
+            m("w", "build", "cargo", &[2.6, 2.6, 2.6]),
+        ]);
+        let (text, n) = compare(&old, &busier, "rune", 0.10);
+        assert_eq!(n, 0, "{text}");
+        assert!(
+            text.contains("+30.0 %") && text.contains("+0.0 %"),
+            "{text}"
+        );
     }
 }
