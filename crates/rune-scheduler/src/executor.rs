@@ -1649,10 +1649,25 @@ impl UnitJob {
         let Some(cas) = &self.cas else { return false };
         let unit = &self.unit;
         let has_script = unit.build_script.is_some();
-        // The other process may have learned external inputs (which change the
-        // key the unit is stored under) that we did not know about.
-        let recorded: Option<DeclaredInputs> = cas.get_value(&format!("{}-inputs", self.base_key));
-        let key = effective_key(&self.base_key, recorded.as_ref(), has_script);
+        // The other process may have learned which files the unit reads and
+        // what it depends on outside itself (which change the key the unit
+        // is stored under), which we did not know about.
+        let mut base = self.base_key.clone();
+        let mut files = rune_fingerprint::FingerprintCache::new();
+        if let Some(read) = read_record_key(unit, &mut files)
+            && let Some(record) = cas.get_value::<inputs::ReadRecord>(&format!("{read}-read"))
+        {
+            base = compute_unit_identity_from(
+                unit,
+                &self.profile,
+                &self.dep_keys,
+                &mut files,
+                Some(&record),
+            )
+            .key;
+        }
+        let recorded: Option<DeclaredInputs> = cas.get_value(&format!("{base}-inputs"));
+        let key = effective_key(&base, recorded.as_ref(), has_script);
         let out_dir = out_dir_for(&self.config, &self.profile, unit);
         let Ok(linked) = cas.link_to(&key, &out_dir) else {
             return false;
