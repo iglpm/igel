@@ -156,10 +156,12 @@ pass under Rune as they do under Cargo. See
 
 ## Status
 
-Rune is young. Linux and macOS are its home; Windows builds are new and less
-tested. It is developed against Cargo's behaviour, with ~480 automated tests and a corpus
-of real crates whose own test suites must pass under Rune as under Cargo. See
-the [roadmap](ROADMAP.md) and the [changelog](CHANGELOG.md).
+**Rune 2027.0** is the first stable release. Linux and macOS are its home;
+Windows builds are new and less tested. It is developed against Cargo's
+behaviour, with ~490 automated tests and a corpus of real crates whose own
+test suites must pass under Rune as under Cargo. Something off? `rune doctor`
+checks your setup. See the [roadmap](ROADMAP.md) and the
+[changelog](CHANGELOG.md).
 
 ## License
 

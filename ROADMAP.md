@@ -1353,3 +1353,28 @@ Windows job and now runs on pushes to `master`, the default branch.
 `rune self uninstall --purge` refuses to delete a `RUNE_HOME` that is the home
 directory, a root, or holds nothing of Rune's; `rune self update` uses Rune's
 network settings and tolerates slow downloads.
+
+## 18. What changed on the way to 2027.0 (2026-10-01)
+
+**Version.** The workspace is `2027.0.0`, the first stable release; versions
+are `YEAR.MINOR.PATCH` from here on (`rune self update --version 2027.1`
+names `v2027.1.0`).
+
+**Failure modes, tried one by one.** No `rustc` on `PATH` used to surface as
+"I/O error during invocation"; a `rustup` without a default toolchain and a
+`RUSTC` pointing nowhere were as opaque — all three are now one sentence with
+the fix, checked once per command. A full disk was tried on a 64 MiB tmpfs:
+rustc dies with SIGBUS and a page of backtrace, so a failed build on a nearly
+full disk now ends naming the disk; builds warn under 1 GiB free and
+`rune doctor` under 2 GiB. A broken manifest printed its TOML error twice
+(an error type that includes its source, printed with its source chain): the
+error printer now skips a cause already contained in an earlier message.
+`edition = "2099"` silently compiled as 2015 and an invalid `version` became
+0.0.0. A failed download printed "downloaded 1 crate". Network and TLS
+failures end with what to check; a panic prints a bug-report request once.
+
+**Test runner.** The edge-case sweeps found that with one test process at a
+time, a doc-test run (ready long before the binaries link) ran first, so its
+failure stopped the run before a failing unit test was ever reported; doc
+tests now run after the binaries, as in Cargo. `rune test -q` printed nothing
+at all; it now prints the result. Rune's own warm `rune test`: 29–31 s.

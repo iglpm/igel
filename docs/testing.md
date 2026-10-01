@@ -23,7 +23,8 @@ as soon as it is in; a failure shows while the rest still runs.
   running two binaries at once makes such suites fail now and then.
   `rune test --test-jobs 4` (or `test.jobs = 4`) runs binaries side by side
   when your tests don't share anything. Each binary still runs its own tests
-  in parallel, as libtest does.
+  in parallel, as libtest does. Doc tests run after the test binaries, in
+  Cargo's order.
 - **The slowest binaries are built first.** Rune remembers how long each test
   binary ran; the scheduler builds the binaries a run will wait longest on
   (and the programs their tests start) before the quick ones.
@@ -56,7 +57,9 @@ rune test --schedule tests         # split binaries into batches spread over eve
 rune bench                         # benchmarks, one binary at a time
 ```
 
-At the end, a run longer than a few seconds names its slowest binaries.
+At the end, a run longer than a few seconds names its slowest binaries; a
+filter that matched no test says so. `-q` leaves out everything but the
+result line (and failures).
 
 ## Scheduling tests across binaries
 
