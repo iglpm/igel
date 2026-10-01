@@ -117,6 +117,12 @@ The first stable release. Changes since the 0.1.0 preview:
   rebuilds its library either.
 - Quick commands on small projects no longer start a thread pool for two or
   three items of work: its spinning workers made their time erratic.
+- Less work when nothing changed, measured on a 73-crate workspace (no-op
+  `check`/`build`/`test --no-run`: 32/39/37 ms, Cargo 65/93/88 ms): unit keys
+  are hashed once instead of twice (the per-part breakdown for `rune
+  explain` is only worked out for units whose key changed), plain workspace
+  member paths are not expanded as globs (which stat every directory from
+  the file system root down), and canonical paths are remembered.
 - The README is a short introduction; the reference documentation moved to
   `docs/` (installation, commands, compatibility, settings, testing, caching,
   CI, supply chain, …). Install with `curl -fsSL https://runepm.com/install.sh | sh`.

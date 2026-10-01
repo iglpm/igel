@@ -12,7 +12,32 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-pub use dunce::{canonicalize, simplified};
+pub use dunce::simplified;
+
+/// [`dunce::canonicalize`], remembered for the rest of the process for
+/// absolute paths: planning asks about the same few directories (the
+/// workspace's packages) hundreds of times, and every answer costs a system
+/// call per path component. (A relative path depends on the working
+/// directory, so it is always asked again.)
+pub fn canonicalize(path: impl AsRef<Path>) -> io::Result<PathBuf> {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static KNOWN: OnceLock<Mutex<HashMap<PathBuf, PathBuf>>> = OnceLock::new();
+    let path = path.as_ref();
+    if !path.is_absolute() {
+        return dunce::canonicalize(path);
+    }
+    let known = KNOWN.get_or_init(Default::default);
+    if let Some(hit) = known.lock().unwrap_or_else(|e| e.into_inner()).get(path) {
+        return Ok(hit.clone());
+    }
+    let resolved = dunce::canonicalize(path)?;
+    known
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(path.to_path_buf(), resolved.clone());
+    Ok(resolved)
+}
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 

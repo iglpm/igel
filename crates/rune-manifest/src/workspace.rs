@@ -138,6 +138,16 @@ impl WorkspaceManifest {
 
         let mut paths = Vec::new();
         for pattern in patterns {
+            // A plain path (most member lists): `glob` would stat every
+            // directory from the file system root down to it, twice.
+            if !pattern.contains(['*', '?', '[']) {
+                // (As `glob` gives it: no `.` components or trailing slash.)
+                let path: PathBuf = root.join(pattern).components().collect();
+                if rune_common::manifest_file::has_manifest(&path) && !excluded.contains(&path) {
+                    paths.push(path);
+                }
+                continue;
+            }
             let full_pattern = root.join(pattern).to_string_lossy().to_string();
             for entry in glob(&full_pattern)? {
                 match entry {
@@ -201,5 +211,19 @@ mod tests {
             .map(|p| p.file_name().unwrap().to_str().unwrap().to_string())
             .collect();
         assert_eq!(names, ["alpha", "zeta"]);
+
+        // Plain paths (no wildcard) give the same, normalized paths.
+        let listed = WorkspaceManifest {
+            members: vec![
+                "./crates/alpha/".into(),
+                "crates/zeta".into(),
+                "crates/skipme".into(),
+                "crates/notapackage".into(),
+                "crates/missing".into(),
+            ],
+            exclude: vec!["crates/skipme".into()],
+            ..Default::default()
+        };
+        assert_eq!(listed.resolve_members(dir.path()).unwrap(), members);
     }
 }

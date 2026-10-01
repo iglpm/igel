@@ -1135,14 +1135,13 @@ impl BuildExecutor {
         };
         let dep_keys = dep_keys_of(graph, id, keys);
         let read = self.read_record(graph, id, unit, keys, source_cache);
-        let base = compute_unit_identity_from(
+        let base = compute_unit_key_from(
             unit,
             &self.profile,
             &dep_keys,
             source_cache,
             read.as_ref().map(|(r, s)| (r, s.as_deref())),
-        )
-        .key;
+        );
         let recorded: Option<DeclaredInputs> = self
             .cas
             .as_ref()
@@ -1427,11 +1426,20 @@ impl BuildExecutor {
             if !built(id) {
                 continue;
             }
+            // The same key is the same identity: nothing to work out again
+            // (every unit of a build where nothing changed).
+            let label = unit_label(&graph.node(id).unit, &self.profile);
+            if keys
+                .get(&id)
+                .is_some_and(|k| all.get(&label).is_some_and(|saved| saved.key == *k))
+            {
+                continue;
+            }
             let mut identity = self.unit_identity(graph, id, keys, source_cache);
             if let Some(key) = keys.get(&id) {
                 identity.key = key.clone();
             }
-            all.insert(unit_label(&graph.node(id).unit, &self.profile), identity);
+            all.insert(label, identity);
         }
         if all != before
             && let Ok(text) = serde_json::to_string(&all)
@@ -1754,14 +1762,13 @@ impl UnitJob {
             && let Some(read) = read_record_key(unit, &mut files)
             && let Some(record) = cas.get_value::<inputs::ReadRecord>(&format!("{read}-read"))
         {
-            base = compute_unit_identity_from(
+            base = compute_unit_key_from(
                 unit,
                 &self.profile,
                 &self.dep_keys,
                 &mut files,
                 Some((&record, script.as_deref())),
-            )
-            .key;
+            );
         }
         let recorded: Option<DeclaredInputs> = cas.get_value(&format!("{base}-inputs"));
         let key = effective_key(&base, recorded.as_ref(), has_script);
@@ -2308,14 +2315,13 @@ impl UnitJob {
                         &self.config.target_dir,
                     );
                     let script = self.read_script.clone().flatten();
-                    let base = compute_unit_identity_from(
+                    let base = compute_unit_key_from(
                         unit,
                         profile,
                         &self.dep_keys,
                         &mut rune_fingerprint::FingerprintCache::new(),
                         Some((&record, script.as_deref())),
-                    )
-                    .key;
+                    );
                     read_record = Some(record);
                     if base != base_key {
                         base_key = base;
@@ -3383,7 +3389,15 @@ pub fn compute_unit_cas_key(
     dep_keys: &[(String, String)],
     source_cache: &mut rune_fingerprint::FingerprintCache,
 ) -> String {
-    compute_unit_identity(unit, profile, dep_keys, source_cache).key
+    identity_with(
+        unit,
+        profile,
+        dep_keys,
+        source_cache,
+        Sources::Package,
+        false,
+    )
+    .key
 }
 
 /// What a unit's key is made of, part by part: what `rune explain` compares
@@ -3398,19 +3412,25 @@ pub struct UnitIdentity {
     pub files: std::collections::BTreeMap<String, String>,
 }
 
-/// Feeds the key hasher exactly as before, and a hasher per named part.
+/// Feeds the key hasher exactly as before, and — when the parts are wanted
+/// (`rune explain`'s records) — a hasher per named part.
 struct KeyRecorder {
     key: rune_common::hash::HashBuilder,
-    parts: std::collections::BTreeMap<String, rune_common::hash::HashBuilder>,
+    parts: Option<std::collections::BTreeMap<String, rune_common::hash::HashBuilder>>,
 }
 
 impl KeyRecorder {
     fn update(&mut self, part: &str, bytes: &[u8]) {
         self.key.update(bytes);
-        self.parts
-            .entry(part.to_string())
-            .or_default()
-            .update(bytes);
+        let Some(parts) = &mut self.parts else { return };
+        match parts.get_mut(part) {
+            Some(hasher) => hasher.update(bytes),
+            None => {
+                let mut hasher = rune_common::hash::HashBuilder::new();
+                hasher.update(bytes);
+                parts.insert(part.to_string(), hasher);
+            }
+        }
     }
 }
 
@@ -3421,7 +3441,14 @@ pub fn compute_unit_identity(
     dep_keys: &[(String, String)],
     source_cache: &mut rune_fingerprint::FingerprintCache,
 ) -> UnitIdentity {
-    identity_with(unit, profile, dep_keys, source_cache, Sources::Package)
+    identity_with(
+        unit,
+        profile,
+        dep_keys,
+        source_cache,
+        Sources::Package,
+        true,
+    )
 }
 
 /// [`compute_unit_identity`] keyed by the files a local crate read when it
@@ -3438,7 +3465,23 @@ pub fn compute_unit_identity_from(
         Some((record, script)) => Sources::Read(record, script),
         None => Sources::Package,
     };
-    identity_with(unit, profile, dep_keys, source_cache, sources)
+    identity_with(unit, profile, dep_keys, source_cache, sources, true)
+}
+
+/// The key alone of [`compute_unit_identity_from`] (without the parts it
+/// is made of, which only `rune explain`'s records need).
+pub fn compute_unit_key_from(
+    unit: &CompilationUnit,
+    profile: &Profile,
+    dep_keys: &[(String, String)],
+    source_cache: &mut rune_fingerprint::FingerprintCache,
+    read: Option<(&inputs::ReadRecord, Option<&str>)>,
+) -> String {
+    let sources = match read {
+        Some((record, script)) => Sources::Read(record, script),
+        None => Sources::Package,
+    };
+    identity_with(unit, profile, dep_keys, source_cache, sources, false).key
 }
 
 /// Where the files a local crate read are recorded (`<this>-read`). Keyed
@@ -3496,7 +3539,7 @@ pub fn compute_script_base(
     for (links, k, v) in dep_metadata {
         deps.push((format!("dep-metadata:{links}:{k}"), v.clone()));
     }
-    let identity = identity_with(unit, profile, &deps, source_cache, Sources::None);
+    let identity = identity_with(unit, profile, &deps, source_cache, Sources::None, false);
     let mut hb = rune_common::hash::HashBuilder::new();
     hb.update(b"build-script-result\0");
     hb.update(identity.key.as_bytes());
@@ -3518,10 +3561,11 @@ fn identity_with(
     dep_keys: &[(String, String)],
     source_cache: &mut rune_fingerprint::FingerprintCache,
     sources: Sources,
+    with_parts: bool,
 ) -> UnitIdentity {
     let mut hb = KeyRecorder {
         key: rune_common::hash::HashBuilder::new(),
-        parts: Default::default(),
+        parts: with_parts.then(Default::default),
     };
     const UNIT: &str = "unit (features, crate type, edition, target)";
     hb.update(UNIT, unit.metadata_hash().as_bytes());
@@ -3635,14 +3679,18 @@ fn identity_with(
                 hb.update("sources", b"=");
                 hb.update("sources", hash.as_bytes());
                 hb.update("sources", b"\0");
-                files.insert(name, hash);
+                if with_parts {
+                    files.insert(name, hash);
+                }
             }
         } else {
             let package_hash =
                 rune_fingerprint::hasher::compute_package_hash(&unit.manifest_dir, source_cache)
                     .unwrap_or_default();
             hb.update("sources", package_hash.as_bytes());
-            files.extend(source_cache.package_file_hashes(&unit.manifest_dir));
+            if with_parts {
+                files.extend(source_cache.package_file_hashes(&unit.manifest_dir));
+            }
         }
         // A build script (or crate root) can live outside the package
         // directory (`build = "../shared/build.rs"`), where the walk above
@@ -3683,6 +3731,7 @@ fn identity_with(
         key: hb.key.finish_blake3(),
         parts: hb
             .parts
+            .unwrap_or_default()
             .into_iter()
             .map(|(k, v)| (k, v.finish_blake3()))
             .collect(),
