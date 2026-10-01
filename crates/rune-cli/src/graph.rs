@@ -242,7 +242,7 @@ impl Locals {
                 .collect();
             for (name, spec) in specs {
                 if let Some(path) = spec.path {
-                    let dir = path.canonicalize().unwrap_or(path);
+                    let dir = rune_common::fsutil::canonicalize(&path).unwrap_or(path);
                     if !this.by_dir.contains_key(&dir)
                         && !rune_common::manifest_file::has_manifest(&dir)
                     {
@@ -265,7 +265,7 @@ impl Locals {
                         .git_patch_dir(url, &real, &req)
                         .map_err(|e| anyhow::anyhow!("{e}"))?
                     {
-                        let dir = dir.canonicalize().unwrap_or(dir);
+                        let dir = rune_common::fsutil::canonicalize(&dir).unwrap_or(dir);
                         let git = rune_registry::git::locate_dir(&dir);
                         this.add(dir, git)?;
                         continue;
@@ -278,7 +278,7 @@ impl Locals {
                     let co = rune_registry::git::checkout(url, &reference)
                         .with_context(|| format!("git dependency `{real}` ({url})"))?;
                     let dir = rune_registry::git::find_package(&co, &real)?;
-                    let dir = dir.canonicalize().unwrap_or(dir);
+                    let dir = rune_common::fsutil::canonicalize(&dir).unwrap_or(dir);
                     this.add(dir, Some(co))?;
                 } else {
                     // A registry-style dependency that a `[patch]` replaces:
@@ -293,7 +293,7 @@ impl Locals {
                         if let Some((dir, _)) =
                             entry.locate(&req).map_err(|e| anyhow::anyhow!("{e}"))?
                         {
-                            let dir = dir.canonicalize().unwrap_or(dir);
+                            let dir = rune_common::fsutil::canonicalize(&dir).unwrap_or(dir);
                             let git = rune_registry::git::locate_dir(&dir);
                             this.add(dir, git)?;
                             break;
@@ -346,7 +346,7 @@ impl Locals {
                 .find(&p.name, &rune_resolver::PatchSource::CratesIo)
             {
                 if let Some((dir, _)) = entry.locate(&req).map_err(|e| anyhow::anyhow!("{e}"))? {
-                    let dir = dir.canonicalize().unwrap_or(dir);
+                    let dir = rune_common::fsutil::canonicalize(&dir).unwrap_or(dir);
                     let git = rune_registry::git::locate_dir(&dir);
                     self.add(dir, git)?;
                     break;
@@ -372,7 +372,7 @@ impl Locals {
             let co = rune_registry::git::checkout(&url, &reference)
                 .with_context(|| format!("git dependency `{}` ({url})", p.name))?;
             let dir = rune_registry::git::find_package(&co, &p.name)?;
-            let dir = dir.canonicalize().unwrap_or(dir);
+            let dir = rune_common::fsutil::canonicalize(&dir).unwrap_or(dir);
             self.add(dir, Some(co))?;
         }
         Ok(())
@@ -1902,7 +1902,7 @@ fn local_view(
         .map(|dep| {
             let spec = locals.spec_for(ws, li, dep);
             let resolved = if let Some(path) = &spec.path {
-                let dir = path.canonicalize().unwrap_or_else(|_| path.clone());
+                let dir = rune_common::fsutil::canonicalize(path).unwrap_or_else(|_| path.clone());
                 locals.by_dir.get(&dir).copied()
             } else if let Some(url) = &spec.git
                 && let Ok(Some(dir)) = ws.patches.git_patch_dir(
@@ -1912,7 +1912,7 @@ fn local_view(
                 )
             {
                 // `[patch."<url>"]` replaces the repository.
-                let dir = dir.canonicalize().unwrap_or(dir);
+                let dir = rune_common::fsutil::canonicalize(&dir).unwrap_or(dir);
                 locals.by_dir.get(&dir).copied()
             } else if let Some(url) = &spec.git {
                 // Already checked out when the locals were loaded.
@@ -1925,7 +1925,7 @@ fn local_view(
                 rune_registry::git::checkout(url, &reference)
                     .ok()
                     .and_then(|co| rune_registry::git::find_package(&co, real).ok())
-                    .map(|d| d.canonicalize().unwrap_or(d))
+                    .map(|d| rune_common::fsutil::canonicalize(&d).unwrap_or(d))
                     .and_then(|d| locals.by_dir.get(&d).copied())
             } else {
                 let real = spec.package.as_deref().unwrap_or(&dep.name);

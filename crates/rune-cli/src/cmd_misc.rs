@@ -139,7 +139,7 @@ fn scaffold(
 }
 
 fn inside_git_repo(dir: &Path) -> bool {
-    let mut cur = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+    let mut cur = rune_common::fsutil::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
     loop {
         if cur.join(".git").exists() {
             return true;
@@ -187,7 +187,7 @@ fn manifest_file_for(choice: &str) -> &'static str {
 
 pub fn init(args: InitArgs) -> Result<()> {
     fs::create_dir_all(&args.path)?;
-    let abs = args.path.canonicalize()?;
+    let abs = rune_common::fsutil::canonicalize(&args.path)?;
     let name = match &args.name {
         Some(n) => n.clone(),
         None => abs
@@ -1107,7 +1107,7 @@ pub fn affected(args: crate::args::AffectedArgs) -> Result<()> {
 
 /// `rune script`.
 pub fn script(args: crate::args::ScriptArgs) -> Result<()> {
-    let file = std::fs::canonicalize(&args.file)
+    let file = rune_common::fsutil::canonicalize(&args.file)
         .with_context(|| format!("cannot read script `{}`", args.file.display()))?;
     let text = std::fs::read_to_string(&file)
         .with_context(|| format!("cannot read script `{}`", file.display()))?;

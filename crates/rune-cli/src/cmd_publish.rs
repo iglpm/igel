@@ -835,11 +835,10 @@ fn vcs_state(dir: &Path) -> Result<Option<Vcs>> {
         .unwrap_or_default()
         .trim()
         .to_string();
-    let path_in_vcs = dir
-        .canonicalize()
+    let path_in_vcs = rune_common::fsutil::canonicalize(dir)
         .ok()
         .and_then(|d| {
-            d.strip_prefix(top.canonicalize().ok()?)
+            d.strip_prefix(rune_common::fsutil::canonicalize(&top).ok()?)
                 .ok()
                 .map(|p| p.to_string_lossy().replace('\\', "/"))
         })
