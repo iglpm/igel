@@ -18,6 +18,7 @@ everything else is reference.
 | [Scripts](scripts.md) | Single-file Rust scripts with dependencies |
 | [Editor integration](editor-integration.md) | JSON messages, rust-analyzer, the build plan as JSON |
 | [Architecture](architecture.md) | The crates Rune is made of, building and testing Rune itself |
+| [Benchmarks](../bench/README.md) | `rune-bench`: measuring Rune against Cargo on generated and real projects |
 
 [ROADMAP.md](../ROADMAP.md) has the status against the compatibility
 specification, measurements and what comes next; [CHANGELOG.md](../CHANGELOG.md)

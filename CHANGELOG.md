@@ -13,6 +13,10 @@ always safe; the first stable release is 2027.0.0.
 The first stable release. Changes since the 0.1.0 preview:
 
 ### Added
+- `rune-bench` (in `bench/`): benchmarks Rune against Cargo on generated
+  workspaces or a copy of any project — startup, cold builds, no-op builds,
+  rebuilds after edits, cache reuse, tests, inspection commands, disk and
+  memory — with JSON, Markdown and HTML reports and a regression check.
 - `rune doctor` checks free disk space and memory per parallel job.
 - "Did you mean" for misspelled `-p` packages; a test filter that matches
   nothing says so.
@@ -82,6 +86,8 @@ The first stable release. Changes since the 0.1.0 preview:
   ever cached. Both are marked with `CACHEDIR.TAG` and left out.
 
 ### Changed
+- Quick commands on small projects no longer start a thread pool for two or
+  three items of work: its spinning workers made their time erratic.
 - The README is a short introduction; the reference documentation moved to
   `docs/` (installation, commands, compatibility, settings, testing, caching,
   CI, supply chain, …). Install with `curl -fsSL https://runepm.com/install.sh | sh`.
