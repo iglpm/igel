@@ -53,6 +53,9 @@ The first stable release. Changes since the 0.1.0 preview:
 - TOML errors in manifests print once, naming the file once.
 - Doc tests run after the test binaries, as with Cargo: run first, a failing
   doc test could stop the run before a failing unit test was reported.
+- `rune watch` no longer restarts forever when a run writes into the project
+  (a JUnit report, logs, test snapshots): changes to files git ignores don't
+  count. It says which file set off a run.
 - A failed test binary's output is followed by one blank line, not three.
 - `rune test -q` prints the result line; a binary killed by a signal counts as
   a failed test; a failed download no longer reports "downloaded".

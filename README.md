@@ -42,10 +42,11 @@ $ rune build
 | Fresh machine, shared cache | **0.65 s** | full rebuild |
 
 On a generated 25-crate workspace, [`rune-bench`](bench/README.md) measures a
-fresh checkout at **39×** Cargo's speed, switching back to a branch at **15×**,
-running the tests at **7×**, and Rune **2.6× faster** overall across 32
+fresh checkout at **108×** Cargo's speed, switching back to a branch at **34×**,
+running the tests at **9×**, and Rune **2.8× faster** overall across 32
 measurements (cold builds and rebuilds after an edit are on par: both run the
-same compiler). Run it on your own project:
+same compiler). On Rune's own workspace, a fresh checkout takes 0.18 s where
+Cargo rebuilds for 84 s. Run it on your own project:
 `rune-bench run --project path/to/it`.
 
 - **Nothing is compiled twice.** Every crate is stored under a key that
