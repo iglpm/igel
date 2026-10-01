@@ -92,6 +92,23 @@ fn edit(ctx: &Ctx, file: Option<&Path>, n: u64) -> Result<()> {
     }
 }
 
+/// Writes a file no crate reads (`NOTES.md`) into the package of `file`.
+fn touch_unread(ctx: &Ctx, file: Option<&Path>, n: u64) -> Result<()> {
+    let Some(file) = file else {
+        bail!("this workload names no file to edit");
+    };
+    let path = ctx.dir.join(file);
+    let Some(package) = path
+        .ancestors()
+        .skip(1)
+        .find(|d| d.join("Cargo.toml").is_file())
+    else {
+        bail!("{} is in no package", file.display());
+    };
+    std::fs::write(package.join("NOTES.md"), format!("notes {n}\n"))?;
+    Ok(())
+}
+
 /// The catalogue, in report order.
 pub fn all() -> Vec<Scenario> {
     vec![
@@ -250,6 +267,20 @@ pub fn all() -> Vec<Scenario> {
             args: &["test"],
             prepare: |ctx, _| setup(ctx, &["test", "--no-run"]),
             before: |ctx, w, _| edit(ctx, w.leaf_edit.as_deref(), fresh_edit()),
+        },
+        Scenario {
+            id: "edit-unread",
+            category: "After an edit",
+            title: "build after a file nothing reads changed",
+            about: "Notes or a log written into the core crate's directory: there is nothing to \
+                    compile.",
+            kind: Kind::Time,
+            heavy: false,
+            full_only: false,
+            needs: Needs::CoreEdit,
+            args: &["build"],
+            prepare: |ctx, _| setup(ctx, &["build"]),
+            before: |ctx, w, _| touch_unread(ctx, w.core_edit.as_deref(), fresh_edit()),
         },
         Scenario {
             id: "fresh-checkout",
