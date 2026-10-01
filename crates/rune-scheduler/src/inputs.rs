@@ -196,6 +196,90 @@ pub fn script_result_key_in(
     }
 }
 
+/// The files a local crate's compilation read, from rustc's dep-info: its
+/// modules and whatever `include_str!`/`include_bytes!` pulled in. Recorded
+/// after it compiles (under `<read record key>-read`) and used to key its
+/// next lookup by exactly these files' contents, so a change to a file it
+/// never read — an integration test, the README, a log — does not compile
+/// it again (and everything above it), as with Cargo.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReadRecord {
+    /// Relative to the package directory (with `..` for files beside it), so
+    /// another checkout finds the same record; absolute when the file shares
+    /// nothing but the root with the package.
+    pub files: Vec<PathBuf>,
+}
+
+impl ReadRecord {
+    /// The record of a dep-info file written by a rustc that ran in `cwd`
+    /// (which its relative paths are relative to), for the package in
+    /// `manifest_dir`.
+    pub fn from_dep_info(dep_info: &Path, cwd: &Path, manifest_dir: &Path) -> Self {
+        let mut files: Vec<PathBuf> = dep_info_sources(dep_info)
+            .into_iter()
+            .map(|f| relative_to(&cwd.join(f), manifest_dir))
+            .collect();
+        files.sort();
+        files.dedup();
+        Self { files }
+    }
+
+    /// Where each recorded file is now.
+    pub fn paths(&self, manifest_dir: &Path) -> Vec<(String, PathBuf)> {
+        self.files
+            .iter()
+            .map(|f| {
+                (
+                    f.to_string_lossy().replace('\\', "/"),
+                    normalize(&manifest_dir.join(f)),
+                )
+            })
+            .collect()
+    }
+}
+
+/// `path` without `.` and `..` components (lexically).
+fn normalize(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for c in path.components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !out.pop() {
+                    out.push("..");
+                }
+            }
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// `path` relative to the directory `base`, through their common ancestor;
+/// `path` itself when they share no more than the root.
+pub fn relative_to(path: &Path, base: &Path) -> PathBuf {
+    let (path, base) = (normalize(path), normalize(base));
+    let p: Vec<_> = path.components().collect();
+    let b: Vec<_> = base.components().collect();
+    let common = p.iter().zip(&b).take_while(|(x, y)| x == y).count();
+    let shares_more_than_root = p
+        .iter()
+        .take(common)
+        .any(|c| matches!(c, std::path::Component::Normal(_)));
+    if !shares_more_than_root {
+        return path;
+    }
+    let mut out = PathBuf::new();
+    for _ in common..b.len() {
+        out.push("..");
+    }
+    for c in &p[common..] {
+        out.push(c);
+    }
+    out
+}
+
 /// The source files a rustc dep-info file lists (`path:` lines).
 pub fn dep_info_sources(dep_info: &Path) -> Vec<PathBuf> {
     let Ok(text) = std::fs::read_to_string(dep_info) else {
@@ -525,6 +609,53 @@ fn apple_developer_identity(developer_dir: &Path, sdkroot: Option<&Path>) -> Str
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn read_files_are_recorded_relative_to_the_package() {
+        let p = |s: &str| PathBuf::from(s);
+        assert_eq!(
+            relative_to(&p("/w/pkg/src/lib.rs"), &p("/w/pkg")),
+            p("src/lib.rs")
+        );
+        assert_eq!(
+            relative_to(&p("/w/shared.txt"), &p("/w/pkg")),
+            p("../shared.txt")
+        );
+        assert_eq!(
+            relative_to(&p("/w/pkg/src/../../other/x.rs"), &p("/w/pkg")),
+            p("../other/x.rs")
+        );
+        // Nothing in common but the root: kept as it is.
+        assert_eq!(
+            relative_to(&p("/usr/include/x.h"), &p("/w/pkg")),
+            p("/usr/include/x.h")
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path().join("lib.d");
+        std::fs::write(
+            &d,
+            "/out/libx.rlib: pkg/src/lib.rs pkg/src/m.rs pkg/data.txt\n\n\
+             pkg/src/lib.rs:\npkg/src/m.rs:\npkg/data.txt:\n../elsewhere/y.rs:\n\
+             # env-dep:X=1\n",
+        )
+        .unwrap();
+        let record = ReadRecord::from_dep_info(&d, &p("/w"), &p("/w/pkg"));
+        // (`/w/../elsewhere` shares nothing with `/w/pkg` but the root.)
+        assert_eq!(
+            record.files,
+            [
+                p("/elsewhere/y.rs"),
+                p("data.txt"),
+                p("src/lib.rs"),
+                p("src/m.rs")
+            ]
+        );
+        assert_eq!(
+            record.paths(&p("/w/pkg"))[1],
+            ("data.txt".to_string(), p("/w/pkg/data.txt"))
+        );
+    }
 
     #[test]
     fn a_script_that_watches_files_is_keyed_by_them_not_the_package() {

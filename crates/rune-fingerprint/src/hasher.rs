@@ -185,6 +185,35 @@ fn compute_package_hash_uncached(
     hash_files(package_dir, files, cache)
 }
 
+/// One file's content hash, reused from `cache` while its modification time
+/// and size are unchanged; `None` when it does not exist (or is not a file).
+pub fn file_hash(path: &Path, cache: &mut FingerprintCache) -> Option<u64> {
+    let meta = std::fs::metadata(path).ok().filter(|m| m.is_file())?;
+    let mtime = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let size = meta.len();
+    let hash = match cache
+        .files
+        .get(path)
+        .filter(|c| mtime != 0 && c.mtime == mtime && c.size == size)
+    {
+        Some(c) => c.hash,
+        None => xxhash3_file(path).ok()?,
+    };
+    cache.mark_visited(path);
+    cache.record(FileEntry {
+        path: path.to_path_buf(),
+        mtime,
+        size,
+        hash,
+    });
+    Some(hash)
+}
+
 /// Computes a hash of all `.rs` files under `source_root`.
 ///
 /// Kept for callers that want just a source-tree hash; see

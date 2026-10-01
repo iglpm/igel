@@ -95,6 +95,13 @@ The first stable release. Changes since the 0.1.0 preview:
   ever cached. Both are marked with `CACHEDIR.TAG` and left out.
 
 ### Changed
+- A crate of the project is keyed by the files rustc read for it (its
+  modules, `include_str!`/`include_bytes!` files), recorded after it
+  compiles, instead of by every file of its package. Editing an integration
+  test, a README or a doc, or a log file appearing in a package no longer
+  recompiles the package's library and everything that depends on it (in a
+  25-crate workspace, a new file in the bottom crate rebuilt 21 crates; now
+  none). Crates with a build script keep the package-wide key.
 - Quick commands on small projects no longer start a thread pool for two or
   three items of work: its spinning workers made their time erratic.
 - The README is a short introduction; the reference documentation moved to

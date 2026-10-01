@@ -206,6 +206,54 @@ fn second_build_is_fully_cached_and_edits_recompile_only_what_changed() {
 }
 
 #[test]
+fn only_files_a_crate_read_rebuild_it() {
+    let p = Project::new();
+    p.write(
+        "Cargo.toml",
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\
+         [dependencies]\nbase = { path = \"base\" }\n[workspace]\n",
+    );
+    p.write("src/lib.rs", "pub fn v() -> &'static str { base::DATA }\n");
+    p.write(
+        "base/Cargo.toml",
+        "[package]\nname = \"base\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    p.write(
+        "base/src/lib.rs",
+        "mod m;\npub use m::f;\npub const DATA: &str = include_str!(\"../data.txt\");\n\
+         pub const SHARED: &str = include_str!(\"../../shared.txt\");\n",
+    );
+    p.write("base/src/m.rs", "pub fn f() {}\n");
+    p.write("base/data.txt", "one");
+    p.write("shared.txt", "s1");
+    let out = p.ok(&["build"]);
+    assert!(out.contains("2 compiled"), "{out}");
+
+    // Files no crate read — notes, a log, an integration test, the README —
+    // compile nothing, as with Cargo.
+    p.write("base/NOTES.md", "notes");
+    p.write("base/build.log", "log");
+    p.write("base/tests/it.rs", "#[test]\nfn t() {}\n");
+    p.write("README.md", "readme");
+    let out = p.ok(&["build"]);
+    assert!(out.contains("0 compiled · 2 cached"), "{out}");
+
+    // What it read, in its package or beside it, does (and its dependents).
+    p.write("base/data.txt", "two");
+    assert!(p.ok(&["build"]).contains("2 compiled"));
+    p.write("shared.txt", "s2");
+    assert!(p.ok(&["build"]).contains("2 compiled"));
+    p.write("base/src/m.rs", "pub fn f() { }\n");
+    assert!(p.ok(&["build"]).contains("2 compiled"));
+    assert!(p.ok(&["build"]).contains("0 compiled · 2 cached"));
+
+    // A fresh checkout finds everything again by the files it read.
+    std::fs::remove_dir_all(p.path().join(".rune")).unwrap();
+    let out = p.ok(&["build"]);
+    assert!(out.contains("0 compiled · 2 cached"), "{out}");
+}
+
+#[test]
 fn binaries_compile_in_deps_and_only_their_names_appear_in_the_profile_dir() {
     let p = Project::new();
     p.write("Cargo.toml", LIB_MANIFEST);

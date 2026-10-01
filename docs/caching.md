@@ -25,12 +25,25 @@ UnitKey = hash(
 * **Registry and git packages are immutable**, so their key never reads the
   disk; registry packages are identified by *index + checksum*, git packages by
   the *resolved commit* (a branch name never enters a key).
-* **Local packages** are hashed package-wide — every file except `.rune/`,
+* **Local packages are keyed by the files they read.** After a crate of the
+  project compiles, Rune records the files rustc read — its modules and
+  whatever `include_str!`/`include_bytes!` pulled in, from rustc's dep-info,
+  relative to the package so another checkout finds them — and from then on
+  its key is the contents of exactly those files. Editing an integration
+  test, the README or a doc, or a log appearing in the package, compiles
+  nothing (as with Cargo); editing a module compiles that crate and what
+  depends on it. The record belongs to the crate root's contents, so going
+  back to an earlier version finds that version's record (and its artifact).
+  A crate with a build script, and one compiled for the first time, is keyed
+  by every file of its package instead — every file except `.rune/`,
   `target/`, directories tagged as caches (`CACHEDIR.TAG`, which Rune writes
   into every target directory and store), VCS and tool directories, editor
-  droppings, nested packages, lock files, `Rune.toml`, and `Cargo.toml` itself
-  (whose semantics are in the key already). Hidden files *are* inputs, since a crate may `include_str!` them. A
-  size+mtime cache means warm runs only `stat` the tree.
+  droppings, nested packages, lock files, `Rune.toml`, and `Cargo.toml`
+  itself (whose semantics are in the key already). A size+mtime cache means
+  warm runs only `stat` the files. As with Cargo, a proc-macro that reads
+  files without telling rustc (no `include_bytes!`, no
+  `proc_macro::tracked_path`) is not seen: such a crate needs a build script
+  with `rerun-if-changed`, as it does under Cargo.
 * **The outside world.** After a unit is built, Rune records what it read beyond
   its source: a build script's `rerun-if-env-changed`/`rerun-if-changed`, the
   native libraries it linked, `env!`/`option_env!` variables (from rustc's

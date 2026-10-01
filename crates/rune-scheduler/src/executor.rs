@@ -831,6 +831,7 @@ impl BuildExecutor {
                         node_id,
                         &unit_base_keys[&node_id],
                         &unit_cas_keys[&node_id],
+                        dep_keys_of(graph, node_id, &unit_cas_keys),
                         &artifact_paths,
                         &metadata_paths,
                         &build_script_outputs,
@@ -1124,13 +1125,26 @@ impl BuildExecutor {
             &node.unit
         };
         let dep_keys = dep_keys_of(graph, id, keys);
-        let base = compute_unit_cas_key(unit, &self.profile, &dep_keys, source_cache);
+        let read = self.read_record(unit, source_cache);
+        let base =
+            compute_unit_identity_from(unit, &self.profile, &dep_keys, source_cache, read.as_ref())
+                .key;
         let recorded: Option<DeclaredInputs> = self
             .cas
             .as_ref()
             .and_then(|c| c.get_value(&format!("{base}-inputs")));
         let key = effective_key(&base, recorded.as_ref(), unit.build_script.is_some());
         (base, key)
+    }
+
+    /// The files a local crate read when it was last compiled, if recorded.
+    fn read_record(
+        &self,
+        unit: &CompilationUnit,
+        source_cache: &mut rune_fingerprint::FingerprintCache,
+    ) -> Option<inputs::ReadRecord> {
+        let key = read_record_key(unit, source_cache)?;
+        self.cas.as_ref()?.get_value(&format!("{key}-read"))
     }
 
     /// What a unit's key is made of now (see [`UnitIdentity`]), given its
@@ -1144,7 +1158,9 @@ impl BuildExecutor {
     ) -> UnitIdentity {
         let unit = &graph.node(id).unit;
         let dep_keys = dep_keys_of(graph, id, keys);
-        let mut identity = compute_unit_identity(unit, &self.profile, &dep_keys, source_cache);
+        let read = self.read_record(unit, source_cache);
+        let mut identity =
+            compute_unit_identity_from(unit, &self.profile, &dep_keys, source_cache, read.as_ref());
         let recorded: Option<DeclaredInputs> = self
             .cas
             .as_ref()
@@ -1213,6 +1229,9 @@ impl BuildExecutor {
                 format!("{base}-inputs"),
             ]);
             let unit = &graph.node(id).unit;
+            if let Some(read) = read_record_key(unit, &mut source_cache) {
+                out.push(format!("{read}-read"));
+            }
             if unit.build_script.is_some() && unit.ext.script_owner.is_none() {
                 let mut dep_metadata = Vec::new();
                 for d in &graph.node(id).dependencies {
@@ -1376,6 +1395,7 @@ impl BuildExecutor {
         node_id: NodeId,
         base_key: &str,
         cas_key: &str,
+        dep_keys: Vec<(String, String)>,
         artifact_paths: &HashMap<NodeId, Vec<PathBuf>>,
         metadata_paths: &HashMap<NodeId, PathBuf>,
         build_script_outputs: &HashMap<NodeId, BuildScriptOutput>,
@@ -1508,6 +1528,7 @@ impl BuildExecutor {
             dep_metadata,
             base_key: base_key.to_string(),
             cas_key: cas_key.to_string(),
+            dep_keys,
             build_output: match &unit_owner_key {
                 // A unit that shares its package's build script takes the
                 // output of the unit that ran it.
@@ -1556,6 +1577,8 @@ struct UnitJob {
     /// The key the unit was scheduled under (may be updated as it learns
     /// about external inputs).
     cas_key: String,
+    /// Its dependencies' keys, to key it again by the files it read.
+    dep_keys: Vec<(String, String)>,
     build_output: Option<BuildScriptOutput>,
     /// Link search paths from the build scripts of the unit's dependencies.
     dep_link_search: Vec<(Option<String>, PathBuf)>,
@@ -1768,8 +1791,13 @@ impl UnitJob {
         // change theirs, and the compilation that follows keys the unit again
         // (with the same script output) once they are settled.
         let script_only = self.script_only;
-        let bump = |declared: &DeclaredInputs, store_key: &mut String| {
-            let key = effective_key(&self.base_key, Some(declared), has_script);
+        // The unit's key before external inputs: what it was scheduled under,
+        // until the compiler says which files it read.
+        let mut base_key = self.base_key.clone();
+        let read_key = read_record_key(unit, &mut rune_fingerprint::FingerprintCache::new());
+        let mut read_record: Option<inputs::ReadRecord> = None;
+        let bump = |base_key: &str, declared: &DeclaredInputs, store_key: &mut String| {
+            let key = effective_key(base_key, Some(declared), has_script);
             if key != *store_key {
                 *store_key = key.clone();
                 if !script_only {
@@ -2046,7 +2074,7 @@ impl UnitJob {
                 &unit.manifest_dir,
                 &script_out_dir,
             ));
-            bump(&declared, &mut store_key);
+            bump(&base_key, &declared, &mut store_key);
         }
         if let (Some(out), Some(cas_store)) = (&script_ran, &self.cas) {
             let key = match &self.script_base {
@@ -2154,6 +2182,29 @@ impl UnitJob {
         let mut sent_metadata = false;
         let result = invoker.invoke_streaming(cmd, &mut |artifact| match artifact.emit.as_str() {
             "dep-info" => {
+                let mut moved = false;
+                // Keyed by exactly the files it read from now on (and found
+                // again by them next time; see `ReadRecord`).
+                if read_key.is_some() {
+                    let record = inputs::ReadRecord::from_dep_info(
+                        &artifact.artifact,
+                        rune_common::fsutil::simplified(&self.config.project_root),
+                        &unit.manifest_dir,
+                    );
+                    let base = compute_unit_identity_from(
+                        unit,
+                        profile,
+                        &self.dep_keys,
+                        &mut rune_fingerprint::FingerprintCache::new(),
+                        Some(&record),
+                    )
+                    .key;
+                    read_record = Some(record);
+                    if base != base_key {
+                        base_key = base;
+                        moved = true;
+                    }
+                }
                 let reads = inputs::env_reads_from_dep_info(&artifact.artifact, &provided);
                 let manifest = rune_common::manifest_file::manifest_in(&unit.manifest_dir);
                 let read_manifest = inputs::reads_manifest(
@@ -2171,7 +2222,10 @@ impl UnitJob {
                         },
                         ..Default::default()
                     });
-                    bump(&declared, &mut store_key);
+                    moved = true;
+                }
+                if moved {
+                    bump(&base_key, &declared, &mut store_key);
                 }
             }
             "metadata" if !sent_metadata => {
@@ -2249,8 +2303,12 @@ impl UnitJob {
                     // Remember what this unit depends on outside itself, so
                     // the next lookup keys on the current values of those.
                     if !declared.is_empty() {
-                        let _ =
-                            cas_store.put_value(&format!("{}-inputs", self.base_key), &declared);
+                        let _ = cas_store.put_value(&format!("{base_key}-inputs"), &declared);
+                    }
+                    // And which of its files it read, which the next lookup
+                    // keys on instead of every file of the package.
+                    if let (Some(key), Some(record)) = (&read_key, &read_record) {
+                        let _ = cas_store.put_value(&format!("{key}-read"), record);
                     }
                     // The script's result under the key the unit is finally
                     // stored under, which is what a later cache hit restores
@@ -3246,7 +3304,65 @@ pub fn compute_unit_identity(
     dep_keys: &[(String, String)],
     source_cache: &mut rune_fingerprint::FingerprintCache,
 ) -> UnitIdentity {
-    identity_with(unit, profile, dep_keys, source_cache, true)
+    identity_with(unit, profile, dep_keys, source_cache, Sources::Package)
+}
+
+/// [`compute_unit_identity`] keyed by the files a local crate read when it
+/// was last compiled, when they are known (see [`inputs::ReadRecord`]).
+pub fn compute_unit_identity_from(
+    unit: &CompilationUnit,
+    profile: &Profile,
+    dep_keys: &[(String, String)],
+    source_cache: &mut rune_fingerprint::FingerprintCache,
+    read: Option<&inputs::ReadRecord>,
+) -> UnitIdentity {
+    let sources = match read {
+        Some(record) => Sources::Read(record),
+        None => Sources::Package,
+    };
+    identity_with(unit, profile, dep_keys, source_cache, sources)
+}
+
+/// Where the files a local crate read are recorded (`<this>-read`), for a
+/// crate whose key can follow them: one without a build script, whose
+/// generated code could change while its own files do not. Keyed by the
+/// crate's configuration and its root file's contents, so each version of
+/// the root keeps its record. A record that does not fit only costs a miss:
+/// a stored result's key names the files it read and their contents.
+pub fn read_record_key(
+    unit: &CompilationUnit,
+    source_cache: &mut rune_fingerprint::FingerprintCache,
+) -> Option<String> {
+    if unit.crate_id.source != CrateSource::Local
+        || unit.build_script.is_some()
+        || unit.ext.script_owner.is_some()
+    {
+        return None;
+    }
+    let root = rune_fingerprint::hasher::file_hash(&unit.source_root, source_cache)?;
+    let mut hb = rune_common::hash::HashBuilder::new();
+    hb.update(b"read-record\0");
+    hb.update(unit.metadata_hash().as_bytes());
+    hb.update(b"\0");
+    hb.update(unit.crate_id.name.as_bytes());
+    hb.update(b"\0");
+    let rel_root = unit
+        .source_root
+        .strip_prefix(&unit.manifest_dir)
+        .unwrap_or(&unit.source_root);
+    hb.update(rel_root.to_string_lossy().as_bytes());
+    hb.update(&root.to_le_bytes());
+    Some(hb.finish_blake3())
+}
+
+/// Which of a local package's files a unit's key covers.
+enum Sources<'a> {
+    /// None (a build script result's base: the script says what it read).
+    None,
+    /// Every file of the package (nothing is known about what it reads).
+    Package,
+    /// The files it read when it was last compiled.
+    Read(&'a inputs::ReadRecord),
 }
 
 /// The base key of a unit's *build script result*: the unit's configuration
@@ -3264,7 +3380,7 @@ pub fn compute_script_base(
     for (links, k, v) in dep_metadata {
         deps.push((format!("dep-metadata:{links}:{k}"), v.clone()));
     }
-    let identity = identity_with(unit, profile, &deps, source_cache, false);
+    let identity = identity_with(unit, profile, &deps, source_cache, Sources::None);
     let mut hb = rune_common::hash::HashBuilder::new();
     hb.update(b"build-script-result\0");
     hb.update(identity.key.as_bytes());
@@ -3285,7 +3401,7 @@ fn identity_with(
     profile: &Profile,
     dep_keys: &[(String, String)],
     source_cache: &mut rune_fingerprint::FingerprintCache,
-    include_sources: bool,
+    sources: Sources,
 ) -> UnitIdentity {
     let mut hb = KeyRecorder {
         key: rune_common::hash::HashBuilder::new(),
@@ -3379,18 +3495,33 @@ fn identity_with(
     }
 
     let mut files = std::collections::BTreeMap::new();
-    if unit.crate_id.source == CrateSource::Local && include_sources {
+    if unit.crate_id.source == CrateSource::Local && !matches!(sources, Sources::None) {
         // Where the crate root lives is an input too (`[lib] path = ...`).
         let rel_root = unit
             .source_root
             .strip_prefix(&unit.manifest_dir)
             .unwrap_or(&unit.source_root);
         hb.update("crate root", rel_root.to_string_lossy().as_bytes());
-        let package_hash =
-            rune_fingerprint::hasher::compute_package_hash(&unit.manifest_dir, source_cache)
-                .unwrap_or_default();
-        hb.update("sources", package_hash.as_bytes());
-        files.extend(source_cache.package_file_hashes(&unit.manifest_dir));
+        if let Sources::Read(record) = sources {
+            // Exactly the files it read, by name and contents ("missing" for
+            // one that is gone).
+            hb.update("sources", b"read\0");
+            for (name, path) in record.paths(&unit.manifest_dir) {
+                let hash = rune_fingerprint::hasher::file_hash(&path, source_cache)
+                    .map_or_else(|| "missing".to_string(), |h| format!("{h:016x}"));
+                hb.update("sources", name.as_bytes());
+                hb.update("sources", b"=");
+                hb.update("sources", hash.as_bytes());
+                hb.update("sources", b"\0");
+                files.insert(name, hash);
+            }
+        } else {
+            let package_hash =
+                rune_fingerprint::hasher::compute_package_hash(&unit.manifest_dir, source_cache)
+                    .unwrap_or_default();
+            hb.update("sources", package_hash.as_bytes());
+            files.extend(source_cache.package_file_hashes(&unit.manifest_dir));
+        }
         // A build script (or crate root) can live outside the package
         // directory (`build = "../shared/build.rs"`), where the walk above
         // doesn't see it.
