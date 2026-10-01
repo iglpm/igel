@@ -56,6 +56,9 @@ The first stable release. Changes since the 0.1.0 preview:
 - `rune watch` no longer restarts forever when a run writes into the project
   (a JUnit report, logs, test snapshots): changes to files git ignores don't
   count. It says which file set off a run.
+- A credential helper (`cargo:libsecret`, an external provider) that exits
+  before reading its input is an error, instead of silently ending
+  `rune login`/`publish` with SIGPIPE.
 - A failed test binary's output is followed by one blank line, not three.
 - `rune test -q` prints the result line; a binary killed by a signal counts as
   a failed test; a failed download no longer reports "downloaded".
