@@ -1381,7 +1381,7 @@ at all; it now prints the result. Rune's own warm `rune test`: 29–31 s.
 
 ## 19. What changed with rune-bench (2026-10-01)
 
-**rune-bench** (`bench/`) measures Rune against Cargo in 17 scenarios —
+**rune-bench** (`bench/`) measures Rune against Cargo in 19 scenarios —
 startup, cold builds, no-op builds, rebuilds after an edit, cache reuse,
 tests, inspection commands, disk and memory — on generated workspaces or a
 copy of any project, with JSON/Markdown/HTML reports and a regression check
