@@ -34,10 +34,10 @@ $ rune build
 
 | On Rune's own workspace (249 packages) | Rune | Cargo |
 | --- | ---: | ---: |
-| Nothing changed: `build` | **56 ms** | 220 ms |
-| Nothing changed: `check` | **57 ms** | 230 ms |
-| Nothing changed: `test --no-run` | **66 ms** | 250 ms |
-| `tree` | **23 ms** | 163 ms |
+| Nothing changed: `build` | **53 ms** | 225 ms |
+| Nothing changed: `check` | **64 ms** | 234 ms |
+| Nothing changed: `test --no-run` | **56 ms** | 272 ms |
+| `tree` | **9 ms** | 184 ms |
 | Full build from scratch | **112.5 s** | 122.8 s |
 | Fresh machine, shared cache | **0.65 s** | full rebuild |
 

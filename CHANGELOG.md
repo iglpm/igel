@@ -63,6 +63,9 @@ The first stable release. Changes since the 0.1.0 preview:
 - A credential helper (`cargo:libsecret`, an external provider) that exits
   before reading its input is an error, instead of silently ending
   `rune login`/`publish` with SIGPIPE.
+- Building Rune itself with Cargo recompiled `rune-cli` on every build in a
+  clone without `.git/packed-refs` (its build script watched the missing
+  file); in a worktree it watched the wrong refs.
 - A failed test binary's output is followed by one blank line, not three.
 - `rune test -q` prints the result line; a binary killed by a signal counts as
   a failed test; a failed download no longer reports "downloaded".
