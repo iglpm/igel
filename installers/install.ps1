@@ -11,7 +11,7 @@
     irm https://runepm.com/install.ps1 | iex
 
 .EXAMPLE
-    & ([scriptblock]::Create((irm https://runepm.com/install.ps1))) -Version v2027.0.0 -To "C:\Tools\Rune"
+    & ([scriptblock]::Create((irm https://runepm.com/install.ps1))) -Version 2027.0 -To "C:\Tools\Rune"
 #>
 
 [CmdletBinding()]
@@ -98,6 +98,17 @@ switch -Regex ($rawArch) {
             default { Die "no prebuilt Rune for architecture: $rawArch" }
         }
     }
+}
+
+# `2027.0`, `v2027.0` and `v2027.0.0` all name release tag `v2027.0.0`.
+if ($Version -ne "latest") {
+    $v = $Version.TrimStart('v')
+    if ($v -notmatch '^\d+(\.\d+){0,2}$') {
+        Die "not a release version: $Version (e.g. 2027.0 or 2027.0.1)"
+    }
+    $parts = @($v.Split('.'))
+    while ($parts.Count -lt 3) { $parts += "0" }
+    $Version = "v" + ($parts -join '.')
 }
 
 $target = "$arch-$os"

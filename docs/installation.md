@@ -17,14 +17,18 @@ irm https://runepm.com/install.ps1 | iex
 The script downloads the release for your machine (Linux, macOS or Windows;
 x86_64 or aarch64), checks it against its published SHA-256 and installs
 `rune` to `~/.rune/bin`. It tells you how to add that directory to your `PATH`
-if it is not there yet.
+(for your shell) if it is not there yet. On Apple silicon it installs the
+native build even from a terminal running under Rosetta. The Linux builds
+need glibc: on musl-based systems such as Alpine, build Rune from source.
 
 Options, passed after `sh -s --`:
 
 ```bash
-curl -fsSL https://runepm.com/install.sh | sh -s -- --version v2027.0.0   # a given release
-curl -fsSL https://runepm.com/install.sh | sh -s -- --to ~/.local/bin  # another directory
+curl -fsSL https://runepm.com/install.sh | sh -s -- --version 2027.0       # a given release
+curl -fsSL https://runepm.com/install.sh | sh -s -- --to ~/.local/bin     # another directory
 ```
+
+`--version` takes `2027.0`, `2027.0.1` or the tag itself (`v2027.0.1`).
 
 The same through the environment: `RUNE_VERSION`, `RUNE_INSTALL_DIR`, and
 `RUNE_DOWNLOAD_BASE` for a mirror that holds the release files (an internal

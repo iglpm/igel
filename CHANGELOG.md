@@ -55,6 +55,11 @@ The first stable release. Changes since the 0.1.0 preview:
 - A crash (a bug in Rune) prints what happened and where to report it.
 - Rune compiles cleanly for Windows (two Unix-only assumptions); CI checks
   Windows and runs on pushes to `master`.
+- The install scripts take `--version 2027.0` (not only the full tag), say
+  what is wrong with a bad option, install the native build under Rosetta,
+  refuse musl-based Linux (the builds need glibc) with how to build from
+  source, show the `PATH` line for the user's shell, and replace a running
+  `rune` safely. The Intel macOS release builds on a supported runner image.
 - `rune self uninstall --purge` refuses to delete a `RUNE_HOME` that is the
   home directory, a file system root, or holds nothing of Rune's.
 - `rune self update` uses Rune's network settings (CA bundles, proxy) and no
