@@ -61,10 +61,10 @@ $ rune build
 - **Stable by default.** Test binaries run one at a time as with Cargo, so
   tests that share a port or a database don't fail at random. Opt into
   parallel binaries with `--test-jobs`.
-- **Built in:** retries with flaky-test detection, JUnit reports, cached test
-  results (`--cached`: 8 s → 0.26 s when nothing changed), nextest-style
-  scheduling of tests across binaries, and **code coverage** with
-  `rune coverage`.
+- **Built in:** timeouts for hung tests, retries with flaky-test detection,
+  JUnit reports, cached test results (`--cached`: 8 s → 0.26 s when nothing
+  changed), nextest-style scheduling of tests across binaries, and **code
+  coverage** with `rune coverage`.
 
 ### ☁️ Built for CI and teams
 

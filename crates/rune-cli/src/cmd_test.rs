@@ -298,6 +298,23 @@ pub fn run_with(args: TestArgs, mode: Mode, instrument: Option<&Instrument>) -> 
     // The build goes on meanwhile, so the next binary is ready when the
     // runner is. Split batches are one binary's tests, which libtest runs
     // in parallel anyway.
+    // `--timeout` / `test.timeout`: how long one test process may run.
+    let timeout: Option<Duration> = match &args.timeout {
+        Some(t) => {
+            let secs = rune_common::time::parse_duration(t).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "invalid --timeout `{t}`: expected a duration such as `90s` or `10m`"
+                )
+            })?;
+            (secs > 0).then(|| Duration::from_secs(secs))
+        }
+        None => sess
+            .ws
+            .config
+            .settings
+            .test_timeout()
+            .map(Duration::from_secs),
+    };
     let runner_count = args
         .test_jobs
         .or_else(|| sess.ws.config.settings.test_jobs())
@@ -384,6 +401,7 @@ pub fn run_with(args: TestArgs, mode: Mode, instrument: Option<&Instrument>) -> 
                                 &script,
                                 args_ref,
                                 &|line| progress.line(id, line),
+                                timeout,
                             );
                             progress.end(id);
                             TestResult { order, ..r }
@@ -454,13 +472,48 @@ pub fn run_with(args: TestArgs, mode: Mode, instrument: Option<&Instrument>) -> 
                             let t = Instant::now();
                             let id = process_ids.fetch_add(1, Ordering::Relaxed);
                             progress.begin(id, &labels[order]);
-                            let ran = run_streaming(&mut cmd, &|line| progress.line(id, line));
+                            let ran = run_streaming(
+                                &mut cmd,
+                                &|line| progress.line(id, line),
+                                timeout,
+                            );
                             progress.end(id);
                             match ran {
                                 Ok(out) => {
                                     let mut text = out.stdout;
                                     text.push_str(&out.stderr);
-                                    if let Some(why) = killed_by(&out.status) {
+                                    let mut unfinished: Vec<String> = Vec::new();
+                                    if out.timed_out {
+                                        if harness {
+                                            // Which tests never reported: the
+                                            // binary's list minus those done.
+                                            let mut list = sess.command_for(&exe);
+                                            list.args(libtest_args)
+                                                .args(["--list", "--format", "terse"])
+                                                .current_dir(&member.dir)
+                                                .stdin(Stdio::null());
+                                            apply_run_env(&mut list, member, sess);
+                                            let done: std::collections::HashSet<String> =
+                                                crate::test_report::parse_cases(&text)
+                                                    .into_iter()
+                                                    .map(|c| c.name)
+                                                    .collect();
+                                            if let Ok(listed) = run_streaming(
+                                                &mut list,
+                                                &|_| {},
+                                                Some(Duration::from_secs(30)),
+                                            ) {
+                                                unfinished = listed
+                                                    .stdout
+                                                    .lines()
+                                                    .filter_map(|l| l.strip_suffix(": test"))
+                                                    .filter(|n| !done.contains(*n))
+                                                    .map(str::to_string)
+                                                    .collect();
+                                            }
+                                        }
+                                        text.push_str(&timed_out_note(&text, timeout, &unfinished));
+                                    } else if let Some(why) = killed_by(&out.status) {
                                         // libtest never got to report: say
                                         // what ended it, as Cargo does.
                                         text.push_str(&format!(
@@ -469,6 +522,20 @@ pub fn run_with(args: TestArgs, mode: Mode, instrument: Option<&Instrument>) -> 
                                         ));
                                     }
                                     let mut counts = parse_counts(&text);
+                                    if out.timed_out {
+                                        // libtest never printed its summary:
+                                        // count what finished, and each test
+                                        // that did not as failed.
+                                        use crate::test_report::Status;
+                                        let cases = crate::test_report::parse_cases(&text);
+                                        let n = |s: Status| {
+                                            cases.iter().filter(|c| c.status == s).count() as u64
+                                        };
+                                        counts.passed = n(Status::Passed);
+                                        counts.ignored = n(Status::Ignored);
+                                        counts.failed =
+                                            n(Status::Failed) + unfinished.len().max(1) as u64;
+                                    }
                                     if let Some(b) = &batch {
                                         // Each batch reports the rest of the
                                         // binary as filtered out.
@@ -499,7 +566,8 @@ pub fn run_with(args: TestArgs, mode: Mode, instrument: Option<&Instrument>) -> 
                                                 .env("CARGO_TARGET_TMPDIR", &tmp)
                                                 .stdin(Stdio::null());
                                             apply_run_env(&mut again, member, sess);
-                                            let out = run_streaming(&mut again, &|_| {}).ok()?;
+                                            let out =
+                                                run_streaming(&mut again, &|_| {}, timeout).ok()?;
                                             let mut text = out.stdout;
                                             text.push_str(&out.stderr);
                                             Some(text)
@@ -973,6 +1041,44 @@ pub fn run_with(args: TestArgs, mode: Mode, instrument: Option<&Instrument>) -> 
     })
 }
 
+/// Why a test process that ran out of time has no result: how long it had,
+/// and how far its tests got.
+fn timed_out_note(output: &str, timeout: Option<Duration>, unfinished: &[String]) -> String {
+    let limit = timeout.map(ui::secs).unwrap_or_default();
+    let total: u64 = output
+        .lines()
+        .filter_map(|l| l.strip_prefix("running "))
+        .filter_map(|rest| rest.split_whitespace().next()?.parse::<u64>().ok())
+        .sum();
+    let done = output
+        .lines()
+        .filter(|l| l.starts_with("test ") && l.contains(" ... "))
+        .count();
+    let progress = if total > 0 {
+        format!(" ({done} of {total} tests had finished)")
+    } else {
+        String::new()
+    };
+    let mut note = format!(
+        "\nstopped after {limit}: the test binary ran longer than the timeout \
+         (`--timeout`, `test.timeout`){progress}\n"
+    );
+    if !unfinished.is_empty() {
+        let shown: Vec<&str> = unfinished.iter().take(10).map(String::as_str).collect();
+        let more = unfinished.len().saturating_sub(shown.len());
+        note.push_str(&format!(
+            "still running or not started: {}{}\n",
+            shown.join(", "),
+            if more > 0 {
+                format!(" and {more} more")
+            } else {
+                String::new()
+            }
+        ));
+    }
+    note
+}
+
 /// `signal 6 (SIGABRT)` when a process was killed by a signal.
 fn killed_by(status: &std::process::ExitStatus) -> Option<String> {
     #[cfg(unix)]
@@ -1008,14 +1114,21 @@ struct Captured {
     status: std::process::ExitStatus,
     stdout: String,
     stderr: String,
+    /// Stopped for running longer than the timeout.
+    timed_out: bool,
 }
 
 /// Runs `cmd` with its output captured, passing each line of its stdout to
 /// `on_line` as it is printed. Unlike `Command::output`, it returns soon
 /// after the process exits even when something the process started still
 /// holds the pipes open (a server a test did not stop): what arrives in the
-/// moment after the exit is kept, and the rest is not waited for.
-fn run_streaming(cmd: &mut Command, on_line: &dyn Fn(&str)) -> std::io::Result<Captured> {
+/// moment after the exit is kept, and the rest is not waited for. A process
+/// still running after `timeout` is killed.
+fn run_streaming(
+    cmd: &mut Command,
+    on_line: &dyn Fn(&str),
+    timeout: Option<Duration>,
+) -> std::io::Result<Captured> {
     use crossbeam_channel::RecvTimeoutError;
     use std::io::{BufRead, Read};
     enum Chunk {
@@ -1025,6 +1138,15 @@ fn run_streaming(cmd: &mut Command, on_line: &dyn Fn(&str)) -> std::io::Result<C
     }
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = spawn_retrying(cmd)?;
+    let started = Instant::now();
+    let mut timed_out = false;
+    // Kills the process once it has had its time.
+    let mut enforce = |child: &mut std::process::Child| {
+        if !timed_out && timeout.is_some_and(|t| started.elapsed() >= t) {
+            timed_out = true;
+            let _ = child.kill();
+        }
+    };
     let (tx, rx) = unbounded::<Chunk>();
     if let Some(out) = child.stdout.take() {
         let tx = tx.clone();
@@ -1093,6 +1215,8 @@ fn run_streaming(cmd: &mut Command, on_line: &dyn Fn(&str)) -> std::io::Result<C
             None => {
                 if let Some(status) = child.try_wait()? {
                     exited = Some((status, Instant::now()));
+                } else {
+                    enforce(&mut child);
                 }
             }
             // Something the test started keeps printing: enough.
@@ -1100,14 +1224,22 @@ fn run_streaming(cmd: &mut Command, on_line: &dyn Fn(&str)) -> std::io::Result<C
             Some(_) => {}
         }
     }
+    // (It closed its output but runs on.)
     let status = match exited {
         Some((status, _)) => status,
-        None => child.wait()?,
+        None => loop {
+            if let Some(status) = child.try_wait()? {
+                break status;
+            }
+            enforce(&mut child);
+            std::thread::sleep(Duration::from_millis(50));
+        },
     };
     Ok(Captured {
         status,
         stdout: String::from_utf8_lossy(&out).into_owned(),
         stderr: String::from_utf8_lossy(&err).into_owned(),
+        timed_out,
     })
 }
 
@@ -1222,7 +1354,7 @@ fn split_into_batches(
             .current_dir(&m.dir)
             .stdin(Stdio::null());
         apply_run_env(&mut cmd, m, sess);
-        let out = run_streaming(&mut cmd, &|_| {})
+        let out = run_streaming(&mut cmd, &|_| {}, None)
             .ok()
             .filter(|o| o.status.success())?;
         Some(
@@ -1617,6 +1749,7 @@ fn run_doctest(
     script: &DocScript,
     args: &TestArgs,
     on_line: &dyn Fn(&str),
+    timeout: Option<Duration>,
 ) -> TestResult {
     let start = Instant::now();
     let member = &sess.ws.members[doc.member];
@@ -1676,10 +1809,13 @@ fn run_doctest(
     cmd.envs(script.env.iter().map(|(k, v)| (k, v)));
     cmd.stdin(Stdio::null());
 
-    match run_streaming(&mut cmd, on_line) {
+    match run_streaming(&mut cmd, on_line, timeout) {
         Ok(out) => {
             let mut text = out.stdout;
             text.push_str(&out.stderr);
+            if out.timed_out {
+                text.push_str(&timed_out_note(&text, timeout, &[]));
+            }
             let counts = parse_counts(&text);
             TestResult {
                 order: 0,

@@ -31,6 +31,15 @@ as soon as it is in; a failure shows while the rest still runs.
   built before its tests run (`CARGO_BIN_EXE_<name>` works), as with Cargo.
 - **Leftover processes don't hang the run.** A test that starts a server and
   forgets it no longer keeps `rune test` waiting once the test binary exits.
+- **A hung test can't hang CI.** With `--timeout 10m` (or `test.timeout`), a
+  test binary that runs longer is stopped and reported as failed, with the
+  tests that had not finished named:
+
+  ```text
+  ✗ FAILED app (test api) · 600.00s
+  stopped after 600.00s: the test binary ran longer than the timeout (`--timeout`, `test.timeout`) (41 of 42 tests had finished)
+  still running or not started: upload_resumes_after_disconnect
+  ```
 - **The environment is Cargo's**: `CARGO`, `CARGO_MANIFEST_DIR`,
   `CARGO_MANIFEST_PATH`, every `CARGO_PKG_*`, `CARGO_TARGET_TMPDIR`, and the
   library paths of build scripts' native libraries.
@@ -41,6 +50,7 @@ rune test parse -- --nocapture     # a filter, and arguments for the test binari
 rune test --no-fail-fast           # run every binary even after a failure
 rune test --retries 2              # re-run failed tests; ones that pass are reported as flaky
 rune test --junit report.xml       # a JUnit report for CI
+rune test --timeout 10m            # stop a test binary that hangs
 rune test --message-format json    # one `test-suite-finished` line per binary
 rune test --schedule tests         # split binaries into batches spread over every core
 rune bench                         # benchmarks, one binary at a time

@@ -20,6 +20,9 @@ All notable changes to Rune are recorded here. The format follows
   so far (counted as they finish), and what is running with its progress and
   time. `rune coverage` shows its merge and report steps.
 - `rune test --test-jobs N` / `test.jobs`: how many test binaries run at once.
+- `rune test --timeout 10m` / `test.timeout`: a test binary that runs longer
+  is stopped and reported as failed, naming the tests that had not finished,
+  so a hung test cannot hang a CI job.
 - Tests get `CARGO`, `CARGO_MANIFEST_PATH` and every `CARGO_PKG_*` variable at
   run time, as Cargo sets them.
 

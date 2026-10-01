@@ -39,6 +39,7 @@ rune config unset build.release-rebuild-all
 | `test.doctests` | `true` | Run documentation tests in `rune test`. |
 | `test.cache` | `false` | Same as `rune test --cached`: remember passing test binaries (see [testing](testing.md#cached-test-results)). |
 | `test.jobs` | `1` | How many test binaries (and doc-test runs) run at once; same as `rune test --test-jobs N`. More is faster, but tests in different binaries that share a port, a file or a database then fail now and then, which is why Cargo runs one at a time too. The build goes on meanwhile either way. |
+| `test.timeout` | `0` | Stop a test binary (or doc-test run) that runs longer than this (`90s`, `10m`) and report it as failed, naming the tests that had not finished; same as `rune test --timeout`. `0`: no limit, as with Cargo. |
 | `test.schedule` | `binaries` | `tests` (or `rune test --schedule tests`): each test binary's tests are split into batches, each its own process, scheduled across all binaries at once (like cargo-nextest). Tests then no longer share a process. |
 
 Each key maps to an environment variable, e.g. `RUNE_BUILD_RELEASE_REBUILD_ALL=1`.

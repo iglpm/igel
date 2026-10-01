@@ -6692,3 +6692,39 @@ fn a_target_directory_or_store_inside_the_package_is_not_its_source() {
     let out = rune_with_env(&p, &["build"], &[("RUNE_HOME", home.as_os_str())]);
     assert!(text(&out).contains("0 compiled"), "{}", text(&out));
 }
+
+#[test]
+fn a_hung_test_is_stopped_by_the_timeout_and_named() {
+    let p = Project::new();
+    p.write(
+        "Cargo.toml",
+        "[package]\nname = \"hang\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    p.write("src/lib.rs", "");
+    p.write(
+        "tests/h.rs",
+        "#[test]\nfn quick() {}\n#[test]\nfn hangs() { std::thread::sleep(std::time::Duration::from_secs(120)); }\n",
+    );
+    let start = std::time::Instant::now();
+    let out = p.rune(&["test", "--timeout", "2s"]);
+    let all = text(&out);
+    assert_eq!(out.status.code(), Some(101), "{all}");
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(60),
+        "{all}"
+    );
+    assert!(all.contains("ran longer than the timeout"), "{all}");
+    assert!(all.contains("still running or not started: hangs"), "{all}");
+    assert!(all.contains("1 passed · 1 failed"), "{all}");
+
+    // The same from the setting; a bad duration is an error, not "no limit".
+    p.ok(&["config", "set", "test.timeout", "2s"]);
+    let out = p.rune(&["test"]);
+    assert_eq!(out.status.code(), Some(101), "{}", text(&out));
+    let out = p.rune(&["test", "--timeout", "soon"]);
+    assert!(
+        text(&out).contains("invalid --timeout `soon`"),
+        "{}",
+        text(&out)
+    );
+}
