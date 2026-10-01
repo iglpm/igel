@@ -295,6 +295,12 @@ impl Workspace {
                     Some(i) => out.push(i),
                     None => {
                         let known: Vec<_> = self.members.iter().map(|m| m.name.as_str()).collect();
+                        if let Some(near) = crate::cmd_deps::closest(name, known.iter().copied()) {
+                            bail!(
+                                "package ID specification `{spec}` did not match any packages in \
+                                 this workspace; did you mean `{near}`?"
+                            );
+                        }
                         bail!(
                             "package ID specification `{spec}` did not match any packages in this \
                              workspace (members: {})",

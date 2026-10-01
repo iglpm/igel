@@ -1065,6 +1065,15 @@ pub fn run_with(args: TestArgs, mode: Mode, instrument: Option<&Instrument>) -> 
         },
         elapsed
     ));
+    if let Some(filter) = &args.filter
+        && counts_total.passed + counts_total.failed + counts_total.ignored == 0
+        && binaries_run > 0
+    {
+        ui::hint(format!(
+            "no test matched `{filter}` ({} filtered out); `rune test -- --list` lists them",
+            counts_total.filtered
+        ));
+    }
     Ok(RunOutcome {
         failed: false,
         executables,
