@@ -1,3 +1,6 @@
 target/
 /.rune/
 /Rune.lock.bin
+
+# rune-bench output
+rune-bench-results/

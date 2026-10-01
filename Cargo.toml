@@ -11,6 +11,7 @@ members = [
     "crates/rune-registry",
     "crates/rune-resolver",
     "crates/rune-cli",
+    "bench",
 ]
 
 [workspace.package]

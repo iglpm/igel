@@ -490,28 +490,32 @@ impl BuildExecutor {
         // whether those dependencies were restored or will be rebuilt.
         if let Some(cas) = self.cas.as_ref().filter(|_| !self.force_rebuild) {
             let _timer = rune_common::timing::phase("cas restore");
-            let restored: Vec<(NodeId, Vec<PathBuf>)> = topo
-                .par_iter()
-                .filter_map(|&id| {
-                    let unit = &graph.node(id).unit;
-                    let key = &unit_cas_keys[&id];
-                    // Another `rune` sharing this target directory may be
-                    // compiling a unit with the same output files right now
-                    // (the same crate built with other flags, as `rune
-                    // coverage` does): putting the store's read-only copy in
-                    // place under its compiler fails that build. Such a unit
-                    // is left to the scheduler, which waits its turn and
-                    // then restores it.
-                    let path = unit_lock_path(&self.config, &self.profile, graph, id);
-                    let rune_common::fsutil::TryLock::Locked(_lock) =
-                        rune_common::fsutil::FileLock::try_exclusive(&path)
-                    else {
-                        return None;
-                    };
-                    let linked = cas.link_to(key, &self.out_dir_for(unit)).ok()?;
-                    (!linked.is_empty()).then_some((id, linked))
-                })
-                .collect();
+            let restore = |&id: &NodeId| -> Option<(NodeId, Vec<PathBuf>)> {
+                let unit = &graph.node(id).unit;
+                let key = &unit_cas_keys[&id];
+                // Another `rune` sharing this target directory may be
+                // compiling a unit with the same output files right now
+                // (the same crate built with other flags, as `rune
+                // coverage` does): putting the store's read-only copy in
+                // place under its compiler fails that build. Such a unit
+                // is left to the scheduler, which waits its turn and
+                // then restores it.
+                let path = unit_lock_path(&self.config, &self.profile, graph, id);
+                let rune_common::fsutil::TryLock::Locked(_lock) =
+                    rune_common::fsutil::FileLock::try_exclusive(&path)
+                else {
+                    return None;
+                };
+                let linked = cas.link_to(key, &self.out_dir_for(unit)).ok()?;
+                (!linked.is_empty()).then_some((id, linked))
+            };
+            // In parallel only where it pays: a small graph's restores are
+            // quicker than starting (and spinning down) a thread pool.
+            let restored: Vec<(NodeId, Vec<PathBuf>)> = if topo.len() < 48 {
+                topo.iter().filter_map(restore).collect()
+            } else {
+                topo.par_iter().filter_map(restore).collect()
+            };
 
             for (id, linked) in restored {
                 let unit = &graph.node(id).unit;
@@ -2595,13 +2599,15 @@ impl Timings {
             .into_iter()
             .filter(|d| !self.source_bytes.contains_key(d))
             .collect();
-        let sizes: Vec<(PathBuf, u64)> = todo
-            .into_par_iter()
-            .map(|d| {
-                let bytes = rust_source_bytes(&d);
-                (d, bytes)
-            })
-            .collect();
+        let measure = |d: PathBuf| {
+            let bytes = rust_source_bytes(&d);
+            (d, bytes)
+        };
+        let sizes: Vec<(PathBuf, u64)> = if todo.len() < 8 {
+            todo.into_iter().map(measure).collect()
+        } else {
+            todo.into_par_iter().map(measure).collect()
+        };
         self.source_bytes.extend(sizes);
     }
 

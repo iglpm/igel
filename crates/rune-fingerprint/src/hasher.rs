@@ -219,38 +219,42 @@ fn hash_files(
     // Stat + (if changed) hash every file in parallel. `cache` is only read
     // here; results are folded back in sequentially below.
     let cache_ref: &FingerprintCache = cache;
-    let hashed: Vec<FileEntry> = files
-        .into_par_iter()
-        .map(|path| {
-            let (mtime, size) = std::fs::metadata(&path)
-                .ok()
-                .map(|m| {
-                    let mtime = m
-                        .modified()
-                        .ok()
-                        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                        .map(|d| d.as_nanos() as u64)
-                        .unwrap_or(0);
-                    (mtime, m.len())
-                })
-                .unwrap_or((0, 0));
+    let one = |path: PathBuf| {
+        let (mtime, size) = std::fs::metadata(&path)
+            .ok()
+            .map(|m| {
+                let mtime = m
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                    .map(|d| d.as_nanos() as u64)
+                    .unwrap_or(0);
+                (mtime, m.len())
+            })
+            .unwrap_or((0, 0));
 
-            let cached = cache_ref
-                .files
-                .get(&path)
-                .filter(|c| mtime != 0 && c.mtime == mtime && c.size == size);
-            let hash = match cached {
-                Some(c) => c.hash,
-                None => xxhash3_file(&path).unwrap_or(0),
-            };
-            FileEntry {
-                path,
-                mtime,
-                size,
-                hash,
-            }
-        })
-        .collect();
+        let cached = cache_ref
+            .files
+            .get(&path)
+            .filter(|c| mtime != 0 && c.mtime == mtime && c.size == size);
+        let hash = match cached {
+            Some(c) => c.hash,
+            None => xxhash3_file(&path).unwrap_or(0),
+        };
+        FileEntry {
+            path,
+            mtime,
+            size,
+            hash,
+        }
+    };
+    // A thread pool costs more than it saves on a small package (and its
+    // idle workers spin, making a quick command's time erratic).
+    let hashed: Vec<FileEntry> = if files.len() < 64 {
+        files.into_iter().map(one).collect()
+    } else {
+        files.into_par_iter().map(one).collect()
+    };
 
     let mut hb = HashBuilder::new();
     for entry in hashed {

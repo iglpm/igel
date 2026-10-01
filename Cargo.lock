@@ -1241,6 +1241,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "rune-bench"
+version = "2027.0.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "libc",
+ "serde",
+ "serde_json",
+ "walkdir",
+]
+
+[[package]]
 name = "rune-cas"
 version = "2027.0.0"
 dependencies = [

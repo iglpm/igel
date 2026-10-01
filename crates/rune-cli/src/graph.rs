@@ -2516,10 +2516,12 @@ pub fn plan(ws: &Workspace, req: &Request) -> Result<Plan> {
     drop(dl_timer);
 
     let manifest_timer = phase("read manifests");
-    let manifests: Vec<Option<Manifest>> = extracted_paths
-        .par_iter()
-        .map(|dir| Manifest::from_path(&dir.join("Cargo.toml")).ok())
-        .collect();
+    let read = |dir: &PathBuf| Manifest::from_path(&dir.join("Cargo.toml")).ok();
+    let manifests: Vec<Option<Manifest>> = if extracted_paths.len() < 16 {
+        extracted_paths.iter().map(read).collect()
+    } else {
+        extracted_paths.par_iter().map(read).collect()
+    };
     drop(manifest_timer);
     let mut reg: HashMap<usize, (PathBuf, Manifest)> = HashMap::new();
     for ((&p, dir), manifest) in needed.iter().zip(&extracted_paths).zip(manifests) {
