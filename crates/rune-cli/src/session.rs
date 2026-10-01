@@ -61,6 +61,9 @@ impl Session {
         let json = crate::messages::wants_json(&common.message_format);
         crate::ui::set_quiet(common.quiet);
         let mut ws = Workspace::load(common.manifest_path.as_deref())?;
+        if let Some(why) = rune_common::toolchain::global().unusable_reason() {
+            bail!(why);
+        }
         if ws.config.settings.low_priority() {
             rune_common::sysinfo::lower_priority();
         }
@@ -215,6 +218,50 @@ impl Session {
         executor
     }
 
+    /// Says so before building when the disk the build writes to is nearly
+    /// full: compilers and linkers that run out of space fail in confusing
+    /// ways (a linker can die with a bus error).
+    pub fn warn_if_disk_is_low(&self) {
+        const LOW: u64 = 1 << 30;
+        let config = self.config();
+        for dir in [&config.target_dir, &config.cas_dir] {
+            if let Some(free) = rune_common::sysinfo::disk_available(dir)
+                && free < LOW
+            {
+                ui::warn(format!(
+                    "only {} free on the disk holding {}: the build may fail for lack of space \
+                     (`rune cas gc --max-size 5GB` shrinks the store, `rune clean` removes \
+                     build output)",
+                    ui::bytes(free),
+                    dir.display()
+                ));
+                return;
+            }
+        }
+    }
+
+    /// A compiler that runs out of disk space rarely says so (rustc and the
+    /// linker crash with a bus error): when a build failed and the disk is
+    /// full, name that as the likely cause.
+    fn explain_failure_by_disk(&self, failures: &[(String, String)]) {
+        const NEARLY_FULL: u64 = 64 << 20;
+        let dir = &self.config().target_dir;
+        let said_so = failures
+            .iter()
+            .any(|(_, e)| e.contains("No space left on device") || e.contains("os error 28"));
+        let free = rune_common::sysinfo::disk_available(dir);
+        if said_so || free.is_some_and(|f| f < NEARLY_FULL) {
+            ui::hint(format!(
+                "the disk holding {} is full{}: that is the likely cause. \
+                 `rune cas gc --max-size 5GB` shrinks the store, `rune clean` removes build \
+                 output",
+                dir.display(),
+                free.map(|f| format!(" ({} free)", ui::bytes(f)))
+                    .unwrap_or_default()
+            ));
+        }
+    }
+
     /// Evicts old CAS entries if `cas.max-size` is set and exceeded, and —
     /// at most once a day — starts `rune cas gc --max-age` in the background
     /// for entries unused for `cas.max-age`.
@@ -361,6 +408,7 @@ pub fn drive(
     graph: &BuildGraph,
     mut on_event: impl FnMut(&PipelineEvent),
 ) -> Result<(BuildResult, Vec<(String, String)>)> {
+    sess.warn_if_disk_is_low();
     let executor = sess.executor();
     let event_rx = executor.event_receiver();
     let mut failures: Vec<(String, String)> = Vec::new();
@@ -464,6 +512,9 @@ pub fn drive(
             ui::err(error.trim_end());
             ui::err("");
         }
+    }
+    if !failures.is_empty() {
+        sess.explain_failure_by_disk(&failures);
     }
     *FAILED.lock().unwrap_or_else(|e| e.into_inner()) =
         failures.iter().map(|(c, _)| c.clone()).collect();
