@@ -45,6 +45,9 @@ pub struct Session {
     pub run_env: Vec<(String, String)>,
     /// `build.sandbox`, checked to work here.
     pub sandbox: Option<rune_scheduler::executor::SandboxPolicy>,
+    /// Seconds of work that follow a unit's build (see
+    /// `BuildExecutor::with_extra_costs`).
+    pub extra_costs: std::collections::HashMap<rune_graph::NodeId, f64>,
 }
 
 impl Session {
@@ -148,6 +151,7 @@ impl Session {
             native_dirs: Default::default(),
             run_env: Vec::new(),
             sandbox,
+            extra_costs: Default::default(),
         })
     }
 
@@ -204,6 +208,9 @@ impl Session {
         }
         if let Some(policy) = &self.sandbox {
             executor = executor.with_sandbox(policy.clone());
+        }
+        if !self.extra_costs.is_empty() {
+            executor = executor.with_extra_costs(self.extra_costs.clone());
         }
         executor
     }

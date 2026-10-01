@@ -305,6 +305,35 @@ pub fn run_with(args: TestArgs, mode: Mode, instrument: Option<&Instrument>) -> 
         .clamp(1, 64);
     let progress = crate::test_progress::TestProgress::new(total_slots, !sess.quiet && !sess.json);
     let process_ids = std::sync::atomic::AtomicUsize::new(0);
+    // How long each binary ran last time: the scheduler builds the ones the
+    // run will wait longest on first (and the programs their package's tests
+    // wait for), so they start while the rest still compiles.
+    let times_path = sess.config().fingerprint_dir.join("test-times.json");
+    let mut run_times: HashMap<String, f64> = std::fs::read_to_string(&times_path)
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default();
+    if !args.no_run {
+        let mut costs: HashMap<NodeId, f64> = HashMap::new();
+        for r in &runnables {
+            let Some(&secs) = run_times.get(&r.label) else {
+                continue;
+            };
+            let mut add = |node: NodeId| {
+                let c = costs.entry(node).or_default();
+                *c = c.max(secs);
+            };
+            add(r.exe_dir_key);
+            for c in plan.requested.iter().filter(|c| {
+                c.member == r.member
+                    && !is_runnable(c, bench)
+                    && matches!(c.kind, TargetKind::Example | TargetKind::Bin)
+            }) {
+                add(c.node);
+            }
+        }
+        sess.extra_costs = costs;
+    }
     let parts_of: std::sync::Mutex<HashMap<usize, usize>> = Default::default();
     let executables: std::cell::RefCell<Vec<PathBuf>> = Default::default();
     let build_result = std::thread::scope(|scope| -> Result<_> {
@@ -862,6 +891,15 @@ pub fn run_with(args: TestArgs, mode: Mode, instrument: Option<&Instrument>) -> 
     executables.dedup();
 
     let elapsed = start.elapsed().as_secs_f64();
+    // Remembered for the next run's scheduling (cached results ran nothing).
+    let mut learned = false;
+    for suite in report_suites.iter().filter(|s| s.seconds > 0.0) {
+        run_times.insert(suite.name.clone(), suite.seconds);
+        learned = true;
+    }
+    if learned && let Ok(text) = serde_json::to_string(&run_times) {
+        let _ = rune_common::fsutil::write_atomic(&times_path, text.as_bytes());
+    }
     if let Some(path) = &args.junit {
         std::fs::write(path, crate::test_report::junit(&report_suites))
             .map_err(|e| anyhow::anyhow!("cannot write {}: {e}", path.display()))?;

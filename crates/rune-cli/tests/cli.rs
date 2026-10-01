@@ -39,11 +39,45 @@ struct Project {
     home_dir: tempfile::TempDir,
 }
 
+/// What `rune` learned about the compiler (`rustc -vV`, the sysroot, the
+/// host's cfg), asked once for the whole suite: every project starts with a
+/// fresh `RUNE_HOME`, and asking again in each cost a few compiler starts per
+/// test.
+fn compiler_probes() -> Option<&'static [u8]> {
+    static PROBES: std::sync::OnceLock<Option<Vec<u8>>> = std::sync::OnceLock::new();
+    PROBES
+        .get_or_init(|| {
+            let home = tempfile::tempdir().ok()?;
+            let project = tempfile::tempdir().ok()?;
+            std::fs::write(
+                project.path().join("Cargo.toml"),
+                "[package]\nname = \"probe\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+            )
+            .ok()?;
+            std::fs::create_dir_all(project.path().join("src")).ok()?;
+            std::fs::write(project.path().join("src/lib.rs"), "").ok()?;
+            rune_command()
+                .arg("check")
+                .current_dir(project.path())
+                .env("RUNE_HOME", home.path())
+                .output()
+                .ok()?;
+            std::fs::read(home.path().join("cache/toolchains.json")).ok()
+        })
+        .as_deref()
+}
+
 impl Project {
     fn new() -> Self {
+        let home_dir = tempfile::tempdir().unwrap();
+        if let Some(probes) = compiler_probes() {
+            let cache = home_dir.path().join("cache");
+            std::fs::create_dir_all(&cache).unwrap();
+            std::fs::write(cache.join("toolchains.json"), probes).unwrap();
+        }
         Self {
             dir: tempfile::tempdir().unwrap(),
-            home_dir: tempfile::tempdir().unwrap(),
+            home_dir,
         }
     }
 
