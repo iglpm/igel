@@ -107,7 +107,7 @@ struct RunArgs {
     /// Runs of each cheap scenario (default: 5 quick, 15 full)
     #[arg(long)]
     runs: Option<usize>,
-    /// Runs of each expensive scenario — builds from scratch (default: 2 quick, 5 full)
+    /// Runs of each expensive scenario — builds from scratch (default: 3 quick, 5 full)
     #[arg(long)]
     runs_heavy: Option<usize>,
     /// Unrecorded runs before each cheap scenario
@@ -264,7 +264,7 @@ fn run(a: RunArgs) -> Result<()> {
         .unwrap_or_else(|| PathBuf::from("rune-bench-results").join(timestamp()));
     std::fs::create_dir_all(&out)?;
     let cfg = runner::Config {
-        runs_heavy: a.runs_heavy.unwrap_or(if full { 5 } else { 2 }).max(1),
+        runs_heavy: a.runs_heavy.unwrap_or(if full { 5 } else { 3 }).max(1),
         runs_light: a.runs.unwrap_or(if full { 15 } else { 5 }).max(1),
         warmup: a.warmup.unwrap_or(if full { 2 } else { 1 }),
         timeout: Duration::from_secs(a.timeout),

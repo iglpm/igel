@@ -41,6 +41,13 @@ $ rune build
 | Full build from scratch | **112.5 s** | 122.8 s |
 | Fresh machine, shared cache | **0.65 s** | full rebuild |
 
+On a generated 25-crate workspace, [`rune-bench`](bench/README.md) measures a
+fresh checkout at **39×** Cargo's speed, switching back to a branch at **15×**,
+running the tests at **7×**, and Rune **2.6× faster** overall across 32
+measurements (cold builds and rebuilds after an edit are on par: both run the
+same compiler). Run it on your own project:
+`rune-bench run --project path/to/it`.
+
 - **Nothing is compiled twice.** Every crate is stored under a key that
   describes everything that went into it — compiler, flags, features,
   dependencies, the environment it read. Same inputs, same artifact, from any

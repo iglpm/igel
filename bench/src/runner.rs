@@ -212,6 +212,7 @@ fn print_line(results: &Results, workload: &str, s: &Scenario) {
             Some(cmp) if r.unit == "bytes" => {
                 format!("{:.1}× the disk", 1.0 / cmp.speedup)
             }
+            Some(cmp) if cmp.within_noise => "about the same (within noise)".to_string(),
             Some(cmp) => stats::describe(cmp.speedup),
             None => String::new(),
         },

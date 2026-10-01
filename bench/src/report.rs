@@ -31,7 +31,9 @@ fn spread(m: &Measurement) -> String {
 /// `3.2× faster` / `1.5× less disk`, from Rune's point of view.
 fn verdict(rune: &Measurement, cargo: &Measurement) -> Option<(f64, String)> {
     let c = stats::compare(&rune.summary, &cargo.summary)?;
-    let text = if rune.unit == "bytes" {
+    let text = if c.within_noise && rune.unit != "bytes" {
+        "about the same (within noise)".to_string()
+    } else if rune.unit == "bytes" {
         if c.speedup >= 1.0 {
             format!("{:.1}× less disk", c.speedup)
         } else {

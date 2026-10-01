@@ -218,7 +218,7 @@ pub fn all() -> Vec<Scenario> {
             title: "build after editing the core crate",
             about: "A change at the bottom of the graph: everything above it rebuilds.",
             kind: Kind::Time,
-            heavy: true,
+            heavy: false,
             full_only: false,
             needs: Needs::CoreEdit,
             args: &["build"],

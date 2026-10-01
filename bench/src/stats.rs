@@ -59,15 +59,22 @@ impl Summary {
 pub struct Comparison {
     pub speedup: f64,
     pub decisive: bool,
+    /// The runs overlap and the difference is within their own spread:
+    /// call it a tie rather than name a winner.
+    pub within_noise: bool,
 }
 
 pub fn compare(rune: &Summary, cargo: &Summary) -> Option<Comparison> {
     if rune.n == 0 || cargo.n == 0 || rune.median <= 0.0 {
         return None;
     }
+    let speedup = cargo.median / rune.median;
+    let decisive = rune.max < cargo.min || cargo.max < rune.min;
+    let spread = rune.cv().max(cargo.cv());
     Some(Comparison {
-        speedup: cargo.median / rune.median,
-        decisive: rune.max < cargo.min || cargo.max < rune.min,
+        speedup,
+        decisive,
+        within_noise: !decisive && rune.n > 1 && cargo.n > 1 && (speedup.ln().abs() <= spread),
     })
 }
 
@@ -129,8 +136,12 @@ mod tests {
         let rune = Summary::of(&[1.0, 1.1]);
         let cargo = Summary::of(&[3.0, 3.3]);
         let c = compare(&rune, &cargo).unwrap();
-        assert!(c.decisive);
+        assert!(c.decisive && !c.within_noise);
         assert_eq!(describe(c.speedup), "3.0× faster");
+        // Overlapping, noisy runs a little apart are a tie.
+        let a = Summary::of(&[1.0, 1.4, 0.8]);
+        let b = Summary::of(&[1.1, 0.9, 1.3]);
+        assert!(compare(&a, &b).unwrap().within_noise);
         assert_eq!(describe(0.5), "2.0× slower");
         assert_eq!(describe(1.01), "about the same");
         assert_eq!(seconds(0.0123), "12 ms");
