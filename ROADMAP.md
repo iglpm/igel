@@ -1401,8 +1401,21 @@ making quick commands erratic (sequential below a threshold now). Writing a
 file into a package — a log, notes, a new integration test — rebuilt the
 package's library and everything above it, because a local crate was keyed
 by every file of its package: 21 of 26 crates for a new file in the bottom
-crate of the medium workspace, where Cargo rebuilds nothing. Crates without
-a build script are now keyed by the files rustc read for them (§ caching).
+crate of the medium workspace, where Cargo rebuilds nothing. Crates are now
+keyed by the files rustc read for them, plus their build script's result
+(docs/caching.md); in Rune's own workspace, editing `rune-cli`'s
+integration tests no longer rebuilds the `rune` binary.
+
+**What dogfooding found.** A Windows smoke script run on Linux exposed the
+key problem above (it wrote its logs into the package). Building Rune with
+Rune after a `cargo update` on master downgraded `xxhash-rust` in
+`Cargo.lock`: a locked release newer than the cached sparse index was
+re-resolved instead of fetched (fixed: the index is refreshed; offline, an
+error). `rune watch -x "test --junit report.xml"` restarted itself forever
+(git-ignored files no longer count), and a test of that change found that
+writing to a child process that exited killed Rune silently with SIGPIPE
+(`rune login` with a failing credential helper; fixed). Cross-target clippy
+found `rune-bench` did not compile for Windows.
 
 **Also.** `rune test --failed` re-runs only the tests that failed; mistyped
 commands get a "did you mean"; the install scripts take `--version 2027.0`,
