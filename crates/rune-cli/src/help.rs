@@ -58,6 +58,7 @@ const ALL: &[(&str, &[&str])] = &[
             "script",
             "version",
             "completions",
+            "self",
         ],
     ),
     (
@@ -123,6 +124,7 @@ fn short(name: &str) -> Option<&'static str> {
         "script" => "Run a single-file Rust script",
         "version" => "Show version information",
         "completions" => "Print a shell completion script",
+        "self" => "Manage Rune itself (self-update)",
         "rustc" => "Build, passing extra flags to rustc",
         "rustdoc" => "Document, passing extra flags to rustdoc",
         "metadata" => "Workspace and dependency metadata as JSON",

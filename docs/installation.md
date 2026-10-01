@@ -2,14 +2,22 @@
 
 ## The install script
 
+Linux and macOS:
+
 ```bash
 curl -fsSL https://runepm.com/install.sh | sh
 ```
 
-The script downloads the release for your machine (Linux or macOS, x86_64 or
-aarch64), checks it against its published SHA-256 and installs `rune` to
-`~/.rune/bin`. It tells you how to add that directory to your `PATH` if it is
-not there yet.
+Windows (PowerShell):
+
+```powershell
+irm https://runepm.com/install.ps1 | iex
+```
+
+The script downloads the release for your machine (Linux, macOS or Windows;
+x86_64 or aarch64), checks it against its published SHA-256 and installs
+`rune` to `~/.rune/bin`. It tells you how to add that directory to your `PATH`
+if it is not there yet.
 
 Options, passed after `sh -s --`:
 
@@ -61,8 +69,23 @@ git dependencies. `rune coverage` adds the `llvm-tools` component on first use.
 `RUNE_HOME` moves everything under `~/.rune` elsewhere. The store cleans
 itself up (see [caching](caching.md#keeping-the-store-small)).
 
+## Updating
+
+```bash
+rune self update            # to the latest release
+rune self update --check    # only say whether there is a newer one
+rune self update --version v0.2.0
+```
+
 ## Uninstalling
 
-Delete the binary and, if you like, `~/.rune` (or `$RUNE_HOME`). Projects keep
-working with Cargo: Rune writes a Cargo-format `Cargo.lock` and changes
-nothing else in your manifests.
+```bash
+rune self uninstall              # the binary
+rune self uninstall --purge      # and ~/.rune: the store, caches and settings
+curl -fsSL https://runepm.com/uninstall.sh | sh            # without Rune itself
+irm https://runepm.com/uninstall.ps1 | iex                  # Windows
+```
+
+Projects keep working with Cargo: Rune writes a Cargo-format `Cargo.lock` and
+changes nothing else in your manifests (delete a project's `.rune/` directory
+to drop its build output).

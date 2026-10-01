@@ -95,13 +95,21 @@ build down), build **timelines**, dependency graphs, `install`, `publish`,
 
 ## Install
 
+**Linux and macOS**
+
 ```bash
 curl -fsSL https://runepm.com/install.sh | sh
 ```
 
-Linux and macOS, x86_64 and Apple Silicon. The script verifies the download's
-checksum and installs `rune` to `~/.rune/bin`. You need a Rust toolchain
-(`rustup`). Other ways to install, and shell completions:
+**Windows** (PowerShell)
+
+```powershell
+irm https://runepm.com/install.ps1 | iex
+```
+
+The installer verifies the download's checksum and puts `rune` in
+`~/.rune/bin`. You need a Rust toolchain (`rustup`). Stay current with
+`rune self update`; other ways to install, shell completions and uninstalling:
 [docs/installation.md](docs/installation.md).
 
 ## Get started
@@ -148,8 +156,8 @@ pass under Rune as they do under Cargo. See
 
 ## Status
 
-Rune is young: Linux and macOS are supported, Windows not yet. It is
-developed against Cargo's behaviour, with ~480 automated tests and a corpus
+Rune is young. Linux and macOS are its home; Windows builds are new and less
+tested. It is developed against Cargo's behaviour, with ~480 automated tests and a corpus
 of real crates whose own test suites must pass under Rune as under Cargo. See
 the [roadmap](ROADMAP.md) and the [changelog](CHANGELOG.md).
 

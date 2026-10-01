@@ -24,6 +24,8 @@ jobs:
             os: macos-13
           - target: aarch64-apple-darwin
             os: macos-14
+          - target: x86_64-pc-windows-msvc
+            os: windows-2022
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -42,8 +44,12 @@ jobs:
         run: |
           name=rune-${{ matrix.target }}
           mkdir "$name"
-          cp target/${{ matrix.target }}/release/rune README.md LICENSE-MIT.md LICENSE-APACHE.md "$name/"
-          "$name/rune" --version
+          bin="rune"
+          if [ -f "target/${{ matrix.target }}/release/rune.exe" ]; then
+            bin="rune.exe"
+          fi
+          cp "target/${{ matrix.target }}/release/$bin" README.md LICENSE-MIT.md LICENSE-APACHE.md "$name/"
+          "$name/$bin" --version
           tar -czf "$name.tar.gz" "$name"
           if command -v sha256sum >/dev/null; then
             sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
