@@ -1491,6 +1491,22 @@ fn similar_crates(index_url: &str, name: &str) -> Vec<String> {
     close.into_iter().take(3).map(|(_, n)| n).collect()
 }
 
+/// The candidate closest to `wanted` within a typo's distance, if any.
+pub fn closest<'a>(wanted: &str, candidates: impl IntoIterator<Item = &'a str>) -> Option<&'a str> {
+    let wanted = wanted.to_lowercase().replace('_', "-");
+    candidates
+        .into_iter()
+        .map(|c| {
+            (
+                edit_distance(&wanted, &c.to_lowercase().replace('_', "-")),
+                c,
+            )
+        })
+        .filter(|(d, c)| *d > 0 && *d <= (c.len() / 3).clamp(1, 3))
+        .min()
+        .map(|(_, c)| c)
+}
+
 /// Levenshtein distance.
 fn edit_distance(a: &str, b: &str) -> usize {
     let b: Vec<char> = b.chars().collect();
@@ -1517,5 +1533,10 @@ mod similar_tests {
         assert_eq!(edit_distance("reqwset", "reqwest"), 2);
         assert_eq!(edit_distance("", "abc"), 3);
         assert_eq!(edit_distance("tokio", "tokio"), 0);
+        assert_eq!(
+            super::closest("rune-clii", ["rune-cas", "rune-cli"]),
+            Some("rune-cli")
+        );
+        assert_eq!(super::closest("zzz", ["rune-cas", "rune-cli"]), None);
     }
 }

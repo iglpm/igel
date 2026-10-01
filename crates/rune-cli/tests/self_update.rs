@@ -75,7 +75,7 @@ fn test_self_update_lifecycle() {
     let bin_name = if cfg!(windows) { "rune.exe" } else { "rune" };
     let mock_bin = inner_dir.join(bin_name);
     // Write a small executable shell script or file
-    let mock_content = b"#!/bin/sh\necho \"rune 9.9.9 (test)\"\n";
+    let mock_content = b"#!/bin/sh\necho \"rune 9999.9.9 (test)\"\n";
     std::fs::write(&mock_bin, mock_content).unwrap();
     #[cfg(unix)]
     {
@@ -107,7 +107,7 @@ fn test_self_update_lifecycle() {
     let target_dest = client_dir.path().join(bin_name);
     std::fs::write(&target_dest, b"old binary").unwrap();
 
-    // Run `rune self update --to <target_dest> -v v9.9.9` with RUNE_DOWNLOAD_BASE set
+    // Run `rune self update --to <target_dest> -v v9999.9.9` with RUNE_DOWNLOAD_BASE set
     let output = Command::new(rune_bin())
         .args([
             "self",
@@ -115,7 +115,7 @@ fn test_self_update_lifecycle() {
             "--to",
             target_dest.to_str().unwrap(),
             "-v",
-            "v9.9.9",
+            "v9999.9.9",
         ])
         .env("RUNE_DOWNLOAD_BASE", &base_url)
         .output()

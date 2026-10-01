@@ -23,16 +23,30 @@ pub struct Member {
 impl Member {
     pub(crate) fn load(dir: &Path, ws: Option<&WorkspaceManifest>) -> Result<Self> {
         let manifest_path = rune_common::manifest_file::manifest_in(dir);
-        let manifest = Manifest::from_path(&manifest_path)
-            .with_context(|| format!("Failed to parse {}", manifest_path.display()))?;
+        let manifest = read_manifest(&manifest_path)?;
         let pkg = manifest
             .package
             .as_ref()
             .with_context(|| format!("{} has no [package] section", manifest_path.display()))?;
+        if let Some(v) = pkg.version_str()
+            && let Err(e) = v.parse::<semver::Version>()
+        {
+            bail!(
+                "invalid `version = \"{v}\"` in {}: {e} (versions look like `1.2.3`)",
+                manifest_path.display()
+            );
+        }
         let version = pkg
             .version_in(ws)
             .unwrap_or_else(|| semver::Version::new(0, 0, 0));
-        let edition = pkg.edition_in(ws).parse().unwrap_or(Edition::E2015);
+        let edition_text = pkg.edition_in(ws);
+        let edition: Edition = edition_text.parse().map_err(|_| {
+            anyhow::anyhow!(
+                "unknown `edition = \"{edition_text}\"` in {}: the editions are 2015, 2018, \
+                 2021 and 2024",
+                manifest_path.display()
+            )
+        })?;
         let meta = pkg.meta_in(ws);
         validate(&manifest, &manifest_path)?;
         Ok(Self {
@@ -158,8 +172,7 @@ impl Workspace {
         };
         let start_dir = start_manifest.parent().unwrap().to_path_buf();
 
-        let start = Manifest::from_path(&start_manifest)
-            .with_context(|| format!("Failed to parse {}", start_manifest.display()))?;
+        let start = read_manifest(&start_manifest)?;
 
         let root_dir = if start.workspace.is_some() {
             start_dir.clone()
@@ -171,7 +184,7 @@ impl Workspace {
             start
         } else {
             let p = rune_common::manifest_file::manifest_in(&root_dir);
-            Manifest::from_path(&p).with_context(|| format!("Failed to parse {}", p.display()))?
+            read_manifest(&p)?
         };
 
         let settings = Settings::load(Some(&root_dir))?;
@@ -282,6 +295,12 @@ impl Workspace {
                     Some(i) => out.push(i),
                     None => {
                         let known: Vec<_> = self.members.iter().map(|m| m.name.as_str()).collect();
+                        if let Some(near) = crate::cmd_deps::closest(name, known.iter().copied()) {
+                            bail!(
+                                "package ID specification `{spec}` did not match any packages in \
+                                 this workspace; did you mean `{near}`?"
+                            );
+                        }
                         bail!(
                             "package ID specification `{spec}` did not match any packages in this \
                              workspace (members: {})",
@@ -476,6 +495,17 @@ fn deep_merge(base: &mut toml::Value, over: toml::Value) {
         }
         (b, o) => *b = o,
     }
+}
+
+/// Reads a manifest; errors name the file once.
+pub fn read_manifest(path: &Path) -> anyhow::Result<Manifest> {
+    Manifest::from_path(path).map_err(|e| {
+        if e.names_path() {
+            anyhow::Error::new(e)
+        } else {
+            anyhow::Error::new(e).context(format!("Failed to parse {}", path.display()))
+        }
+    })
 }
 
 #[cfg(test)]

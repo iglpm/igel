@@ -988,6 +988,21 @@ pub fn doctor() -> Result<()> {
                 && std::fs::read_to_string(root.join(CARGO_TOML))
                     .is_ok_and(|t| text_is_manifest(&t))
         }),
+        disk_free: {
+            let mut v = Vec::new();
+            if let Some(free) = rune_common::sysinfo::disk_available(&config.cas_dir) {
+                v.push(("the store".to_string(), free));
+            }
+            if root.is_some()
+                && let Some(free) = rune_common::sysinfo::disk_available(&config.target_dir)
+                && rune_common::sysinfo::disk_size(&config.target_dir)
+                    != rune_common::sysinfo::disk_size(&config.cas_dir)
+            {
+                v.push(("this project's build output".to_string(), free));
+            }
+            v
+        },
+        memory_total: rune_common::sysinfo::memory().map(|m| m.total),
     };
 
     let findings = diagnose(&env);

@@ -111,6 +111,18 @@ pub fn lower_priority() {
 
 /// The size in bytes of the filesystem holding `path`.
 pub fn disk_size(path: &std::path::Path) -> Option<u64> {
+    filesystem(path).map(|(total, _)| total)
+}
+
+/// The bytes an unprivileged process can still write on the filesystem
+/// holding `path`.
+pub fn disk_available(path: &std::path::Path) -> Option<u64> {
+    filesystem(path).map(|(_, available)| available)
+}
+
+/// Total and available bytes of the filesystem holding `path` (or its
+/// nearest existing ancestor).
+fn filesystem(path: &std::path::Path) -> Option<(u64, u64)> {
     #[cfg(unix)]
     {
         use std::os::unix::ffi::OsStrExt;
@@ -124,7 +136,8 @@ pub fn disk_size(path: &std::path::Path) -> Option<u64> {
         if unsafe { libc::statvfs(c.as_ptr(), &mut st) } != 0 {
             return None;
         }
-        Some(st.f_blocks as u64 * st.f_frsize as u64)
+        let unit = st.f_frsize as u64;
+        Some((st.f_blocks as u64 * unit, st.f_bavail as u64 * unit))
     }
     #[cfg(not(unix))]
     {

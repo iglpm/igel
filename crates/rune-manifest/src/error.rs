@@ -15,7 +15,7 @@ pub enum ManifestError {
     },
 
     /// Parse error for TOML.
-    #[error("Failed to parse TOML in {path}: {source}")]
+    #[error("invalid TOML in {path}:\n{source}")]
     TomlParse {
         /// Path to the manifest file.
         path: PathBuf,
@@ -54,4 +54,19 @@ pub enum ManifestError {
     /// Glob error.
     #[error("Glob pattern error: {0}")]
     Glob(#[from] glob::PatternError),
+}
+
+impl ManifestError {
+    /// Whether the message already names the manifest it is about, so a
+    /// caller need not add "while reading <path>" around it.
+    pub fn names_path(&self) -> bool {
+        matches!(
+            self,
+            Self::Io { .. }
+                | Self::TomlParse { .. }
+                | Self::MissingField { .. }
+                | Self::InvalidValue { .. }
+                | Self::NotFound(_)
+        )
+    }
 }

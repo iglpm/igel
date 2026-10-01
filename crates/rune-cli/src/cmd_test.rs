@@ -522,6 +522,21 @@ pub fn run_with(args: TestArgs, mode: Mode, instrument: Option<&Instrument>) -> 
                                         ));
                                     }
                                     let mut counts = parse_counts(&text);
+                                    let crashed = !out.timed_out
+                                        && killed_by(&out.status).is_some()
+                                        && !text.contains("test result:");
+                                    if crashed {
+                                        // No summary: count what finished, and
+                                        // the test that took the binary down.
+                                        use crate::test_report::Status;
+                                        let cases = crate::test_report::parse_cases(&text);
+                                        let n = |s: Status| {
+                                            cases.iter().filter(|c| c.status == s).count() as u64
+                                        };
+                                        counts.passed = n(Status::Passed);
+                                        counts.ignored = n(Status::Ignored);
+                                        counts.failed = n(Status::Failed) + 1;
+                                    }
                                     if out.timed_out {
                                         // libtest never printed its summary:
                                         // count what finished, and each test
@@ -814,7 +829,14 @@ pub fn run_with(args: TestArgs, mode: Mode, instrument: Option<&Instrument>) -> 
                 });
             }
         }
+        // Doc tests run after every test binary, as with Cargo: a doc-test
+        // run is often ready long before the binaries link, and run first
+        // it would decide what `--no-fail-fast`-less runs report.
+        let build_over = std::cell::Cell::new(false);
         let try_dispatch_docs = || {
+            if !build_over.get() && !dispatched.borrow().iter().all(|d| *d) {
+                return;
+            }
             for (i, doc) in plan.doc_tests.iter().enumerate() {
                 if doc_dispatched.borrow()[i] {
                     continue;
@@ -914,6 +936,10 @@ pub fn run_with(args: TestArgs, mode: Mode, instrument: Option<&Instrument>) -> 
             }
         }
 
+        // Every binary is settled: the doc tests whose dependencies built go.
+        build_over.set(true);
+        try_dispatch_docs();
+
         // Doctests that never got their dependencies (the build failed) are
         // skipped.
         for (i, done) in doc_dispatched.borrow().iter().enumerate() {
@@ -1005,9 +1031,13 @@ pub fn run_with(args: TestArgs, mode: Mode, instrument: Option<&Instrument>) -> 
             },
             failed_labels.join(", ")
         ));
-        ui::detail(format!(
-            "{} passed · {} failed · {} ignored · {:.2}s",
-            counts_total.passed, counts_total.failed, counts_total.ignored, elapsed
+        ui::err(format!(
+            "  {}",
+            format!(
+                "{} passed · {} failed · {} ignored · {:.2}s",
+                counts_total.passed, counts_total.failed, counts_total.ignored, elapsed
+            )
+            .dimmed()
         ));
         return Ok(RunOutcome {
             failed: true,
@@ -1020,7 +1050,7 @@ pub fn run_with(args: TestArgs, mode: Mode, instrument: Option<&Instrument>) -> 
             executables,
         });
     }
-    ui::summary(format!(
+    ui::result(format!(
         "{} passed{} · {} · {:.2}s",
         counts_total.passed,
         if counts_total.ignored > 0 {
@@ -1035,6 +1065,15 @@ pub fn run_with(args: TestArgs, mode: Mode, instrument: Option<&Instrument>) -> 
         },
         elapsed
     ));
+    if let Some(filter) = &args.filter
+        && counts_total.passed + counts_total.failed + counts_total.ignored == 0
+        && binaries_run > 0
+    {
+        ui::hint(format!(
+            "no test matched `{filter}` ({} filtered out); `rune test -- --list` lists them",
+            counts_total.filtered
+        ));
+    }
     Ok(RunOutcome {
         failed: false,
         executables,

@@ -68,6 +68,7 @@ fn main() {
         return;
     }
     ui::setup_logging();
+    install_panic_hook();
 
     let args = external::expand(std::env::args_os().collect());
     apply_color_flag(&args);
@@ -147,9 +148,126 @@ fn main() {
     };
 
     if let Err(err) = result {
-        ui::error(format!("{err:#}"));
+        ui::error(render_error(&err));
+        if let Some(hint) = hint_for(&err) {
+            ui::hint(hint);
+        }
         std::process::exit(1);
     }
+}
+
+/// An error and its causes, each once: errors that already include their
+/// cause in their own message (a TOML error naming the file and the parse
+/// error) would otherwise print it twice. A cause spanning several lines
+/// (a compiler's or parser's report) starts on a line of its own.
+fn render_error(err: &anyhow::Error) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    for cause in err.chain() {
+        let text = cause.to_string();
+        let text = text.trim();
+        if text.is_empty() || parts.iter().any(|p| p.contains(text)) {
+            continue;
+        }
+        parts.push(text.to_string());
+    }
+    let mut out = String::new();
+    for (i, part) in parts.iter().enumerate() {
+        if i > 0 {
+            out.push_str(if part.contains('\n') { ":\n" } else { ": " });
+        }
+        out.push_str(part);
+    }
+    out
+}
+
+/// What to do about an error the machine caused, not the project.
+fn hint_for(err: &anyhow::Error) -> Option<String> {
+    for cause in err.chain() {
+        if let Some(io) = cause.downcast_ref::<std::io::Error>() {
+            if io.kind() == std::io::ErrorKind::StorageFull || io.raw_os_error() == Some(28) {
+                return Some(disk_full_hint());
+            }
+            if io.kind() == std::io::ErrorKind::PermissionDenied {
+                return Some(
+                    "a file or directory Rune needs is not writable: check the ownership of \
+                     the project's `.rune/` and of `~/.rune` (or `RUNE_HOME`)"
+                        .to_string(),
+                );
+            }
+        }
+    }
+    let text = format!("{err:#}");
+    if text.contains("No space left on device") || text.contains("os error 28") {
+        return Some(disk_full_hint());
+    }
+    let network = [
+        "error sending request",
+        "tcp connect error",
+        "dns error",
+        "Connection refused",
+        "connection reset",
+        "operation timed out",
+        "tunnel error",
+        "invalid peer certificate",
+        "UnknownIssuer",
+    ];
+    if network.iter().any(|n| text.contains(n)) {
+        let certificate = text.contains("certificate") || text.contains("UnknownIssuer");
+        return Some(if certificate {
+            "the server's TLS certificate is not trusted here: behind a proxy that inspects \
+             traffic, point `http.cainfo` (or `SSL_CERT_FILE`) at its CA bundle"
+                .to_string()
+        } else {
+            "the network could not be reached: check the connection and any proxy \
+             (`HTTPS_PROXY`, `http.proxy`); `--offline` builds with what is already downloaded"
+                .to_string()
+        });
+    }
+    None
+}
+
+fn disk_full_hint() -> String {
+    "the disk is full: `rune cas gc --max-size 5GB` shrinks the shared store, `rune clean` \
+     removes this project's build output"
+        .to_string()
+}
+
+/// A panic is a bug in Rune: say so plainly, with what to report, instead of
+/// a bare panic message under a half-drawn progress line.
+fn install_panic_hook() {
+    use colored::Colorize;
+    static REPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let default = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        if std::env::var_os("RUST_BACKTRACE").is_some() {
+            default(info);
+        }
+        // A worker's panic resurfaces where its scope ends: report it once.
+        if REPORTED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        let _ = ui::multi_progress().clear();
+        let what = info
+            .payload()
+            .downcast_ref::<&str>()
+            .map(|s| s.to_string())
+            .or_else(|| info.payload().downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "unknown panic".to_string());
+        let place = info
+            .location()
+            .map(|l| format!(" at {}:{}", l.file(), l.line()))
+            .unwrap_or_default();
+        let args: Vec<String> = std::env::args().skip(1).collect();
+        eprintln!(
+            "{} rune {} crashed: {what}{place}\n  \
+             This is a bug in Rune, not in your project. Please report it at\n  \
+             https://github.com/runepm/rune/issues with the command (`rune {}`) and, if you \
+             can,\n  the output of the same command with RUST_BACKTRACE=1.",
+            "✗".red().bold(),
+            env!("CARGO_PKG_VERSION"),
+            args.join(" ")
+        );
+    }));
 }
 
 /// `--color` takes effect before anything is printed, help included.

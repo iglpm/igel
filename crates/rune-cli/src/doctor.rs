@@ -82,6 +82,10 @@ pub struct Environment {
     /// The project has a `Rune.toml` manifest *and* a `Cargo.toml` manifest: Rune
     /// reads the first, plain `cargo` reads the second.
     pub shadowed_cargo_toml: bool,
+    /// Free bytes where builds and the store write, by what lives there.
+    pub disk_free: Vec<(String, u64)>,
+    /// The machine's memory in bytes, when known.
+    pub memory_total: Option<u64>,
 }
 
 /// The file-system type of the mount `path` lives on, from `/proc/mounts` text.
@@ -234,6 +238,30 @@ pub fn diagnose(env: &Environment) -> Vec<Finding> {
         ));
     }
 
+    // Several compilers at once each want memory; below ~1 GiB per job the
+    // scheduler holds jobs back and builds get slower than they need to be.
+    if let Some(total) = env.memory_total {
+        let per_job = total / env.jobs.max(1) as u64;
+        if per_job < (768 << 20) {
+            out.push(Finding::note(
+                format!("{} of memory for {} parallel jobs", human(total), env.jobs),
+                "Rune starts fewer compilers when memory runs short, so this costs time rather \
+                 than failing; fewer jobs (`build.jobs`) can be steadier on this machine.",
+            ));
+        }
+    }
+    for (what, free) in &env.disk_free {
+        if *free < (2 << 30) {
+            out.push(Finding::warn(
+                format!("only {} free for {what}", human(*free)),
+                "Compilers and linkers that run out of space fail with confusing errors \
+                 (a linker can crash with a bus error).",
+                "rune cas gc --max-size 5GB     (shrinks the store; `rune clean` removes this \
+                 project's build output)",
+            ));
+        }
+    }
+
     // --- manifests ----------------------------------------------------------
     if env.shadowed_cargo_toml {
         out.push(Finding::warn(
@@ -281,7 +309,40 @@ mod tests {
             cpus: 12,
             rustc_wrapper: None,
             shadowed_cargo_toml: false,
+            disk_free: vec![("the store".into(), 50 << 30)],
+            memory_total: Some(32 << 30),
         }
+    }
+
+    #[test]
+    fn a_nearly_full_disk_is_a_warning_with_the_fix() {
+        let mut e = env();
+        e.disk_free = vec![("the store".into(), 300 << 20)];
+        let f = diagnose(&e);
+        let w = f
+            .iter()
+            .find(|f| f.title.contains("free for the store"))
+            .unwrap();
+        assert_eq!(w.level, Level::Warn);
+        assert!(w.fix.as_deref().unwrap().contains("rune cas gc"));
+    }
+
+    #[test]
+    fn little_memory_per_job_is_noted() {
+        let mut e = env();
+        e.memory_total = Some(4 << 30);
+        e.jobs = 16;
+        assert!(
+            diagnose(&e)
+                .iter()
+                .any(|f| f.title.contains("of memory for"))
+        );
+        e.jobs = 4;
+        assert!(
+            !diagnose(&e)
+                .iter()
+                .any(|f| f.title.contains("of memory for"))
+        );
     }
 
     fn warnings(f: &[Finding]) -> Vec<&str> {

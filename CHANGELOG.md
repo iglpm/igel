@@ -1,12 +1,21 @@
 # Changelog
 
 All notable changes to Rune are recorded here. The format follows
-[Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
-[Semantic Versioning](https://semver.org/).
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [Unreleased]
+Versions are `YEAR.MINOR.PATCH`: the year of the release line, a minor
+release for new features, a patch release for fixes. Within a year's line
+releases are compatible (semver-style), so `rune self update` within it is
+always safe; the first stable release is 2027.0.0.
+
+## [2027.0.0] - Unreleased
+
+The first stable release. Changes since the 0.1.0 preview:
 
 ### Added
+- `rune doctor` checks free disk space and memory per parallel job.
+- "Did you mean" for misspelled `-p` packages; a test filter that matches
+  nothing says so.
 - `rune audit`: RustSec/OSV advisories (vulnerabilities with CVSS scores,
   unmaintained, unsound, malicious) and yanked releases in the lockfile, with
   the dependency path and the fix; cached database, `--deny`, `--ignore`,
@@ -29,6 +38,17 @@ All notable changes to Rune are recorded here. The format follows
   run time, as Cargo sets them.
 
 ### Fixed
+- Clear messages instead of low-level errors: no Rust toolchain (or a
+  `rustup` without a default toolchain), a full disk (rustc and linkers crash
+  with a bus error there; Rune now names the cause, and warns before a build
+  when under 1 GiB is free), network and TLS failures (with what to check).
+- `edition = "2099"` and `version = "1.x"` are errors, as in Cargo.
+- TOML errors in manifests print once, naming the file once.
+- Doc tests run after the test binaries, as with Cargo: run first, a failing
+  doc test could stop the run before a failing unit test was reported.
+- `rune test -q` prints the result line; a binary killed by a signal counts as
+  a failed test; a failed download no longer reports "downloaded".
+- A crash (a bug in Rune) prints what happened and where to report it.
 - Rune compiles cleanly for Windows (two Unix-only assumptions); CI checks
   Windows and runs on pushes to `master`.
 - `rune self uninstall --purge` refuses to delete a `RUNE_HOME` that is the
@@ -80,7 +100,7 @@ All notable changes to Rune are recorded here. The format follows
 
 ## [0.1.0] - 2026-09-29
 
-The first release: a Cargo-compatible build system and package manager for
+The preview release: a Cargo-compatible build system and package manager for
 Rust that builds with `rustc` directly and reuses compiled artifacts through
 a content-addressable store.
 

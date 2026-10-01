@@ -6728,3 +6728,34 @@ fn a_hung_test_is_stopped_by_the_timeout_and_named() {
         text(&out)
     );
 }
+
+#[test]
+fn doc_tests_run_after_the_test_binaries_and_quiet_still_shows_the_result() {
+    // The doc-test run is ready long before the unit tests link; run first,
+    // its failure would stop the run before the unit tests' failure is seen.
+    let p = Project::new();
+    p.write(
+        "Cargo.toml",
+        "[package]\nname = \"order\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    p.write(
+        "src/lib.rs",
+        "/// ```\n/// assert_eq!(1, 2);\n/// ```\npub fn f() {}\n\n#[test]\nfn unit_fails() { panic!(\"unit\") }\n",
+    );
+    let out = p.rune(&["test"]);
+    let all = text(&out);
+    assert_eq!(out.status.code(), Some(101), "{all}");
+    assert!(all.contains("FAILED order (unit tests: lib)"), "{all}");
+    assert!(
+        !all.contains("order (doc-tests)"),
+        "doc tests ran first: {all}"
+    );
+
+    p.write(
+        "src/lib.rs",
+        "/// ```\n/// assert_eq!(1, 1);\n/// ```\npub fn f() {}\n\n#[test]\nfn unit() {}\n",
+    );
+    let out = p.ok(&["test", "-q"]);
+    assert!(out.contains("2 passed"), "{out}");
+    assert!(!out.contains("ok order"), "{out}");
+}

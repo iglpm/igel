@@ -312,8 +312,7 @@ impl Locals {
             return Ok(li);
         }
         let manifest_path = rune_common::manifest_file::manifest_in(&dir);
-        let manifest = Manifest::from_path(&manifest_path)
-            .with_context(|| format!("Failed to parse {}", manifest_path.display()))?;
+        let manifest = crate::workspace::read_manifest(&manifest_path)?;
         let enclosing = rune_manifest::find_enclosing_workspace(&dir, &manifest);
         let member = Member::load(&dir, enclosing.as_ref().map(|(_, w)| w))?;
         let li = self.list.len();

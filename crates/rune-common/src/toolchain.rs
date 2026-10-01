@@ -55,6 +55,47 @@ pub struct Toolchain {
 }
 
 impl Toolchain {
+    /// Why this compiler cannot be used, when it cannot: not installed, or a
+    /// `rustup` without a toolchain for here. Asked once before building, so
+    /// the answer is a sentence instead of an I/O error from the first
+    /// compiler start.
+    pub fn unusable_reason(&self) -> Option<String> {
+        if !self.verbose_version.is_empty() {
+            return None;
+        }
+        let configured = self.rustc.components().count() > 1;
+        match Command::new(&self.rustc).arg("-vV").output() {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(if configured {
+                format!(
+                    "the Rust compiler `{}` does not exist (set by `RUSTC` or `build.rustc`)",
+                    self.rustc.display()
+                )
+            } else {
+                "no Rust compiler found: `rustc` is not on PATH. Install Rust with \
+                 rustup (https://rustup.rs), or point `RUSTC` at a compiler"
+                    .to_string()
+            }),
+            Err(e) => Some(format!(
+                "the Rust compiler `{}` cannot be started: {e}",
+                self.rustc.display()
+            )),
+            Ok(out) if !out.status.success() => {
+                let why = String::from_utf8_lossy(&out.stderr);
+                let why = why.trim();
+                let mut msg = format!("`{} -vV` failed", self.rustc.display());
+                if !why.is_empty() {
+                    msg.push_str(":\n");
+                    msg.push_str(why);
+                }
+                if why.contains("rustup") || why.contains("toolchain") {
+                    msg.push_str("\n(install a toolchain with `rustup default stable`)");
+                }
+                Some(msg)
+            }
+            Ok(_) => None,
+        }
+    }
+
     /// Discovers the toolchain for a project rooted at `project_root`.
     pub fn discover(cfg: &CargoConfig, project_root: &Path) -> Toolchain {
         Self::discover_with_cache(cfg, project_root, &probe_cache_path())

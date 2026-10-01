@@ -11,7 +11,7 @@
     irm https://runepm.com/install.ps1 | iex
 
 .EXAMPLE
-    & ([scriptblock]::Create((irm https://runepm.com/install.ps1))) -Version v0.1.0 -To "C:\Tools\Rune"
+    & ([scriptblock]::Create((irm https://runepm.com/install.ps1))) -Version v2027.0.0 -To "C:\Tools\Rune"
 #>
 
 [CmdletBinding()]
