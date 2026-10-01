@@ -23,10 +23,14 @@ All notable changes to Rune are recorded here. The format follows
 - `rune test --timeout 10m` / `test.timeout`: a test binary that runs longer
   is stopped and reported as failed, naming the tests that had not finished,
   so a hung test cannot hang a CI job.
+- The live test line names tests libtest reports as running for over a
+  minute.
 - Tests get `CARGO`, `CARGO_MANIFEST_PATH` and every `CARGO_PKG_*` variable at
   run time, as Cargo sets them.
 
 ### Fixed
+- Rune compiles cleanly for Windows (two Unix-only assumptions); CI checks
+  Windows and runs on pushes to `master`.
 - `rune self uninstall --purge` refuses to delete a `RUNE_HOME` that is the
   home directory, a file system root, or holds nothing of Rune's.
 - `rune self update` uses Rune's network settings (CA bundles, proxy) and no

@@ -1321,3 +1321,35 @@ the CLI tests clear `RUNE_*`, `CARGO_TARGET_DIR` and flag variables from the
 environment; a fake HTTP server's header/body writes stalled on Nagle's
 algorithm (rune-cas tests 2.9 → 0.5 s); a probe test slept a second it did
 not need.
+
+## 17. What changed in the docs, cold-start and timeout update (2026-10-01)
+
+**Documentation.** The README is now an introduction (what Rune does,
+measured against Cargo, install from runepm.com); the reference moved to
+`docs/`, one page per topic, with outdated statements corrected (the resolver
+does use PubGrub; `rune audit` is built in).
+
+**Cold starts.** A fresh `RUNE_HOME` used to start the compiler three times
+in a row before anything was built (`-vV`, `--print sysroot`, then the host's
+`--print=cfg`); the third now runs beside the other two. Probes were also
+keyed by the working directory, so every new project and checkout probed
+again; they are now keyed by what selects the toolchain (a `rustup override`
+covering the directory, the nearest `rust-toolchain` file). Rune's own CLI
+suite seeds each test's home with one shared probe: 29–30 s → 25–27 s.
+
+**Test scheduling.** `rune test` records each binary's run time
+(`.rune/fingerprints/test-times.json`) and hands it to the scheduler as work
+that follows the unit, so the binaries a run waits longest on — and the
+programs their package's tests start — are built first.
+
+**Timeouts.** `rune test --timeout 10m` / `test.timeout` stops a test binary
+or doc-test run that runs longer, counts what finished, and names the tests
+that never reported (the binary's `--list` minus the finished ones). libtest's
+"has been running for over 60 seconds" warnings show in the live line.
+
+**Release hygiene.** Rune type-checks for `x86_64-pc-windows-msvc` (checked
+here with a stub C compiler; two Unix-only assumptions fixed); CI gains a
+Windows job and now runs on pushes to `master`, the default branch.
+`rune self uninstall --purge` refuses to delete a `RUNE_HOME` that is the home
+directory, a root, or holds nothing of Rune's; `rune self update` uses Rune's
+network settings and tolerates slow downloads.
