@@ -105,6 +105,8 @@ impl<'de> Deserialize<'de> for DependencySpec {
     where
         D: Deserializer<'de>,
     {
+        // Lives only while one value is deserialized; boxing would not help.
+        #[allow(clippy::large_enum_variant)]
         #[derive(Deserialize)]
         #[serde(untagged)]
         enum Repr {
