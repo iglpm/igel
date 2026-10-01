@@ -93,10 +93,15 @@ impl BuildScriptEnv {
     fn apply_package_env(&self, cmd: &mut Command) {
         cmd.env("CARGO_PKG_NAME", &self.pkg_name);
         cmd.env("CARGO_PKG_VERSION", &self.pkg_version);
-        cmd.env("CARGO_MANIFEST_DIR", &self.manifest_dir);
+        cmd.env(
+            "CARGO_MANIFEST_DIR",
+            rune_common::fsutil::simplified(&self.manifest_dir),
+        );
         cmd.env(
             "CARGO_MANIFEST_PATH",
-            rune_common::manifest_file::manifest_in(&self.manifest_dir),
+            rune_common::fsutil::simplified(&rune_common::manifest_file::manifest_in(
+                &self.manifest_dir,
+            )),
         );
         let core = self
             .pkg_version
@@ -199,11 +204,12 @@ impl BuildScriptRunner {
         configure: &dyn Fn(&mut Command),
     ) -> Result<(PathBuf, String)> {
         let _ = std::fs::create_dir_all(out_dir);
-        cmd.arg(build_rs_path);
+        cmd.arg(rune_common::fsutil::simplified(build_rs_path));
         cmd.arg("--crate-name").arg("build_script_build");
         cmd.arg("--crate-type").arg("bin");
         cmd.arg("--edition").arg(edition);
-        cmd.arg("--out-dir").arg(out_dir);
+        cmd.arg("--out-dir")
+            .arg(rune_common::fsutil::simplified(out_dir));
         // The dep-info lists the files the script is compiled from, which is
         // what decides whether the compiled script can be reused.
         cmd.arg("--emit=dep-info,link");
@@ -292,10 +298,10 @@ impl BuildScriptRunner {
         // directory as the current directory, and build scripts routinely
         // rely on that to resolve relative paths (e.g. openssl-sys's
         // `build/expando.c`).
-        cmd.current_dir(&env.manifest_dir);
+        cmd.current_dir(rune_common::fsutil::simplified(&env.manifest_dir));
 
         env.apply_package_env(&mut cmd);
-        cmd.env("OUT_DIR", &env.out_dir);
+        cmd.env("OUT_DIR", rune_common::fsutil::simplified(&env.out_dir));
         cmd.env("TARGET", &env.target);
         cmd.env("HOST", &env.host);
         cmd.env("OPT_LEVEL", &env.opt_level);

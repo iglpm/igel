@@ -142,7 +142,7 @@ impl Workspace {
                 } else {
                     p.to_path_buf()
                 };
-                p.canonicalize()
+                rune_common::fsutil::canonicalize(&p)
                     .with_context(|| format!("manifest path `{}` does not exist", p.display()))?
             }
             None => {
@@ -203,7 +203,7 @@ impl Workspace {
         }
         if let Some(ws) = ws_manifest {
             for d in ws.resolve_members(&root_dir).unwrap_or_default() {
-                let d = d.canonicalize().unwrap_or(d);
+                let d = rune_common::fsutil::canonicalize(&d).unwrap_or(d);
                 if !dirs.contains(&d) {
                     dirs.push(d);
                 }
@@ -302,7 +302,7 @@ impl Workspace {
                 .unwrap_or_default()
                 .into_iter()
                 .filter_map(|d| {
-                    let d = d.canonicalize().unwrap_or(d);
+                    let d = rune_common::fsutil::canonicalize(&d).unwrap_or(d);
                     self.members.iter().position(|m| m.dir == d)
                 })
                 .collect();
@@ -329,7 +329,7 @@ fn find_manifest_upwards(start: &Path) -> Option<PathBuf> {
     let mut cur = start.to_path_buf();
     loop {
         if let Some(candidate) = rune_common::manifest_file::find_manifest(&cur) {
-            return candidate.canonicalize().ok();
+            return rune_common::fsutil::canonicalize(&candidate).ok();
         }
         if !cur.pop() {
             return None;
@@ -342,7 +342,7 @@ fn find_workspace_root(member_dir: &Path, member: &Manifest) -> Option<PathBuf> 
     // An explicit `package.workspace = "../.."` wins.
     if let Some(explicit) = member.package.as_ref().and_then(|p| p.workspace.as_ref()) {
         let dir = member_dir.join(explicit);
-        return dir.canonicalize().ok();
+        return rune_common::fsutil::canonicalize(&dir).ok();
     }
     let mut cur = member_dir.parent()?.to_path_buf();
     loop {
@@ -351,9 +351,9 @@ fn find_workspace_root(member_dir: &Path, member: &Manifest) -> Option<PathBuf> 
             && let Some(ws) = &m.workspace
         {
             let members = ws.resolve_members(&cur).unwrap_or_default();
-            let is_member = members
-                .iter()
-                .any(|d| d.canonicalize().unwrap_or_else(|_| d.clone()) == member_dir);
+            let is_member = members.iter().any(|d| {
+                rune_common::fsutil::canonicalize(d).unwrap_or_else(|_| d.clone()) == member_dir
+            });
             if is_member {
                 return Some(cur);
             }
@@ -369,7 +369,7 @@ fn find_workspace_root(member_dir: &Path, member: &Manifest) -> Option<PathBuf> 
 /// [`Workspace::load`] (no member parsing), for commands like `rune config`.
 pub fn find_project_root(manifest_path: Option<&Path>) -> Option<PathBuf> {
     let nearest = match manifest_path {
-        Some(p) => p.canonicalize().ok()?,
+        Some(p) => rune_common::fsutil::canonicalize(p).ok()?,
         None => find_manifest_upwards(&std::env::current_dir().ok()?)?,
     };
     let dir = nearest.parent()?.to_path_buf();

@@ -81,7 +81,7 @@ pub fn find_enclosing_workspace(
             .and_then(|m| m.workspace)
     };
     if let Some(explicit) = manifest.package.as_ref().and_then(|p| p.workspace.as_ref()) {
-        let root = dir.join(explicit).canonicalize().ok()?;
+        let root = rune_common::fsutil::canonicalize(dir.join(explicit)).ok()?;
         return load(&root).map(|w| (root, w));
     }
     // A package that is itself a workspace root is its own workspace.
@@ -89,6 +89,7 @@ pub fn find_enclosing_workspace(
         return Some((dir.to_path_buf(), ws.clone()));
     }
     let mut cur = dir.parent()?.to_path_buf();
+    let dir_canon = rune_common::fsutil::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
     loop {
         if rune_common::manifest_file::has_manifest(&cur)
             && let Some(ws) = load(&cur)
@@ -97,7 +98,9 @@ pub fn find_enclosing_workspace(
                 .resolve_members(&cur)
                 .unwrap_or_default()
                 .iter()
-                .any(|d| d.canonicalize().unwrap_or_else(|_| d.clone()) == dir);
+                .any(|d| {
+                    rune_common::fsutil::canonicalize(d).unwrap_or_else(|_| d.clone()) == dir_canon
+                });
             if is_member {
                 return Some((cur, ws));
             }

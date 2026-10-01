@@ -2795,13 +2795,17 @@ pub fn with_cargo_env(
         .env("CARGO_PKG_VERSION", &pkg_version)
         .env(
             "CARGO_MANIFEST_DIR",
-            &unit.manifest_dir.display().to_string(),
+            &rune_common::fsutil::simplified(&unit.manifest_dir)
+                .display()
+                .to_string(),
         )
         .env(
             "CARGO_MANIFEST_PATH",
-            &rune_common::manifest_file::manifest_in(&unit.manifest_dir)
-                .display()
-                .to_string(),
+            &rune_common::fsutil::simplified(&rune_common::manifest_file::manifest_in(
+                &unit.manifest_dir,
+            ))
+            .display()
+            .to_string(),
         )
         .env("CARGO_PKG_AUTHORS", &meta.authors)
         .env("CARGO_PKG_DESCRIPTION", &meta.description)
@@ -2961,11 +2965,11 @@ pub fn build_rustc_command(
     let eff = unit.effective_profile(profile);
     // A crate of the project is compiled from the project root with a
     // relative path, as Cargo does: diagnostics and panic locations read
-    // `src/main.rs:3:5` instead of a long absolute path, and the paths baked
-    // into the artifact do not depend on where the checkout lives.
-    let (source, cwd) = match unit.source_root.strip_prefix(&config.project_root) {
+    let unit_source_root = rune_common::fsutil::simplified(&unit.source_root);
+    let config_project_root = rune_common::fsutil::simplified(&config.project_root);
+    let (source, cwd) = match unit_source_root.strip_prefix(config_project_root) {
         Ok(rel) if unit.crate_id.source == CrateSource::Local && !rel.as_os_str().is_empty() => {
-            (rel.to_path_buf(), Some(config.project_root.clone()))
+            (rel.to_path_buf(), Some(config_project_root.to_path_buf()))
         }
         _ => (unit.source_root.clone(), None),
     };

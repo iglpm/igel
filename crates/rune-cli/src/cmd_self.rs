@@ -17,9 +17,9 @@ pub fn update(args: SelfUpdateArgs) -> Result<()> {
     let current_exe = match args.to {
         Some(to) => to,
         None => std::env::current_exe()
-            .context("cannot determine current executable path")?
-            .canonicalize()
-            .unwrap_or_else(|_| std::env::current_exe().unwrap()),
+            .ok()
+            .and_then(|p| rune_common::fsutil::canonicalize(&p).ok())
+            .unwrap_or_else(|| std::env::current_exe().unwrap()),
     };
 
     let repo = args
@@ -216,9 +216,9 @@ pub fn update(args: SelfUpdateArgs) -> Result<()> {
 /// Uninstalls the Rune binary from the system.
 pub fn uninstall(args: SelfUninstallArgs) -> Result<()> {
     let current_exe = std::env::current_exe()
-        .context("cannot determine current executable path")?
-        .canonicalize()
-        .unwrap_or_else(|_| std::env::current_exe().unwrap());
+        .ok()
+        .and_then(|p| rune_common::fsutil::canonicalize(&p).ok())
+        .unwrap_or_else(|| std::env::current_exe().unwrap());
 
     if !args.yes {
         print!(
