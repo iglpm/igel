@@ -269,7 +269,13 @@ fn write_lib(dest: &Path, name: &str, deps: &[String], spec: &Spec, seed: usize)
             "    let mut i{t} = Item{t}::<u32>::default();\n    n += i{t}.bump({t}) as usize + Item{t}::<String>::default().describe().len();"
         );
     }
-    src.push_str("    n\n}\n\npub fn combined(x: u64) -> u64 {\n    let mut a = f0(x) ^ EDIT;\n");
+    // (`mut` only where something is folded in: generated code compiles
+    // without warnings, which both tools would replay on every run.)
+    let binding = if deps.is_empty() { "let" } else { "let mut" };
+    let _ = write!(
+        src,
+        "    n\n}}\n\npub fn combined(x: u64) -> u64 {{\n    {binding} a = f0(x) ^ EDIT;\n"
+    );
     for d in deps {
         let _ = writeln!(src, "    a ^= {d}::combined(x.wrapping_add(1));");
     }
