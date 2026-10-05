@@ -41,6 +41,16 @@ pub fn default_jobs() -> usize {
     cpus + cpus / 3
 }
 
+/// `path` as an absolute path: itself if it is one, else below `base`.
+fn absolute_in(base: &Path, path: &Path) -> PathBuf {
+    let path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        base.join(path)
+    };
+    crate::fsutil::simplified(&path).to_path_buf()
+}
+
 impl RuneConfig {
     /// Create a new `RuneConfig` for the given project root.
     ///
@@ -58,11 +68,11 @@ impl RuneConfig {
             .unwrap_or_else(|| PathBuf::from("."))
             .join(".rune")
             .join("cas");
-        let cas_dir = match std::env::var_os("RUNE_HOME") {
+        let cas_dir = match std::env::var_os("RUNE_HOME").filter(|h| !h.is_empty()) {
             Some(home) => PathBuf::from(home).join("cas"),
             None => cas_dir,
         };
-        let cas_dir = crate::fsutil::simplified(&cas_dir).to_path_buf();
+        let cas_dir = absolute_in(&std::env::current_dir().unwrap_or_default(), &cas_dir);
 
         Self {
             project_root,
@@ -78,11 +88,16 @@ impl RuneConfig {
     /// Applies user settings: `build.target-dir`, `cas.dir`, and `build.jobs`
     /// take effect on the paths and job count carried by this config.
     pub fn with_settings(mut self, settings: Settings) -> Self {
+        // The compiler runs in other directories (a registry crate's package
+        // root), so every path it is handed must be absolute. (`Rune.toml`'s
+        // relative paths arrive resolved against the project; one from the
+        // environment or the command line is the current directory's.)
+        let cwd = std::env::current_dir().unwrap_or_default();
         if let Some(dir) = settings.target_dir() {
-            self.target_dir = crate::fsutil::simplified(&dir).to_path_buf();
+            self.target_dir = absolute_in(&cwd, &dir);
         }
         if let Some(dir) = settings.cas_dir() {
-            self.cas_dir = crate::fsutil::simplified(&dir).to_path_buf();
+            self.cas_dir = absolute_in(&cwd, &dir);
         }
         if let Some(jobs) = settings.jobs() {
             self.jobs = jobs;
@@ -183,6 +198,25 @@ mod tests {
             config.deps_dir("release"),
             PathBuf::from("/tmp/myproject/.rune/target/release/deps")
         );
+    }
+
+    #[test]
+    fn directories_handed_to_the_compiler_are_absolute() {
+        use crate::settings::{Origin, Value};
+        let root = std::env::temp_dir().join("rune-config-test");
+        let mut settings = Settings::default();
+        let origin = || Origin::Env("TEST".into());
+        settings.override_value(
+            "build.target-dir",
+            Value::Path("out/build".into()),
+            origin(),
+        );
+        settings.override_value("cas.dir", Value::Path("shared-cas".into()), origin());
+        let config = RuneConfig::new(&root).with_settings(settings);
+        let cwd = std::env::current_dir().unwrap();
+        assert_eq!(config.target_dir, cwd.join("out").join("build"));
+        assert_eq!(config.cas_dir, cwd.join("shared-cas"));
+        assert!(config.target_dir.is_absolute() && config.cas_dir.is_absolute());
     }
 
     #[test]

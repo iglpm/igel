@@ -36,11 +36,14 @@ pub fn package_id(unit: &CompilationUnit) -> String {
                 .file_name()
                 .is_some_and(|n| n == name.as_str()) =>
         {
-            format!("path+file://{}#{version}", unit.manifest_dir.display())
+            format!(
+                "path+{}#{version}",
+                rune_common::fsutil::file_url(&unit.manifest_dir)
+            )
         }
         CrateSource::Local => format!(
-            "path+file://{}#{name}@{version}",
-            unit.manifest_dir.display()
+            "path+{}#{name}@{version}",
+            rune_common::fsutil::file_url(&unit.manifest_dir)
         ),
         CrateSource::Registry { index, .. } => {
             let index = if index.contains("index.crates.io") {

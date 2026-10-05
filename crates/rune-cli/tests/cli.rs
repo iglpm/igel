@@ -127,6 +127,17 @@ impl Project {
     }
 }
 
+/// A relative path with this platform's separators, as the compiler names
+/// the files it was handed (`app/src/main.rs`, `app\src\main.rs`).
+fn native(path: &str) -> String {
+    path.replace('/', std::path::MAIN_SEPARATOR_STR)
+}
+
+/// A program's file name on this platform (`demo`, `demo.exe`).
+fn exe(name: &str) -> String {
+    format!("{name}{}", std::env::consts::EXE_SUFFIX)
+}
+
 fn text(out: &Output) -> String {
     format!(
         "{}{}",
@@ -260,7 +271,7 @@ fn binaries_compile_in_deps_and_only_their_names_appear_in_the_profile_dir() {
     p.write("src/main.rs", "fn main() { println!(\"hi\"); }\n");
     p.ok(&["build"]);
     let debug = p.path().join(".rune/target/debug");
-    let run = Command::new(debug.join("demo")).output().unwrap();
+    let run = Command::new(debug.join(exe("demo"))).output().unwrap();
     assert_eq!(String::from_utf8_lossy(&run.stdout), "hi\n");
     // The hash-named binary and anything the compiler leaves beside it
     // (object files under `split-debuginfo=unpacked` on macOS) stay in `deps/`.
@@ -270,7 +281,7 @@ fn binaries_compile_in_deps_and_only_their_names_appear_in_the_profile_dir() {
         .filter(|e| e.file_type().unwrap().is_file())
         .map(|e| e.file_name().to_string_lossy().into_owned())
         .collect();
-    assert_eq!(files, ["demo"], "{files:?}");
+    assert_eq!(files, [exe("demo")], "{files:?}");
     // Tools reading `--message-format json` get that name too, as from Cargo.
     let json = p.ok(&["build", "--message-format", "json"]);
     let exe = json
@@ -278,11 +289,14 @@ fn binaries_compile_in_deps_and_only_their_names_appear_in_the_profile_dir() {
         .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
         .find_map(|v| v["executable"].as_str().map(str::to_string))
         .expect("an executable in the JSON output");
-    assert!(exe.ends_with(".rune/target/debug/demo"), "{exe}");
+    assert!(
+        Path::new(&exe).ends_with(Path::new(".rune/target/debug").join(self::exe("demo"))),
+        "{exe}"
+    );
     // Restored from the store, the name comes back too.
     std::fs::remove_dir_all(p.path().join(".rune/target")).unwrap();
     assert!(p.ok(&["build"]).contains("0 compiled"));
-    assert!(debug.join("demo").is_file());
+    assert!(debug.join(self::exe("demo")).is_file());
 }
 
 /// A `-sys`-style crate whose build script builds a *dynamic* C library with
@@ -1146,7 +1160,7 @@ fn cross_builds_use_a_target_directory_and_host_scripts() {
         .join(".rune/target")
         .join(&host)
         .join("debug")
-        .join("demo");
+        .join(exe("demo"));
     assert!(bin.is_file(), "expected {}", bin.display());
     let run = Command::new(&bin).output().unwrap();
     let stdout = String::from_utf8_lossy(&run.stdout);
@@ -1332,19 +1346,23 @@ fn library_crate_types_produce_every_requested_artifact() {
         .flatten()
         .map(|e| e.file_name().to_string_lossy().into_owned())
         .collect();
-    let has = |suffix: &str| {
-        names
-            .iter()
-            .any(|n| n.starts_with("libdemo") && n.ends_with(suffix))
+    let has = |prefix: &str, suffix: &str| {
+        names.iter().any(|n| {
+            n.starts_with(&format!("{prefix}demo-"))
+                && n.ends_with(suffix)
+                // (MSVC's import library for the DLL is not the static one.)
+                && !n.ends_with(".dll.lib")
+        })
     };
-    assert!(has(".rlib"), "{names:?}");
-    assert!(has(".a"), "{names:?}");
+    assert!(has("lib", ".rlib"), "{names:?}");
+    let (static_prefix, static_suffix) = if cfg!(target_env = "msvc") {
+        ("", ".lib")
+    } else {
+        ("lib", ".a")
+    };
+    assert!(has(static_prefix, static_suffix), "{names:?}");
     assert!(
-        has(if cfg!(target_os = "macos") {
-            ".dylib"
-        } else {
-            ".so"
-        }),
+        has(std::env::consts::DLL_PREFIX, std::env::consts::DLL_SUFFIX),
         "{names:?}"
     );
 }
@@ -1604,7 +1622,7 @@ fn git_app(dep: &str) -> Project {
 }
 
 fn url(repo: &Path) -> String {
-    format!("file://{}", repo.display())
+    rune_common::fsutil::file_url(repo)
 }
 
 #[test]
@@ -1876,13 +1894,12 @@ fn replace_and_configuration_patches_work_too() {
 // ---------------------------------------------------------------------------
 
 /// Packs `name-version/` into a `.crate` and returns its bytes and SHA-256.
-#[cfg(unix)]
 fn make_crate(name: &str, version: &str, lib_rs: &str) -> (Vec<u8>, String) {
     make_crate_with(name, version, &[("src/lib.rs", lib_rs)])
 }
 
-/// Like [`make_crate`], with any files (paths relative to the package).
-#[cfg(unix)]
+/// Like [`make_crate`], with any files (paths relative to the package; a
+/// `Cargo.toml` among them replaces the minimal one).
 fn make_crate_with(name: &str, version: &str, files: &[(&str, &str)]) -> (Vec<u8>, String) {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().join(format!("{name}-{version}"));
@@ -1897,26 +1914,19 @@ fn make_crate_with(name: &str, version: &str, files: &[(&str, &str)]) -> (Vec<u8
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, content).unwrap();
     }
+    let mut bytes = Vec::new();
+    {
+        let gz = flate2::write::GzEncoder::new(&mut bytes, flate2::Compression::default());
+        let mut archive = tar::Builder::new(gz);
+        archive
+            .append_dir_all(format!("{name}-{version}"), &root)
+            .unwrap();
+        archive.into_inner().unwrap().finish().unwrap();
+    }
     let out = tmp.path().join("out.crate");
-    let status = Command::new("tar")
-        .args(["-czf"])
-        .arg(&out)
-        .args(["-C"])
-        .arg(tmp.path())
-        .arg(format!("{name}-{version}"))
-        .status()
-        .expect("tar is required for these tests");
-    assert!(status.success());
-    let sum = Command::new("sha256sum")
-        .arg(&out)
-        .output()
-        .expect("sha256sum is required");
-    let sum = String::from_utf8_lossy(&sum.stdout)
-        .split_whitespace()
-        .next()
-        .unwrap()
-        .to_string();
-    (std::fs::read(&out).unwrap(), sum)
+    std::fs::write(&out, &bytes).unwrap();
+    let sum = rune_registry::download::sha256_file(&out).unwrap();
+    (bytes, sum)
 }
 
 fn registry_app(dep: &str) -> Project {
@@ -1934,10 +1944,8 @@ fn registry_app(dep: &str) -> Project {
     p
 }
 
-#[cfg(unix)]
 const FOO_LIB: &str = "pub fn says() -> &'static str { \"hello from the registry\" }\n";
 
-#[cfg(unix)]
 #[test]
 fn a_local_registry_replaces_crates_io_but_the_lockfile_keeps_the_identity() {
     let reg = tempfile::tempdir().unwrap();
@@ -1970,11 +1978,9 @@ fn a_local_registry_replaces_crates_io_but_the_lockfile_keeps_the_identity() {
 }
 
 /// `(name, version, [(dependency, requirement)])`.
-#[cfg(unix)]
 type RegistryCrate<'a> = (&'a str, &'a str, &'a [(&'a str, &'a str)]);
 
 /// A local registry holding these crates.
-#[cfg(unix)]
 fn local_registry(crates: &[RegistryCrate]) -> tempfile::TempDir {
     let reg = tempfile::tempdir().unwrap();
     let mut index: std::collections::BTreeMap<String, String> = Default::default();
@@ -2006,7 +2012,6 @@ fn local_registry(crates: &[RegistryCrate]) -> tempfile::TempDir {
 }
 
 /// An app depending on `deps` from `reg` (replacing crates.io).
-#[cfg(unix)]
 fn app_with(reg: &tempfile::TempDir, deps: &str) -> Project {
     let p = Project::new();
     p.write(
@@ -2025,7 +2030,6 @@ fn app_with(reg: &tempfile::TempDir, deps: &str) -> Project {
 }
 
 /// `name version` of every package in `Cargo.lock`.
-#[cfg(unix)]
 fn locked(p: &Project) -> Vec<String> {
     let lock: toml::Table = p.read("Cargo.lock").parse().unwrap();
     let mut out: Vec<String> = lock["package"]
@@ -2044,7 +2048,6 @@ fn locked(p: &Project) -> Vec<String> {
     out
 }
 
-#[cfg(unix)]
 #[test]
 fn one_version_per_compatible_range_like_cargo() {
     // The first requirement alone would take `a 1.1.0`; `b` needs exactly
@@ -2059,7 +2062,6 @@ fn one_version_per_compatible_range_like_cargo() {
     assert_eq!(locked(&p), ["a 1.0.0", "app 0.1.0", "b 1.0.0"]);
 }
 
-#[cfg(unix)]
 #[test]
 fn resolution_backtracks_to_an_older_release_that_fits() {
     // The newest `b` needs an `a` the app's pin rules out; an older `b` fits.
@@ -2074,7 +2076,6 @@ fn resolution_backtracks_to_an_older_release_that_fits() {
     assert_eq!(locked(&p), ["a 1.0.0", "app 0.1.0", "b 1.0.0"]);
 }
 
-#[cfg(unix)]
 #[test]
 fn resolution_backtracks_several_crates_when_one_is_not_enough() {
     // Both newest `b` and newest `c` need an `a` the app's pin rules out:
@@ -2092,7 +2093,6 @@ fn resolution_backtracks_several_crates_when_one_is_not_enough() {
     assert_eq!(locked(&p), ["a 1.0.0", "app 0.1.0", "b 1.0.0", "c 1.0.0"]);
 }
 
-#[cfg(unix)]
 #[test]
 fn update_precise_and_dry_run_move_one_package_like_cargo() {
     let reg = local_registry(&[
@@ -2130,7 +2130,6 @@ fn update_precise_and_dry_run_move_one_package_like_cargo() {
     assert_eq!(locked(&p), ["app 0.1.0", "foo 1.2.0"]);
 }
 
-#[cfg(unix)]
 #[test]
 fn add_lists_the_features_it_turns_on_like_cargo() {
     let reg = local_registry(&[("foo", "1.0.0", &[])]);
@@ -2169,7 +2168,6 @@ fn add_lists_the_features_it_turns_on_like_cargo() {
     assert!(quiet.contains("- std"), "{quiet}");
 }
 
-#[cfg(unix)]
 #[test]
 fn add_supports_renames_platforms_workspace_deps_and_replaced_sources() {
     let reg = local_registry(&[("foo", "1.0.0", &[]), ("foo", "1.4.2", &[])]);
@@ -2253,11 +2251,11 @@ fn trim_paths_keeps_this_machines_paths_out_of_the_binary() {
     );
     p.write("src/main.rs", "fn main() { panic!(\"where am I\"); }\n");
     p.ok(&["build", "--release"]);
-    let exe = p.path().join(".rune/target/release/demo");
+    let exe = p.path().join(".rune/target/release").join(exe("demo"));
     let run = Command::new(&exe).output().unwrap();
     let stderr = String::from_utf8_lossy(&run.stderr);
-    assert!(stderr.contains("src/main.rs:1"), "{stderr}");
-    let root = p.path().canonicalize().unwrap();
+    assert!(stderr.contains(&native("src/main.rs:1")), "{stderr}");
+    let root = rune_common::fsutil::canonicalize(p.path()).unwrap();
     assert!(!stderr.contains(root.to_str().unwrap()), "{stderr}");
     let bytes = std::fs::read(&exe).unwrap();
     for path in [root.to_str().unwrap(), p.home().to_str().unwrap()] {
@@ -2274,7 +2272,7 @@ fn trim_paths_keeps_this_machines_paths_out_of_the_binary() {
     p.ok(&["build", "--release"]);
     let run = Command::new(&exe).output().unwrap();
     let stderr = String::from_utf8_lossy(&run.stderr);
-    assert!(stderr.contains("src/main.rs:1"), "{stderr}");
+    assert!(stderr.contains(&native("src/main.rs:1")), "{stderr}");
     assert!(!stderr.contains(root.to_str().unwrap()), "{stderr}");
 }
 
@@ -2293,8 +2291,8 @@ fn compiler_messages_name_workspace_files_relative_to_the_root() {
     let out = p.rune(&["build"]);
     assert!(!out.status.success());
     let text = text(&out);
-    assert!(text.contains("--> app/src/main.rs:1:26"), "{text}");
-    let root = p.path().canonicalize().unwrap();
+    assert!(text.contains(&native("--> app/src/main.rs:1:26")), "{text}");
+    let root = rune_common::fsutil::canonicalize(p.path()).unwrap();
     assert!(!text.contains(root.to_str().unwrap()), "{text}");
     // One verdict, after the compiler's message.
     let verdict = text.find("could not compile app v0.1.0").expect(&text);
@@ -2366,7 +2364,6 @@ fn fmt_check_after_the_separator_works_as_in_ci() {
     p.ok(&["fmt", "--all", "--", "--check"]);
 }
 
-#[cfg(unix)]
 #[test]
 fn install_from_a_registry_lists_upgrades_and_uninstalls_like_cargo() {
     let reg = tempfile::tempdir().unwrap();
@@ -2436,7 +2433,6 @@ fn install_from_a_registry_lists_upgrades_and_uninstalls_like_cargo() {
     );
 }
 
-#[cfg(unix)]
 #[test]
 fn a_cargo_lock_changed_outside_rune_is_respected_not_reverted() {
     // `git pull` / `git checkout` / `cargo update --precise` change
@@ -2481,7 +2477,6 @@ fn a_cargo_lock_changed_outside_rune_is_respected_not_reverted() {
     assert_eq!(p.read("Cargo.lock"), older);
 }
 
-#[cfg(unix)]
 #[test]
 fn vendored_directories_replace_crates_io_for_offline_builds() {
     let (_, sum) = make_crate("foo", "1.0.0", FOO_LIB);
@@ -2509,7 +2504,6 @@ fn vendored_directories_replace_crates_io_for_offline_builds() {
 
 /// A minimal sparse registry: serves `config.json`, one index file and one
 /// `.crate`, and answers 401 unless the request carries the expected token.
-#[cfg(unix)]
 fn serve_registry(token: &'static str, crate_bytes: Vec<u8>, index_line: String) -> u16 {
     use std::io::{Read, Write};
     use std::net::TcpListener;
@@ -2573,7 +2567,6 @@ fn serve_registry(token: &'static str, crate_bytes: Vec<u8>, index_line: String)
 
 /// What the publishing mock registry holds: `(name, version)` → crate bytes,
 /// and each crate's index lines.
-#[cfg(unix)]
 #[derive(Default)]
 struct MockRegistry {
     crates: std::collections::HashMap<(String, String), Vec<u8>>,
@@ -2581,7 +2574,6 @@ struct MockRegistry {
 }
 
 /// A registry with a web API: reads are open, `/api/v1/…` writes need `token`.
-#[cfg(unix)]
 fn serve_publishing_registry(
     token: &'static str,
 ) -> (u16, std::sync::Arc<std::sync::Mutex<MockRegistry>>) {
@@ -2645,12 +2637,7 @@ fn serve_publishing_registry(
                         let bytes = body[8 + n..8 + n + c].to_vec();
                         let tmp = tempfile::NamedTempFile::new().unwrap();
                         std::fs::write(tmp.path(), &bytes).unwrap();
-                        let sum = Command::new("sha256sum").arg(tmp.path()).output().unwrap();
-                        let sum = String::from_utf8_lossy(&sum.stdout)
-                            .split_whitespace()
-                            .next()
-                            .unwrap()
-                            .to_string();
+                        let sum = rune_registry::download::sha256_file(tmp.path()).unwrap();
                         let name = meta["name"].as_str().unwrap().to_string();
                         let vers = meta["vers"].as_str().unwrap().to_string();
                         let deps: Vec<serde_json::Value> = meta["deps"]
@@ -2741,7 +2728,6 @@ fn serve_publishing_registry(
     (port, state)
 }
 
-#[cfg(unix)]
 #[test]
 fn a_locked_release_newer_than_the_cached_index_is_fetched_not_downgraded() {
     let (port, state) = serve_publishing_registry("unused");
@@ -2799,7 +2785,6 @@ fn a_locked_release_newer_than_the_cached_index_is_fetched_not_downgraded() {
     assert!(text(&out).contains("without `--offline`"), "{}", text(&out));
 }
 
-#[cfg(unix)]
 #[test]
 fn packages_are_published_installed_yanked_and_owned_through_a_registry_api() {
     let (port, state) = serve_publishing_registry("tok-123");
@@ -2902,14 +2887,18 @@ fn packages_are_published_installed_yanked_and_owned_through_a_registry_api() {
         assert!(app["deps"][0]["registry"].is_null(), "{app}");
         // The uploaded manifest has no path dependency left.
         let bytes = st.crates[&("mockapp".to_string(), "0.3.0".to_string())].clone();
-        let tmp = tempfile::tempdir().unwrap();
-        std::fs::write(tmp.path().join("a.crate"), bytes).unwrap();
-        let manifest = Command::new("tar")
-            .args(["xzf", "a.crate", "-O", "mockapp-0.3.0/Cargo.toml"])
-            .current_dir(tmp.path())
-            .output()
-            .unwrap();
-        let manifest = String::from_utf8_lossy(&manifest.stdout);
+        let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(&bytes[..]));
+        let manifest = archive
+            .entries()
+            .unwrap()
+            .flatten()
+            .find(|e| e.path().unwrap() == Path::new("mockapp-0.3.0/Cargo.toml"))
+            .map(|mut e| {
+                let mut text = String::new();
+                std::io::Read::read_to_string(&mut e, &mut text).unwrap();
+                text
+            })
+            .expect("the package has a manifest");
         assert!(!manifest.contains("path ="), "{manifest}");
         assert!(manifest.contains("version = \"0.3.0\""), "{manifest}");
     }
@@ -2986,7 +2975,6 @@ fn registry_tokens_come_from_external_credential_providers() {
     assert_eq!(state.lock().unwrap().index["foo"][0]["yanked"], true);
 }
 
-#[cfg(unix)]
 #[test]
 fn git_based_registry_indexes_resolve_download_and_lock_like_cargo() {
     // The index is a git repository; the `.crate` files come from the `dl`
@@ -3028,7 +3016,7 @@ fn git_based_registry_indexes_resolve_download_and_lock_like_cargo() {
                 .success()
         );
     }
-    let url = format!("file://{}", index.path().display());
+    let url = rune_common::fsutil::file_url(index.path());
     let p = registry_app("{ version = \"1\", registry = \"corp\" }");
     p.write(
         ".cargo/config.toml",
@@ -3047,7 +3035,6 @@ fn git_based_registry_indexes_resolve_download_and_lock_like_cargo() {
     assert!(p.ok(&["run", "--offline"]).contains("foo says"));
 }
 
-#[cfg(unix)]
 #[test]
 fn authenticated_alternative_registries_resolve_download_and_are_part_of_the_identity() {
     let (bytes, sum) = make_crate("foo", "1.0.0", FOO_LIB);
@@ -3172,7 +3159,7 @@ fn build_script_rerun_if_env_changed_and_external_files_invalidate_the_cache() {
         &format!(
             r#"fn main() {{
     println!("cargo::rerun-if-env-changed=RUNE_TEST_SCRIPT_VAR");
-    println!("cargo::rerun-if-changed={}");
+    println!("cargo::rerun-if-changed={{}}", {:?});
     let var = std::env::var("RUNE_TEST_SCRIPT_VAR").unwrap_or_default();
     let header = std::fs::read_to_string({:?}).unwrap();
     println!("cargo::rustc-env=SEEN={{}}/{{}}", var, header);
@@ -3497,7 +3484,6 @@ fn concurrent_check_and_build_do_not_break_each_other() {
     assert!(p.ok(&["run", "-p", "app"]).contains("value=42"));
 }
 
-#[cfg(unix)]
 #[test]
 fn deps_only_builds_dependencies_and_leaves_the_workspace_alone() {
     let (_, sum) = make_crate("foo", "1.0.0", FOO_LIB);
@@ -3885,7 +3871,7 @@ fn a_script_with_a_compile_error_reports_it_with_the_right_line_number() {
     let t = text(&out);
     assert!(t.contains("mismatched types"), "{t}");
     assert!(
-        t.contains("src/main.rs:5"),
+        t.contains(&native("src/main.rs:5")),
         "the error is on line 5 of the file: {t}"
     );
 }
@@ -4019,6 +4005,141 @@ fn a_shared_store_lets_another_machine_skip_what_was_already_built() {
     let alone = chain_project(6);
     let t = text(&rune_with_env(&alone, &["build"], &[]));
     assert!(!t.contains("0 compiled"), "{t}");
+}
+
+/// `app → mid → dep`, all in the workspace; `app` also uses `dep` directly.
+fn layered_project() -> Project {
+    let p = Project::new();
+    p.write(
+        "Cargo.toml",
+        "[workspace]\nresolver = \"2\"\nmembers = [\"app\", \"mid\", \"dep\"]\n",
+    );
+    p.write(
+        "dep/Cargo.toml",
+        "[package]\nname = \"dep\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    p.write("dep/src/lib.rs", "pub fn value() -> u32 { 41 }\n");
+    p.write(
+        "mid/Cargo.toml",
+        "[package]\nname = \"mid\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\ndep = { path = \"../dep\" }\n",
+    );
+    p.write(
+        "mid/src/lib.rs",
+        "pub fn value() -> u32 { dep::value() + 1 }\n",
+    );
+    p.write(
+        "app/Cargo.toml",
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\nmid = { path = \"../mid\" }\ndep = { path = \"../dep\" }\n",
+    );
+    p.write(
+        "app/src/main.rs",
+        "fn main() { println!(\"value={}\", mid::value() + dep::value() * 0); }\n",
+    );
+    p
+}
+
+/// Runs `rune` in `p` with the store of `home`, asserting success.
+fn ok_with_home(p: &Project, home: &Path, args: &[&str]) -> String {
+    let out = rune_with_env(p, args, &[("RUNE_HOME", home.as_os_str())]);
+    let t = text(&out);
+    assert!(
+        out.status.success(),
+        "`rune {}` failed:\n{t}",
+        args.join(" ")
+    );
+    t
+}
+
+#[test]
+fn a_crate_compiled_against_another_build_of_its_dependency_is_never_restored_beside_it() {
+    // rustc does not always produce the same crate from the same inputs (a
+    // workspace crate's identity includes the directory it is compiled in),
+    // and it loads a crate only next to the very build of each dependency it
+    // was compiled against. Three checkouts share one store.
+    let home = tempfile::tempdir().unwrap();
+    let first = layered_project();
+    ok_with_home(&first, home.path(), &["build"]);
+
+    // A second checkout changes `mid` and rebuilds everything: its own build
+    // of `dep` is not the stored one, and `mid` is compiled against it.
+    let second = layered_project();
+    second.write(
+        "mid/src/lib.rs",
+        "pub fn value() -> u32 { dep::value() + 1 } // changed\n",
+    );
+    ok_with_home(&second, home.path(), &["build", "--rebuild-all"]);
+
+    // A third with the same change restores `dep` from the first checkout and
+    // compiles `app` against it and `mid`: had the second checkout's `mid`
+    // been stored, rustc would find no `dep` it fits ("can't find crate").
+    let third = layered_project();
+    third.write(
+        "mid/src/lib.rs",
+        "pub fn value() -> u32 { dep::value() + 1 } // changed\n",
+    );
+    third.write(
+        "app/src/main.rs",
+        "fn main() { println!(\"value={}\", mid::value() + dep::value() * 0); } // changed\n",
+    );
+    ok_with_home(&third, home.path(), &["build"]);
+    let run = ok_with_home(&third, home.path(), &["run", "-p", "app"]);
+    assert!(run.contains("value=42"), "{run}");
+}
+
+/// The manifests of every stored build of `krate` in the store under `home`.
+fn stored_manifests(home: &Path, krate: &str) -> Vec<PathBuf> {
+    walkdir::WalkDir::new(home.join("cas").join("objects"))
+        .into_iter()
+        .flatten()
+        .filter(|e| e.file_name() == "manifest.json")
+        .filter(|e| {
+            std::fs::read_to_string(e.path())
+                .ok()
+                .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+                .is_some_and(|m| m["crate_name"] == krate)
+        })
+        .map(|e| e.path().to_path_buf())
+        .collect()
+}
+
+#[test]
+fn a_stored_crate_that_does_not_fit_its_dependencies_is_compiled_again_and_replaced() {
+    // What an older Rune, or two processes racing, may have left in a store:
+    // an entry compiled against a build of its dependency that is not the
+    // stored one.
+    let home = tempfile::tempdir().unwrap();
+    let first = layered_project();
+    ok_with_home(&first, home.path(), &["build"]);
+    let manifests = stored_manifests(home.path(), "mid");
+    assert!(!manifests.is_empty(), "mid is stored");
+    for path in &manifests {
+        let mut m: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        let against = m["compiled_against"]
+            .as_object_mut()
+            .expect("an entry records what it was compiled against");
+        assert_eq!(against.len(), 1, "mid has one dependency: {against:?}");
+        for content in against.values_mut() {
+            *content = serde_json::Value::from("another build");
+        }
+        std::fs::write(path, m.to_string()).unwrap();
+    }
+
+    // Another checkout restores `dep` but compiles `mid` again (and `app`,
+    // which is compiled against it), instead of failing to compile `app`.
+    let second = layered_project();
+    let out = ok_with_home(&second, home.path(), &["build"]);
+    assert!(out.contains("2 compiled"), "{out}");
+    let run = ok_with_home(&second, home.path(), &["run", "-p", "app"]);
+    assert!(run.contains("value=42"), "{run}");
+    // The entry now records the build it fits, so the next checkout reuses it.
+    for path in stored_manifests(home.path(), "mid") {
+        let m = std::fs::read_to_string(path).unwrap();
+        assert!(!m.contains("another build"), "{m}");
+    }
+    let third = layered_project();
+    let out = ok_with_home(&third, home.path(), &["build"]);
+    assert!(out.contains("0 compiled"), "{out}");
 }
 
 // ---------------------------------------------------------------------------
@@ -4581,7 +4702,6 @@ fn a_dependency_that_learns_an_outside_input_late_still_rekeys_its_dependents() 
 // ---------------------------------------------------------------------------
 
 /// Adds `"rust_version":"<rv>"` to one release in a local registry's index.
-#[cfg(unix)]
 fn require_rust(reg: &tempfile::TempDir, name: &str, version: &str, rv: &str) {
     let path = reg.path().join("index/1").join(name);
     let text = std::fs::read_to_string(&path).unwrap().replace(
@@ -4591,7 +4711,6 @@ fn require_rust(reg: &tempfile::TempDir, name: &str, version: &str, rv: &str) {
     std::fs::write(path, text).unwrap();
 }
 
-#[cfg(unix)]
 #[test]
 fn outdated_lists_what_the_lockfile_and_the_manifest_hold_back() {
     let reg = local_registry(&[
@@ -4631,7 +4750,6 @@ fn outdated_lists_what_the_lockfile_and_the_manifest_hold_back() {
     assert_eq!(rows[0]["compatible"], "1.2.0");
 }
 
-#[cfg(unix)]
 #[test]
 fn upgrade_raises_requirements_keeping_the_manifests_formatting() {
     let reg = local_registry(&[
@@ -4685,7 +4803,6 @@ fn upgrade_raises_requirements_keeping_the_manifests_formatting() {
     assert_eq!(p.read("Cargo.toml"), before);
 }
 
-#[cfg(unix)]
 #[test]
 fn upgrade_and_outdated_respect_the_packages_rust_version() {
     let reg = local_registry(&[
@@ -4717,7 +4834,6 @@ fn upgrade_and_outdated_respect_the_packages_rust_version() {
     );
 }
 
-#[cfg(unix)]
 #[test]
 fn upgrade_edits_workspace_dependencies_where_members_inherit_them() {
     let reg = local_registry(&[("a", "1.0.0", &[]), ("a", "1.3.0", &[])]);
@@ -4888,7 +5004,6 @@ fn a_dependency_used_only_under_another_cfg_is_reported_but_never_removed() {
 // sbom
 // ---------------------------------------------------------------------------
 
-#[cfg(unix)]
 #[test]
 fn sbom_lists_what_ships_with_checksums_purls_and_edges() {
     let reg = local_registry(&[
@@ -5011,7 +5126,6 @@ fn exec_surface_lists_build_scripts_and_proc_macros_with_their_chain() {
 }
 
 /// Sets `pubtime` of one release in a local registry's index.
-#[cfg(unix)]
 fn published(reg: &tempfile::TempDir, name: &str, version: &str, when: &str) {
     let path = reg.path().join("index/1").join(name);
     let text = std::fs::read_to_string(&path).unwrap().replace(
@@ -5021,7 +5135,6 @@ fn published(reg: &tempfile::TempDir, name: &str, version: &str, when: &str) {
     std::fs::write(path, text).unwrap();
 }
 
-#[cfg(unix)]
 #[test]
 fn a_minimum_release_age_keeps_brand_new_releases_out_until_they_mature() {
     let reg = local_registry(&[
@@ -5349,7 +5462,8 @@ fn a_build_script_reruns_only_when_a_file_it_watches_changes() {
         .next()
         .unwrap()
         .path()
-        .join("script/build_script_build");
+        .join("script")
+        .join(exe("build_script_build"));
     let compiled_at = std::fs::metadata(&bin).unwrap().modified().unwrap();
 
     // The crate's own sources are not something the script reads.
@@ -5457,7 +5571,6 @@ fn graph_units_lists_the_build_plan_with_keys_and_cache_state() {
     assert_eq!(plan(&p)["units"], after["units"]);
 }
 
-#[cfg(unix)]
 #[test]
 fn a_dependencys_build_script_warnings_stay_quiet_but_the_workspaces_show() {
     let reg = tempfile::tempdir().unwrap();
@@ -5521,13 +5634,21 @@ fn tree_shows_what_a_build_here_uses_like_cargo_tree() {
         );
         p.write(&format!("{name}/src/lib.rs"), "");
     }
+    // `win` is for the other kind of platform than this one.
+    let (elsewhere, elsewhere_triple) = if cfg!(windows) {
+        ("unix", "x86_64-unknown-linux-gnu")
+    } else {
+        ("windows", "x86_64-pc-windows-msvc")
+    };
     p.write(
         "app/Cargo.toml",
-        "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
-         [dependencies]\nlib1 = { path = \"../lib1\", features = [\"extra\"] }\n\n\
-         [build-dependencies]\nbld = { path = \"../bld\" }\n\n\
-         [dev-dependencies]\ndevd = { path = \"../devd\" }\n\n\
-         [target.'cfg(windows)'.dependencies]\nwin = { path = \"../win\" }\n",
+        &format!(
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
+             [dependencies]\nlib1 = {{ path = \"../lib1\", features = [\"extra\"] }}\n\n\
+             [build-dependencies]\nbld = {{ path = \"../bld\" }}\n\n\
+             [dev-dependencies]\ndevd = {{ path = \"../devd\" }}\n\n\
+             [target.'cfg({elsewhere})'.dependencies]\nwin = {{ path = \"../win\" }}\n"
+        ),
     );
     p.write("app/src/lib.rs", "");
     p.write("app/build.rs", "fn main() {}\n");
@@ -5545,12 +5666,10 @@ fn tree_shows_what_a_build_here_uses_like_cargo_tree() {
     assert!(lines[3].starts_with("└── bld v0.1.0"), "{tree}");
     assert_eq!(lines[4], "[dev-dependencies]", "{tree}");
     assert!(lines[5].starts_with("└── devd v0.1.0"), "{tree}");
-    // Not a Windows machine (these tests run on Linux and macOS).
+    // Not for this machine, but for the platform it is for.
     assert!(!tree.contains("win v0.1.0"), "{tree}");
     assert!(stdout(&["tree", "-p", "app", "--target", "all"]).contains("win v0.1.0"));
-    assert!(
-        stdout(&["tree", "-p", "app", "--target", "x86_64-pc-windows-msvc"]).contains("win v0.1.0")
-    );
+    assert!(stdout(&["tree", "-p", "app", "--target", elsewhere_triple]).contains("win v0.1.0"));
 
     let normal = stdout(&["tree", "-p", "app", "-e", "normal", "--prefix", "none"]);
     let names: Vec<&str> = normal
@@ -5697,7 +5816,9 @@ fn store_entries_unused_for_a_month_are_removed_in_the_background() {
         perms.set_readonly(false);
         std::fs::set_permissions(m, perms).unwrap();
         std::fs::write(m, json.to_string()).unwrap();
-        std::fs::File::open(m)
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(m)
             .unwrap()
             .set_modified(days_ago(40))
             .unwrap();
@@ -5708,7 +5829,9 @@ fn store_entries_unused_for_a_month_are_removed_in_the_background() {
     assert!(old.iter().all(|m| m.exists()));
 
     // A day after the last run, the next build starts one in the background.
-    std::fs::File::open(&stamp)
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&stamp)
         .unwrap()
         .set_modified(days_ago(2))
         .unwrap();
@@ -5853,7 +5976,6 @@ fn a_links_package_with_integration_tests_is_not_its_own_conflict() {
     assert!(out.contains("(test aead_tests) · 1 passed"), "{out}");
 }
 
-#[cfg(unix)]
 #[test]
 fn a_workspace_crate_does_not_stand_in_for_its_published_release() {
     // `helper` (a dev-dependency) depends on the published `core_lib 1.0.0`;
@@ -6002,7 +6124,6 @@ fn features_says_which_are_on_and_who_turned_them_on() {
     );
 }
 
-#[cfg(unix)]
 #[test]
 fn a_lockfile_from_another_resolution_is_never_trusted() {
     // Two `rune` processes at once (an editor's `rune check` and a build),
@@ -6142,7 +6263,12 @@ fn pinned_workspaces_survive_cleanup_and_idle_entries_are_compressed() {
             perms.set_readonly(false);
             std::fs::set_permissions(m, perms).unwrap();
             std::fs::write(m, json.to_string()).unwrap();
-            std::fs::File::open(m).unwrap().set_modified(then).unwrap();
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(m)
+                .unwrap()
+                .set_modified(then)
+                .unwrap();
         }
     };
     age();
@@ -6212,7 +6338,6 @@ fn tests_can_be_scheduled_one_batch_at_a_time_across_binaries() {
     assert!(t.contains("nope") && t.contains("1 failed"), "{t}");
 }
 
-#[cfg(unix)]
 #[test]
 fn resolution_moves_back_from_a_release_whose_dependency_does_not_exist() {
     // The newest `b` needs a `c` that was never published; Cargo takes the
@@ -6227,7 +6352,6 @@ fn resolution_moves_back_from_a_release_whose_dependency_does_not_exist() {
     assert_eq!(locked(&p), ["app 0.1.0", "b 1.0.0", "c 1.0.0"], "{out}");
 }
 
-#[cfg(unix)]
 #[test]
 fn an_impossible_version_choice_is_explained() {
     let reg = local_registry(&[
@@ -6292,7 +6416,6 @@ fn main() {{
     assert!(!outside.exists());
 }
 
-#[cfg(unix)]
 #[test]
 fn audit_reports_advisories_for_locked_versions() {
     let reg = local_registry(&[
@@ -6692,9 +6815,10 @@ fn default_run_and_metadata_nodes_match_cargo() {
 
     let out = p.rune(&["metadata", "--format-version", "1"]);
     let m: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
-    let dir = p.path().canonicalize().unwrap();
-    let app_id = format!("path+file://{}/app#0.1.0", dir.display());
-    let helper_id = format!("path+file://{}/helper#0.2.0", dir.display());
+    let dir = rune_common::fsutil::canonicalize(p.path()).unwrap();
+    let url = |name: &str| rune_common::fsutil::file_url(&dir.join(name));
+    let app_id = format!("path+{}#0.1.0", url("app"));
+    let helper_id = format!("path+{}#0.2.0", url("helper"));
     let nodes = m["resolve"]["nodes"].as_array().unwrap();
     assert_eq!(nodes.len(), 2, "{m}");
     let app = nodes

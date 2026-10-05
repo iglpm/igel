@@ -10,7 +10,7 @@
 use crate::args::WatchArgs;
 use crate::ui;
 use anyhow::{Context, Result};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -115,11 +115,20 @@ fn git_ignored(root: &Path, paths: &[PathBuf]) -> HashSet<PathBuf> {
     // is not a repository after all, and writing to it then would raise a
     // SIGPIPE, which ends Rune (it lets the signal stop it, for `| head`).
     for chunk in paths.chunks(256) {
+        // Relative and with `/`, as git spells paths: it echoes the ones it
+        // ignores, and quotes (so changes) any with a backslash in them.
+        let asked: HashMap<String, &PathBuf> = chunk
+            .iter()
+            .map(|p| {
+                let rel = p.strip_prefix(root).unwrap_or(p);
+                (rel.to_string_lossy().replace('\\', "/"), p)
+            })
+            .collect();
         let Ok(out) = Command::new("git")
             .arg("-C")
             .arg(root)
             .args(["-c", "core.quotePath=false", "check-ignore", "--"])
-            .args(chunk.iter().map(|p| p.strip_prefix(root).unwrap_or(p)))
+            .args(asked.keys())
             .stdin(Stdio::null())
             .stderr(Stdio::null())
             .output()
@@ -133,11 +142,47 @@ fn git_ignored(root: &Path, paths: &[PathBuf]) -> HashSet<PathBuf> {
         ignored.extend(
             String::from_utf8_lossy(&out.stdout)
                 .lines()
-                .filter(|l| !l.is_empty())
-                .map(|l| root.join(l)),
+                .filter_map(|l| asked.get(&git_unquote(l)).map(|p| (*p).clone())),
         );
     }
     ignored
+}
+
+/// A path as git prints it: as is, or in double quotes with C escapes when it
+/// holds a quote, a backslash or a control character (`"a\\b"` is `a\b`).
+fn git_unquote(line: &str) -> String {
+    let Some(inner) = line.strip_prefix('"').and_then(|l| l.strip_suffix('"')) else {
+        return line.to_string();
+    };
+    let mut bytes = Vec::new();
+    let mut chars = inner.bytes().peekable();
+    while let Some(b) = chars.next() {
+        if b != b'\\' {
+            bytes.push(b);
+            continue;
+        }
+        match chars.next() {
+            Some(b'n') => bytes.push(b'\n'),
+            Some(b't') => bytes.push(b'\t'),
+            Some(b'r') => bytes.push(b'\r'),
+            Some(d @ b'0'..=b'7') => {
+                let mut value = u32::from(d - b'0');
+                for _ in 0..2 {
+                    match chars.peek() {
+                        Some(&o @ b'0'..=b'7') => {
+                            value = value * 8 + u32::from(o - b'0');
+                            chars.next();
+                        }
+                        _ => break,
+                    }
+                }
+                bytes.push(value as u8);
+            }
+            Some(other) => bytes.push(other),
+            None => bytes.push(b'\\'),
+        }
+    }
+    String::from_utf8_lossy(&bytes).into_owned()
 }
 
 /// `src/lib.rs`, or `src/lib.rs and 3 more`.
@@ -419,11 +464,24 @@ mod tests {
         std::fs::write(p.path().join("test.log"), "x").unwrap();
         let now = snap.state();
         assert_ne!(base, now);
-        assert!(snap.changes(&base, &now).is_empty());
+        let changes = snap.changes(&base, &now);
+        assert!(changes.is_empty(), "{changes:?}");
         std::fs::write(p.path().join("src/lib.rs"), "fn b() {}").unwrap();
         let changed = snap.changes(&base, &snap.state());
         assert_eq!(changed, [p.path().join("src/lib.rs")]);
-        assert_eq!(describe(p.path(), &changed), "src/lib.rs");
+        assert_eq!(
+            describe(p.path(), &changed),
+            Path::new("src").join("lib.rs").display().to_string()
+        );
+    }
+
+    #[test]
+    fn git_quoted_paths_are_read_back() {
+        assert_eq!(git_unquote("src/lib.rs"), "src/lib.rs");
+        assert_eq!(git_unquote(r#""a\\b.log""#), r"a\b.log");
+        assert_eq!(git_unquote(r#""say \"hi\".txt""#), r#"say "hi".txt"#);
+        assert_eq!(git_unquote(r#""tab\there""#), "tab\there");
+        assert_eq!(git_unquote(r#""m\303\274nchen""#), "münchen");
     }
 
     #[test]

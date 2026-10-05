@@ -95,6 +95,11 @@ pub struct FeatureResolution {
     /// `(package, dependency package, feature)`: a feature a package asked a
     /// dependency for that the dependency does not have.
     pub unknown_features: Vec<(usize, usize, String)>,
+    /// `(unit, index into its PackageView::deps)`: a dependency the build
+    /// needs (not optional, or switched on, for this platform) that the
+    /// resolution has no package for. Building anyway would only end in
+    /// rustc's "can't find crate".
+    pub unresolved: Vec<(UnitRef, usize)>,
 }
 
 #[derive(Default)]
@@ -120,6 +125,7 @@ pub fn resolve(
     let mut queue: VecDeque<UnitRef> = VecDeque::new();
     let mut edges: BTreeSet<(UnitRef, UnitRef, usize)> = BTreeSet::new();
     let mut unknown: BTreeSet<(usize, usize, String)> = BTreeSet::new();
+    let mut unresolved: BTreeSet<(UnitRef, usize)> = BTreeSet::new();
     let has_feature = |p: &PackageView, f: &str| {
         f == "default"
             || f.contains('/')
@@ -161,9 +167,6 @@ pub fn resolve(
             (st.activated.clone(), st.dep_features.clone())
         };
         for (di, dep) in pkg.deps.iter().enumerate() {
-            let Some(target_pkg) = dep.resolved else {
-                continue;
-            };
             if dep.optional && !activated.contains(&dep.alias) {
                 continue;
             }
@@ -186,6 +189,13 @@ pub fn resolve(
             {
                 continue;
             }
+            // Only now, when the build would follow it, does a dependency
+            // without a resolved package matter (an optional one nothing
+            // switches on is routinely left out of the lockfile).
+            let Some(target_pkg) = dep.resolved else {
+                unresolved.insert((unit, di));
+                continue;
+            };
             let child_host =
                 role(host || dep.kind == DependencyKind::Build || pkgs[target_pkg].proc_macro);
             let child = (target_pkg, child_host);
@@ -235,6 +245,7 @@ pub fn resolve(
     FeatureResolution {
         features,
         unknown_features: unknown.into_iter().collect(),
+        unresolved: unresolved.into_iter().collect(),
         edges: edges
             .into_iter()
             .map(|(from, to, dep)| Edge { from, to, dep })

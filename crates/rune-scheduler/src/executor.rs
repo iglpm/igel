@@ -4,6 +4,7 @@ use crate::schedule::{Gate, ScheduleReport, Step, StepId};
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use rayon::prelude::*;
 use rune_cas::CasStore;
+use rune_cas::store::Content;
 use rune_common::toolchain::{self, TargetInfo, Toolchain};
 use rune_common::{
     BuildScriptOutput, CompilationUnit, CrateSource, CrateType, LinkArgScope, Profile, RuneConfig,
@@ -49,6 +50,12 @@ enum WorkerMsg {
     MetadataReady {
         node_id: NodeId,
         rmeta_path: PathBuf,
+        /// What identifies this build of the unit to its dependents.
+        content: Option<Content>,
+        /// The store already holds a different build of the unit, compiled
+        /// against the same dependencies: what is compiled against this one
+        /// must not be published (see `BuildExecutor::tainted`).
+        diverged: bool,
     },
     BuildScriptDone {
         node_id: NodeId,
@@ -69,6 +76,8 @@ enum WorkerMsg {
         /// Taken from the store (another process built it while we waited)
         /// rather than compiled by this one.
         restored: bool,
+        /// See `MetadataReady` (for a unit that announced no metadata).
+        content: Option<Content>,
     },
     Failed {
         node_id: NodeId,
@@ -481,6 +490,14 @@ impl BuildExecutor {
         let mut artifact_paths: HashMap<NodeId, Vec<PathBuf>> = HashMap::new();
         let mut metadata_paths: HashMap<NodeId, PathBuf> = HashMap::new();
         let mut build_script_outputs: HashMap<NodeId, BuildScriptOutput> = HashMap::new();
+        // What identifies the build of each unit that is in place (restored or
+        // compiled) to the units compiled against it.
+        let mut contents: HashMap<NodeId, Content> = HashMap::new();
+        // Units whose result must not be published: compiled against a build
+        // of a dependency that differs from the one the store holds under its
+        // key (a non-reproducible compiler output), so the store's entries
+        // would not fit together.
+        let mut tainted: HashSet<NodeId> = HashSet::new();
         let mut compiled = 0;
         let mut cached = 0;
         let mut failed: Vec<NodeId> = Vec::new();
@@ -490,7 +507,7 @@ impl BuildExecutor {
         // whether those dependencies were restored or will be rebuilt.
         if let Some(cas) = self.cas.as_ref().filter(|_| !self.force_rebuild) {
             let _timer = rune_common::timing::phase("cas restore");
-            let restore = |&id: &NodeId| -> Option<(NodeId, Vec<PathBuf>)> {
+            let restore = |&id: &NodeId| -> Option<(NodeId, rune_cas::store::Linked)> {
                 let unit = &graph.node(id).unit;
                 let key = &unit_cas_keys[&id];
                 // Another `rune` sharing this target directory may be
@@ -506,18 +523,61 @@ impl BuildExecutor {
                 else {
                     return None;
                 };
-                let linked = cas.link_to(key, &self.out_dir_for(unit)).ok()?;
-                (!linked.is_empty()).then_some((id, linked))
+                let linked = cas
+                    .link_entry(key, &self.out_dir_for(unit))
+                    .inspect_err(|e| {
+                        if cas.contains(key) {
+                            debug!(
+                                "could not restore {} v{}: {e}",
+                                unit.crate_id.name, unit.crate_id.version
+                            );
+                        }
+                    })
+                    .ok()?;
+                (!linked.files.is_empty()).then_some((id, linked))
             };
             // In parallel only where it pays: a small graph's restores are
             // quicker than starting (and spinning down) a thread pool.
-            let restored: Vec<(NodeId, Vec<PathBuf>)> = if topo.len() < 48 {
+            let mut restored: HashMap<NodeId, rune_cas::store::Linked> = if topo.len() < 48 {
                 topo.iter().filter_map(restore).collect()
             } else {
                 topo.par_iter().filter_map(restore).collect()
             };
 
-            for (id, linked) in restored {
+            // A restored unit is usable only next to the very builds of its
+            // dependencies it was compiled against: rustc refuses to load a
+            // crate whose dependency is a different build ("can't find crate
+            // for `tracing`"), and the same key does not always mean the same
+            // bytes. Dependencies first, so a unit whose dependency is not
+            // restored, or was compiled against something else, is compiled
+            // again — and so is everything compiled against it.
+            for &id in &topo {
+                let Some(linked) = restored.get(&id) else {
+                    continue;
+                };
+                let fits = compiled_against(graph, id, &contents)
+                    .is_some_and(|deps| linked.manifest.matches_dependencies(&deps));
+                match linked.manifest.content() {
+                    Some(content) if fits => {
+                        contents.insert(id, content);
+                    }
+                    None if fits => {}
+                    _ => {
+                        let unit = &graph.node(id).unit;
+                        debug!(
+                            "stored {} v{} was compiled against other builds of its dependencies: compiling it again",
+                            unit.crate_id.name, unit.crate_id.version
+                        );
+                        restored.remove(&id);
+                    }
+                }
+            }
+
+            for &id in &topo {
+                let Some(linked) = restored.remove(&id) else {
+                    continue;
+                };
+                let linked = linked.files;
                 let unit = &graph.node(id).unit;
                 debug!(
                     "CAS hit for {} v{}",
@@ -838,6 +898,17 @@ impl BuildExecutor {
                         worker_tx.clone(),
                     );
                     job.script_only = script_only;
+                    if !script_only {
+                        // Every dependency's build is known by now: the unit
+                        // only starts once their metadata exists.
+                        job.compiled_against = compiled_against(graph, node_id, &contents);
+                        let fits = job.compiled_against.is_some()
+                            && extern_dependencies(graph, node_id).all(|d| !tainted.contains(&d));
+                        if !fits {
+                            tainted.insert(node_id);
+                        }
+                        job.publish = fits;
+                    }
                     job.lock = Some(lock);
                     job.lock_waited = lock_waited;
                     if script_only {
@@ -886,11 +957,25 @@ impl BuildExecutor {
                     WorkerMsg::MetadataReady {
                         node_id,
                         rmeta_path,
+                        content,
+                        diverged,
                     } => {
                         debug!("Metadata ready for node {:?}", node_id);
                         metadata_at.entry(node_id).or_insert_with(now);
                         metadata_ready.insert(node_id);
                         metadata_paths.insert(node_id, rmeta_path);
+                        if let Some(content) = content {
+                            contents.insert(node_id, content);
+                        }
+                        if diverged {
+                            let unit = &graph.node(node_id).unit;
+                            debug!(
+                                "{} v{} compiled to other bytes than the stored build of it: \
+                                 what is compiled against it is not stored",
+                                unit.crate_id.name, unit.crate_id.version
+                            );
+                            tainted.insert(node_id);
+                        }
                     }
                     WorkerMsg::BuildScriptDone { node_id, output } => {
                         let _ = self.event_tx.send(PipelineEvent::ScriptOutput {
@@ -986,7 +1071,11 @@ impl BuildExecutor {
                         duration,
                         peak_memory,
                         restored,
+                        content,
                     } => {
+                        if let Some(content) = content {
+                            contents.entry(node_id).or_insert(content);
+                        }
                         predicted_running.remove(&node_id);
                         debug!("Finished compiling node {:?}", node_id);
                         in_flight.remove(&node_id);
@@ -1661,6 +1750,8 @@ impl BuildExecutor {
             script_cache_key: None,
             package_hash: String::new(),
             read_script: None,
+            compiled_against: None,
+            publish: false,
         }
     }
 }
@@ -1717,6 +1808,12 @@ struct UnitJob {
     /// Whether the unit is keyed by the files it read, and with which build
     /// script result (see [`BuildExecutor::read_mode`]).
     read_script: Option<Option<String>>,
+    /// The builds of its dependencies the unit is compiled against (see
+    /// `ArtifactManifest::compiled_against`); `None` if one is not known.
+    compiled_against: Option<std::collections::BTreeMap<String, String>>,
+    /// Whether its result may be stored: it is compiled against the builds
+    /// of its dependencies the store holds (see `tainted` in `execute`).
+    publish: bool,
 }
 
 impl UnitJob {
@@ -1772,13 +1869,29 @@ impl UnitJob {
         }
         let recorded: Option<DeclaredInputs> = cas.get_value(&format!("{base}-inputs"));
         let key = effective_key(&base, recorded.as_ref(), has_script);
-        let out_dir = out_dir_for(&self.config, &self.profile, unit);
-        let Ok(linked) = cas.link_to(&key, &out_dir) else {
-            return false;
+        // Only a result compiled against the builds of its dependencies that
+        // this build uses fits next to them (see `execute`).
+        let fits = |m: &rune_cas::store::ArtifactManifest| {
+            self.compiled_against
+                .as_ref()
+                .is_some_and(|deps| m.matches_dependencies(deps))
         };
-        if linked.is_empty() {
+        if !cas.get(&key).is_some_and(|e| fits(&e.manifest)) {
             return false;
         }
+        let out_dir = out_dir_for(&self.config, &self.profile, unit);
+        let Ok(rune_cas::store::Linked {
+            files: linked,
+            manifest,
+        }) = cas.link_entry(&key, &out_dir)
+        else {
+            return false;
+        };
+        // (It may have been replaced in between.)
+        if linked.is_empty() || !fits(&manifest) {
+            return false;
+        }
+        let content = manifest.content();
         if key != self.cas_key {
             let _ = self.worker_tx.send(WorkerMsg::KeyUpdate {
                 node_id: self.node_id,
@@ -1807,6 +1920,8 @@ impl UnitJob {
             let _ = self.worker_tx.send(WorkerMsg::MetadataReady {
                 node_id: self.node_id,
                 rmeta_path: rmeta.clone(),
+                content: content.clone(),
+                diverged: false,
             });
         }
         uplift_artifacts(&self.config, &self.profile, unit, &linked);
@@ -1836,6 +1951,7 @@ impl UnitJob {
             duration,
             peak_memory: None,
             restored: true,
+            content,
         });
         true
     }
@@ -2283,6 +2399,7 @@ impl UnitJob {
         if let Some(js) = &self.jobserver {
             js.configure(&mut cmd);
         }
+        debug!("Running {:?}", cmd);
 
         // 3. Pipelined invocation: report `.rmeta` as soon as it exists. rustc
         // announces its dep-info first; it lists the environment variables the
@@ -2302,6 +2419,7 @@ impl UnitJob {
                 || self.extra_env.iter().any(|(n, _)| n == name)
         };
         let mut sent_metadata = false;
+        let mut own_content: Option<Content> = None;
         let result = invoker.invoke_streaming(cmd, &mut |artifact| match artifact.emit.as_str() {
             "dep-info" => {
                 let mut moved = false;
@@ -2353,6 +2471,21 @@ impl UnitJob {
             }
             "metadata" if !sent_metadata => {
                 sent_metadata = true;
+                // Before anything is compiled against it: is this the build
+                // the store holds for these inputs? A compiler that produced
+                // other bytes than last time (its output is not always
+                // reproducible) makes a crate other crates were not compiled
+                // against, so nothing compiled against it may be stored.
+                own_content =
+                    rune_cas::store::content_of_files(std::slice::from_ref(&artifact.artifact));
+                let diverged = match (&self.cas, &own_content, &self.compiled_against) {
+                    (Some(cas), Some(own), Some(deps)) if self.publish => {
+                        cas.manifest(&store_key).is_some_and(|m| {
+                            m.matches_dependencies(deps) && m.content().is_some_and(|c| c != *own)
+                        })
+                    }
+                    _ => false,
+                };
                 let _ = event_tx.send(PipelineEvent::MetadataReady {
                     node_id,
                     rmeta_path: artifact.artifact.clone(),
@@ -2360,6 +2493,8 @@ impl UnitJob {
                 let _ = worker_tx.send(WorkerMsg::MetadataReady {
                     node_id,
                     rmeta_path: artifact.artifact.clone(),
+                    content: own_content.clone(),
+                    diverged,
                 });
             }
             _ => {}
@@ -2388,6 +2523,11 @@ impl UnitJob {
                 let artifacts: Vec<PathBuf> =
                     comp_res.artifacts.into_iter().map(|a| a.artifact).collect();
                 uplift_artifacts(config, profile, unit, &artifacts);
+                // (A unit that announced no metadata: a binary, or a compiler
+                // that does not say.)
+                if own_content.is_none() {
+                    own_content = rune_cas::store::content_of_files(&artifacts);
+                }
 
                 // Dependents can start now; storing the result is not their
                 // concern (the files they use are the ones just written).
@@ -2404,18 +2544,30 @@ impl UnitJob {
                     duration,
                     peak_memory: comp_res.peak_memory,
                     restored: false,
+                    content: own_content,
                 });
                 // Storing is disk work, not compiler work: give the job slot's
                 // token back so another compiler can use the core meanwhile.
                 drop(token);
 
                 if let Some(cas_store) = &self.cas {
-                    let _ = cas_store.put_adopted(
-                        &store_key,
-                        &unit.crate_id.name,
-                        &unit.crate_id.version.to_string(),
-                        &artifacts,
-                    );
+                    // Only a unit compiled against the stored builds of its
+                    // dependencies is stored: the record says which, and an
+                    // entry compiled against others (no longer stored) is
+                    // replaced.
+                    if let (true, Some(deps)) = (self.publish, &self.compiled_against) {
+                        let _ = cas_store.put_unit(
+                            &store_key,
+                            &unit.crate_id.name,
+                            &unit.crate_id.version.to_string(),
+                            &artifacts,
+                            &rune_cas::store::PutOptions {
+                                adopt: true,
+                                compiled_against: deps.clone(),
+                                replace_stale: true,
+                            },
+                        );
+                    }
                     if !warnings.is_empty() {
                         let _ = cas_store.put_value(&format!("{store_key}-warnings"), &warnings);
                     }
@@ -2559,6 +2711,39 @@ fn extern_name(graph: &BuildGraph, node_id: NodeId, dep_id: NodeId) -> String {
         .get(&dep_id)
         .map(|s| s.replace('-', "_"))
         .unwrap_or_else(|| graph.node(dep_id).unit.rustc_crate_name())
+}
+
+/// The dependencies a unit's compiler is handed with `--extern` (see
+/// [`extern_deps_for`]): normal edges to libraries and proc-macros.
+fn extern_dependencies(graph: &BuildGraph, node_id: NodeId) -> impl Iterator<Item = NodeId> + '_ {
+    graph
+        .node(node_id)
+        .dependencies
+        .iter()
+        .copied()
+        .filter(move |&dep| {
+            graph.is_normal_edge(node_id, dep) && graph.node(dep).unit.crate_type != CrateType::Bin
+        })
+}
+
+/// What a unit is compiled against when its dependencies are the builds
+/// `contents` describes (see `ArtifactManifest::compiled_against`). `None`
+/// while a dependency's build is not known.
+///
+/// By file name, not by unit: `rune check` puts a fully built dependency's
+/// `.rmeta` where its own would go (see `execute`), and what was compiled
+/// against that is what it is.
+fn compiled_against(
+    graph: &BuildGraph,
+    node_id: NodeId,
+    contents: &HashMap<NodeId, Content>,
+) -> Option<std::collections::BTreeMap<String, String>> {
+    extern_dependencies(graph, node_id)
+        .map(|dep| {
+            let content = contents.get(&dep)?;
+            Some((content.file.clone(), content.id.clone()))
+        })
+        .collect()
 }
 
 /// Builds the `--extern name=path` list for a graph node.
@@ -2725,6 +2910,13 @@ fn link_or_copy_replace(src: &Path, dest: &Path) {
 /// how long a pipelined dependent waits for it.
 const METADATA_FRACTION: f64 = 0.4;
 
+/// What a compiler never measured before is assumed to need at its peak.
+const DEFAULT_COMPILER_MEMORY: u64 = 256 << 20;
+
+/// Part of every unit's key: how Rune runs the compiler, where that changes
+/// what the compiler produces from the same inputs (see `identity_with`).
+const INVOCATION: &str = "\0invocation=2";
+
 /// Compile times, used to weight the critical path.
 ///
 /// Measured seconds from earlier builds win (this project's, then those of any
@@ -2732,9 +2924,6 @@ const METADATA_FRACTION: f64 = 0.4;
 /// start blind). For a unit nobody has timed yet the estimate comes from the
 /// size of its sources, which on a cold build is the difference between
 /// starting `syn` first and starting it last.
-/// What a compiler never measured before is assumed to need at its peak.
-const DEFAULT_COMPILER_MEMORY: u64 = 256 << 20;
-
 #[derive(Default)]
 struct Timings {
     secs: HashMap<String, f64>,
@@ -3152,19 +3341,30 @@ pub fn build_rustc_command(
     let eff = unit.effective_profile(profile);
     // A crate of the project is compiled from the project root with a
     // relative path, as Cargo does: diagnostics and panic locations read
+    // `src/main.rs`, not an absolute path. Everything else (registry and git
+    // crates, path dependencies outside the project) is compiled from its own
+    // package root, also as Cargo does — never from wherever `rune` happened
+    // to be started. rustc hashes its working directory into the crate's
+    // identity (its SVH): the same crate compiled from two directories is two
+    // different crates to every dependent, and the store shares one result
+    // for both between all projects on the machine.
     let unit_source_root = rune_common::fsutil::simplified(&unit.source_root);
     let config_project_root = rune_common::fsutil::simplified(&config.project_root);
     let (source, cwd) = match unit_source_root.strip_prefix(config_project_root) {
         Ok(rel) if unit.crate_id.source == CrateSource::Local && !rel.as_os_str().is_empty() => {
-            (rel.to_path_buf(), Some(config_project_root.to_path_buf()))
+            (rel.to_path_buf(), config_project_root.to_path_buf())
         }
-        _ => (unit.source_root.clone(), None),
+        _ => (
+            unit.source_root.clone(),
+            rune_common::fsutil::simplified(&unit.manifest_dir).to_path_buf(),
+        ),
     };
-    let mut builder = RustcCommandBuilder::new(source);
-    if let Some(dir) = cwd {
-        builder = builder.current_dir(dir);
-    }
-    let mut builder = builder
+    // With the platform's separators throughout, as Cargo passes it: rustc
+    // names the file in diagnostics and panics as it was given, and a
+    // manifest's `src/main.rs` below a Windows directory is `app\src/main.rs`.
+    let source: PathBuf = source.components().collect();
+    let mut builder = RustcCommandBuilder::new(source)
+        .current_dir(cwd)
         .crate_name(&unit.rustc_crate_name())
         .edition(unit.edition.as_str())
         .metadata_hash(&unit.metadata_hash());
@@ -3584,6 +3784,10 @@ fn identity_with(
         "toolchain",
         toolchain::global().identity_for(unit.ext.member).as_bytes(),
     );
+    // How Rune runs the compiler, where that changes what it produces for the
+    // same inputs. 2: crates outside the project compile in their package
+    // root (rustc hashes its working directory into a crate's identity).
+    hb.update("toolchain", INVOCATION.as_bytes());
     for flag in &unit.ext.rustflags {
         hb.update("rustflags", b"\0rustflag=");
         hb.update("rustflags", flag.as_bytes());

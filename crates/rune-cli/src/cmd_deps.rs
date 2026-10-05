@@ -3,6 +3,7 @@
 
 use anyhow::{Context, Result, bail};
 use colored::Colorize;
+use rune_common::fsutil;
 use rune_common::settings::Settings;
 use rune_resolver::lockfile::LockfileManager;
 use rune_resolver::{TreeOptions, render_tree, trace_why};
@@ -1213,9 +1214,9 @@ pub fn metadata(args: MetadataArgs) -> Result<()> {
 /// the name spelled out when the directory is named differently.
 fn path_id(dir: &std::path::Path, name: &str, version: &semver::Version) -> String {
     if dir.file_name().is_some_and(|n| n == name) {
-        format!("path+file://{}#{version}", dir.display())
+        format!("path+{}#{version}", fsutil::file_url(dir))
     } else {
-        format!("path+file://{}#{name}@{version}", dir.display())
+        format!("path+{}#{name}@{version}", fsutil::file_url(dir))
     }
 }
 
@@ -1364,7 +1365,7 @@ pub fn pkgid(args: PkgidArgs) -> Result<()> {
     };
     let path_id = |m: &crate::workspace::Member| {
         let dir_name = m.dir.file_name().and_then(|n| n.to_str()).unwrap_or("");
-        let url = format!("path+file://{}", m.dir.display());
+        let url = format!("path+{}", fsutil::file_url(&m.dir));
         if dir_name == m.name {
             format!("{url}#{}", m.version)
         } else {
@@ -1420,7 +1421,9 @@ pub fn pkgid(args: PkgidArgs) -> Result<()> {
                     Some(q) => format!("git+{url}?{q}"),
                     None => format!("git+{url}"),
                 },
-                rune_resolver::PackageSource::Path(dir) => format!("path+file://{}", dir.display()),
+                rune_resolver::PackageSource::Path(dir) => {
+                    format!("path+{}", fsutil::file_url(dir))
+                }
             };
             println!("{source}#{}@{}", p.name, p.version);
             Ok(())

@@ -1247,6 +1247,7 @@ dependencies = [
  "anyhow",
  "clap",
  "libc",
+ "same-file",
  "serde",
  "serde_json",
  "walkdir",

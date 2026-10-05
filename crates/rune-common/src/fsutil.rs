@@ -39,6 +39,31 @@ pub fn canonicalize(path: impl AsRef<Path>) -> io::Result<PathBuf> {
     Ok(resolved)
 }
 
+/// `path` (absolute) as a `file:` URL, spelled as Cargo spells it in package
+/// ids: `file:///home/me/app`, `file:///C:/Users/me/app` — forward slashes,
+/// three of them before a drive, and characters a URL path cannot hold
+/// percent-encoded (`My%20Projects`). Tools read package ids as URLs; a
+/// Windows path pasted after `file://` is not one.
+pub fn file_url(path: &Path) -> String {
+    let text = path.to_string_lossy();
+    let text = text.strip_prefix(r"\\?\").unwrap_or(&text);
+    let slashed = text.replace('\\', "/");
+    let mut url = String::from("file://");
+    if !slashed.starts_with('/') {
+        url.push('/');
+    }
+    for byte in slashed.bytes() {
+        match byte {
+            b'%' | b' ' | b'"' | b'#' | b'<' | b'>' | b'?' | b'`' | b'{' | b'}' => {
+                url.push_str(&format!("%{byte:02X}"))
+            }
+            0..0x20 | 0x7F.. => url.push_str(&format!("%{byte:02X}")),
+            _ => url.push(byte as char),
+        }
+    }
+    url
+}
+
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// A name next to `dest` that no other process or thread will pick.
@@ -97,9 +122,132 @@ pub fn replace_with_link(src: &Path, dest: &Path) -> io::Result<()> {
         let _ = fs::remove_file(&tmp);
         return Err(e);
     }
-    fs::rename(&tmp, dest).inspect_err(|_| {
+    rename_over(&tmp, dest).inspect_err(|_| {
         let _ = fs::remove_file(&tmp);
     })
+}
+
+/// [`fs::rename`], also when `to` is a read-only file — as every output Rune
+/// restores or stores is. On Unix a rename replaces it regardless. Windows
+/// refuses ("Access is denied"), and every switch back to an earlier build of
+/// a unit (another branch, an edit undone) failed to restore it and compiled
+/// it instead; there the replacement is still atomic where the file system
+/// allows, and otherwise moves the old file aside for the moment it takes.
+pub fn rename_over(from: &Path, to: &Path) -> io::Result<()> {
+    match fs::rename(from, to) {
+        #[cfg(windows)]
+        Err(e)
+            if e.kind() == io::ErrorKind::PermissionDenied
+                && fs::symlink_metadata(to).is_ok_and(|m| m.permissions().readonly()) =>
+        {
+            windows::rename_over_read_only(from, to).map_err(|_| e)
+        }
+        result => result,
+    }
+}
+
+#[cfg(windows)]
+mod windows {
+    use std::ffi::c_void;
+    use std::fs::{self, OpenOptions};
+    use std::io;
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    use std::path::Path;
+
+    const DELETE: u32 = 0x0001_0000;
+    const FILE_SHARE_READ: u32 = 0x1;
+    const FILE_SHARE_WRITE: u32 = 0x2;
+    const FILE_SHARE_DELETE: u32 = 0x4;
+    /// `FILE_INFO_BY_HANDLE_CLASS::FileRenameInfoEx`.
+    const FILE_RENAME_INFO_EX: i32 = 22;
+    const FILE_RENAME_FLAG_REPLACE_IF_EXISTS: u32 = 0x1;
+    const FILE_RENAME_FLAG_POSIX_SEMANTICS: u32 = 0x2;
+    const FILE_RENAME_FLAG_IGNORE_READONLY_ATTRIBUTE: u32 = 0x40;
+
+    /// `FILE_RENAME_INFO` (the `Flags` member of its union), followed in the
+    /// same allocation by the rest of `FileName`.
+    #[repr(C)]
+    struct FileRenameInfo {
+        flags: u32,
+        root_directory: *mut c_void,
+        file_name_length: u32,
+        file_name: [u16; 1],
+    }
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn SetFileInformationByHandle(
+            file: *mut c_void,
+            class: i32,
+            info: *const c_void,
+            size: u32,
+        ) -> i32;
+    }
+
+    /// Replaces the read-only `to` with `from`.
+    pub(super) fn rename_over_read_only(from: &Path, to: &Path) -> io::Result<()> {
+        rename_ignoring_read_only(from, to).or_else(|_| rename_moving_aside(from, to))
+    }
+
+    /// One atomic rename that ignores the read-only attribute (Windows 10
+    /// 1809 and later, on NTFS).
+    pub(super) fn rename_ignoring_read_only(from: &Path, to: &Path) -> io::Result<()> {
+        let file = OpenOptions::new()
+            .access_mode(DELETE)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .open(from)?;
+        let name: Vec<u16> = std::path::absolute(to)?.as_os_str().encode_wide().collect();
+        let name_bytes = name.len() * 2;
+        let size = std::mem::size_of::<FileRenameInfo>() + name_bytes;
+        // `u64`s: aligned for the struct, which holds a pointer.
+        let mut buffer = vec![0u64; size.div_ceil(8)];
+        let info = buffer.as_mut_ptr().cast::<FileRenameInfo>();
+        // SAFETY: `buffer` is zeroed, suitably aligned, and large enough for
+        // the header plus `name` (`size` counts the name in full on top of
+        // the one-element array the header ends with).
+        unsafe {
+            (*info).flags = FILE_RENAME_FLAG_REPLACE_IF_EXISTS
+                | FILE_RENAME_FLAG_POSIX_SEMANTICS
+                | FILE_RENAME_FLAG_IGNORE_READONLY_ATTRIBUTE;
+            (*info).root_directory = std::ptr::null_mut();
+            (*info).file_name_length = name_bytes as u32;
+            std::ptr::copy_nonoverlapping(
+                name.as_ptr(),
+                std::ptr::addr_of_mut!((*info).file_name).cast::<u16>(),
+                name.len(),
+            );
+        }
+        // SAFETY: a valid handle opened with `DELETE` access, and a
+        // `FILE_RENAME_INFO` of `size` bytes.
+        let ok = unsafe {
+            SetFileInformationByHandle(
+                file.as_raw_handle().cast(),
+                FILE_RENAME_INFO_EX,
+                info.cast(),
+                size as u32,
+            )
+        };
+        if ok == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    /// Elsewhere: the old file steps aside (a rename may move a read-only
+    /// file, only not replace one), the new one takes its name, and the old
+    /// one is deleted.
+    pub(super) fn rename_moving_aside(from: &Path, to: &Path) -> io::Result<()> {
+        let aside = super::temp_sibling(to);
+        fs::rename(to, &aside)?;
+        if let Err(e) = fs::rename(from, to) {
+            let _ = fs::rename(&aside, to);
+            return Err(e);
+        }
+        let _ = fs::remove_file(&aside);
+        Ok(())
+    }
 }
 
 /// An exclusive advisory lock on a file, released when dropped (or when the
@@ -231,6 +379,88 @@ mod tests {
             .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
             .collect();
         assert!(leftovers.is_empty(), "{leftovers:?}");
+    }
+
+    #[test]
+    fn file_urls_are_spelled_like_cargos() {
+        assert_eq!(file_url(Path::new("/home/me/app")), "file:///home/me/app");
+        assert_eq!(
+            file_url(Path::new(r"C:\Users\me\My Projects\a#1")),
+            "file:///C:/Users/me/My%20Projects/a%231"
+        );
+        assert_eq!(
+            file_url(Path::new(r"\\?\C:\work\app")),
+            "file:///C:/work/app"
+        );
+        assert_eq!(
+            file_url(Path::new("/srv/münchen")),
+            "file:///srv/m%C3%BCnchen"
+        );
+    }
+
+    fn read_only(path: &Path) {
+        let mut perms = fs::metadata(path).unwrap().permissions();
+        perms.set_readonly(true);
+        fs::set_permissions(path, perms).unwrap();
+    }
+
+    #[test]
+    fn a_read_only_destination_is_replaced_too() {
+        // Restored and stored outputs are read-only, and hard links to a
+        // shared object: replacing one must neither fail nor touch the object.
+        let dir = tempfile::tempdir().unwrap();
+        let object = dir.path().join("object");
+        let dest = dir.path().join("dest");
+        let src = dir.path().join("src");
+        fs::write(&object, "old").unwrap();
+        read_only(&object);
+        fs::hard_link(&object, &dest).unwrap();
+        fs::write(&src, "new").unwrap();
+        read_only(&src);
+        replace_with_link(&src, &dest).unwrap();
+        assert_eq!(fs::read_to_string(&dest).unwrap(), "new");
+        assert_eq!(fs::read_to_string(&object).unwrap(), "old");
+        assert!(fs::metadata(&object).unwrap().permissions().readonly());
+        let leftovers: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+        // And once more over the now read-only replacement.
+        let newer = dir.path().join("newer");
+        fs::write(&newer, "newer").unwrap();
+        rename_over(&newer, &dest).unwrap();
+        assert_eq!(fs::read_to_string(&dest).unwrap(), "newer");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn ntfs_replaces_a_read_only_file_in_one_rename() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("dest");
+        let src = dir.path().join("src");
+        fs::write(&dest, "old").unwrap();
+        read_only(&dest);
+        fs::write(&src, "new").unwrap();
+        windows::rename_ignoring_read_only(&src, &dest).unwrap();
+        assert_eq!(fs::read_to_string(&dest).unwrap(), "new");
+        assert!(!src.exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn moving_a_read_only_file_aside_replaces_it_too() {
+        // Where the file system cannot rename over a read-only file at once.
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("dest");
+        let src = dir.path().join("src");
+        fs::write(&dest, "old").unwrap();
+        read_only(&dest);
+        fs::write(&src, "new").unwrap();
+        windows::rename_moving_aside(&src, &dest).unwrap();
+        assert_eq!(fs::read_to_string(&dest).unwrap(), "new");
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 
     #[test]

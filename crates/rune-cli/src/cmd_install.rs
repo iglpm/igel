@@ -46,7 +46,7 @@ pub fn install(args: InstallArgs) -> Result<()> {
                 .with_context(|| format!("`{}` does not exist", path.display()))?;
             let manifest = rune_common::manifest_file::manifest_in(&dir);
             let name = package_name(&manifest)?;
-            let source = format!("path+file://{}", dir.display());
+            let source = format!("path+{}", rune_common::fsutil::file_url(&dir));
             build_and_install(&args, &manifest, &name, None, &source, &root)
         }
     }
@@ -223,9 +223,14 @@ fn build_and_install(
         // Copy to a temporary name and rename: a running copy of the old
         // binary keeps working, and the new one appears whole.
         let tmp = bin_dir.join(format!(".{}.rune-install", exe(&r.target)));
+        let _ = remove_read_only(&tmp);
         std::fs::copy(&src, &tmp)
             .with_context(|| format!("failed to install {}", dest.display()))?;
-        std::fs::rename(&tmp, &dest)
+        // The build's copy is read-only (it is the store's); an installed
+        // program is the user's, and the next install replaces it.
+        make_writable(&tmp).with_context(|| format!("failed to install {}", dest.display()))?;
+        // (One installed by an earlier Rune may still be read-only.)
+        rune_common::fsutil::rename_over(&tmp, &dest)
             .with_context(|| format!("failed to install {}", dest.display()))?;
         ui::action("installed", dest.display());
         installed.push(r.target.clone());
@@ -567,13 +572,27 @@ fn copy_tree(src: &Path, dest: &Path) -> std::io::Result<()> {
             std::fs::copy(&from, &to)?;
             // Sources are read-only in the store; the copy must be writable
             // for the build (and removable afterwards).
-            let mut perms = std::fs::metadata(&to)?.permissions();
-            #[allow(clippy::permissions_set_readonly_false)]
-            perms.set_readonly(false);
-            std::fs::set_permissions(&to, perms)?;
+            make_writable(&to)?;
         }
     }
     Ok(())
+}
+
+/// Clears a file's read-only flag (a copy of a stored file keeps it).
+fn make_writable(path: &Path) -> std::io::Result<()> {
+    let mut perms = std::fs::metadata(path)?.permissions();
+    if perms.readonly() {
+        #[allow(clippy::permissions_set_readonly_false)]
+        perms.set_readonly(false);
+        std::fs::set_permissions(path, perms)?;
+    }
+    Ok(())
+}
+
+/// Removes a file, read-only or not (`fs::copy` cannot write over one).
+fn remove_read_only(path: &Path) -> std::io::Result<()> {
+    make_writable(path)?;
+    std::fs::remove_file(path)
 }
 
 fn package_name(manifest: &Path) -> Result<String> {

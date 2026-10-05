@@ -90,7 +90,53 @@ mod imp {
     }
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(windows)]
+mod imp {
+    use super::Memory;
+
+    /// `MEMORYSTATUSEX`.
+    #[repr(C)]
+    struct MemoryStatus {
+        length: u32,
+        memory_load: u32,
+        total_phys: u64,
+        avail_phys: u64,
+        total_page_file: u64,
+        avail_page_file: u64,
+        total_virtual: u64,
+        avail_virtual: u64,
+        avail_extended_virtual: u64,
+    }
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GlobalMemoryStatusEx(buffer: *mut MemoryStatus) -> i32;
+    }
+
+    pub fn memory() -> Option<Memory> {
+        let mut status = MemoryStatus {
+            length: std::mem::size_of::<MemoryStatus>() as u32,
+            memory_load: 0,
+            total_phys: 0,
+            avail_phys: 0,
+            total_page_file: 0,
+            avail_page_file: 0,
+            total_virtual: 0,
+            avail_virtual: 0,
+            avail_extended_virtual: 0,
+        };
+        // SAFETY: a `MEMORYSTATUSEX` with its length set, as the call needs.
+        let ok = unsafe { GlobalMemoryStatusEx(&mut status) };
+        // Available physical memory counts the standby (file cache) list,
+        // which Windows hands out without paging anything.
+        (ok != 0 && status.total_phys > 0).then_some(Memory {
+            total: status.total_phys,
+            available: status.avail_phys,
+        })
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 mod imp {
     use super::Memory;
 
@@ -242,7 +288,7 @@ mod tests {
         assert_eq!(m.available, 8_192_000 * 1024);
     }
 
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     #[test]
     fn this_machine_reports_its_memory() {
         let m = memory().expect("memory is known here");

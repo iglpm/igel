@@ -1219,15 +1219,11 @@ pub fn download_all(resolved: &ResolvedGraph, offline: bool) -> Result<usize> {
     Ok(pkgs.len())
 }
 
-/// Resolves the workspace, or reuses the previous resolution when nothing
-/// that feeds it changed. Returns the graph and the lockfile it corresponds to.
-fn resolve(ws: &Workspace, locals: &Locals, req: &Request) -> Result<(ResolvedGraph, Lockfile)> {
-    resolve_with(ws, locals, req, true)
-}
-
-/// [`resolve`]; with `trust_cache` false, the binary lockfile is not reused
-/// even when its fingerprint matches (it was found not to cover the
-/// manifests).
+/// Resolves the workspace, or (with `trust_cache`) reuses the previous
+/// resolution when nothing that feeds it changed. Returns the graph and the
+/// lockfile it corresponds to. Without `trust_cache`, the binary lockfile is
+/// not reused even when its fingerprint matches (it was found not to cover
+/// the manifests).
 fn resolve_with(
     ws: &Workspace,
     locals: &Locals,
@@ -1802,8 +1798,13 @@ fn incomplete(
         .collect();
     for p in &lock.packages {
         for d in &p.decls {
+            // An optional dependency nothing switches on is left out of the
+            // lockfile on purpose (as Cargo does): `combine`'s `bytes 0.5`.
+            // Whether a build switches it on is the feature resolver's to
+            // say (see `unresolved_deps`).
             if let Some(id) = &d.resolved
                 && d.kind != 1
+                && !d.optional
                 && applies(&d.target)
                 && !ids.contains(id)
             {
@@ -1811,6 +1812,19 @@ fn incomplete(
             }
         }
     }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Dependencies a feature resolution follows (needed, or switched on by a
+/// feature) that the lockfile has no package for.
+fn unresolved_deps(uni: &Universe, res: &FeatureResolution) -> Vec<String> {
+    let mut out: Vec<String> = res
+        .unresolved
+        .iter()
+        .map(|&((pkg, _), di)| format!("`{}` → `{}`", uni.name[pkg], uni.views[pkg].deps[di].alias))
+        .collect();
     out.sort();
     out.dedup();
     out
@@ -2384,47 +2398,18 @@ fn reachable(mut res: FeatureResolution, roots: &[UnitRef]) -> FeatureResolution
     }
     res.features.retain(|u, _| seen.contains(u));
     res.edges.retain(|e| seen.contains(&e.from));
+    res.unresolved.retain(|(u, _)| seen.contains(u));
     res
 }
 
-/// Plans the build for `req`.
-pub fn plan(ws: &Workspace, req: &Request) -> Result<Plan> {
-    let total = phase("plan");
-    configure_git(ws, req.offline, false, None);
-    let mut locals = Locals::load(ws)?;
-    let (_resolved, mut lock) = resolve(ws, &locals, req)?;
-    locals.extend_from_lock(ws, &lock)?;
-    let roles = Roles::new(ws, req);
-    let applies = |t: &Option<String>| {
-        t.as_deref()
-            .is_none_or(|t| roles.target.info.matches(t) || roles.host.info.matches(t))
-    };
-    let mut uni = Universe::build(ws, &locals, &lock);
-    // Never build from a lockfile that leaves a declared dependency out:
-    // rustc would only say "undeclared crate". Resolve again from scratch,
-    // and if even that cannot place it, say which one.
-    let missing = incomplete(&uni, &locals, &lock, &applies);
-    if !missing.is_empty() {
-        tracing::debug!("the lockfile does not cover {missing:?}; resolving again");
-        locals = Locals::load(ws)?;
-        let (_resolved, fresh) = resolve_with(ws, &locals, req, false)?;
-        lock = fresh;
-        locals.extend_from_lock(ws, &lock)?;
-        uni = Universe::build(ws, &locals, &lock);
-        let still = incomplete(&uni, &locals, &lock, &applies);
-        if !still.is_empty() {
-            bail!(
-                "the dependency resolution does not contain {} (declared in the manifests); \
-                 `rune update` resolves everything again",
-                still.join(", ")
-            );
-        }
-    }
-    let locals = locals;
-    let lock = lock;
-    let uni = uni;
-    let resolver_version = ws.root_manifest.resolver_version();
-
+/// The feature resolver's roots for `req`: the selected members' requests,
+/// those plus every other member's with workspace feature unification, and
+/// the selected members' units.
+fn feature_roots(
+    ws: &Workspace,
+    locals: &Locals,
+    req: &Request,
+) -> Result<(Vec<RootRequest>, Vec<RootRequest>, Vec<UnitRef>)> {
     // -- What is requested, and does it involve development dependencies?
     let include_dev = matches!(req.mode, Mode::Test | Mode::Bench)
         || req.targets.all_targets
@@ -2469,25 +2454,67 @@ pub fn plan(ws: &Workspace, req: &Request) -> Result<Plan> {
         }
     }
     let selected_units: Vec<UnitRef> = roots.iter().map(|r| (r.package, false)).collect();
+    Ok((roots, all_roots, selected_units))
+}
 
-    // -- Feature resolution, pass 1: which packages does this build reach in
-    // either role? (Proc-macro-ness of registry crates isn't known before
-    // their manifests are, so this may over-approximate roles, never packages.)
-    let mut uni = uni;
+/// Plans the build for `req`.
+pub fn plan(ws: &Workspace, req: &Request) -> Result<Plan> {
+    let total = phase("plan");
+    configure_git(ws, req.offline, false, None);
+    let roles = Roles::new(ws, req);
+    let applies = |t: &Option<String>| {
+        t.as_deref()
+            .is_none_or(|t| roles.target.info.matches(t) || roles.host.info.matches(t))
+    };
+    let resolver_version = ws.root_manifest.resolver_version();
     let either_role =
         |t: &str, _host: bool| roles.target.info.matches(t) || roles.host.info.matches(t);
-    let pass1 = reachable(
-        unit_features::resolve(
-            &uni.views,
-            &all_roots,
-            &FeatureOptions {
-                resolver: resolver_version,
-                platform_matches: &either_role,
-                weak_activates: false,
-            },
-        ),
-        &selected_units,
-    );
+
+    // Never build from a lockfile that leaves out a dependency this build
+    // needs: rustc would only say "undeclared crate". Resolve again from
+    // scratch, and if even that cannot place it, say which one.
+    let mut fresh = false;
+    let (locals, lock, uni, all_roots, selected_units, pass1) = loop {
+        let mut locals = Locals::load(ws)?;
+        let (_resolved, lock) = resolve_with(ws, &locals, req, !fresh)?;
+        locals.extend_from_lock(ws, &lock)?;
+        let uni = Universe::build(ws, &locals, &lock);
+        let mut missing = incomplete(&uni, &locals, &lock, &applies);
+        let (_roots, all_roots, selected_units) = feature_roots(ws, &locals, req)?;
+
+        // -- Feature resolution, pass 1: which packages does this build reach
+        // in either role? (Proc-macro-ness of registry crates isn't known
+        // before their manifests are, so this may over-approximate roles,
+        // never packages.)
+        let pass1 = reachable(
+            unit_features::resolve(
+                &uni.views,
+                &all_roots,
+                &FeatureOptions {
+                    resolver: resolver_version,
+                    platform_matches: &either_role,
+                    weak_activates: false,
+                },
+            ),
+            &selected_units,
+        );
+        missing.extend(unresolved_deps(&uni, &pass1));
+        missing.sort();
+        missing.dedup();
+        if missing.is_empty() {
+            break (locals, lock, uni, all_roots, selected_units, pass1);
+        }
+        if fresh {
+            bail!(
+                "the dependency resolution does not contain {} (declared in the manifests); \
+                 `rune update` resolves everything again",
+                missing.join(", ")
+            );
+        }
+        tracing::debug!("the lockfile does not cover {missing:?}; resolving again");
+        fresh = true;
+    };
+    let mut uni = uni;
 
     // -- Download and read the manifests of the registry crates we need.
     let mut needed: Vec<usize> = pass1
@@ -2547,8 +2574,22 @@ pub fn plan(ws: &Workspace, req: &Request) -> Result<Plan> {
     );
     check_rust_versions(&uni, &locals, &reg, &res, req)?;
     // A local package asking a local dependency for a feature it lacks
-    // (registry packages were checked when they were published).
-    if let Some((from, to, f)) = res.unknown_features.iter().find(|(from, to, _)| {
+    // (registry packages were checked when they were published) — on any
+    // platform, as Cargo checks: a manifest that builds on Windows must not
+    // be refused on Linux CI over a `[target.'cfg(unix)']` dependency.
+    let everywhere = reachable(
+        unit_features::resolve(
+            &uni.views,
+            &all_roots,
+            &FeatureOptions {
+                resolver: resolver_version,
+                platform_matches: &|_, _| true,
+                weak_activates: false,
+            },
+        ),
+        &selected_units,
+    );
+    if let Some((from, to, f)) = everywhere.unknown_features.iter().find(|(from, to, _)| {
         matches!(uni.origin[*from], Origin::Local(_)) && matches!(uni.origin[*to], Origin::Local(_))
     }) {
         bail!(

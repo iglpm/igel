@@ -144,8 +144,12 @@ pub fn dir_size(dir: &std::path::Path) -> u64 {
 pub fn dirs_size(dirs: &[&std::path::Path]) -> u64 {
     #[cfg(unix)]
     use std::os::unix::fs::MetadataExt;
-    // (Windows: no inode numbers on stable, so links count once per path.)
+    #[cfg(unix)]
     let mut seen: std::collections::HashSet<(u64, u64)> = std::collections::HashSet::new();
+    // (Windows: the volume and file index identify a file; std has no stable
+    // accessor for them, so a handle is opened per file.)
+    #[cfg(windows)]
+    let mut seen: std::collections::HashSet<same_file::Handle> = std::collections::HashSet::new();
     let mut total = 0;
     for entry in dirs
         .iter()
@@ -159,8 +163,12 @@ pub fn dirs_size(dirs: &[&std::path::Path]) -> u64 {
         if !seen.insert((meta.dev(), meta.ino())) {
             continue;
         }
-        #[cfg(not(unix))]
-        let _ = &mut seen;
+        #[cfg(windows)]
+        if let Ok(handle) = same_file::Handle::from_path(entry.path())
+            && !seen.insert(handle)
+        {
+            continue;
+        }
         total += meta.len();
     }
     total

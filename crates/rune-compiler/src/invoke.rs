@@ -172,7 +172,56 @@ fn wait_with_peak_memory(
     Ok((std::process::ExitStatus::from_raw(status), Some(bytes)))
 }
 
-#[cfg(not(unix))]
+/// Waits for `child` and returns its exit status and peak memory: the
+/// process's handle stays open after it exits (until `child` is dropped),
+/// and its counters with it.
+#[cfg(windows)]
+fn wait_with_peak_memory(
+    child: &mut std::process::Child,
+) -> std::io::Result<(std::process::ExitStatus, Option<u64>)> {
+    use std::os::windows::io::AsRawHandle;
+
+    /// `PROCESS_MEMORY_COUNTERS`.
+    #[repr(C)]
+    #[derive(Default)]
+    struct Counters {
+        cb: u32,
+        page_fault_count: u32,
+        peak_working_set_size: usize,
+        working_set_size: usize,
+        quota_peak_paged_pool_usage: usize,
+        quota_paged_pool_usage: usize,
+        quota_peak_non_paged_pool_usage: usize,
+        quota_non_paged_pool_usage: usize,
+        pagefile_usage: usize,
+        peak_pagefile_usage: usize,
+    }
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn K32GetProcessMemoryInfo(
+            process: *mut std::ffi::c_void,
+            counters: *mut Counters,
+            size: u32,
+        ) -> i32;
+    }
+
+    let status = child.wait()?;
+    let mut counters = Counters {
+        cb: std::mem::size_of::<Counters>() as u32,
+        ..Counters::default()
+    };
+    // SAFETY: the child's process handle (still open: `child` owns it) and
+    // a `PROCESS_MEMORY_COUNTERS` of the size it says.
+    let ok = unsafe {
+        K32GetProcessMemoryInfo(child.as_raw_handle().cast(), &mut counters, counters.cb)
+    };
+    let peak = (ok != 0 && counters.peak_working_set_size > 0)
+        .then_some(counters.peak_working_set_size as u64);
+    Ok((status, peak))
+}
+
+#[cfg(not(any(unix, windows)))]
 fn wait_with_peak_memory(
     child: &mut std::process::Child,
 ) -> std::io::Result<(std::process::ExitStatus, Option<u64>)> {

@@ -101,7 +101,7 @@ fn begin_atomic(dst: &Path) -> io::Result<(PathBuf, fs::File)> {
 fn finish_atomic(tmp: &Path, dst: &Path, exec: bool) -> io::Result<()> {
     let result = (|| {
         set_read_only(tmp, exec)?;
-        fs::rename(tmp, dst)
+        rune_common::fsutil::rename_over(tmp, dst)
     })();
     if result.is_err() {
         let _ = fs::remove_file(tmp);
