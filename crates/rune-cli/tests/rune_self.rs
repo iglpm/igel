@@ -1,3 +1,9 @@
+//! `rune self update`, against a local download server.
+//!
+//! (Not named `self_update`: Windows takes a program whose name holds
+//! "update", "setup" or "install" for an installer and refuses to start the
+//! test binary without elevation.)
+
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};

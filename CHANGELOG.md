@@ -45,6 +45,38 @@ The first stable release. Changes since the 0.1.0 preview:
   run time, as Cargo sets them.
 
 ### Fixed
+- Crates built by different projects did not fit together: registry crates
+  compiled in whatever directory `rune` was started from, which rustc hashes
+  into a crate's identity, and a store entry could then name a build of its
+  dependency the store did not hold — a later build failed with "can't find
+  crate for `tracing`" or "found possibly newer version of crate". Crates
+  outside the project compile in their package root, as with Cargo; every
+  stored crate records the builds of its dependencies it was compiled
+  against and is restored only next to them (otherwise compiled again, and
+  its entry replaced); nothing compiled against a build that differs from the
+  stored one is stored. Entries from earlier versions are not reused, so
+  everything compiles once.
+- A build failed with "the dependency resolution does not contain `combine` →
+  `bytes 0.5.6`" when a dependency had an optional dependency nothing switches
+  on (Cargo leaves those out of the lockfile, and so does Rune). The version
+  resolver also no longer resolves a renamed optional dependency (`bytes_05 =
+  { package = "bytes" }`) because another one on the same package is on.
+- Windows: a crate whose earlier build was still in the target directory
+  (back on a branch, an edit undone) compiled again instead of coming from
+  the store — a rename cannot replace a read-only file there, and every
+  restored output is one. It is now replaced atomically.
+- Windows: `rune install` could not upgrade a program it had installed;
+  `rune watch` ran again for changes to files git ignores; compiler messages
+  named files with mixed separators (`app\src/main.rs`); package ids in
+  `rune metadata`, JSON messages and `rune pkgid` were not URLs
+  (`path+file://C:\…`, now `path+file:///C:/…` as from Cargo).
+- Windows: memory is watched as on Linux and macOS (what is available, and
+  each compiler's peak), so a big build holds back new compilers instead of
+  running the machine out of memory.
+- A feature a local dependency lacks is an error on every platform, as with
+  Cargo — also when the dependency is for another platform only.
+- `rune-bench` counted a file hard-linked into several directories once per
+  link on Windows, overstating disk use.
 - A lockfile pinning a release newer than the registry index cached on the
   machine (after `cargo update`, or a teammate's commit) was quietly
   re-resolved to an older release, rewriting `Cargo.lock`; Rune now fetches
@@ -71,7 +103,9 @@ The first stable release. Changes since the 0.1.0 preview:
   a failed test; a failed download no longer reports "downloaded".
 - A crash (a bug in Rune) prints what happened and where to report it.
 - Rune compiles cleanly for Windows (two Unix-only assumptions); CI checks
-  Windows and runs on pushes to `master`.
+  Windows and runs on pushes to `master`. The whole test suite passes on
+  Windows and runs there in CI, registry tests included (they no longer need
+  `tar` and `sha256sum`).
 - The install scripts take `--version 2027.0` (not only the full tag), say
   what is wrong with a bad option, install the native build under Rosetta,
   refuse musl-based Linux (the builds need glibc) with how to build from

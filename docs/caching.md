@@ -68,6 +68,18 @@ UnitKey = hash(
 * **Correctness beats hit rate.** A false rebuild is acceptable; reusing a wrong
   artifact is not. Objects in the store are immutable (first writer wins),
   read-only, published atomically, and verified on every hit.
+* **Stored crates fit together.** A key names what went into a crate, not the
+  bytes rustc made of it, and rustc does not always make the same bytes (it
+  hashes the directory it runs in into a crate's identity; a proc-macro may
+  iterate a `HashMap`). rustc loads a crate only next to the very build of
+  each dependency it was compiled against ("can't find crate", "found
+  possibly newer version of crate"), so every stored crate records those
+  builds (the hash of each dependency's `.rmeta`) and is restored only next
+  to them; otherwise it is compiled again and its entry replaced. A crate
+  compiled to other bytes than the stored build of it keeps everything
+  compiled against it out of the store. Crates outside the project (registry,
+  git, path dependencies elsewhere) compile in their package root, as with
+  Cargo, so every project builds them alike.
 * Compiler warnings are stored with the artifact and replayed on cache hits.
 
 ## `check` after `build`

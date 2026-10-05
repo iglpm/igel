@@ -1029,13 +1029,7 @@ impl DependencyResolver {
                     continue;
                 }
                 let real = dep.package.clone().unwrap_or_else(|| dep.name.clone());
-                let active = !dep.optional
-                    || feats.is_some_and(|f| {
-                        f.activated_dependencies.contains(&dep.name)
-                            || f.active_features.contains(&dep.name)
-                            || f.activated_dependencies.contains(&real)
-                            || f.active_features.contains(&real)
-                    });
+                let active = !dep.optional || feats.is_some_and(|f| switched_on(f, &dep.name));
                 let Ok(req) = VersionReq::from_str(&dep.req) else {
                     continue;
                 };
@@ -1708,6 +1702,17 @@ fn git_package_dir(spec: &DependencySpec, url: &str, package: &str) -> Result<Pa
     Ok(rune_registry::git::find_package(&checkout, package)?)
 }
 
+/// Whether a package's features switch on its optional dependency `alias`
+/// (the name it declares the dependency under). Only that name: features
+/// spell an optional dependency the way the manifest declares it (`dep:alias`,
+/// `alias/feat`, the implicit feature `alias`), never by its package — a
+/// crate with `bytes` and `bytes_05 = { package = "bytes" }` switching on
+/// `bytes` has not switched on `bytes_05`.
+fn switched_on(features: &crate::features::ResolvedPackageFeatures, alias: &str) -> bool {
+    features.activated_dependencies.iter().any(|d| d == alias)
+        || features.active_features.iter().any(|f| f == alias)
+}
+
 /// Scans every currently resolved package for an optional dependency whose
 /// activating feature has become active (from features requested on that
 /// package at any point up to now, by any dependent) but which hasn't been
@@ -1740,12 +1745,7 @@ fn activate_newly_enabled_optional_deps(
                 .package
                 .clone()
                 .unwrap_or_else(|| dep_ref.name.clone());
-            if !dep_ref.optional
-                || !(feats.activated_dependencies.contains(&dep_ref.name)
-                    || feats.active_features.contains(&dep_ref.name)
-                    || feats.activated_dependencies.contains(&actual_pkg_name)
-                    || feats.active_features.contains(&actual_pkg_name))
-            {
+            if !dep_ref.optional || !switched_on(feats, &dep_ref.name) {
                 continue;
             }
 
@@ -1974,6 +1974,27 @@ mod tests {
             }
             crate::solver::Solution::Found(c) => panic!("{c:?}"),
         }
+    }
+
+    #[test]
+    fn an_optional_dependency_is_switched_on_by_its_own_name_only() {
+        // `combine`: `std = ["bytes"]` switches on its `bytes` (1.x), not
+        // `bytes_05 = { package = "bytes", version = "0.5" }`.
+        let features = crate::features::ResolvedPackageFeatures {
+            package_name: "combine".into(),
+            active_features: vec!["default".into(), "std".into(), "bytes".into()],
+            activated_dependencies: vec!["bytes".into(), "memchr".into()],
+            cfg_flags: vec![],
+        };
+        assert!(switched_on(&features, "bytes"));
+        assert!(switched_on(&features, "memchr"));
+        assert!(!switched_on(&features, "bytes_05"));
+        // Through `dep:` alone, without a feature of that name.
+        let features = crate::features::ResolvedPackageFeatures {
+            activated_dependencies: vec!["bytes_05".into()],
+            ..features
+        };
+        assert!(switched_on(&features, "bytes_05"));
     }
 
     #[test]

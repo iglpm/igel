@@ -1998,17 +1998,128 @@ fn local_registry(crates: &[RegistryCrate]) -> tempfile::TempDir {
             deps.join(",")
         ));
     }
+    write_index(reg.path(), &index);
+    reg
+}
+
+/// Writes a local registry's index: each crate's lines where Cargo puts them.
+fn write_index(reg: &Path, index: &std::collections::BTreeMap<String, String>) {
     for (name, lines) in index {
         let dir = match name.len() {
-            1 => reg.path().join("index/1"),
-            2 => reg.path().join("index/2"),
-            3 => reg.path().join("index/3").join(&name[..1]),
-            _ => reg.path().join("index").join(&name[..2]).join(&name[2..4]),
+            1 => reg.join("index/1"),
+            2 => reg.join("index/2"),
+            3 => reg.join("index/3").join(&name[..1]),
+            _ => reg.join("index").join(&name[..2]).join(&name[2..4]),
         };
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join(&name), lines).unwrap();
+        std::fs::write(dir.join(name), lines).unwrap();
     }
-    reg
+}
+
+/// One dependency of a registry index entry.
+fn index_dep(alias: &str, package: Option<&str>, req: &str, optional: bool) -> String {
+    let package = package.map_or(String::new(), |p| format!("\"package\":\"{p}\","));
+    format!(
+        "{{\"name\":\"{alias}\",{package}\"req\":\"{req}\",\"features\":[],\"optional\":{optional},\"default_features\":true,\"target\":null,\"kind\":\"normal\"}}"
+    )
+}
+
+#[test]
+fn an_optional_dependency_nothing_switches_on_may_be_missing_from_the_lockfile() {
+    // Resolving versions, Rune over-approximates which optional dependencies
+    // are on; its lockfile then leaves out what no feature switches on, as
+    // Cargo's does. A build must not take that for a lockfile missing a
+    // dependency. jolter has both shapes:
+    //
+    // * `hb` 1 and 2 each switch their optional `fh` on by default; `im`
+    //   uses `hb` 2 without its defaults (`indexmap` → `hashbrown` 0.17, which
+    //   leaves out `foldhash` 0.2, while `hashbrown` 0.15 has `foldhash` 0.1);
+    // * `cb` has two optional dependencies on `by`, the 1.x one switched on,
+    //   the renamed 0.5 one not (`combine` → `bytes`, `bytes_05`).
+    let reg = tempfile::tempdir().unwrap();
+    let mut index: std::collections::BTreeMap<String, String> = Default::default();
+    let mut publish = |name: &str, version: &str, extra: &str, deps: &str, features: &str, lib| {
+        let manifest = format!(
+            "[package]\nname = \"{name}\"\nversion = \"{version}\"\nedition = \"2021\"\n{extra}"
+        );
+        let (bytes, sum) = make_crate_with(
+            name,
+            version,
+            &[("Cargo.toml", manifest.as_str()), ("src/lib.rs", lib)],
+        );
+        std::fs::write(reg.path().join(format!("{name}-{version}.crate")), bytes).unwrap();
+        index.entry(name.to_string()).or_default().push_str(&format!(
+            "{{\"name\":\"{name}\",\"vers\":\"{version}\",\"deps\":[{deps}],\"cksum\":\"{sum}\",\"features\":{features},\"yanked\":false}}\n"
+        ));
+    };
+    publish("fh", "1.0.0", "", "", "{}", "pub fn v() -> u32 { 1 }\n");
+    publish("fh", "2.0.0", "", "", "{}", "pub fn v() -> u32 { 2 }\n");
+    for (version, major) in [("1.0.0", "1"), ("2.0.0", "2")] {
+        publish(
+            "hb",
+            version,
+            &format!(
+                "[dependencies]\nfh = {{ version = \"{major}\", optional = true }}\n[features]\ndefault = [\"fh\"]\n"
+            ),
+            &index_dep("fh", None, &format!("^{major}"), true),
+            "{\"default\":[\"fh\"]}",
+            "pub fn v() -> u32 { if cfg!(feature = \"fh\") { 10 } else { 0 } }\n#[cfg(feature = \"fh\")]\npub use fh;\n",
+        );
+    }
+    let hb2 = index_dep("hb", None, "^2", false)
+        .replace("\"default_features\":true", "\"default_features\":false");
+    publish(
+        "im",
+        "1.0.0",
+        "[dependencies]\nhb = { version = \"2\", default-features = false }\n",
+        &hb2,
+        "{}",
+        "pub fn v() -> u32 { hb::v() }\n",
+    );
+    publish("by", "0.5.6", "", "", "{}", "pub fn v() -> u32 { 5 }\n");
+    publish("by", "1.0.0", "", "", "{}", "pub fn v() -> u32 { 100 }\n");
+    publish(
+        "cb",
+        "4.0.0",
+        "[dependencies]\nby = { version = \"1\", optional = true }\n\
+         by05 = { package = \"by\", version = \"0.5\", optional = true }\n\
+         [features]\ndefault = [\"std\"]\nstd = [\"by\"]\nold = [\"by05\"]\n",
+        &format!(
+            "{},{}",
+            index_dep("by", None, "^1", true),
+            index_dep("by05", Some("by"), "^0.5", true)
+        ),
+        "{\"default\":[\"std\"],\"std\":[\"by\"],\"old\":[\"by05\"]}",
+        "#[cfg(feature = \"std\")]\npub use by;\n",
+    );
+    write_index(reg.path(), &index);
+
+    let p = app_with(&reg, "hb = \"1\"\nim = \"1\"\ncb = \"4\"\n");
+    p.write(
+        "src/main.rs",
+        "fn main() { println!(\"{} {} {} {}\", hb::v(), hb::fh::v(), im::v(), cb::by::v()); }\n",
+    );
+    let out = p.ok(&["run"]);
+    assert!(out.contains("10 1 0 100"), "{out}");
+    assert_eq!(
+        locked(&p),
+        [
+            "app 0.1.0",
+            "by 1.0.0",
+            "cb 4.0.0",
+            "fh 1.0.0",
+            "hb 1.0.0",
+            "hb 2.0.0",
+            "im 1.0.0"
+        ]
+    );
+    // From the lockfile it wrote, too.
+    let again = p.ok(&["build"]);
+    assert!(again.contains("0 compiled"), "{again}");
+    assert!(
+        !again.contains("resolved"),
+        "nothing to resolve again: {again}"
+    );
 }
 
 /// An app depending on `deps` from `reg` (replacing crates.io).

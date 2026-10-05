@@ -623,4 +623,39 @@ mod tests {
         );
         assert!(r.features.contains_key(&(1, false)));
     }
+
+    #[test]
+    fn a_needed_dependency_without_a_package_is_reported_and_an_unused_one_is_not() {
+        // `a` has an optional `opt` nothing switches on, one `on` its default
+        // switches on, a dependency for another platform and a plain one —
+        // none of them resolved to a package.
+        let unresolved = |alias: &str, optional: bool, target: Option<&str>| DepDecl {
+            optional,
+            target: target.map(str::to_string),
+            resolved: None,
+            ..dep(alias, 0)
+        };
+        let pkgs = vec![pkg(
+            "a",
+            &[("default", &["on"])],
+            vec![
+                unresolved("opt", true, None),
+                unresolved("on", true, None),
+                unresolved("windows-only", false, Some("cfg(windows)")),
+                unresolved("plain", false, None),
+            ],
+        )];
+        let r = run(&pkgs, &[root(0)], 2);
+        let names: Vec<&str> = r
+            .unresolved
+            .iter()
+            .map(|&(unit, di)| {
+                assert_eq!(unit, (0, false));
+                pkgs[0].deps[di].alias.as_str()
+            })
+            .collect();
+        assert_eq!(names, ["on", "plain"]);
+        // Which the build then has no edge for, rather than a dangling one.
+        assert!(r.edges.is_empty());
+    }
 }

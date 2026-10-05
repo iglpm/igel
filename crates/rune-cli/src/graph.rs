@@ -2576,22 +2576,36 @@ pub fn plan(ws: &Workspace, req: &Request) -> Result<Plan> {
     // A local package asking a local dependency for a feature it lacks
     // (registry packages were checked when they were published) — on any
     // platform, as Cargo checks: a manifest that builds on Windows must not
-    // be refused on Linux CI over a `[target.'cfg(unix)']` dependency.
-    let everywhere = reachable(
-        unit_features::resolve(
-            &uni.views,
-            &all_roots,
-            &FeatureOptions {
-                resolver: resolver_version,
-                platform_matches: &|_, _| true,
-                weak_activates: false,
-            },
-        ),
-        &selected_units,
-    );
-    if let Some((from, to, f)) = everywhere.unknown_features.iter().find(|(from, to, _)| {
-        matches!(uni.origin[*from], Origin::Local(_)) && matches!(uni.origin[*to], Origin::Local(_))
-    }) {
+    // be refused on Linux CI over a `[target.'cfg(unix)']` dependency. This
+    // build's resolution already follows every edge between local packages
+    // unless a platform-gated dependency (or, through `[patch]`, a registry
+    // package) leads to one; only then is it worth resolving again.
+    let is_local = |p: usize| matches!(uni.origin[p], Origin::Local(_));
+    let gated_way_to_a_local = uni.views.iter().enumerate().any(|(from, view)| {
+        view.deps.iter().any(|d| {
+            d.resolved
+                .is_some_and(|to| is_local(to) && (d.target.is_some() || !is_local(from)))
+        })
+    });
+    let everywhere = gated_way_to_a_local.then(|| {
+        reachable(
+            unit_features::resolve(
+                &uni.views,
+                &all_roots,
+                &FeatureOptions {
+                    resolver: resolver_version,
+                    platform_matches: &|_, _| true,
+                    weak_activates: false,
+                },
+            ),
+            &selected_units,
+        )
+    });
+    let unknown = everywhere.as_ref().unwrap_or(&res).unknown_features.iter();
+    if let Some((from, to, f)) = unknown
+        .clone()
+        .find(|(from, to, _)| is_local(*from) && is_local(*to))
+    {
         bail!(
             "package `{} v{}` depends on `{}` with feature `{f}`, but `{}` does not have that feature",
             uni.name[*from],
