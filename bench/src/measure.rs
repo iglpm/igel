@@ -180,29 +180,44 @@ mod tests {
 
     #[test]
     fn a_command_is_timed_and_its_exit_status_kept() {
-        let ok = run(
-            Command::new("sh").args(["-c", "echo hi"]),
-            Duration::from_secs(10),
-        )
-        .unwrap();
+        let mut cmd = if cfg!(windows) {
+            let mut c = Command::new("cmd");
+            c.args(["/C", "echo hi"]);
+            c
+        } else {
+            let mut c = Command::new("sh");
+            c.args(["-c", "echo hi"]);
+            c
+        };
+        let ok = run(&mut cmd, Duration::from_secs(10)).unwrap();
         assert!(ok.sample.ok);
         assert!(ok.output.contains("hi"));
-        let bad = run(
-            Command::new("sh").args(["-c", "exit 3"]),
-            Duration::from_secs(10),
-        )
-        .unwrap();
+        let mut cmd = if cfg!(windows) {
+            let mut c = Command::new("cmd");
+            c.args(["/C", "exit /b 3"]);
+            c
+        } else {
+            let mut c = Command::new("sh");
+            c.args(["-c", "exit 3"]);
+            c
+        };
+        let bad = run(&mut cmd, Duration::from_secs(10)).unwrap();
         assert!(!bad.sample.ok);
     }
 
     #[test]
     fn a_command_past_its_time_is_stopped() {
         let t = Instant::now();
-        let out = run(
-            Command::new("sh").args(["-c", "sleep 30"]),
-            Duration::from_millis(200),
-        )
-        .unwrap();
+        let mut cmd = if cfg!(windows) {
+            let mut c = Command::new("ping");
+            c.args(["-n", "31", "127.0.0.1"]);
+            c
+        } else {
+            let mut c = Command::new("sh");
+            c.args(["-c", "sleep 30"]);
+            c
+        };
+        let out = run(&mut cmd, Duration::from_millis(200)).unwrap();
         assert!(!out.sample.ok);
         assert!(t.elapsed() < Duration::from_secs(10));
     }

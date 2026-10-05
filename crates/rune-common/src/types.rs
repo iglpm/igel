@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 
 // ---------------------------------------------------------------------------
 // CrateId — uniquely identifies a crate in the dependency graph
@@ -823,6 +823,498 @@ pub struct BuildScriptOutput {
     /// restored, like a crate's warnings.
     #[serde(default)]
     pub compile_warnings: String,
+    /// The OUT_DIR the script ran with when its output was recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recorded_out_dir: Option<PathBuf>,
+    /// The CARGO_MANIFEST_DIR the script ran with when its output was recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recorded_manifest_dir: Option<PathBuf>,
+}
+
+impl BuildScriptOutput {
+    pub const OUT_DIR_PLACEHOLDER: &'static str = "${RUNE_OUT_DIR}";
+    pub const MANIFEST_DIR_PLACEHOLDER: &'static str = "${RUNE_MANIFEST_DIR}";
+
+    /// Normalizes this build script output before storing it in the CAS,
+    /// replacing paths starting with `out_dir` or `manifest_dir` with portable
+    /// placeholders and recording the original directories.
+    pub fn normalize(&mut self, out_dir: &Path, manifest_dir: &Path) {
+        self.recorded_out_dir = Some(out_dir.to_path_buf());
+        self.recorded_manifest_dir = Some(manifest_dir.to_path_buf());
+
+        for ls in &mut self.link_search {
+            ls.path = normalize_path(&ls.path, out_dir, manifest_dir);
+        }
+        for (_, val) in &mut self.env_vars {
+            *val = normalize_string(val, out_dir, manifest_dir);
+        }
+        for (_, val) in &mut self.metadata {
+            *val = normalize_string(val, out_dir, manifest_dir);
+        }
+        for arg in &mut self.link_args {
+            arg.arg = normalize_string(&arg.arg, out_dir, manifest_dir);
+        }
+        for p in &mut self.rerun_if_changed {
+            *p = normalize_path(p, out_dir, manifest_dir);
+        }
+    }
+
+    /// Relocates paths in this build script output (after restoring from CAS)
+    /// to point to the current `out_dir` and `manifest_dir`.
+    ///
+    /// Handles:
+    /// 1. Portable `${RUNE_OUT_DIR}` and `${RUNE_MANIFEST_DIR}` placeholders.
+    /// 2. Explicit `recorded_out_dir` / `recorded_manifest_dir` entries.
+    /// 3. Legacy CAS entries that were stored with raw absolute paths.
+    pub fn relocate(&mut self, current_out_dir: &Path, current_manifest_dir: &Path) {
+        let old_out_dir = self
+            .recorded_out_dir
+            .clone()
+            .or_else(|| self.detect_legacy_out_dir(current_out_dir));
+        let old_manifest_dir = self
+            .recorded_manifest_dir
+            .clone()
+            .or_else(|| self.detect_legacy_manifest_dir(current_manifest_dir));
+
+        for ls in &mut self.link_search {
+            ls.path = relocate_path(
+                &ls.path,
+                current_out_dir,
+                current_manifest_dir,
+                old_out_dir.as_deref(),
+                old_manifest_dir.as_deref(),
+            );
+        }
+        for (_, val) in &mut self.env_vars {
+            *val = relocate_string(
+                val,
+                current_out_dir,
+                current_manifest_dir,
+                old_out_dir.as_deref(),
+                old_manifest_dir.as_deref(),
+            );
+        }
+        for (_, val) in &mut self.metadata {
+            *val = relocate_string(
+                val,
+                current_out_dir,
+                current_manifest_dir,
+                old_out_dir.as_deref(),
+                old_manifest_dir.as_deref(),
+            );
+        }
+        for arg in &mut self.link_args {
+            arg.arg = relocate_string(
+                &arg.arg,
+                current_out_dir,
+                current_manifest_dir,
+                old_out_dir.as_deref(),
+                old_manifest_dir.as_deref(),
+            );
+        }
+        for p in &mut self.rerun_if_changed {
+            *p = relocate_path(
+                p,
+                current_out_dir,
+                current_manifest_dir,
+                old_out_dir.as_deref(),
+                old_manifest_dir.as_deref(),
+            );
+        }
+
+        self.recorded_out_dir = Some(current_out_dir.to_path_buf());
+        self.recorded_manifest_dir = Some(current_manifest_dir.to_path_buf());
+    }
+
+    fn detect_legacy_out_dir(&self, current_out_dir: &Path) -> Option<PathBuf> {
+        for ls in &self.link_search {
+            if let Some(out) = find_build_out_dir(&ls.path) {
+                if !paths_match_loosely(&out, current_out_dir) {
+                    return Some(out);
+                }
+            }
+        }
+        for (_, v) in &self.env_vars {
+            if let Some(out) = find_build_out_dir(Path::new(v)) {
+                if !paths_match_loosely(&out, current_out_dir) {
+                    return Some(out);
+                }
+            }
+            if let Some(out) = find_build_out_dir_in_str(v) {
+                if !paths_match_loosely(&out, current_out_dir) {
+                    return Some(out);
+                }
+            }
+        }
+        for (_, v) in &self.metadata {
+            if let Some(out) = find_build_out_dir(Path::new(v)) {
+                if !paths_match_loosely(&out, current_out_dir) {
+                    return Some(out);
+                }
+            }
+            if let Some(out) = find_build_out_dir_in_str(v) {
+                if !paths_match_loosely(&out, current_out_dir) {
+                    return Some(out);
+                }
+            }
+        }
+        for arg in &self.link_args {
+            if let Some(out) = find_build_out_dir_in_str(&arg.arg) {
+                if !paths_match_loosely(&out, current_out_dir) {
+                    return Some(out);
+                }
+            }
+        }
+        None
+    }
+
+    fn detect_legacy_manifest_dir(&self, current_manifest_dir: &Path) -> Option<PathBuf> {
+        let manifest_name = current_manifest_dir.file_name()?;
+        let manifest_name_str = manifest_name.to_str()?;
+
+        let check_path = |p: &Path| -> Option<PathBuf> {
+            let comps: Vec<_> = p.components().collect();
+            for i in (0..comps.len()).rev() {
+                if component_str_eq(&comps[i], manifest_name_str) {
+                    let mut candidate = PathBuf::new();
+                    for c in &comps[..=i] {
+                        candidate.push(c);
+                    }
+                    if !paths_match_loosely(&candidate, current_manifest_dir) {
+                        return Some(candidate);
+                    }
+                }
+            }
+            None
+        };
+
+        for arg in &self.link_args {
+            if let Some(candidate) = extract_path_from_str(&arg.arg).and_then(check_path) {
+                return Some(candidate);
+            }
+        }
+        for p in &self.rerun_if_changed {
+            if let Some(candidate) = check_path(p) {
+                return Some(candidate);
+            }
+        }
+        None
+    }
+}
+
+fn component_str_eq(c: &Component, s: &str) -> bool {
+    match c {
+        Component::Normal(os) => {
+            if cfg!(windows) {
+                os.to_string_lossy().eq_ignore_ascii_case(s)
+            } else {
+                os.to_str() == Some(s)
+            }
+        }
+        _ => false,
+    }
+}
+
+fn component_eq(a: &Component, b: &Component) -> bool {
+    match (a, b) {
+        (Component::Prefix(p1), Component::Prefix(p2)) => {
+            if cfg!(windows) {
+                p1.as_os_str()
+                    .to_string_lossy()
+                    .eq_ignore_ascii_case(&p2.as_os_str().to_string_lossy())
+            } else {
+                p1 == p2
+            }
+        }
+        (Component::RootDir, Component::RootDir) => true,
+        (Component::CurDir, Component::CurDir) => true,
+        (Component::ParentDir, Component::ParentDir) => true,
+        (Component::Normal(s1), Component::Normal(s2)) => {
+            if cfg!(windows) {
+                s1.to_string_lossy()
+                    .eq_ignore_ascii_case(&s2.to_string_lossy())
+            } else {
+                s1 == s2
+            }
+        }
+        _ => false,
+    }
+}
+
+fn paths_match_loosely(a: &Path, b: &Path) -> bool {
+    let a_comps: Vec<_> = a.components().collect();
+    let b_comps: Vec<_> = b.components().collect();
+    if a_comps.len() != b_comps.len() {
+        return false;
+    }
+    a_comps.iter().zip(&b_comps).all(|(c1, c2)| component_eq(c1, c2))
+}
+
+fn path_strip_prefix<'a>(path: &'a Path, prefix: &Path) -> Option<PathBuf> {
+    if let Ok(rel) = path.strip_prefix(prefix) {
+        return Some(rel.to_path_buf());
+    }
+    let p_comps: Vec<_> = path.components().collect();
+    let prefix_comps: Vec<_> = prefix.components().collect();
+    if prefix_comps.is_empty() || p_comps.len() < prefix_comps.len() {
+        return None;
+    }
+    let matches = p_comps
+        .iter()
+        .zip(&prefix_comps)
+        .all(|(p, pref)| component_eq(p, pref));
+    if matches {
+        let mut rel = PathBuf::new();
+        for c in &p_comps[prefix_comps.len()..] {
+            rel.push(c);
+        }
+        return Some(rel);
+    }
+    None
+}
+
+fn path_strip_placeholder(path: &Path, placeholder: &str) -> Option<PathBuf> {
+    let s = path.to_string_lossy();
+    if s == placeholder {
+        return Some(PathBuf::new());
+    }
+    if let Some(rest) = s.strip_prefix(placeholder) {
+        let rest = rest.trim_start_matches(['/', '\\']);
+        return Some(PathBuf::from(rest));
+    }
+    None
+}
+
+fn normalize_path(path: &Path, out_dir: &Path, manifest_dir: &Path) -> PathBuf {
+    if let Some(rel) = path_strip_prefix(path, out_dir) {
+        if rel.as_os_str().is_empty() {
+            PathBuf::from(BuildScriptOutput::OUT_DIR_PLACEHOLDER)
+        } else {
+            PathBuf::from(BuildScriptOutput::OUT_DIR_PLACEHOLDER).join(rel)
+        }
+    } else if let Some(rel) = path_strip_prefix(path, manifest_dir) {
+        if rel.as_os_str().is_empty() {
+            PathBuf::from(BuildScriptOutput::MANIFEST_DIR_PLACEHOLDER)
+        } else {
+            PathBuf::from(BuildScriptOutput::MANIFEST_DIR_PLACEHOLDER).join(rel)
+        }
+    } else {
+        path.to_path_buf()
+    }
+}
+
+fn relocate_path(
+    path: &Path,
+    current_out_dir: &Path,
+    current_manifest_dir: &Path,
+    old_out_dir: Option<&Path>,
+    old_manifest_dir: Option<&Path>,
+) -> PathBuf {
+    if let Some(rel) = path_strip_placeholder(path, BuildScriptOutput::OUT_DIR_PLACEHOLDER) {
+        return current_out_dir.join(rel);
+    }
+    if let Some(rel) = path_strip_placeholder(path, BuildScriptOutput::MANIFEST_DIR_PLACEHOLDER) {
+        return current_manifest_dir.join(rel);
+    }
+
+    if path_strip_prefix(path, current_out_dir).is_some() {
+        return path.to_path_buf();
+    }
+
+    if let Some(old_out) = old_out_dir {
+        if let Some(rel) = path_strip_prefix(path, old_out) {
+            return current_out_dir.join(rel);
+        }
+    }
+
+    if let Some(old_out) = find_build_out_dir(path) {
+        if !paths_match_loosely(&old_out, current_out_dir) {
+            if let Some(rel) = path_strip_prefix(path, &old_out) {
+                return current_out_dir.join(rel);
+            }
+        }
+    }
+
+    if let Some(old_manifest) = old_manifest_dir {
+        if let Some(rel) = path_strip_prefix(path, old_manifest) {
+            return current_manifest_dir.join(rel);
+        }
+    }
+
+    path.to_path_buf()
+}
+
+fn replace_all_ci(haystack: &str, needle: &str, replacement: &str) -> String {
+    if needle.is_empty() {
+        return haystack.to_string();
+    }
+    let mut result = String::with_capacity(haystack.len());
+    let h_lower = haystack.to_lowercase();
+    let n_lower = needle.to_lowercase();
+    let mut last_end = 0;
+    let mut start = 0;
+
+    while let Some(pos) = h_lower[start..].find(&n_lower) {
+        let abs_pos = start + pos;
+        result.push_str(&haystack[last_end..abs_pos]);
+        result.push_str(replacement);
+        last_end = abs_pos + needle.len();
+        start = last_end;
+    }
+    result.push_str(&haystack[last_end..]);
+    result
+}
+
+fn replace_prefix_in_str(s: &str, prefix: &Path, replacement: &str) -> String {
+    let prefix_str = prefix.display().to_string();
+    if prefix_str.is_empty() {
+        return s.to_string();
+    }
+
+    if s == prefix_str {
+        return replacement.to_string();
+    }
+
+    let prefix_slash = prefix_str.replace('\\', "/");
+    let prefix_back = prefix_str.replace('/', "\\");
+
+    if cfg!(windows) {
+        let mut res = replace_all_ci(s, &prefix_back, replacement);
+        res = replace_all_ci(&res, &prefix_slash, replacement);
+        res
+    } else {
+        s.replace(&prefix_str, replacement)
+    }
+}
+
+fn normalize_string(s: &str, out_dir: &Path, manifest_dir: &Path) -> String {
+    let s = replace_prefix_in_str(s, out_dir, BuildScriptOutput::OUT_DIR_PLACEHOLDER);
+    replace_prefix_in_str(&s, manifest_dir, BuildScriptOutput::MANIFEST_DIR_PLACEHOLDER)
+}
+
+fn find_build_out_dir(path: &Path) -> Option<PathBuf> {
+    let comps: Vec<_> = path.components().collect();
+    if comps.len() < 3 {
+        return None;
+    }
+    for i in 0..comps.len() - 2 {
+        if component_str_eq(&comps[i], "build") && component_str_eq(&comps[i + 2], "out") {
+            let mut out = PathBuf::new();
+            for c in &comps[..=i + 2] {
+                out.push(c);
+            }
+            return Some(out);
+        }
+    }
+    None
+}
+
+fn find_path_start_in_before(before: &str) -> usize {
+    let bytes = before.as_bytes();
+    let mut i = bytes.len();
+    while i > 0 {
+        i -= 1;
+        let b = bytes[i];
+        if b == b' ' || b == b'"' || b == b'\'' || b == b';' || b == b'=' {
+            return i + 1;
+        }
+        if b == b':' {
+            // Check if this colon is part of a Windows drive letter like "C:\"
+            if i > 0 && bytes[i - 1].is_ascii_alphabetic() {
+                if i == 1 || matches!(bytes[i - 2], b' ' | b'"' | b'\'' | b';' | b'=' | b':' | b'/' | b'\\') {
+                    // This colon is part of the drive letter, skip it!
+                    continue;
+                }
+            }
+            return i + 1;
+        }
+    }
+    0
+}
+
+fn find_build_out_dir_in_str(s: &str) -> Option<PathBuf> {
+    let s_norm = s.replace('\\', "/");
+    let lower = s_norm.to_lowercase();
+    let build_idx = lower.find("/build/")?;
+    let after_build = &lower[build_idx + 7..];
+    let next_slash = after_build.find('/')?;
+    let after_crate = &after_build[next_slash + 1..];
+    if after_crate.starts_with("out") {
+        let out_len = 3;
+        let char_after = after_crate[out_len..].chars().next();
+        if char_after.is_none()
+            || matches!(
+                char_after,
+                Some('/' | ' ' | '"' | '\'' | ';' | ':' | '\n' | '\r')
+            )
+        {
+            let before = &s[..build_idx];
+            let start = find_path_start_in_before(before);
+            let end_idx = build_idx + 7 + next_slash + 1 + out_len;
+            let raw_path = &s[start..end_idx];
+            return Some(PathBuf::from(raw_path));
+        }
+    }
+    None
+}
+
+fn relocate_string(
+    s: &str,
+    current_out_dir: &Path,
+    current_manifest_dir: &Path,
+    old_out_dir: Option<&Path>,
+    old_manifest_dir: Option<&Path>,
+) -> String {
+    let mut result = s.to_string();
+
+    if result.contains(BuildScriptOutput::OUT_DIR_PLACEHOLDER) {
+        result = result.replace(
+            BuildScriptOutput::OUT_DIR_PLACEHOLDER,
+            &current_out_dir.display().to_string(),
+        );
+    }
+    if result.contains(BuildScriptOutput::MANIFEST_DIR_PLACEHOLDER) {
+        result = result.replace(
+            BuildScriptOutput::MANIFEST_DIR_PLACEHOLDER,
+            &current_manifest_dir.display().to_string(),
+        );
+    }
+
+    if let Some(old_out) = old_out_dir {
+        result = replace_prefix_in_str(&result, old_out, &current_out_dir.display().to_string());
+    }
+    if let Some(legacy_out) = find_build_out_dir_in_str(&result) {
+        if !paths_match_loosely(&legacy_out, current_out_dir) {
+            result = replace_prefix_in_str(
+                &result,
+                &legacy_out,
+                &current_out_dir.display().to_string(),
+            );
+        }
+    }
+
+    if let Some(old_manifest) = old_manifest_dir {
+        result = replace_prefix_in_str(
+            &result,
+            old_manifest,
+            &current_manifest_dir.display().to_string(),
+        );
+    }
+
+    result
+}
+
+fn extract_path_from_str(s: &str) -> Option<&Path> {
+    let raw = s
+        .strip_prefix("/MANIFESTINPUT:")
+        .or_else(|| s.strip_prefix("-L"))
+        .unwrap_or(s);
+    let trimmed = raw.trim().trim_matches(['"', '\'']);
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(Path::new(trimmed))
+    }
 }
 
 /// Which artifacts a `cargo::rustc-link-arg*` directive applies to.
@@ -1035,6 +1527,89 @@ mod unit_tests {
         assert!(
             !h.produces_real_artifact(),
             "`rune check` never links a harness"
+        );
+    }
+
+    #[test]
+    fn test_build_script_output_normalize_and_relocate() {
+        let old_out = PathBuf::from("C:\\tmp\\runefix\\jolter\\.rune\\target\\debug\\build\\cranelift_codegen-c9f33280984f8c9f\\out");
+        let old_manifest = PathBuf::from("C:\\tmp\\runefix\\jolter\\crates\\cranelift-codegen");
+        let new_out = PathBuf::from("C:\\Users\\jonas\\Documents\\GitHub\\jolter\\jolter\\.rune\\target\\debug\\build\\cranelift_codegen-4a227c3258f96fdd\\out");
+        let new_manifest = PathBuf::from("C:\\Users\\jonas\\Documents\\GitHub\\jolter\\jolter\\crates\\cranelift-codegen");
+
+        let mut out = BuildScriptOutput {
+            link_search: vec![
+                LinkSearch {
+                    kind: Some("native".into()),
+                    path: old_out.join("lib"),
+                }
+            ],
+            env_vars: vec![
+                ("ISLE_DIR".into(), old_out.display().to_string()),
+                ("OUT_DIR".into(), old_out.display().to_string()),
+                ("OTHER".into(), "not-a-path".into()),
+            ],
+            metadata: vec![
+                ("root".into(), old_out.display().to_string()),
+                ("include".into(), old_out.join("include").display().to_string()),
+            ],
+            link_args: vec![
+                LinkArg {
+                    scope: LinkArgScope::Bins,
+                    arg: format!("/MANIFESTINPUT:{}\\windows\\app.manifest", old_manifest.display()),
+                }
+            ],
+            rerun_if_changed: vec![
+                old_manifest.join("build.rs"),
+            ],
+            ..Default::default()
+        };
+
+        // 1. Test normalize
+        out.normalize(&old_out, &old_manifest);
+        assert_eq!(out.env_vars[0].1, BuildScriptOutput::OUT_DIR_PLACEHOLDER);
+        assert_eq!(out.metadata[1].1, format!("{}\\include", BuildScriptOutput::OUT_DIR_PLACEHOLDER));
+        assert!(out.link_args[0].arg.contains(BuildScriptOutput::MANIFEST_DIR_PLACEHOLDER));
+
+        // 2. Test relocate from normalized placeholders
+        out.relocate(&new_out, &new_manifest);
+        assert_eq!(out.env_vars[0].1, new_out.display().to_string());
+        assert_eq!(out.env_vars[2].1, "not-a-path");
+        assert_eq!(out.link_search[0].path, new_out.join("lib"));
+        assert_eq!(out.metadata[1].1, new_out.join("include").display().to_string());
+        assert_eq!(out.link_args[0].arg, format!("/MANIFESTINPUT:{}\\windows\\app.manifest", new_manifest.display()));
+        assert_eq!(out.rerun_if_changed[0], new_manifest.join("build.rs"));
+
+        // 3. Test relocate from LEGACY unnormalized CAS entry (no placeholders, recorded_out_dir=None)
+        let mut legacy_out = BuildScriptOutput {
+            link_search: vec![
+                LinkSearch {
+                    kind: Some("native".into()),
+                    path: PathBuf::from("C:\\tmp\\runefix\\hedge\\.rune\\target\\debug\\build\\webview2_com_sys-f0d9c7a5087228b6\\out\\x64"),
+                }
+            ],
+            env_vars: vec![
+                ("ISLE_DIR".into(), "C:\\tmp\\runefix\\jolter-wt\\.rune\\target\\debug\\build\\cranelift_codegen-4a227c3258f96fdd\\out".into()),
+            ],
+            metadata: vec![
+                ("libcrypto_path".into(), "C:\\tmp\\runefix\\jolter\\RUNE~1\\target\\debug\\build\\AWS_LC~1\\out\\aws_lc_0_45_0_crypto.lib".into()),
+            ],
+            ..Default::default()
+        };
+
+        let target_webview_out = PathBuf::from("C:\\Users\\jonas\\Documents\\GitHub\\hedgebrowser\\hedge\\.rune\\target\\debug\\build\\webview2_com_sys-f0d9c7a5087228b6\\out");
+        legacy_out.relocate(&target_webview_out, &new_manifest);
+        assert_eq!(
+            legacy_out.link_search[0].path,
+            target_webview_out.join("x64")
+        );
+        assert_eq!(
+            legacy_out.env_vars[0].1,
+            target_webview_out.display().to_string()
+        );
+        assert_eq!(
+            legacy_out.metadata[0].1,
+            target_webview_out.join("aws_lc_0_45_0_crypto.lib").display().to_string()
         );
     }
 }
