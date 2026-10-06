@@ -65,6 +65,15 @@ UnitKey = hash(
   `rerun-if-changed` — exactly the files it watches and its own sources. Editing
   the rest of the package does not run it again (as in Cargo), and a script
   that must run again because a watched file changed is not recompiled.
+* **A script's result moves with the project.** The store is shared by every
+  project, but a script's output names absolute paths (`OUT_DIR`, the
+  package). Paths into its own `OUT_DIR` and package — in either spelling,
+  including Windows 8.3 short names (`RUNE~1`) that CMake-style tools print —
+  are stored as placeholders and filled in for the project that restores
+  them. A result that still names the project after that (a path into
+  another package's `OUT_DIR`, or a generated `.rs` file in `OUT_DIR` with
+  an absolute path in it) is stored for that project's directories only;
+  elsewhere the script runs again.
 * **Correctness beats hit rate.** A false rebuild is acceptable; reusing a wrong
   artifact is not. Objects in the store are immutable (first writer wins),
   read-only, published atomically, and verified on every hit.

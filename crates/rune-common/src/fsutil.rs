@@ -14,6 +14,43 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 pub use dunce::simplified;
 
+/// The 8.3 short spelling of an existing path (`C:\Users\me\DOCUME~1\...`),
+/// when it differs from `path`. Tools driven by build scripts (CMake, notably)
+/// report paths this way, so a path recognized by its long spelling alone
+/// can be missed. Always `None` off Windows.
+pub fn short_path(path: &Path) -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
+        use std::ffi::OsString;
+        use std::os::windows::ffi::{OsStrExt, OsStringExt};
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn GetShortPathNameW(long: *const u16, short: *mut u16, len: u32) -> u32;
+        }
+        let wide: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
+        let mut buf = vec![0u16; 512];
+        loop {
+            // SAFETY: `wide` is NUL-terminated and `buf` holds `buf.len()` units.
+            let n = unsafe { GetShortPathNameW(wide.as_ptr(), buf.as_mut_ptr(), buf.len() as u32) }
+                as usize;
+            if n == 0 {
+                return None;
+            }
+            if n > buf.len() {
+                buf.resize(n, 0);
+                continue;
+            }
+            let short = PathBuf::from(OsString::from_wide(&buf[..n]));
+            return (short.as_os_str() != path.as_os_str()).then_some(short);
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        None
+    }
+}
+
 /// [`dunce::canonicalize`], remembered for the rest of the process for
 /// absolute paths: planning asks about the same few directories (the
 /// workspace's packages) hundreds of times, and every answer costs a system

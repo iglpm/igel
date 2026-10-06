@@ -45,6 +45,15 @@ The first stable release. Changes since the 0.1.0 preview:
   run time, as Cargo sets them.
 
 ### Fixed
+- A build script's stored result could carry another project's absolute
+  paths into a build: a project restored `ISLE_DIR`, link search paths or
+  `DEP_*` values pointing into the target directory of whichever project ran
+  the script first, failing with "couldn't read `…/out/isle_numerics.rs`"
+  (cranelift-codegen) or "could not find native static library
+  `WebView2LoaderStatic`" once that directory was gone. Paths into the
+  script's `OUT_DIR` and package are now stored portably (Windows 8.3 short
+  names included) and relocated on restore; results that cannot be relocated
+  are kept per project. Results stored by earlier versions are not used.
 - Crates built by different projects did not fit together: registry crates
   compiled in whatever directory `rune` was started from, which rustc hashes
   into a crate's identity, and a store entry could then name a build of its

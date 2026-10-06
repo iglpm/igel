@@ -510,6 +510,23 @@ impl BuildExecutor {
             let restore = |&id: &NodeId| -> Option<(NodeId, rune_cas::store::Linked)> {
                 let unit = &graph.node(id).unit;
                 let key = &unit_cas_keys[&id];
+                // Without its script's result (or with one stored for another
+                // project) a unit is no use to its dependents: it is built.
+                if unit.build_script.is_some()
+                    && unit.ext.script_owner.is_none()
+                    && stored_script_output(
+                        cas,
+                        &format!("{key}-script-output"),
+                        &self.config.build_script_out_dir_by_key(
+                            self.profile.output_dir_name(),
+                            &script_key(unit),
+                        ),
+                        &unit.manifest_dir,
+                    )
+                    .is_none()
+                {
+                    return None;
+                }
                 // Another `rune` sharing this target directory may be
                 // compiling a unit with the same output files right now
                 // (the same crate built with other flags, as `rune
@@ -592,8 +609,19 @@ impl BuildExecutor {
                 // and the package's other units (cfgs, link libraries,
                 // `OUT_DIR`) still need. Restore it from the store.
                 if unit.build_script.is_some() {
-                    let script_key_name = format!("{}-buildscript", unit_cas_keys[&id]);
-                    if let Some(output) = cas.get_value::<BuildScriptOutput>(&script_key_name) {
+                    let script_key_name = format!("{}-script-output", unit_cas_keys[&id]);
+                    let script_out_dir = self.config.build_script_out_dir_by_key(
+                        self.profile.output_dir_name(),
+                        &script_key(unit),
+                    );
+                    // The generated files too: the package's other units
+                    // `include!` them from the shared `OUT_DIR`.
+                    if let Some(output) = restore_script_output(
+                        cas,
+                        &script_key_name,
+                        &script_out_dir,
+                        &unit.manifest_dir,
+                    ) {
                         let _ = self.event_tx.send(PipelineEvent::ScriptOutput {
                             node_id: id,
                             output: output.clone(),
@@ -601,15 +629,6 @@ impl BuildExecutor {
                         replay_script_warnings(&self.event_tx, id, Some(&output));
                         build_script_outputs.insert(id, output);
                     }
-                    // The generated files too: the package's other units
-                    // `include!` them from the shared `OUT_DIR`.
-                    let _ = cas.restore_dir_tree(
-                        &script_key_name,
-                        &self.config.build_script_out_dir_by_key(
-                            self.profile.output_dir_name(),
-                            &script_key(unit),
-                        ),
-                    );
                 }
                 if let Some(rmeta) = linked
                     .iter()
@@ -1390,7 +1409,7 @@ impl BuildExecutor {
                 key.clone(),
                 // The script output a cache hit of the unit restores (for its
                 // dependents' `DEP_*`, link paths and `OUT_DIR`).
-                format!("{key}-buildscript"),
+                format!("{key}-script-output"),
                 format!("{key}-warnings"),
                 format!("{key}-diagnostics"),
                 format!("{base}-inputs"),
@@ -1416,8 +1435,13 @@ impl BuildExecutor {
                 }
                 let (script_base, _, script) =
                     self.script_keys(graph, id, &keys, &dep_metadata, &mut source_cache);
-                let result = format!("{script}-buildscript");
-                if let Some(output) = self.cas.as_ref().and_then(|c| c.get_value(&result)) {
+                let result = format!("{script}-script-output");
+                let script_out_dir = self
+                    .config
+                    .build_script_out_dir_by_key(self.profile.output_dir_name(), &script_key(unit));
+                if let Some((_, output)) = self.cas.as_ref().and_then(|c| {
+                    stored_script_output(c, &result, &script_out_dir, &unit.manifest_dir)
+                }) {
                     script_outputs.insert(script_key(unit), output);
                 }
                 out.extend([format!("{script_base}-script-record"), result]);
@@ -1876,7 +1900,17 @@ impl UnitJob {
                 .as_ref()
                 .is_some_and(|deps| m.matches_dependencies(deps))
         };
-        if !cas.get(&key).is_some_and(|e| fits(&e.manifest)) {
+        let script_out_dir = self
+            .config
+            .build_script_out_dir_by_key(self.profile.output_dir_name(), &script_key(unit));
+        let script_key_name = format!("{key}-script-output");
+        // (Without its script's result, see `execute`.)
+        if !cas.get(&key).is_some_and(|e| fits(&e.manifest))
+            || (has_script
+                && unit.ext.script_owner.is_none()
+                && stored_script_output(cas, &script_key_name, &script_out_dir, &unit.manifest_dir)
+                    .is_none())
+        {
             return false;
         }
         let out_dir = out_dir_for(&self.config, &self.profile, unit);
@@ -1898,20 +1932,14 @@ impl UnitJob {
                 key: key.clone(),
             });
         }
-        if has_script {
-            let script_key_name = format!("{key}-buildscript");
-            if let Some(output) = cas.get_value::<BuildScriptOutput>(&script_key_name) {
-                let _ = self.worker_tx.send(WorkerMsg::BuildScriptDone {
-                    node_id: self.node_id,
-                    output,
-                });
-            }
-            let _ = cas.restore_dir_tree(
-                &script_key_name,
-                &self
-                    .config
-                    .build_script_out_dir_by_key(self.profile.output_dir_name(), &script_key(unit)),
-            );
+        if has_script
+            && let Some(output) =
+                restore_script_output(cas, &script_key_name, &script_out_dir, &unit.manifest_dir)
+        {
+            let _ = self.worker_tx.send(WorkerMsg::BuildScriptDone {
+                node_id: self.node_id,
+                output,
+            });
         }
         if let Some(rmeta) = linked
             .iter()
@@ -1996,8 +2024,8 @@ impl UnitJob {
         // `compute_script_base`): editing the package's other files does not
         // run a script that declared which files it reads.
         let build_script_cache_key = match &self.script_cache_key {
-            Some(k) => format!("{k}-buildscript"),
-            None => format!("{}-buildscript", self.cas_key),
+            Some(k) => format!("{k}-script-output"),
+            None => format!("{}-script-output", self.cas_key),
         };
         // The files the script's own compilation read (for its record).
         let mut script_sources: Vec<PathBuf> = Vec::new();
@@ -2048,13 +2076,13 @@ impl UnitJob {
             && !shares_script
             && let Some(cas_store) = &self.cas
         {
-            let restored = cas_store
-                .restore_dir_tree(&build_script_cache_key, &script_out_dir)
-                .unwrap_or(false);
-            if restored {
-                effective_build_output = cas_store.get_value(&build_script_cache_key);
-                replay_script_warnings(&self.event_tx, node_id, effective_build_output.as_ref());
-            }
+            effective_build_output = restore_script_output(
+                cas_store,
+                &build_script_cache_key,
+                &script_out_dir,
+                &unit.manifest_dir,
+            );
+            replay_script_warnings(&self.event_tx, node_id, effective_build_output.as_ref());
         }
 
         if let (Some(build_rs), true) = (
@@ -2332,12 +2360,11 @@ impl UnitJob {
                         Some(&unit.manifest_dir),
                         || package_hash,
                     );
-                    format!("{key}-buildscript")
+                    format!("{key}-script-output")
                 }
-                None => format!("{store_key}-buildscript"),
+                None => format!("{store_key}-script-output"),
             };
-            let _ = cas_store.put_dir_tree(&key, &script_out_dir);
-            let _ = cas_store.put_value(&key, out);
+            store_script_output(cas_store, &key, out, &script_out_dir, &unit.manifest_dir);
         }
 
         if let Some(output) = &effective_build_output {
@@ -2590,10 +2617,22 @@ impl UnitJob {
                     // it by (the script step stored it under the key the unit
                     // had then, which its dependencies may have changed since).
                     if let (Some(out), false) = (&effective_build_output, shares_script) {
-                        let key = format!("{store_key}-buildscript");
-                        if !cas_store.contains_tree(&key) {
-                            let _ = cas_store.put_dir_tree(&key, &script_out_dir);
-                            let _ = cas_store.put_value(&key, out);
+                        let key = format!("{store_key}-script-output");
+                        if stored_script_output(
+                            cas_store,
+                            &key,
+                            &script_out_dir,
+                            &unit.manifest_dir,
+                        )
+                        .is_none()
+                        {
+                            store_script_output(
+                                cas_store,
+                                &key,
+                                out,
+                                &script_out_dir,
+                                &unit.manifest_dir,
+                            );
                         }
                     }
                 }
@@ -2656,6 +2695,123 @@ fn tree_stamp(dir: &Path) -> u64 {
 /// The `crate-name-hash` directory a unit's build script output lives in.
 pub fn script_key(unit: &CompilationUnit) -> String {
     format!("{}-{}", unit.rustc_crate_name(), unit.metadata_hash())
+}
+
+/// Where a build script's result that only fits one project is stored: the
+/// script's key, qualified by the directories it names (its `OUT_DIR`, which
+/// is inside the project's target directory, and its package).
+fn pinned_script_key(key: &str, out_dir: &Path, manifest_dir: &Path) -> String {
+    let at = format!(
+        "{}\0{}",
+        rune_common::fsutil::simplified(out_dir).display(),
+        rune_common::fsutil::simplified(manifest_dir).display()
+    );
+    format!("{key}-at-{}", rune_common::hash::xxhash3_hex(at.as_bytes()))
+}
+
+/// Whether a script's result names this project's directories in a way that
+/// cannot be relocated: a directive pointing into another package's
+/// `OUT_DIR`, say, or a generated Rust file with an absolute path in it
+/// (`include_bytes!("C:\\proj\\assets\\logo.png")`) that the package will
+/// `include!`.
+fn names_project(output: &BuildScriptOutput, out_dir: &Path, manifest_dir: &Path) -> bool {
+    let build_dir = out_dir.parent().and_then(Path::parent).unwrap_or(out_dir);
+    let dirs = [
+        rune_common::fsutil::simplified(build_dir),
+        rune_common::fsutil::simplified(manifest_dir),
+    ];
+    if output.names_any(&dirs) {
+        return true;
+    }
+    fn sources(dir: &Path, found: &mut Vec<PathBuf>) {
+        for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            match entry.file_type() {
+                Ok(t) if t.is_dir() => sources(&path, found),
+                Ok(t) if t.is_file() && path.extension().is_some_and(|e| e == "rs") => {
+                    found.push(path)
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut files = Vec::new();
+    sources(out_dir, &mut files);
+    files.iter().any(|f| {
+        std::fs::read(f).is_ok_and(|bytes| {
+            let text = String::from_utf8_lossy(&bytes);
+            dirs.iter().any(|d| rune_common::text_names_dir(&text, d))
+        })
+    })
+}
+
+/// Stores a build script's result: the files it wrote to `out_dir` and its
+/// directives. The store is shared by every project and its keys do not say
+/// where a project lives, so paths into `out_dir` and the package are stored
+/// as placeholders (see [`BuildScriptOutput::normalize`]); a result that still
+/// names the project is stored for this project alone.
+fn store_script_output(
+    cas: &CasStore,
+    key: &str,
+    output: &BuildScriptOutput,
+    out_dir: &Path,
+    manifest_dir: &Path,
+) {
+    let mut portable = output.clone();
+    portable.normalize(
+        rune_common::fsutil::simplified(out_dir),
+        rune_common::fsutil::simplified(manifest_dir),
+    );
+    let key = if names_project(&portable, out_dir, manifest_dir) {
+        pinned_script_key(key, out_dir, manifest_dir)
+    } else {
+        key.to_string()
+    };
+    let _ = cas.put_dir_tree(&key, out_dir);
+    let _ = cas.put_value(&key, &portable);
+}
+
+/// A build script's stored result that fits this project, and the key it is
+/// stored under (which its `OUT_DIR` files are restored from), with paths
+/// pointed at this project's `out_dir` and package. An entry stored before
+/// paths were made portable names another project's directories (which may
+/// be gone), so it counts as absent.
+fn stored_script_output(
+    cas: &CasStore,
+    key: &str,
+    out_dir: &Path,
+    manifest_dir: &Path,
+) -> Option<(String, BuildScriptOutput)> {
+    [
+        key.to_string(),
+        pinned_script_key(key, out_dir, manifest_dir),
+    ]
+    .into_iter()
+    .find_map(|key| {
+        let mut output: BuildScriptOutput = cas.get_value(&key)?;
+        if !output.is_portable() {
+            return None;
+        }
+        output.relocate(
+            rune_common::fsutil::simplified(out_dir),
+            rune_common::fsutil::simplified(manifest_dir),
+        );
+        Some((key, output))
+    })
+}
+
+/// Restores a build script's stored result for this project: its directives
+/// and the files it wrote to `out_dir`.
+fn restore_script_output(
+    cas: &CasStore,
+    key: &str,
+    out_dir: &Path,
+    manifest_dir: &Path,
+) -> Option<BuildScriptOutput> {
+    let (key, output) = stored_script_output(cas, key, out_dir, manifest_dir)?;
+    cas.restore_dir_tree(&key, out_dir)
+        .unwrap_or(false)
+        .then_some(output)
 }
 
 /// Where a unit is compiled to (and restored from the store to): `deps/`, or
