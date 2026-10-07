@@ -1,0 +1,3 @@
+[submodule "hyprlnk"]
+	path = hyprlnk
+	url = git@github.com:runepm/hyprlnk.git
