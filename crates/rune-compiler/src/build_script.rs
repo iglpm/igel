@@ -238,7 +238,11 @@ impl BuildScriptRunner {
             // and linker, not the device's.
             cmd.args(&e.rustflags);
             if let Some(linker) = &e.linker {
-                cmd.arg("-C").arg(format!("linker={}", linker.display()));
+                let (exe, env) = rune_common::linker::for_rustc(&linker.to_string_lossy());
+                cmd.arg("-C").arg(format!("linker={}", exe.display()));
+                if let Some((k, v)) = env {
+                    cmd.env(k, v);
+                }
             }
             e.apply_package_env(&mut cmd);
         }
@@ -318,7 +322,10 @@ impl BuildScriptRunner {
             Some(w) => cmd.env("RUSTC_WORKSPACE_WRAPPER", w),
             None => cmd.env_remove("RUSTC_WORKSPACE_WRAPPER"),
         };
-        if let Some(linker) = &env.linker {
+        // The built-in linker is no program a build script could run.
+        if let Some(linker) = &env.linker
+            && !rune_common::linker::is_embedded(&linker.to_string_lossy())
+        {
             cmd.env("RUSTC_LINKER", linker);
         }
         // Flags meant for the compiler are handed over encoded so that

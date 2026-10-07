@@ -47,6 +47,17 @@ use args::{Cli, Commands};
 use graph::Mode;
 
 fn main() {
+    // The built-in linker (`build.linker = "hyprlnk"`): Rune passes its own
+    // executable to rustc as the linker and marks the compiler's environment,
+    // so this process is rustc running "the linker".
+    if std::env::var_os(rune_common::linker::EMBEDDED_ENV).is_some() {
+        std::process::exit(hyprlnk::main_with_args(std::env::args_os()));
+    }
+    // `rune __hyprlnk <link.exe-style arguments>`: the same, by hand.
+    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("__hyprlnk")) {
+        let args = std::iter::once(OsString::from("hyprlnk")).chain(std::env::args_os().skip(2));
+        std::process::exit(hyprlnk::main_with_args(args));
+    }
     // `rune tree | head`: when the reader goes away, stop quietly, as Cargo
     // and every Unix tool do, instead of panicking on the next write.
     #[cfg(unix)]

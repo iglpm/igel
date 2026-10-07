@@ -693,6 +693,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "hyprlnk"
+version = "2027.0.0"
+dependencies = [
+ "hashbrown",
+ "libc",
+ "mimalloc",
+ "rayon",
+ "rustc-demangle",
+ "xxhash-rust",
+]
+
+[[package]]
 name = "icu_collections"
 version = "2.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1290,6 +1302,7 @@ dependencies = [
  "flate2",
  "glob",
  "home",
+ "hyprlnk",
  "indicatif",
  "libc",
  "mimalloc",

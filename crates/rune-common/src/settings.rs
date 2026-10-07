@@ -176,6 +176,16 @@ pub const KEYS: &[KeyDef] = &[
                       on Rune's own build (4 cores) it kept the cores busy but saved no time.",
     },
     KeyDef {
+        name: "build.linker",
+        kind: ValueKind::Text,
+        default: "default",
+        description: "Which linker links binaries, tests and dynamic libraries. `default`: the \
+                      one `rustc` and `.cargo/config.toml` choose. `hyprlnk`: the linker built \
+                      into Rune, about twice as fast as lld on Rune's own build; it takes \
+                      precedence over `target.<triple>.linker`. hyprlnk links \
+                      x86_64-pc-windows-msvc for now: other targets keep their linker.",
+    },
+    KeyDef {
         name: "build.target-dir",
         kind: ValueKind::Path,
         default: ".rune/target",
@@ -603,6 +613,14 @@ impl Settings {
                 .filter(|n| *n > 1)
                 .map_or(FrontendThreads::Off, FrontendThreads::Fixed),
             _ => FrontendThreads::Off,
+        }
+    }
+
+    /// `build.linker`, when set: `default` or `hyprlnk`.
+    pub fn linker(&self) -> Option<String> {
+        match self.values.get("build.linker") {
+            Some((Value::Text(t), _)) => Some(t.clone()),
+            _ => None,
         }
     }
 

@@ -13,6 +13,12 @@ always safe; the first stable release is 2027.0.0.
 The first stable release. Changes since the 0.1.0 preview:
 
 ### Added
+- hyprlnk (in `hyprlnk/`), a linker developed with Rune and built into it:
+  `build.linker = "hyprlnk"` links binaries, tests, build scripts and DLLs
+  with it instead of the platform linker. It links x86-64 Windows (PE/COFF)
+  images from `link.exe`-style command lines, and links Rune itself in about
+  half the time lld takes. `rune __hyprlnk <args>` runs it by hand; it also
+  builds as a standalone `hyprlnk` executable.
 - `rune-bench` (in `bench/`): benchmarks Rune against Cargo on generated
   workspaces or a copy of any project — startup, cold builds, no-op builds,
   rebuilds after edits, cache reuse, tests, inspection commands, disk and

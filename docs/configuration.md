@@ -22,6 +22,7 @@ rune config unset build.release-rebuild-all
 | `build.sandbox` | `false` | Run build scripts and the compiler (proc-macros) with no network and nothing writable outside the build — see [supply chain](supply-chain.md#confining-build-time-code). |
 | `build.sandbox-network` | none | Packages whose build scripts may use the network in the sandbox (comma-separated). |
 | `build.feature-unification` | `selected` | `workspace`: every member's feature requests count, so any subset of the workspace shares dependency builds (see [caching](caching.md#workspace-feature-unification)). |
+| `build.linker` | `default` | `hyprlnk`: link binaries, tests and DLLs with [hyprlnk](../hyprlnk/README.md), the linker built into Rune (about twice as fast as lld on Rune's own build, and nothing to install). It takes precedence over `target.<triple>.linker`. Links `x86_64-pc-windows-msvc` for now; other targets keep their linker. |
 | `build.target-dir` | `.rune/target` | Build output directory. |
 | `cas.enabled` | `true` | Use the CAS at all. |
 | `cas.dir` | `~/.rune/cas` | CAS location. |

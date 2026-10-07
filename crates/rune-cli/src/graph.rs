@@ -1633,10 +1633,17 @@ struct Roles {
 }
 
 impl Roles {
-    fn new(ws: &Workspace, req: &Request) -> Roles {
+    fn new(ws: &Workspace, req: &Request) -> Result<Roles> {
         let tc = toolchain::global();
         let cfg = &ws.cargo_config;
         let cross = req.target.is_some();
+        let hyprlnk = match ws.config.settings.linker().as_deref() {
+            None | Some("default") => false,
+            Some("hyprlnk") => true,
+            Some(other) => {
+                bail!("unknown `build.linker` `{other}`: expected `default` or `hyprlnk`")
+            }
+        };
         let build = |arg: Option<&str>, role: Role| {
             // The flags that apply can depend on the target's cfgs, and the
             // cfgs on the flags (`-C target-feature`): ask once bare, pick
@@ -1648,7 +1655,12 @@ impl Roles {
             } else {
                 TargetInfo::query(tc, arg, &flags)
             };
-            let linker = toolchain::linker(cfg, &info).map(|p| p.to_string_lossy().into_owned());
+            // The built-in linker, where it can link for the target.
+            let linker = if hyprlnk && hyprlnk::supports_target(&info.name) {
+                Some(rune_common::linker::embedded(hyprlnk::VERSION))
+            } else {
+                toolchain::linker(cfg, &info).map(|p| p.to_string_lossy().into_owned())
+            };
             RoleCfg {
                 info,
                 flags,
@@ -1661,11 +1673,11 @@ impl Roles {
         } else {
             target.clone()
         };
-        Roles {
+        Ok(Roles {
             target,
             host,
             cross,
-        }
+        })
     }
 
     fn of(&self, host: bool) -> &RoleCfg {
@@ -2461,7 +2473,7 @@ fn feature_roots(
 pub fn plan(ws: &Workspace, req: &Request) -> Result<Plan> {
     let total = phase("plan");
     configure_git(ws, req.offline, false, None);
-    let roles = Roles::new(ws, req);
+    let roles = Roles::new(ws, req)?;
     let applies = |t: &Option<String>| {
         t.as_deref()
             .is_none_or(|t| roles.target.info.matches(t) || roles.host.info.matches(t))

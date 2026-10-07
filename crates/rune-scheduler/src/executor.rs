@@ -3580,7 +3580,12 @@ pub fn build_rustc_command(
         builder = builder.extra_flags(unit.ext.rustflags.clone());
     }
     if let (Some(linker), true) = (&unit.ext.linker, links_final_artifact) {
-        builder = builder.linker(linker);
+        // `rune:hyprlnk@...` becomes this executable, in linker mode.
+        let (exe, env) = rune_common::linker::for_rustc(linker);
+        builder = builder.linker(&exe.to_string_lossy());
+        if let Some((k, v)) = env {
+            builder = builder.env(k, v);
+        }
     }
 
     if !unit.lint_args.is_empty() {

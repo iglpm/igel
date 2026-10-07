@@ -24,6 +24,7 @@ rune-scheduler.workspace = true
 rune-cas.workspace = true
 rune-registry.workspace = true
 rune-resolver.workspace = true
+hyprlnk.workspace = true
 clap.workspace = true
 clap_complete = "4"
 colored.workspace = true
