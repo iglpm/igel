@@ -1,7 +1,4 @@
-//! # rune-cas
-//!
-//! Content-Addressable Store for Rune build artifacts.
-//! Enables artifact reuse across projects and machines.
+//! Content-addressable store for build artifacts, shared across projects and machines.
 
 pub mod bundle;
 pub mod gc;

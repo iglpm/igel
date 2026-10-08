@@ -1,11 +1,4 @@
-//! `rune outdated` and `rune upgrade`: which declared dependencies have newer
-//! releases, and raising manifest requirements to them.
-//!
-//! Only what the manifests say is considered — `[dependencies]`,
-//! `[dev-dependencies]`, `[build-dependencies]` (also under `[target.*]`) of
-//! every member, and `[workspace.dependencies]` — never what they pull in:
-//! those are the requirements a user can change. Path and git dependencies
-//! have no releases to compare with.
+//! `rune outdated` and `rune upgrade`, for the requirements the manifests declare.
 
 use anyhow::{Context, Result, bail};
 use colored::Colorize;
@@ -19,43 +12,28 @@ use crate::args::{OutdatedArgs, UpgradeArgs};
 use crate::ui;
 use crate::workspace::Workspace;
 
-/// A registry dependency as a manifest declares it.
 #[derive(Debug, Clone)]
 struct Declared {
     manifest: PathBuf,
-    /// Where the entry sits: `["dependencies"]`,
-    /// `["target", "cfg(unix)", "dev-dependencies"]`,
-    /// `["workspace", "dependencies"]`.
     table: Vec<String>,
-    /// The key in that table (a rename's alias).
     key: String,
-    /// The crate's name in the registry.
     package: String,
     requirement: String,
     registry: Option<String>,
-    /// `normal`, `dev`, `build` or `workspace`.
     kind: &'static str,
-    /// The member declaring it, or `workspace`.
     owner: String,
-    /// The owner's `rust-version`, if any.
     msrv: Option<Version>,
 }
 
-/// What the registry has for one declared dependency.
 #[derive(Debug, Clone, serde::Serialize)]
 struct Status {
     name: String,
     requirement: String,
     kind: &'static str,
     owner: String,
-    /// The newest locked version the requirement accepts.
     locked: Option<String>,
-    /// The newest release the requirement accepts.
     compatible: Option<String>,
-    /// The newest release (a pre-release only when there is no other), or
-    /// with an MSRV, the newest the MSRV allows.
     latest: Option<String>,
-    /// The newest release ignoring the MSRV, when that differs.
     latest_ignoring_msrv: Option<String>,
 }
 
@@ -74,8 +52,6 @@ impl Status {
     }
 }
 
-/// Every registry dependency declared by the selected members (and the
-/// workspace's own table when `with_workspace`).
 fn declared(ws: &Workspace, members: &[usize], with_workspace: bool) -> Result<Vec<Declared>> {
     let mut out = Vec::new();
     let ws_msrv = ws
@@ -169,9 +145,6 @@ fn declared(ws: &Workspace, members: &[usize], with_workspace: bool) -> Result<V
     Ok(out)
 }
 
-/// `(package, requirement, registry)` of a registry dependency entry; `None`
-/// for path/git dependencies and `workspace = true` (whose requirement lives
-/// in `[workspace.dependencies]`).
 fn registry_entry(key: &str, entry: &Item) -> Option<(String, String, Option<String>)> {
     if let Some(req) = entry.as_str() {
         return Some((key.to_string(), req.to_string(), None));
@@ -190,8 +163,6 @@ fn registry_entry(key: &str, entry: &Item) -> Option<(String, String, Option<Str
     Some((package, req, registry))
 }
 
-/// The newest release in `versions` accepted by `pick`, preferring stable
-/// ones.
 fn newest<'a>(
     versions: &'a [(Version, &'a IndexRecord)],
     pick: impl Fn(&Version, &IndexRecord) -> bool,
@@ -217,12 +188,9 @@ fn fits_msrv(record: &IndexRecord, msrv: Option<&Version>) -> bool {
     }
 }
 
-/// Looks every declared dependency up in its registry (one request per crate,
-/// concurrently) and compares.
 fn statuses(ws: &Workspace, deps: &[Declared], offline: bool) -> Result<Vec<Status>> {
     let defs = rune_registry::source::defs();
     let lock = rune_resolver::lockfile::LockfileManager::load_fast(ws.root());
-    // Crates by registry, each looked up once.
     let mut by_registry: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for d in deps {
         let index = defs.index_for_name(d.registry.as_deref())?;
@@ -403,10 +371,8 @@ pub fn outdated(args: OutdatedArgs) -> Result<()> {
     Ok(())
 }
 
-/// The requirement `req` rewritten to accept `to` as its minimum, keeping its
-/// operator and how many version parts it spells out (`1` stays `1`, `0.7`
-/// becomes `0.8`, `1.0.100` becomes `1.0.229`). `None` when the requirement is
-/// not one simple comparison (`>=1, <3`, `*`), which is left alone.
+/// Rewrites `req` to accept `to` as its minimum, keeping its operator and precision. `None` for
+/// requirements that aren't one simple comparison.
 pub fn upgraded_requirement(req: &str, to: &Version) -> Option<String> {
     let req = req.trim();
     if req.contains(',') || req.contains('*') || req.contains('<') || req.contains('>') {
@@ -434,8 +400,6 @@ pub fn upgraded_requirement(req: &str, to: &Version) -> Option<String> {
         }
     };
     let new = format!("{op}{body}");
-    // The rewritten requirement must accept the release (a `1` for a `0.9`
-    // would not).
     VersionReq::parse(&new).ok().filter(|r| r.matches(to))?;
     Some(new)
 }
@@ -474,7 +438,6 @@ pub fn upgrade(args: UpgradeArgs) -> Result<()> {
     }
     let status = statuses(&ws, &deps, offline)?;
 
-    // Edits grouped by manifest, applied in one write each.
     let mut edits: BTreeMap<PathBuf, Vec<(&Declared, String)>> = BTreeMap::new();
     let mut skipped = Vec::new();
     for (d, s) in deps.iter().zip(&status) {
@@ -576,7 +539,6 @@ pub fn upgrade(args: UpgradeArgs) -> Result<()> {
         ui::warn("not writing the manifests (--dry-run)");
         return Ok(());
     }
-    // The lockfile follows: the upgraded crates resolve again, the rest stay.
     let ws = Workspace::load(args.manifest.manifest_path.as_deref())?;
     crate::cmd_deps::refresh_lockfile(&ws, offline, false, &changed_packages)?;
     ui::summary(format!(
@@ -636,7 +598,6 @@ mod tests {
 
     #[test]
     fn a_rewrite_that_would_not_accept_the_release_is_refused() {
-        // `~1` accepts 1.x only; fine for 1.9, and `~2` for 2.1.
         assert_eq!(
             upgraded_requirement("~1", &v("1.9.0")).as_deref(),
             Some("~1")

@@ -1,5 +1,3 @@
-//! Summary statistics of a set of runs.
-
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
@@ -9,7 +7,6 @@ pub struct Summary {
     pub mean: f64,
     pub min: f64,
     pub max: f64,
-    /// Sample standard deviation.
     pub stddev: f64,
 }
 
@@ -42,7 +39,6 @@ impl Summary {
         }
     }
 
-    /// Relative spread: stddev / mean.
     pub fn cv(&self) -> f64 {
         if self.mean > 0.0 {
             self.stddev / self.mean
@@ -52,15 +48,10 @@ impl Summary {
     }
 }
 
-/// How `rune` compares with `cargo` on one measurement: the ratio of
-/// medians (above 1: Rune is faster) and whether the two sets of runs are
-/// clearly apart (no overlap of their ranges).
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct Comparison {
     pub speedup: f64,
     pub decisive: bool,
-    /// The runs overlap and the difference is within their own spread:
-    /// call it a tie rather than name a winner.
     pub within_noise: bool,
 }
 
@@ -78,7 +69,6 @@ pub fn compare(rune: &Summary, cargo: &Summary) -> Option<Comparison> {
     })
 }
 
-/// `3.2× faster`, `1.4× slower`, `about the same`.
 pub fn describe(speedup: f64) -> String {
     if (0.95..=1.05).contains(&speedup) {
         "about the same".to_string()
@@ -89,7 +79,6 @@ pub fn describe(speedup: f64) -> String {
     }
 }
 
-/// `840 ms`, `12.3 s`, `2 min 05 s`.
 pub fn seconds(s: f64) -> String {
     if s < 1.0 {
         format!("{:.0} ms", s * 1000.0)
@@ -100,7 +89,6 @@ pub fn seconds(s: f64) -> String {
     }
 }
 
-/// `1.2 GiB`, `340 MiB`.
 pub fn bytes(n: f64) -> String {
     const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
     let mut v = n;
@@ -138,7 +126,6 @@ mod tests {
         let c = compare(&rune, &cargo).unwrap();
         assert!(c.decisive && !c.within_noise);
         assert_eq!(describe(c.speedup), "3.0× faster");
-        // Overlapping, noisy runs a little apart are a tie.
         let a = Summary::of(&[1.0, 1.4, 0.8]);
         let b = Summary::of(&[1.1, 0.9, 1.3]);
         assert!(compare(&a, &b).unwrap().within_noise);

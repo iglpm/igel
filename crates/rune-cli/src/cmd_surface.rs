@@ -1,13 +1,4 @@
-//! `rune tree --exec-surface`: which crates run code on this machine while
-//! the workspace builds.
-//!
-//! A build script is a program compiled and run with your privileges; a
-//! proc-macro runs inside the compiler; a crate with `links` builds or links
-//! native code. Those are what a poisoned dependency would use to attack a
-//! developer machine or CI runner at build time, so they are worth knowing by
-//! name. The list comes from the same build plan `rune build --all-targets`
-//! uses, so it is exactly what would run here (this platform, these
-//! features), each with the chain of dependencies that brings it in.
+//! `rune tree --exec-surface`: crates that run code at build time (build scripts, proc-macros, `links`).
 
 use anyhow::Result;
 use colored::Colorize;
@@ -24,16 +15,12 @@ use crate::session::Session;
 struct Item {
     name: String,
     version: String,
-    /// `build-script`, `proc-macro`, `links`.
     runs: Vec<&'static str>,
     links: Option<String>,
-    /// A workspace member (your own code).
     workspace: bool,
-    /// From a workspace member to this crate.
     via: Vec<String>,
 }
 
-/// The shortest chain of dependencies from any member to each node.
 fn paths_from_members(graph: &BuildGraph) -> HashMap<NodeId, Vec<NodeId>> {
     let mut parent: HashMap<NodeId, Option<NodeId>> = HashMap::new();
     let mut queue: VecDeque<NodeId> = VecDeque::new();
@@ -88,7 +75,6 @@ pub fn exec_surface(args: &TreeArgs) -> Result<()> {
     let graph = &plan.graph;
     let paths = paths_from_members(graph);
 
-    // One entry per package (its units share the script, macro and links).
     let mut items: BTreeMap<(String, String), Item> = BTreeMap::new();
     let mut packages: std::collections::HashSet<(String, String)> = Default::default();
     for n in graph.nodes() {

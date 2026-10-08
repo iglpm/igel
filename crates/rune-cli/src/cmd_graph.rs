@@ -1,10 +1,4 @@
-//! `rune graph`: the workspace's package graph — or, with `--units`, the
-//! compilation units a build would use — as Graphviz DOT, Mermaid or JSON.
-//!
-//! The package graph is the lockfile's (only what is used, as `rune tree`
-//! shows it), with build and development edges drawn apart. The unit graph is
-//! exactly what the scheduler would run: every unit with its key and whether
-//! the store already has it, so it doubles as a machine-readable build plan.
+//! `rune graph`: the package graph, or with `--units` the compilation units, as DOT, Mermaid or JSON.
 
 use anyhow::Result;
 use std::collections::BTreeSet;
@@ -17,7 +11,6 @@ use crate::session::Session;
 use crate::ui;
 use crate::workspace::Workspace;
 
-/// A drawable graph: labelled nodes, some highlighted, and kinded edges.
 struct Drawing {
     nodes: Vec<Node>,
     edges: BTreeSet<(usize, usize, &'static str)>,
@@ -25,7 +18,6 @@ struct Drawing {
 
 struct Node {
     label: String,
-    /// `member` (a workspace package), `cached` or `compile` (a unit).
     class: &'static str,
 }
 
@@ -143,8 +135,6 @@ fn packages(args: &GraphArgs) -> Result<(Drawing, serde_json::Value)> {
         .into_iter()
         .filter(|&i| !args.workspace_only || pkgs[i].member)
         .collect();
-    // Two versions of one crate need their version to tell them apart; a
-    // single one reads better without.
     let versions = |name: &str| listed.iter().filter(|&&i| pkgs[i].name == name).count();
     let position = |i: usize| listed.iter().position(|&j| j == i);
 
@@ -171,8 +161,6 @@ fn packages(args: &GraphArgs) -> Result<(Drawing, serde_json::Value)> {
             "member": p.member,
         }));
         for &(j, kind) in &p.deps {
-            // Development dependencies matter for the workspace's own
-            // packages only (a dependency's tests are never built).
             if kind == EdgeKind::Dev && !(args.dev && p.member) {
                 continue;
             }

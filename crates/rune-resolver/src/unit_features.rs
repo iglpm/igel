@@ -1,104 +1,58 @@
-//! Per-build feature resolution, following Cargo's *feature resolver*.
-//!
-//! Version resolution (`resolver.rs`) decides which package versions a
-//! workspace uses and is independent of the command line: like `Cargo.lock`,
-//! it covers every platform and every feature. What a *particular build*
-//! compiles depends on the selection, and that is decided here:
-//!
-//! * only the selected packages' requested features count (`-p a` no longer
-//!   enables features that only `b` asked a shared dependency for),
-//! * with resolver 2/3, a package built for the **host** (build scripts,
-//!   proc-macros, and everything only they use) gets its own feature set,
-//!   separate from the same package built for the **target**,
-//! * dependencies gated on `[target.'cfg(..)']` count only for the platform
-//!   they are built for,
-//! * dev-dependency features count only when dev targets are being built.
-//!
-//! The result names every *(package, role)* pair to compile, its features, and
-//! the dependency edges between them — the skeleton of the unit graph.
+//! Per-build feature resolution following Cargo's feature resolver: per selection, separate host/target
+//! features (resolver 2+), platform-gated dependencies, dev features only for dev targets.
 
 use rune_manifest::dependency::DependencyKind;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 
-/// One dependency declaration of a package.
 #[derive(Debug, Clone)]
 pub struct DepDecl {
-    /// The name the package uses for the dependency: the `[dependencies]`
-    /// key, and the spelling used in `[features]` (`dep:alias`, `alias/feat`).
     pub alias: String,
-    /// Declared with `package = "..."`: the alias is then the `--extern` name.
     pub renamed: bool,
     pub kind: DependencyKind,
-    /// `[target.'cfg(unix)'.dependencies]` or a bare triple.
     pub target: Option<String>,
     pub optional: bool,
     pub features: Vec<String>,
     pub default_features: bool,
-    /// Index of the resolved package (into the slice given to [`resolve`]), or
-    /// `None` when the dependency cannot be satisfied (it is then skipped).
     pub resolved: Option<usize>,
 }
 
-/// What the feature resolver needs to know about one resolved package.
 #[derive(Debug, Clone, Default)]
 pub struct PackageView {
     pub name: String,
-    /// Declared `[features]`.
     pub features: HashMap<String, Vec<String>>,
     pub deps: Vec<DepDecl>,
-    /// The package's library is a proc-macro: always built for the host.
     pub proc_macro: bool,
 }
 
-/// What a root package (a selected workspace member) asks for.
 #[derive(Debug, Clone, Default)]
 pub struct RootRequest {
     pub package: usize,
-    /// Feature strings in `[features]` syntax: `a`, `dep:x`, `x/f`, `x?/f`.
     pub features: Vec<String>,
     pub default_features: bool,
-    /// Dev-dependencies are in play for this root (tests/examples/benches).
     pub dev: bool,
 }
 
-/// How the graph is being built.
 pub struct FeatureOptions<'a> {
-    /// `1`, `2` or `3` (`3` behaves like `2` here).
     pub resolver: u8,
-    /// Whether a target-gated dependency applies to the platform a unit is
-    /// built for (`true` = the host platform).
     pub platform_matches: &'a dyn Fn(&str, bool) -> bool,
-    /// Lockfile mode: a weak dependency feature (`dep?/feat`) also puts the
-    /// dependency into the graph. Cargo's lockfile does this — a package only
-    /// weakly referenced still gets locked — while a build does not compile it.
+    /// Lockfile mode: `dep?/feat` puts the dependency in the graph (as Cargo locks it), a build doesn't.
     pub weak_activates: bool,
 }
 
-/// A package built for one role.
 pub type UnitRef = (usize, bool);
 
-/// A dependency edge between two roles.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Edge {
     pub from: UnitRef,
     pub to: UnitRef,
-    /// Index into `PackageView::deps` of `from`.
     pub dep: usize,
 }
 
-/// The outcome of feature resolution.
 #[derive(Debug, Default)]
 pub struct FeatureResolution {
-    /// Features per (package, for_host), sorted.
     pub features: BTreeMap<UnitRef, Vec<String>>,
     pub edges: Vec<Edge>,
-    /// `(package, dependency package, feature)`: a feature a package asked a
-    /// dependency for that the dependency does not have.
     pub unknown_features: Vec<(usize, usize, String)>,
-    /// `(unit, index into its PackageView::deps)`: a dependency the build
-    /// needs (not optional, or switched on, for this platform) that the
-    /// resolution has no package for. Building anyway would only end in
-    /// rustc's "can't find crate".
     pub unresolved: Vec<(UnitRef, usize)>,
 }
 
@@ -106,13 +60,10 @@ pub struct FeatureResolution {
 struct State {
     enabled: BTreeSet<String>,
     default_requested: bool,
-    /// Optional dependencies switched on (aliases).
     activated: BTreeSet<String>,
-    /// Features requested on a dependency by this unit's own `[features]`.
     dep_features: BTreeMap<String, BTreeSet<String>>,
 }
 
-/// Runs the feature resolver.
 pub fn resolve(
     pkgs: &[PackageView],
     roots: &[RootRequest],
@@ -134,7 +85,6 @@ pub fn resolve(
             || p.deps.iter().any(|d| d.optional && d.alias == f)
     };
 
-    // Roots.
     let root_pkgs: BTreeSet<usize> = roots.iter().map(|r| r.package).collect();
     let dev_roots: BTreeSet<usize> = roots.iter().filter(|r| r.dev).map(|r| r.package).collect();
     for root in roots {
@@ -147,21 +97,17 @@ pub fn resolve(
         queue.push_back(unit);
     }
 
-    // Fixed point: expanding a unit's features may activate dependencies,
-    // which request features on their targets, and so on. Every step only
-    // adds to monotone sets over a finite universe, so this terminates.
+    // Monotone sets over a finite universe: terminates.
     while let Some(unit) = queue.pop_front() {
         let (pi, host) = unit;
         let pkg = &pkgs[pi];
 
-        // 1. Expand this unit's own enabled features to a fixed point.
         expand(
             pkg,
             states.get_mut(&unit).expect("queued unit has state"),
             opts.weak_activates,
         );
 
-        // 2. Walk its dependencies.
         let (activated, dep_features) = {
             let st = &states[&unit];
             (st.activated.clone(), st.dep_features.clone())
@@ -170,9 +116,7 @@ pub fn resolve(
             if dep.optional && !activated.contains(&dep.alias) {
                 continue;
             }
-            // Dev-dependencies belong to roots. Resolver 2 counts them only
-            // when dev targets are built; resolver 1 unifies their features
-            // for every selected root regardless, as Cargo does.
+            // Resolver 2 counts dev features only for dev targets; resolver 1 always, as Cargo does.
             if dep.kind == DependencyKind::Dev {
                 let counts = !host
                     && if opts.resolver >= 2 {
@@ -189,9 +133,6 @@ pub fn resolve(
             {
                 continue;
             }
-            // Only now, when the build would follow it, does a dependency
-            // without a resolved package matter (an optional one nothing
-            // switches on is routinely left out of the lockfile).
             let Some(target_pkg) = dep.resolved else {
                 unresolved.insert((unit, di));
                 continue;
@@ -233,7 +174,6 @@ pub fn resolve(
     let features = states
         .into_iter()
         .map(|(unit, st)| {
-            // `dep:x` and `x/f` are instructions, not features.
             let names: Vec<String> = st
                 .enabled
                 .into_iter()
@@ -262,18 +202,11 @@ fn signature(st: &State) -> (usize, bool, usize, usize) {
     )
 }
 
-/// Records a requested feature string on a unit. `x/f` and `x?/f` requests
-/// (from `--features dep/feat` or a dependent's `features = [...]`) are kept
-/// as feature strings and split during expansion.
 fn request(st: &mut State, feature: &str) {
     st.enabled.insert(feature.to_string());
 }
 
-/// Expands `st.enabled` (which may contain `dep:x` / `x/f` strings) through
-/// the package's `[features]` table until nothing changes, filling `activated`
-/// and `dep_features`.
 fn expand(pkg: &PackageView, st: &mut State, weak_activates: bool) {
-    // Which optional dependencies are only reachable through `dep:` syntax.
     let explicit_dep_syntax: BTreeSet<&str> = pkg
         .features
         .values()
@@ -300,7 +233,6 @@ fn expand(pkg: &PackageView, st: &mut State, weak_activates: bool) {
         for feature in todo {
             done.insert(feature.clone());
 
-            // Strings that came from a request rather than the table.
             if let Some(dep) = feature.strip_prefix("dep:") {
                 st.activated.insert(dep.to_string());
                 continue;
@@ -310,8 +242,7 @@ fn expand(pkg: &PackageView, st: &mut State, weak_activates: bool) {
                 continue;
             }
 
-            // An optional dependency is an implicit feature unless the table
-            // uses `dep:name` for it.
+            // An optional dependency is an implicit feature unless the table uses `dep:name`.
             if optional.contains(feature.as_str())
                 && !explicit_dep_syntax.contains(feature.as_str())
             {
@@ -401,8 +332,6 @@ mod tests {
 
     #[test]
     fn only_selected_roots_contribute_features() {
-        // shared has `x`; `a` asks for it, `b` does not. Selecting only `b`
-        // must not turn `x` on.
         let mut a_dep = dep("shared", 2);
         a_dep.features = vec!["x".into()];
         let pkgs = vec![
@@ -418,8 +347,6 @@ mod tests {
 
     #[test]
     fn build_dependencies_get_their_own_features_under_resolver_2() {
-        // `app` uses `dep` normally (no features) and as a build-dependency
-        // with `extra`.
         let mut build = dep("dep", 1);
         build.kind = DependencyKind::Build;
         build.features = vec!["extra".into()];
@@ -430,7 +357,6 @@ mod tests {
         let v2 = run(&pkgs, &[root(0)], 2);
         assert_eq!(feats(&v2, 1, false), Vec::<String>::new());
         assert_eq!(feats(&v2, 1, true), ["extra"]);
-        // Resolver 1 unifies them: one universe.
         let v1 = run(&pkgs, &[root(0)], 1);
         assert_eq!(feats(&v1, 1, false), ["extra"]);
         assert!(!v1.features.contains_key(&(1, true)));
@@ -465,7 +391,6 @@ mod tests {
                 &[
                     ("default", &["std"]),
                     ("std", &[]),
-                    // `dep:tokio` keeps the implicit `tokio` feature away.
                     ("async", &["dep:tokio", "tokio/rt"]),
                 ],
                 vec![opt, modern],
@@ -477,13 +402,11 @@ mod tests {
             ),
             pkg("tokio", &[("rt", &[])], vec![]),
         ];
-        // Defaults only: the implicit `serde` feature is NOT on.
         let base = run(&pkgs, &[root(0)], 2);
         assert_eq!(feats(&base, 0, false), ["default", "std"]);
         assert!(!base.features.contains_key(&(1, false)));
         assert!(!base.features.contains_key(&(2, false)));
 
-        // Turning on `serde` (implicit) pulls it in with its defaults.
         let with_serde = run(
             &pkgs,
             &[RootRequest {
@@ -494,7 +417,6 @@ mod tests {
         );
         assert_eq!(feats(&with_serde, 1, false), ["default", "derive"]);
 
-        // `async` activates tokio without defaults and enables `rt`.
         let with_async = run(
             &pkgs,
             &[RootRequest {
@@ -557,7 +479,6 @@ mod tests {
 
     #[test]
     fn cli_style_requests_reach_dependencies() {
-        // `--features shared/x` on a root that depends on `shared`.
         let pkgs = vec![
             pkg("app", &[], vec![dep("shared", 1)]),
             pkg("shared", &[("x", &[])], vec![]),
@@ -609,7 +530,6 @@ mod tests {
 
     #[test]
     fn cycles_terminate() {
-        // Dev-dependency cycles (a dev-depends on b, b depends on a) are legal.
         let mut d = dep("b", 1);
         d.kind = DependencyKind::Dev;
         let pkgs = vec![pkg("a", &[], vec![d]), pkg("b", &[], vec![dep("a", 0)])];
@@ -626,9 +546,6 @@ mod tests {
 
     #[test]
     fn a_needed_dependency_without_a_package_is_reported_and_an_unused_one_is_not() {
-        // `a` has an optional `opt` nothing switches on, one `on` its default
-        // switches on, a dependency for another platform and a plain one —
-        // none of them resolved to a package.
         let unresolved = |alias: &str, optional: bool, target: Option<&str>| DepDecl {
             optional,
             target: target.map(str::to_string),
@@ -655,7 +572,6 @@ mod tests {
             })
             .collect();
         assert_eq!(names, ["on", "plain"]);
-        // Which the build then has no edge for, rather than a dangling one.
         assert!(r.edges.is_empty());
     }
 }

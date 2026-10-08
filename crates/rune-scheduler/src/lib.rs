@@ -1,7 +1,4 @@
-//! # rune-scheduler
-//!
-//! Parallel build task scheduler with DAG-based execution,
-//! critical-path-first scheduling, and rmeta pipelining.
+//! Parallel build scheduling: critical-path-first with `.rmeta` pipelining.
 
 pub mod executor;
 pub mod hints;

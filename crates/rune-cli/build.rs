@@ -20,20 +20,14 @@ fn git(args: &[&str]) -> Option<String> {
 fn main() {
     println!("cargo::rerun-if-env-changed=RUNE_BUILD_COMMIT");
     let version = std::env::var("CARGO_PKG_VERSION").unwrap_or_default();
-    // Release builds from a source archive can name their commit.
     let commit = std::env::var("RUNE_BUILD_COMMIT")
         .ok()
         .filter(|c| !c.is_empty())
         .or_else(|| git(&["rev-parse", "--short=9", "HEAD"]));
     let date = git(&["log", "-1", "--format=%cs"]);
     if let Some(git_dir) = git(&["rev-parse", "--absolute-git-dir"]) {
-        // A new commit or checkout changes the version string. Only files
-        // that exist are watched: Cargo treats a missing one as changed on
-        // every build (no `packed-refs` in a fresh clone, a branch whose ref
-        // is packed), which rebuilt Rune every time.
+        // Only watch files that exist: Cargo treats a missing one as changed on every build.
         let git_dir = Path::new(&git_dir);
-        // Branch refs live in the main repository's directory, not a
-        // worktree's.
         let common = git(&["rev-parse", "--path-format=absolute", "--git-common-dir"])
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|| git_dir.to_path_buf());

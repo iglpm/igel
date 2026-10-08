@@ -1,17 +1,5 @@
-//! `rune coverage`: source-based code coverage of the workspace's tests, like
-//! `cargo llvm-cov`.
-//!
-//! The workspace's own crates are compiled with `-C instrument-coverage`
-//! (dependencies are not: nothing of theirs would be reported, and they stay
-//! shared with ordinary builds in the store), the tests run with
-//! `LLVM_PROFILE_FILE` pointing into `<target>/coverage`, and the profiles are
-//! merged and reported with the toolchain's own `llvm-profdata` and
-//! `llvm-cov` (the `llvm-tools` component, installed on first use).
-//!
-//! The instrumented build has a directory of its own, `<target>/coverage/
-//! build`: its crates have the same file names as the ordinary build's, and
-//! sharing one directory made each command replace the other's files (and
-//! a `rune test` running beside `rune coverage` fail).
+//! `rune coverage`: source-based coverage like `cargo llvm-cov`. Only workspace crates are instrumented,
+//! in a build directory of their own; reports come from the toolchain's `llvm-profdata`/`llvm-cov`.
 
 use anyhow::{Context, Result, bail};
 use colored::Colorize;
@@ -24,7 +12,6 @@ use crate::graph::Mode;
 use crate::ui;
 use crate::workspace::Workspace;
 
-/// `llvm-profdata` and `llvm-cov` from the toolchain.
 struct LlvmTools {
     profdata: PathBuf,
     cov: PathBuf,
@@ -41,7 +28,6 @@ fn find_tools(install: bool) -> Result<LlvmTools> {
         };
         (tools.profdata.is_file() && tools.cov.is_file()).then_some(tools)
     };
-    // Explicit paths win, as with cargo-llvm-cov.
     if let (Ok(p), Ok(c)) = (std::env::var("LLVM_PROFDATA"), std::env::var("LLVM_COV")) {
         return Ok(LlvmTools {
             profdata: p.into(),
@@ -52,7 +38,6 @@ fn find_tools(install: bool) -> Result<LlvmTools> {
         if let Some(t) = in_sysroot(sysroot) {
             return Ok(t);
         }
-        // A rustup toolchain: add the component.
         if install && sysroot.components().any(|c| c.as_os_str() == "toolchains") {
             ui::action("installing", "the llvm-tools component (once)");
             let toolchain = sysroot
@@ -75,7 +60,6 @@ fn find_tools(install: bool) -> Result<LlvmTools> {
     )
 }
 
-/// Summary numbers of one file or the total.
 #[derive(Default, Clone, Copy)]
 struct Counts {
     covered: u64,
@@ -97,7 +81,6 @@ struct FileSummary {
     lines: Counts,
     functions: Counts,
     regions: Counts,
-    /// Lines that never ran.
     missing: Vec<u64>,
 }
 
@@ -114,7 +97,6 @@ fn counts(v: &serde_json::Value, key: &str) -> Counts {
     }
 }
 
-/// `1-3, 7, 9-12`.
 fn ranges(lines: &[u64]) -> String {
     let mut out: Vec<String> = Vec::new();
     let mut i = 0;
@@ -135,9 +117,6 @@ fn ranges(lines: &[u64]) -> String {
     out.join(", ")
 }
 
-/// Per-file lines with their execution counts, from an LCOV report (a line
-/// listed more than once — several instantiations — counts once, with the
-/// executions added up).
 fn lcov_lines(lcov: &str) -> BTreeMap<String, Vec<(u64, u64)>> {
     let mut files: BTreeMap<String, BTreeMap<u64, u64>> = BTreeMap::new();
     let mut current: Option<String> = None;
@@ -163,12 +142,10 @@ fn lcov_lines(lcov: &str) -> BTreeMap<String, Vec<(u64, u64)>> {
         .collect()
 }
 
-/// A readable Rust symbol (`covp::classify`), or the input unchanged.
 fn demangle(name: &str) -> String {
     format!("{:#}", rustc_demangle::demangle(name))
 }
 
-/// The helper `llvm-cov show -Xdemangler` runs.
 pub fn demangle_stdin() {
     use std::io::{BufRead, Write};
     let stdin = std::io::stdin();
@@ -178,8 +155,6 @@ pub fn demangle_stdin() {
     }
 }
 
-/// An LCOV report with readable function names, and each function listed
-/// once however many test binaries instantiated it.
 fn tidy_lcov(lcov: &str) -> String {
     let mut out = String::with_capacity(lcov.len());
     let mut record: Vec<String> = Vec::new();
@@ -265,7 +240,6 @@ fn tidy_lcov(lcov: &str) -> String {
     out
 }
 
-/// A Cobertura XML report from LCOV line data.
 fn cobertura(lines: &BTreeMap<String, Vec<(u64, u64)>>, root: &Path) -> String {
     let (mut valid, mut covered) = (0u64, 0u64);
     let mut classes = String::new();
@@ -318,9 +292,6 @@ fn xml_escape(s: &str) -> String {
         .replace('"', "&quot;")
 }
 
-/// What llvm-cov leaves out of a report: sources outside the workspace's own
-/// code (the standard library, dependencies, generated files in the target
-/// directory) and tests, examples and benches, as cargo-llvm-cov does.
 fn ignore_regex(ws: &Workspace, user: Option<&str>) -> String {
     let target = regex_escape(&ws.config.target_dir.display().to_string());
     let home = regex_escape(&rune_common::settings::rune_home().display().to_string());
@@ -357,7 +328,6 @@ pub fn coverage(args: CoverageArgs) -> Result<()> {
     let tools = find_tools(true)?;
     let dir = ws.config.target_dir.join("coverage");
     let profraw_dir = dir.join("profraw");
-    // Profiles of an earlier run would mix in.
     let _ = std::fs::remove_dir_all(&profraw_dir);
     std::fs::create_dir_all(&profraw_dir)?;
 
@@ -389,7 +359,6 @@ pub fn coverage(args: CoverageArgs) -> Result<()> {
         no_run: false,
         no_fail_fast: args.no_fail_fast,
         test_threads: None,
-        // A remembered pass runs nothing, and records nothing.
         cached: Some(false),
         test_args: args.test_args.clone(),
         retries: 0,
@@ -409,8 +378,7 @@ pub fn coverage(args: CoverageArgs) -> Result<()> {
         return Ok(());
     }
 
-    // Merge. A profile cut short (a test binary killed mid-write) is left
-    // out with a warning instead of failing the report.
+    // A truncated profile (killed test) is left out with a warning.
     let profraws: Vec<PathBuf> = std::fs::read_dir(&profraw_dir)?
         .flatten()
         .map(|e| e.path())
@@ -443,7 +411,6 @@ pub fn coverage(args: CoverageArgs) -> Result<()> {
         }
     }
 
-    // The programs whose coverage mappings describe the code.
     let objects: Vec<&PathBuf> = outcome.executables.iter().filter(|p| p.is_file()).collect();
     if objects.is_empty() {
         bail!("no instrumented programs to report on");
@@ -476,8 +443,6 @@ pub fn coverage(args: CoverageArgs) -> Result<()> {
         Ok(out.stdout)
     };
 
-    // The summary and the per-line counts are separate exports; llvm-cov
-    // runs on one core, so both run at once.
     let what = format!("on {}", ui::plural(objects.len(), "program"));
     let activity = ui::Activity::start("reporting", &what);
     let (summary, lcov) = std::thread::scope(|scope| {
@@ -542,7 +507,6 @@ pub fn coverage(args: CoverageArgs) -> Result<()> {
     };
     print_table(&files, &total, args.show_missing_lines);
 
-    // Reports.
     if args.lcov || args.json || args.cobertura {
         let (ext, body): (&str, Vec<u8>) = if args.lcov {
             ("lcov.info", tidy_lcov(&lcov).into_bytes())

@@ -2,67 +2,34 @@ use serde::{Deserialize, Deserializer, Serialize};
 use std::path::PathBuf;
 use std::str::FromStr;
 
-/// The kind of dependency (normal, dev, build).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum DependencyKind {
-    /// Normal dependency.
     Normal,
-    /// Development dependency.
     Dev,
-    /// Build dependency.
     Build,
 }
 
-/// A dependency specification in a Cargo.toml manifest.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct DependencySpec {
-    /// Semantic version requirement.
     pub version: Option<semver::VersionReq>,
-    /// Local path to the crate.
     pub path: Option<PathBuf>,
-    /// Git repository URL.
     pub git: Option<String>,
-    /// Git branch.
     pub branch: Option<String>,
-    /// Git tag.
     pub tag: Option<String>,
-    /// Git revision.
     pub rev: Option<String>,
-    /// Enabled features.
     pub features: Vec<String>,
-    /// Whether the dependency is optional.
     pub optional: bool,
-    /// Whether default features are enabled.
     pub default_features: bool,
-    /// Package name, if different from the dependency name.
     pub package: Option<String>,
-    /// Registry to use.
     pub registry: Option<String>,
-    /// Whether this dependency is inherited from the workspace.
     pub workspace: bool,
 }
 
 impl DependencySpec {
-    /// Merges fields inherited from a `[workspace.dependencies]` entry into
-    /// this spec, for a member's `dep.workspace = true` reference.
-    ///
-    /// There is exactly one correct place to call this: right after parsing
-    /// any manifest that might contain a `workspace = true` dependency,
-    /// before that spec is used for anything (resolution, feature
-    /// unification, or being carried into a nested local-path traversal).
-    /// A second, independent traversal that re-reads the same manifest
-    /// without calling this — e.g. a resolver walking `path = "..."`
-    /// dependencies on its own — silently reverts every inherited field
-    /// back to the member's unmerged (default) values, which is exactly how
-    /// this was missed once already: the CLI's root-dependency collection
-    /// merged correctly, but the resolver's separate local-path-dependency
-    /// walk (taken for every internal `path` dependency reachable
-    /// transitively, which includes every workspace member depending on
-    /// another) read the same `workspace = true` spec straight off disk and
-    /// never merged it, undoing `default-features = false` the moment a
-    /// crate was reached that way instead of as a declared root dependency.
+    /// Merges a `[workspace.dependencies]` entry into a `dep.workspace = true` spec. Must run right after
+    /// parsing, before any use: every traversal that reads such a manifest needs it.
     pub fn merge_workspace(&mut self, ws_dep: &DependencySpec) {
         if !self.workspace {
             return;
@@ -88,11 +55,6 @@ impl DependencySpec {
         if self.features.is_empty() {
             self.features = ws_dep.features.clone();
         }
-        // Not distinguishable from "member explicitly re-set the default",
-        // since the parser has no way to tell an unset field from one that
-        // was explicitly written as `true`; always inheriting the workspace
-        // value is correct for the overwhelmingly common bare
-        // `dep.workspace = true` case.
         self.default_features = ws_dep.default_features;
         if !self.optional && ws_dep.optional {
             self.optional = ws_dep.optional;
@@ -105,22 +67,12 @@ impl<'de> Deserialize<'de> for DependencySpec {
     where
         D: Deserializer<'de>,
     {
-        // Lives only while one value is deserialized; boxing would not help.
         #[allow(clippy::large_enum_variant)]
         #[derive(Deserialize)]
         #[serde(untagged)]
         enum Repr {
             String(String),
-            // `rename_all` on the enum itself only renames variant names, not
-            // the fields of a struct-like variant — it must be repeated here
-            // for `default-features` (and any other hyphenated key) to
-            // actually bind. Without it, serde looks for a literal
-            // `default_features` key, never finds it in real Cargo.toml
-            // files (which always write the hyphenated form), and silently
-            // falls back to `default_true()` — so every `default-features =
-            // false` in every manifest, root or transitive, was being
-            // ignored and every dependency resolved with its full default
-            // feature set regardless of what the manifest actually said.
+            // Repeated here: the enum's `rename_all` doesn't apply to variant fields (`default-features`).
             #[serde(rename_all = "kebab-case")]
             Table {
                 version: Option<String>,
@@ -191,13 +143,8 @@ impl<'de> Deserialize<'de> for DependencySpec {
     }
 }
 
-/// A dependency as it applies to the package that declares it: relative paths
-/// made absolute and `workspace = true` inheritance merged in.
-///
-/// A `path` written on a member is relative to that member; one inherited from
-/// `[workspace.dependencies]` is relative to the workspace root. Both are made
-/// absolute against the directory they were *written in* before merging, so
-/// every later consumer can just use the result.
+/// The spec as it applies to its package: paths absolute (relative to where they were written) and
+/// workspace inheritance merged.
 pub fn effective_spec(
     dep: &Dependency,
     member_dir: &std::path::Path,
@@ -218,21 +165,15 @@ pub fn effective_spec(
     spec
 }
 
-/// A full dependency combining name, kind, and specification.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Dependency {
-    /// Dependency name.
     pub name: String,
-    /// Dependency kind.
     pub kind: DependencyKind,
-    /// Dependency specification.
     pub spec: DependencySpec,
-    /// Target-specific restriction, e.g. `cfg(unix)`.
     pub target: Option<String>,
 }
 
 impl Dependency {
-    /// Try parsing a dependency from a TOML value.
     pub fn try_from_toml(
         name: &str,
         kind: DependencyKind,
@@ -277,12 +218,6 @@ mod tests {
 
     #[test]
     fn test_parse_default_features_false() {
-        // Regression test: `default-features` (the hyphenated form Cargo.toml
-        // actually uses) must bind to `DependencySpec::default_features`.
-        // The inner `Repr::Table` enum variant used to have no `rename_all`
-        // of its own, so serde looked for a literal `default_features` key,
-        // never found it, and silently defaulted to `true` no matter what
-        // the manifest said.
         let toml_doc =
             r#"dep = { version = "0.12", default-features = false, features = ["rustls-tls"] }"#;
         let table: toml::Table = toml::from_str(toml_doc).unwrap();

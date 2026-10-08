@@ -1,16 +1,10 @@
-//! Resolution of `[profile.*]` tables into concrete [`Profile`]s.
-//!
-//! Follows Cargo: `dev`, `release`, `test` (inherits `dev`) and `bench`
-//! (inherits `release`) exist without being declared; any other profile must
-//! name a parent with `inherits`. Only the workspace root's `[profile]` tables
-//! are consulted, as in Cargo.
+//! Resolution of `[profile.*]` tables into concrete [`Profile`]s, as in Cargo.
 
 use rune_common::{DebugInfo, LtoMode, OptLevel, PanicStrategy, Profile};
 use std::collections::HashMap;
 
 use crate::cargo_toml::ProfileOverride;
 
-/// Error resolving a profile.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ProfileError {
     #[error(
@@ -27,7 +21,6 @@ pub enum ProfileError {
     },
 }
 
-/// Resolves the named profile against the `[profile]` tables of a root manifest.
 pub fn resolve_profile(
     name: &str,
     tables: &HashMap<String, ProfileOverride>,
@@ -58,7 +51,6 @@ fn resolve_inner(
             Some(inherits.to_string())
         }
     };
-    // `test`/`bench` may still override `inherits`, as in Cargo.
     let base_name = table
         .and_then(|t| t.extra.get("inherits"))
         .and_then(|v| v.as_str())
@@ -79,29 +71,17 @@ fn resolve_inner(
     Ok(profile)
 }
 
-/// Which override tables of a profile apply to a unit.
 #[derive(Debug, Clone, Copy)]
 pub struct UnitRole<'a> {
-    /// The package the unit belongs to.
     pub package: &'a str,
-    /// Its version, for `package."name@1.2.3"` specs.
     pub version: &'a semver::Version,
-    /// Whether the package is a workspace member (`package."*"` only matches
-    /// packages that are *not*).
     pub workspace_member: bool,
-    /// Build scripts, proc-macros and their dependencies (`build-override`).
     pub host: bool,
-    /// The package is an immutable registry/git dependency and the user has not
-    /// asked for full dependency debuginfo: unless some profile says
-    /// otherwise, compile it with `debug = "line-tables-only"` in the dev
-    /// profile. Debuginfo is a large share of a cold build's time and is
-    /// rarely used inside dependencies.
+    /// A registry/git dependency: in dev, use `line-tables-only` debuginfo unless a profile says otherwise.
     pub lean_debuginfo: bool,
 }
 
-/// The profile a specific unit is compiled with: the named profile plus, in
-/// Cargo's order of precedence, `build-override`, `package."*"` and
-/// `package.<name>`. Returns the base profile unchanged when nothing applies.
+/// The named profile plus, in Cargo's precedence, `build-override`, `package."*"` and `package.<name>`.
 pub fn resolve_unit_profile(
     name: &str,
     tables: &HashMap<String, ProfileOverride>,
@@ -109,20 +89,15 @@ pub fn resolve_unit_profile(
 ) -> Result<Profile, ProfileError> {
     let mut profile = resolve_profile(name, tables)?;
 
-    // Cargo's built-in `build-override`: build scripts, proc-macros and their
-    // dependencies run once per build on the host, so compiling them fast
-    // beats compiling them well (`opt-level = 0`, no debuginfo, 256 codegen
-    // units) — whatever the profile is. User tables below override this.
+    // Cargo's built-in `build-override`: host units are compiled fast, not well.
     if role.host {
         profile.opt_level = OptLevel::O0;
         profile.debuginfo = DebugInfo::None;
         profile.codegen_units = Some(256);
-        // Neither can these be linked with LTO or stripped.
         profile.lto = LtoMode::Off;
         profile.strip = None;
     }
 
-    // The inheritance chain, root first, so a child's override wins.
     let mut chain = vec![name.to_string()];
     let mut cur = name.to_string();
     while let Some(parent) = tables
@@ -143,8 +118,6 @@ pub fn resolve_unit_profile(
         cur = parent;
     }
 
-    // Cargo's implicit `debug = true` for dev is what makes dependencies slow
-    // to build. An explicit `debug` anywhere in the chain means the user chose.
     let explicit_debug = chain
         .iter()
         .any(|level| tables.get(level).is_some_and(|t| t.debug.is_some()));
@@ -201,7 +174,6 @@ fn apply(profile: &mut Profile, name: &str, table: &ProfileOverride) -> Result<(
             toml::Value::Integer(3) => OptLevel::O3,
             toml::Value::String(s) if s == "s" => OptLevel::Os,
             toml::Value::String(s) if s == "z" => OptLevel::Oz,
-            // Tolerate quoted digits, which Cargo also accepts.
             toml::Value::String(s) if s == "0" => OptLevel::O0,
             toml::Value::String(s) if s == "1" => OptLevel::O1,
             toml::Value::String(s) if s == "2" => OptLevel::O2,
@@ -315,10 +287,7 @@ fn apply(profile: &mut Profile, name: &str, table: &ProfileOverride) -> Result<(
                 };
             }
             "trim-paths" => {
-                // `true`/`"all"`, a scope or a list of scopes: paths are
-                // trimmed; `false`/`"none"`/`[]`: they are not. Rune cannot
-                // limit the trimming to some scopes on stable rustc, so any
-                // scope means all of them.
+                // Any scope means all of them: stable rustc can't trim only some.
                 const SCOPES: [&str; 5] = ["macro", "diagnostics", "object", "all", "none"];
                 let on = match value {
                     toml::Value::Boolean(b) => *b,
@@ -338,8 +307,6 @@ fn apply(profile: &mut Profile, name: &str, table: &ProfileOverride) -> Result<(
                 };
                 profile.trim_paths = on;
             }
-            // `inherits`, `package`, `build-override`, ...
-            // are either handled elsewhere or don't affect what we pass to rustc.
             _ => {}
         }
     }
@@ -454,15 +421,10 @@ mod tests {
             lean_debuginfo: false,
         };
         let opt = |r| resolve_unit_profile("dev", &p, r).unwrap().opt_level;
-        // Workspace members are untouched by `"*"`.
         assert_eq!(opt(role("mine", true, false)), OptLevel::O0);
-        // Dependencies get `"*"`, and a named override beats it.
         assert_eq!(opt(role("dep", false, false)), OptLevel::O2);
         assert_eq!(opt(role("hot", false, false)), OptLevel::O3);
-        // A build dependency: `"*"` (more specific) still beats build-override
-        // for non-members, but a member's build script gets build-override.
         assert_eq!(opt(role("mine", true, true)), OptLevel::O1);
-        // Without an override, host units get Cargo's cheap built-in defaults.
         let plain = profiles("[profile.release]\nopt-level = 3\n");
         let host = resolve_unit_profile("release", &plain, role("dep", false, true)).unwrap();
         assert_eq!(host.opt_level, OptLevel::O0);
@@ -472,7 +434,6 @@ mod tests {
         assert_eq!(opt(role("dep", false, true)), OptLevel::O2);
         let built = resolve_unit_profile("dev", &p, role("mine", true, true)).unwrap();
         assert_eq!(built.debuginfo, DebugInfo::None);
-        // `name@version` specs only match that version.
         let p2 = profiles("[profile.dev.package.\"dep@2.0.0\"]\nopt-level = 3\n");
         assert_eq!(
             resolve_unit_profile("dev", &p2, role("dep", false, false))
@@ -555,7 +516,6 @@ mod tests {
 
     #[test]
     fn dependencies_default_to_line_tables_in_dev() {
-        // The implicit `debug = true` of dev is what is trimmed for dependencies…
         assert_eq!(
             debuginfo_of("", "dev", true, false, false),
             DebugInfo::LineTablesOnly
@@ -564,12 +524,10 @@ mod tests {
             debuginfo_of("", "test", true, false, false),
             DebugInfo::LineTablesOnly
         );
-        // …only when asked for (the planner sets this for registry/git packages).
         assert_eq!(
             debuginfo_of("", "dev", false, false, false),
             DebugInfo::Full
         );
-        // Release has no debuginfo to trim.
         assert_eq!(
             debuginfo_of("", "release", true, false, false),
             DebugInfo::None

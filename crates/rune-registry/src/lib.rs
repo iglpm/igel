@@ -1,7 +1,4 @@
-//! # rune-registry
-//!
-//! Fast crates.io Sparse Index client, parallel `.crate` package downloader,
-//! tarball decompression & extraction, and registry cache management for Rune.
+//! Registry indexes, package downloads and the registry cache.
 
 pub mod api;
 pub mod credential;

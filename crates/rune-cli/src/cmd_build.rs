@@ -27,7 +27,6 @@ pub fn selection(t: &TargetArgs) -> TargetSelection {
     }
 }
 
-/// Plans a build for a session.
 pub fn plan_for(sess: &Session, mode: Mode, targets: &TargetSelection) -> Result<Plan> {
     graph::plan(
         &sess.ws,
@@ -50,7 +49,6 @@ pub fn build(args: BuildArgs, mode: Mode) -> Result<()> {
     build_with(args, mode, |_| Ok(()))
 }
 
-/// [`build`], with a chance to adjust the plan before it runs.
 fn build_with(
     args: BuildArgs,
     mode: Mode,
@@ -62,7 +60,6 @@ fn build_with(
     sess.ws.config.ensure_dirs(sess.profile.output_dir_name())?;
 
     let (result, _) = if args.deps_only {
-        // Everything that is not a workspace member, and what those need.
         let roots: Vec<_> = plan
             .graph
             .nodes()
@@ -100,7 +97,6 @@ pub fn summarize(sess: &Session, result: &rune_scheduler::executor::BuildResult)
             result.memory_held.as_secs_f64()
         ));
     }
-    // A slow build that left most cores idle says why.
     if !sess.json
         && let Some(hint) = result.schedule.as_ref().and_then(|s| s.hint())
     {
@@ -108,18 +104,8 @@ pub fn summarize(sess: &Session, result: &rune_scheduler::executor::BuildResult)
     }
 }
 
-/// `rune clippy`: lints the workspace's crates with `clippy-driver`.
-///
-/// Reuses the exact same resolve/graph/executor pipeline as `rune check`,
-/// with `clippy-driver` as `RUSTC_WORKSPACE_WRAPPER` — exactly what `cargo
-/// clippy` does. Only workspace members go through it; dependencies are
-/// compiled by rustc as for `rune check` (and share its cached results), and
-/// build scripts see the real compiler as `RUSTC`: one that runs `$RUSTC
-/// --version` (libc, serde, proc-macro2, …) would otherwise read clippy's
-/// version and fail. Lint flags after `--`
-/// (`-D warnings`, `-W clippy::pedantic`) go to the workspace's own crates,
-/// and are part of their keys: a result cached without `-D warnings` is never
-/// replayed as a pass with it.
+/// `rune clippy`: `rune check` with `clippy-driver` as `RUSTC_WORKSPACE_WRAPPER`, as `cargo clippy` does.
+/// Build scripts see the real compiler as `RUSTC`.
 pub fn clippy(args: crate::args::ClippyArgs) -> Result<()> {
     let clippy_driver = std::env::var_os("CLIPPY_DRIVER")
         .map(PathBuf::from)
@@ -148,8 +134,6 @@ pub fn clippy(args: crate::args::ClippyArgs) -> Result<()> {
     })
 }
 
-/// `rune rustc -- <ARGS>`: builds, with extra rustc arguments for the
-/// selected targets only (their keys include them).
 pub fn rustc(args: crate::args::RustcArgs) -> Result<()> {
     let extra = args.args.clone();
     build_with(args.build, Mode::Build, move |plan| {
@@ -171,7 +155,6 @@ pub fn rustc(args: crate::args::RustcArgs) -> Result<()> {
     })
 }
 
-/// Settings of `rune fix` about uncommitted changes.
 #[derive(Default)]
 pub struct FixVcs {
     pub allow_dirty: bool,
@@ -179,7 +162,6 @@ pub struct FixVcs {
     pub allow_no_vcs: bool,
 }
 
-/// `rune fix`: applies the compiler's machine-applicable suggestions.
 pub fn fix(args: crate::args::FixArgs) -> Result<()> {
     let vcs = FixVcs {
         allow_dirty: args.allow_dirty,
@@ -189,8 +171,6 @@ pub fn fix(args: crate::args::FixArgs) -> Result<()> {
     fix_loop(&args.build, &[], &vcs, "rustc")
 }
 
-/// Checks, applies suggestions, and checks again until none are left (at
-/// most four rounds, as rustfix does).
 fn fix_loop(args: &BuildArgs, flags: &[String], vcs: &FixVcs, what: &str) -> Result<()> {
     let sess = Session::new(&args.common, "dev")?;
     crate::fix::check_vcs(
@@ -240,7 +220,6 @@ fn fix_loop(args: &BuildArgs, flags: &[String], vcs: &FixVcs, what: &str) -> Res
     Ok(())
 }
 
-/// Adds `flags` to the rustc invocation of every node `pick` selects.
 fn add_flags(plan: &mut Plan, flags: &[String], pick: impl Fn(&rune_graph::BuildNode) -> bool) {
     if flags.is_empty() {
         return;
@@ -262,14 +241,9 @@ fn add_flags(plan: &mut Plan, flags: &[String], pick: impl Fn(&rune_graph::Build
     }
 }
 
-// ---------------------------------------------------------------------------
-// run
-// ---------------------------------------------------------------------------
-
 pub fn run(args: RunArgs) -> Result<()> {
     let sess = Session::new(&args.common, "dev")?;
 
-    // Decide what to run: `--bin`, `--example`, `default-run`, or the only binary.
     let mut targets = TargetSelection::default();
     let (kind, name) = if let Some(ex) = &args.example {
         targets.example = vec![ex.clone()];
@@ -305,7 +279,6 @@ pub fn run(args: RunArgs) -> Result<()> {
     exec(cmd)
 }
 
-/// The binary `rune run` picks when `--bin` isn't given.
 fn default_bin(sess: &Session) -> Result<String> {
     let mut bins: Vec<(String, Option<String>)> = Vec::new();
     for &mi in &sess.selected {
@@ -343,8 +316,6 @@ fn default_bin(sess: &Session) -> Result<String> {
     }
 }
 
-/// The runtime environment Cargo gives programs it runs.
-/// The `cargo` of the toolchain, if there is one.
 fn cargo_program() -> Option<&'static PathBuf> {
     static CARGO: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
     CARGO
@@ -374,8 +345,7 @@ pub fn apply_run_env(
         .env("CARGO_PKG_LICENSE_FILE", &meta.license_file)
         .env("CARGO_PKG_README", &meta.readme)
         .env("CARGO_PKG_RUST_VERSION", &meta.rust_version);
-    // Tests that build fixtures run `$CARGO` (escargot, trybuild and the
-    // like), as Cargo sets it for them.
+    // Tests that build fixtures run `$CARGO` (escargot, trybuild).
     if std::env::var_os("CARGO").is_none()
         && let Some(cargo) = cargo_program()
     {
@@ -384,9 +354,6 @@ pub fn apply_run_env(
     for (k, v) in &sess.run_env {
         cmd.env(k, v);
     }
-    // Where the program's dynamic libraries are, as Cargo sets it up: the
-    // native libraries build scripts produced, `deps/` (dylib dependencies)
-    // and the profile directory (the workspace's own cdylibs).
     let dir = sess.profile.output_dir_name();
     let mut paths: Vec<PathBuf> = sess.native_dirs.lock().unwrap().clone();
     paths.push(sess.config().deps_dir(dir));
@@ -409,7 +376,6 @@ pub fn apply_run_env(
     }
 }
 
-/// The variable the platform's dynamic loader searches.
 fn dylib_path_var() -> &'static str {
     if cfg!(windows) {
         "PATH"
@@ -420,8 +386,6 @@ fn dylib_path_var() -> &'static str {
     }
 }
 
-/// Replaces the current process with `cmd` on Unix; elsewhere spawns and
-/// mirrors the exit code. The child's exit status becomes ours.
 fn exec(mut cmd: std::process::Command) -> Result<()> {
     #[cfg(unix)]
     {
@@ -439,18 +403,10 @@ fn exec(mut cmd: std::process::Command) -> Result<()> {
     }
 }
 
-// ---------------------------------------------------------------------------
-// doc
-// ---------------------------------------------------------------------------
-
-/// `rune doc`: builds documentation with `rustdoc` for the selected packages'
-/// libraries (and, unless `--no-deps`, everything they depend on).
 pub fn doc(args: DocArgs) -> Result<()> {
     doc_with(args, &[])
 }
 
-/// `rune rustdoc -- <ARGS>`: `rune doc` with extra rustdoc arguments for the
-/// selected packages' own documentation.
 pub fn rustdoc(args: crate::args::RustdocArgs) -> Result<()> {
     doc_with(args.doc, &args.args)
 }
@@ -474,8 +430,6 @@ fn doc_with(args: DocArgs, extra: &[String]) -> Result<()> {
     let tc = rune_common::toolchain::global();
     let rustdoc = tc.rustdoc.clone();
     let doc_flags = sess.rustdoc_flags();
-    // Documentation has an identity of its own: the rustdoc that renders it and
-    // its flags, on top of everything that identifies the crate's compilation.
     let rustdoc_id = format!(
         "{}|{}|{}",
         rune_common::toolchain::program_fingerprint(&rustdoc),
@@ -504,7 +458,6 @@ fn doc_with(args: DocArgs, extra: &[String]) -> Result<()> {
         if args.no_deps && !requested.contains(&id) {
             continue;
         }
-        // `[lib] doc = false` opts a library out of documentation.
         if sess
             .ws
             .members
@@ -516,9 +469,8 @@ fn doc_with(args: DocArgs, extra: &[String]) -> Result<()> {
             continue;
         }
         if unit.crate_type == rune_common::CrateType::ProcMacro && !requested.contains(&id) {
-            continue; // documenting proc-macro dependencies needs extra plumbing
+            continue;
         }
-        // Unchanged since the last `rune doc`? Then so is its documentation.
         let mut hb = rune_common::hash::HashBuilder::new();
         hb.update(
             result
@@ -582,8 +534,6 @@ fn doc_with(args: DocArgs, extra: &[String]) -> Result<()> {
         cmd.env("CARGO_MANIFEST_DIR", &unit.manifest_dir)
             .env("CARGO_PKG_NAME", &unit.crate_id.name)
             .env("CARGO_PKG_VERSION", unit.crate_id.version.to_string());
-        // What the crate's build script gave its compilation: generated code
-        // in `OUT_DIR` (bindgen output), `cfg`s, environment.
         if unit.build_script.is_some() {
             let key = unit
                 .ext
@@ -627,8 +577,6 @@ fn doc_with(args: DocArgs, extra: &[String]) -> Result<()> {
         if requested.contains(&id) {
             ui::action("documenting", &unit.crate_id.name);
         }
-        // Record the identity this output corresponds to; older stamps of the
-        // same crate no longer describe it.
         let _ = std::fs::create_dir_all(&stamp_dir);
         if let Ok(entries) = std::fs::read_dir(&stamp_dir) {
             for e in entries.flatten() {
@@ -666,9 +614,6 @@ fn doc_with(args: DocArgs, extra: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// `rune cas export`: the store entries the requested builds need, in one
-/// file. Nothing is compiled: keys are computed from the sources, and only
-/// entries the store has go in (run the build first to fill it).
 /// The store keys a build of the workspace needs for each of `commands`.
 fn workspace_store_keys(
     build: &crate::args::BuildArgs,
@@ -688,8 +633,6 @@ fn workspace_store_keys(
     Ok(keys)
 }
 
-/// `rune cas pin`: the entries this workspace's builds need survive every
-/// cleanup, however long they go unused and however full the store gets.
 pub fn cas_pin(args: crate::args::CasPinArgs) -> Result<()> {
     let sess = Session::new(&args.build.common, "dev")?;
     let Some(cas) = sess.cas() else {

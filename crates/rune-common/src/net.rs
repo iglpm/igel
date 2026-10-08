@@ -1,48 +1,22 @@
-//! Network settings shared by every HTTP client Rune creates (registry index,
-//! downloads, registry web API, the shared store).
-//!
-//! These are Cargo's `[http]` and `[net]` configuration keys, with the same
-//! environment overrides, so a machine set up for Cargo — a corporate proxy
-//! that re-signs TLS, a private CA, a slow link — works for Rune unchanged:
-//!
-//! | Key | Environment | Meaning |
-//! | --- | --- | --- |
-//! | `http.cainfo` | `CARGO_HTTP_CAINFO` | Extra CA bundle (PEM) to trust |
-//! | `http.proxy` | `CARGO_HTTP_PROXY` | Proxy for every request (else `HTTPS_PROXY`, …) |
-//! | `http.timeout` | `CARGO_HTTP_TIMEOUT` | Seconds before a stalled request fails |
-//! | `http.user-agent` | `CARGO_HTTP_USER_AGENT` | `User-Agent` header |
-//! | `net.retry` | `CARGO_NET_RETRY` | Retries of a failed request (default 3) |
-//!
-//! `SSL_CERT_FILE` is honoured as well (as by curl and OpenSSL), and the
-//! operating system's trust store is used next to the bundled roots.
+//! Network settings shared by every HTTP client: Cargo's `[http]`/`[net]` keys and env overrides.
 
 use crate::cargo_config::CargoConfig;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::time::Duration;
 
-/// Cargo's default for `net.retry`.
 pub const DEFAULT_RETRIES: u32 = 3;
 
-/// The effective network configuration.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct HttpConfig {
-    /// PEM bundles whose certificates are trusted in addition to the
-    /// built-in and system roots.
     pub ca_files: Vec<PathBuf>,
-    /// Explicit proxy URL (`http.proxy`); `None` leaves reqwest's own
-    /// `HTTPS_PROXY`/`NO_PROXY` handling in charge.
     pub proxy: Option<String>,
-    /// Overall per-request timeout (`http.timeout`).
     pub timeout: Option<Duration>,
-    /// `http.user-agent`.
     pub user_agent: Option<String>,
-    /// How often a request that failed for a transient reason is retried.
     pub retries: u32,
 }
 
 impl HttpConfig {
-    /// Settings from configuration files and the environment.
     pub fn from_config(config: &CargoConfig) -> Self {
         let mut ca_files = Vec::new();
         if let Some(p) = config.string(&["http", "cainfo"]).filter(|s| !s.is_empty()) {
@@ -86,14 +60,10 @@ impl HttpConfig {
         }
     }
 
-    /// Settings from the environment only (no project configuration found).
     pub fn from_env() -> Self {
         Self::from_config(&CargoConfig::empty())
     }
 
-    /// The PEM text of every configured CA file that could be read, with its
-    /// path (unreadable files are reported by the caller, not silently
-    /// skipped).
     pub fn ca_bundles(&self) -> Vec<(PathBuf, std::io::Result<Vec<u8>>)> {
         self.ca_files
             .iter()
@@ -104,26 +74,18 @@ impl HttpConfig {
 
 static GLOBAL: OnceLock<HttpConfig> = OnceLock::new();
 
-/// Fixes the network settings for this process (called once the workspace's
-/// configuration is known). Later calls are ignored.
 pub fn configure(config: HttpConfig) {
     let _ = GLOBAL.set(config);
 }
 
-/// The process's network settings: those passed to [`configure`], or else
-/// what the environment says.
 pub fn global() -> &'static HttpConfig {
     GLOBAL.get_or_init(HttpConfig::from_env)
 }
 
-/// Whether an HTTP status is worth retrying: the server was overloaded or
-/// briefly unavailable, not "no such thing" or "not allowed".
 pub fn is_retryable_status(status: u16) -> bool {
     matches!(status, 408 | 429 | 500 | 502 | 503 | 504)
 }
 
-/// Delay before retry number `attempt` (1-based): 250 ms, 500 ms, 1 s, …
-/// capped at 4 s, like Cargo's growing back-off.
 pub fn retry_delay(attempt: u32) -> Duration {
     let ms = 250u64.saturating_mul(1u64 << attempt.saturating_sub(1).min(4));
     Duration::from_millis(ms.min(4_000))
@@ -145,7 +107,6 @@ mod tests {
         .unwrap();
         let cfg = CargoConfig::load(dir.path());
         let http = HttpConfig::from_config(&cfg);
-        // The `CARGO_HTTP_*` variables win over files, as in Cargo.
         let env_or = |var: &str, file: &str| std::env::var(var).unwrap_or_else(|_| file.into());
         assert_eq!(
             http.ca_files[0],

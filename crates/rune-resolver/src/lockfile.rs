@@ -5,14 +5,8 @@ use std::path::Path;
 use thiserror::Error;
 use tracing::debug;
 
-/// Bumped whenever the binary layout changes; an unknown version is treated as
-/// "no binary lockfile", which just costs one re-resolution.
 const BINARY_LOCK_MAGIC: &[u8; 9] = b"RUNELOCK\x02";
-/// The current format: the magic, then the fingerprint of what the
-/// resolution was made from (a `u16` length and the bytes), then the lock.
-/// Keeping both in one file, replaced in one rename, means a lockfile can
-/// never be paired with another resolution's fingerprint — which two
-/// `rune` processes writing separate files at once could do.
+/// Magic, fingerprint, lock in one file, so a lockfile is never paired with another resolution's fingerprint.
 const BINARY_LOCK_MAGIC_V3: &[u8; 9] = b"RUNELOCK\x03";
 
 #[derive(Debug, Error)]
@@ -31,26 +25,7 @@ pub enum LockfileError {
 
 pub type Result<T> = std::result::Result<T, LockfileError>;
 
-/// Represents a package pinned in the lockfile.
-///
-/// Deliberately carries no `skip_serializing_if` on any field, even though
-/// this struct is also exported as TOML/JSON where that would be cosmetically
-/// nice (an explicit `dependencies = []` instead of omitting the key). This
-/// struct's *primary* serialization is `bincode` (`Rune.lock.bin`), a
-/// positional format with no field names or "this key is absent" marker: a
-/// derived bincode deserializer just reads the next field in declared order,
-/// with no way to know a writer skipped one. `skip_serializing_if` is
-/// serialize-only — it has no matching "field was skipped" signal a
-/// deserializer can act on — so a package with, say, an empty `dependencies`
-/// (skipped) followed by a non-empty `features` desyncs the byte stream by
-/// exactly one missing length-prefixed vec, and every field of every
-/// subsequent package in the file is then read from the wrong offset. This
-/// happened for real: any local (path-sourced) package has `source: None`,
-/// and once one was written, every alphabetically-later package's fields
-/// (dependencies, features, ...) came back corrupted or empty on the very
-/// next read of the exact same, unchanged file — deterministic given the
-/// bytes, but invisible unless you compare two reads of one file byte-for-
-/// byte, since it looks like "sometimes wrong" from the outside.
+/// No `skip_serializing_if`: bincode is positional, so a skipped field desyncs every later package.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LockPackage {
     pub name: String,
@@ -63,40 +38,27 @@ pub struct LockPackage {
     pub dependencies: Vec<String>,
     #[serde(default)]
     pub features: Vec<String>,
-    /// Every dependency the package declares (all platforms, optional ones
-    /// included), as the registry index reports them. Together with
-    /// `feature_table` this lets a build compute its own feature set from the
-    /// lockfile alone, without the index or the package sources. Only
-    /// recorded for registry packages; local packages are read from disk.
+    /// Every declared dependency, so a build can compute features from the lockfile alone (registry only).
     #[serde(default)]
     pub decls: Vec<LockDecl>,
-    /// The package's `[features]` table.
     #[serde(default)]
     pub feature_table: Vec<(String, Vec<String>)>,
 }
 
-/// One declared dependency of a registry package.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LockDecl {
-    /// The name the package uses for it (the `[dependencies]` key).
     pub alias: String,
-    /// The real package name when renamed with `package = "..."`.
     pub package: Option<String>,
-    /// 0 = normal, 1 = dev, 2 = build.
     pub kind: u8,
-    /// `cfg(unix)` or a triple.
     pub target: Option<String>,
     pub optional: bool,
     pub features: Vec<String>,
     pub default_features: bool,
-    /// The locked `name version` this resolves to, if any.
     pub resolved: Option<String>,
 }
 
-/// One package of [`Lockfile::graph_view`].
 pub type GraphEntry = (String, String, Option<String>, Option<String>, Vec<String>);
 
-/// The in-memory representation of a resolved lockfile.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct Lockfile {
     #[serde(default)]
@@ -113,8 +75,6 @@ impl Lockfile {
         }
     }
 
-    /// Renders this lockfile in Cargo's format. `version` is the lockfile
-    /// format version to declare (3 unless an existing file says otherwise).
     pub fn to_cargo_string(&self, version: u32) -> String {
         fn quote(s: &str) -> String {
             format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
@@ -149,7 +109,6 @@ impl Lockfile {
                 .dependencies
                 .iter()
                 .map(|d| {
-                    // `name version` → `name` when the name is unambiguous.
                     let name = d.split(' ').next().unwrap_or(d);
                     if by_name.get(name).copied().unwrap_or(0) <= 1 {
                         name.to_string()
@@ -171,14 +130,8 @@ impl Lockfile {
         out
     }
 
-    /// The graph this lockfile describes, independent of formatting and of
-    /// Rune-only data: `(name, version, source, checksum, dependencies)` with
-    /// every dependency spelled `name version`. Two lockfiles with equal views
-    /// resolve identically, whichever tool wrote them.
     pub fn graph_view(&self) -> std::collections::BTreeSet<GraphEntry> {
         let full = |dep: &str| -> String {
-            // Cargo spells a dependency `name`, `name version` or
-            // `name version (source)`.
             let mut parts = dep.split(' ');
             let name = parts.next().unwrap_or(dep);
             match parts.next() {
@@ -209,20 +162,10 @@ impl Lockfile {
             .collect()
     }
 
-    /// Finds a package by name in the lockfile.
     pub fn find_package(&self, name: &str) -> Option<&LockPackage> {
         self.packages.iter().find(|p| p.name == name)
     }
 
-    /// Adds or replaces a package in the lockfile, keeping packages ordered
-    /// by `(name, version)`.
-    ///
-    /// Uses a binary search to find the slot, instead of a linear scan plus a
-    /// full re-sort on every insert (which made building a lockfile of N
-    /// packages O(N² log N)). The order is also *total*: sorting by name alone
-    /// left same-named packages in whatever order they were inserted, which —
-    /// coming from a `HashMap` walk — differed run to run and made otherwise
-    /// identical lockfiles compare unequal, forcing needless rewrites.
     pub fn add_or_replace(&mut self, package: LockPackage) {
         let key = |p: &LockPackage| (p.name.clone(), p.version.clone());
         match self
@@ -235,42 +178,28 @@ impl Lockfile {
     }
 }
 
-/// Manager for reading, writing, and synchronizing binary and Cargo.lock files.
 pub struct LockfileManager;
 
 impl LockfileManager {
-    /// Loads a lockfile, preferring `Rune.lock.bin` for maximum speed, falling back to `Cargo.lock`.
     pub fn load_fast(project_root: &Path) -> Option<Lockfile> {
         let binary = Self::read_binary(&project_root.join("Rune.lock.bin")).ok();
         let cargo = Self::read_cargo(&project_root.join("Cargo.lock")).ok();
         match (binary, cargo) {
-            // `Cargo.lock` is the source of truth; the binary lockfile is a
-            // cache of it that also carries feature sets. It is only used
-            // while it describes the same packages: after a `git pull`, a
-            // checkout or a `cargo update`, trusting it would silently put
-            // the old versions back.
+            // `Cargo.lock` is the source of truth; the binary lockfile is only used while it agrees.
             (Some(bin), Some(cargo)) if bin.graph_view() == cargo.graph_view() => Some(bin),
             (_, Some(cargo)) => Some(cargo),
             (bin, None) => bin,
         }
     }
 
-    /// Loads only `Rune.lock.bin` (never falling back to `Cargo.lock`).
-    ///
-    /// The binary lockfile is the only one that carries Rune's per-package
-    /// resolved feature sets, so it is the only one a build may trust as a
-    /// complete substitute for re-resolving.
     pub fn load_binary(project_root: &Path) -> Option<Lockfile> {
         Self::read_binary(&project_root.join("Rune.lock.bin")).ok()
     }
 
-    /// Reads a binary lockfile (`Rune.lock.bin`).
     pub fn read_binary(path: &Path) -> Result<Lockfile> {
         Self::read_binary_with_fingerprint(path).map(|(lock, _)| lock)
     }
 
-    /// Reads a binary lockfile and the fingerprint of the inputs it was
-    /// resolved from (`None` for the older format that had none).
     pub fn read_binary_with_fingerprint(path: &Path) -> Result<(Lockfile, Option<String>)> {
         let mut file = File::open(path)?;
         let mut magic = [0u8; 9];
@@ -297,14 +226,10 @@ impl LockfileManager {
         Ok((lockfile, None))
     }
 
-    /// Writes a binary lockfile (`Rune.lock.bin`).
     pub fn write_binary(lock: &Lockfile, path: &Path) -> Result<()> {
         Self::write_binary_with_fingerprint(lock, path, None)
     }
 
-    /// Writes a binary lockfile carrying `fingerprint`, atomically: to a
-    /// temporary file beside it, then renamed over it, so a reader (another
-    /// `rune`, an editor running `rune check`) never sees half of one.
     pub fn write_binary_with_fingerprint(
         lock: &Lockfile,
         path: &Path,
@@ -336,19 +261,14 @@ impl LockfileManager {
         Ok(())
     }
 
-    /// Reads standard `Cargo.lock` (TOML format).
     pub fn read_cargo(path: &Path) -> Result<Lockfile> {
         let content = fs::read_to_string(path)?;
         let lockfile: Lockfile = toml::from_str(&content)?;
         Ok(lockfile)
     }
 
-    /// Writes standard `Cargo.lock` (TOML format), byte-compatible with what
-    /// Cargo itself writes for the same graph.
     pub fn write_cargo(lock: &Lockfile, path: &Path) -> Result<()> {
         let text = lock.to_cargo_string(lock.version);
-        // Write beside the file and rename, so an interrupted write never
-        // leaves a truncated lockfile that Cargo would refuse to read.
         let tmp = path.with_extension(format!("lock.{}.tmp", std::process::id()));
         {
             let mut file = File::create(&tmp)?;
@@ -359,25 +279,11 @@ impl LockfileManager {
         Ok(())
     }
 
-    /// Writes the resolved lockfile to `Rune.lock.bin`.
-    ///
-    /// Deliberately does **not** also overwrite `Cargo.lock`, despite the
-    /// name this replaced (`sync_all`) suggesting otherwise. Rune's resolver
-    /// doesn't yet reproduce Cargo's resolution with full fidelity (see the
-    /// feature-activation gaps tracked separately), so silently regenerating
-    /// a project's real, git-tracked `Cargo.lock` from Rune's own result on
-    /// every `build`/`add`/`remove`/`update` risked handing a plain `cargo
-    /// build` a lockfile subtly different from what Cargo's own resolver
-    /// would have produced — for an existing Cargo project that never asked
-    /// to adopt Rune, this is real, unannounced data loss on a file other
-    /// tooling and CI depend on. `Cargo.lock` is only ever written by an
-    /// explicit, user-initiated `rune lockfile export --format cargo`.
+    /// Writes `Rune.lock.bin` only: `Cargo.lock` is written solely by `rune lockfile export --format cargo`.
     pub fn sync_all(project_root: &Path, lock: &Lockfile) -> Result<()> {
         Self::sync_all_with_fingerprint(project_root, lock, None)
     }
 
-    /// [`Self::sync_all`], recording the fingerprint of the inputs the
-    /// resolution was made from in the same file.
     pub fn sync_all_with_fingerprint(
         project_root: &Path,
         lock: &Lockfile,
@@ -413,12 +319,10 @@ mod tests {
 
         LockfileManager::write_binary(&lock, &bin_path).unwrap();
         let loaded = LockfileManager::read_binary(&bin_path).unwrap();
-        // The fingerprint travels in the same file.
         LockfileManager::write_binary_with_fingerprint(&lock, &bin_path, Some("abc")).unwrap();
         let (again, fp) = LockfileManager::read_binary_with_fingerprint(&bin_path).unwrap();
         assert_eq!(again, lock);
         assert_eq!(fp.as_deref(), Some("abc"));
-        // No temporary file is left behind.
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
 
         assert_eq!(lock, loaded);
@@ -461,7 +365,6 @@ mod tests {
             .collect();
         assert_eq!(names, ["a 1.0.0", "a 2.0.0", "b 1.0.0", "c 0.1.0"]);
 
-        // Replacing keeps a single entry.
         let mut replaced = pkg("a", "1.0.0");
         replaced.features = vec!["x".into()];
         a.add_or_replace(replaced);
@@ -545,8 +448,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "abc"
 "#
         );
-        // What we wrote reads back as the same graph, even though Cargo's
-        // short `solo` spelling differs from our `solo 0.3.0`.
         let dir = tempdir().unwrap();
         let path = dir.path().join("Cargo.lock");
         LockfileManager::write_cargo(&lock, &path).unwrap();

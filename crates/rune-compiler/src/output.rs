@@ -1,6 +1,5 @@
 use std::path::PathBuf;
 
-/// Result of a rustc compilation.
 #[derive(Debug, Clone)]
 pub struct CompilationResult {
     pub success: bool,
@@ -8,19 +7,15 @@ pub struct CompilationResult {
     pub artifacts: Vec<ArtifactEvent>,
     pub diagnostics: Vec<Diagnostic>,
     pub stderr_raw: String,
-    /// The compiler's peak memory (resident set) in bytes, where the
-    /// platform reports it.
     pub peak_memory: Option<u64>,
 }
 
-/// An artifact emitted by rustc (from --json=artifacts).
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct ArtifactEvent {
     pub artifact: PathBuf,
     pub emit: String,
 }
 
-/// A compiler diagnostic.
 #[derive(Debug, Clone)]
 pub struct Diagnostic {
     pub level: String,
@@ -35,8 +30,6 @@ pub(crate) struct RawDiagnostic {
     pub(crate) rendered: Option<String>,
 }
 
-/// Parses line-by-line JSON from rustc stderr.
-/// Lines that aren't valid JSON are raw compiler output and are ignored here.
 pub fn parse_rustc_output(stderr: &str) -> (Vec<ArtifactEvent>, Vec<Diagnostic>) {
     let mut artifacts = Vec::new();
     let mut diagnostics = Vec::new();
@@ -65,9 +58,7 @@ pub fn parse_rustc_output(stderr: &str) -> (Vec<ArtifactEvent>, Vec<Diagnostic>)
     (artifacts, diagnostics)
 }
 
-/// The raw JSON of every diagnostic rustc printed, one string per message,
-/// exactly as rustc wrote it (so tools such as rust-analyzer see the same
-/// structure — spans, codes, suggestions — they would from Cargo).
+/// Every diagnostic's raw JSON exactly as rustc wrote it (for tools like rust-analyzer).
 pub fn diagnostic_lines(stderr: &str) -> Vec<String> {
     stderr
         .lines()

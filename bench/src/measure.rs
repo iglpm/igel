@@ -1,24 +1,16 @@
-//! Running one command and measuring it: wall time, CPU time (user and
-//! system, the command and every process it waited for — compilers,
-//! linkers, test binaries) and the peak memory of its largest process.
+//! Runs one command, measuring wall time, CPU time of the process tree, and peak memory.
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-/// One measured run.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct Sample {
-    /// Seconds from start to exit.
     pub wall: f64,
-    /// CPU seconds in user mode, the process tree included.
     pub user: f64,
-    /// CPU seconds in the kernel, the process tree included.
     pub sys: f64,
-    /// Peak resident memory of the largest single process, in KiB.
     pub max_rss_kib: u64,
-    /// Exited successfully (and within the time limit).
     pub ok: bool,
 }
 
@@ -28,13 +20,11 @@ impl Sample {
     }
 }
 
-/// What a run printed, for when it failed.
 pub struct Outcome {
     pub sample: Sample,
     pub output: String,
 }
 
-/// Runs `cmd` to completion (killing it after `timeout`) and measures it.
 pub fn run(cmd: &mut Command, timeout: Duration) -> Result<Outcome> {
     use std::process::Stdio;
     let log = tempfile_path();
@@ -65,8 +55,7 @@ fn tempfile_path() -> std::path::PathBuf {
 
 #[cfg(unix)]
 fn wait(child: std::process::Child, started: Instant, timeout: Duration) -> Result<Sample> {
-    // `wait4` reports the child's resource use including every descendant it
-    // waited for, which is how a build tool's compilers are counted.
+    // `wait4` includes every waited-for descendant (the build's compilers).
     let pid = child.id() as libc::pid_t;
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
@@ -88,7 +77,6 @@ fn wait(child: std::process::Child, started: Instant, timeout: Duration) -> Resu
             (r, s, u, e, true)
         }
     };
-    // The `Child` must not try to wait again.
     std::mem::forget(child);
     anyhow::ensure!(
         r == pid,
@@ -134,20 +122,15 @@ fn wait(mut child: std::process::Child, started: Instant, timeout: Duration) -> 
     }
 }
 
-/// Bytes of the files under `dir` (hard links to one file counted once).
 pub fn dir_size(dir: &std::path::Path) -> u64 {
     dirs_size(&[dir])
 }
 
-/// Bytes of the files under all of `dirs`, a file hard-linked into several
-/// of them counted once (Rune's build output links to its store).
 pub fn dirs_size(dirs: &[&std::path::Path]) -> u64 {
     #[cfg(unix)]
     use std::os::unix::fs::MetadataExt;
     #[cfg(unix)]
     let mut seen: std::collections::HashSet<(u64, u64)> = std::collections::HashSet::new();
-    // (Windows: the volume and file index identify a file; std has no stable
-    // accessor for them, so a handle is opened per file.)
     #[cfg(windows)]
     let mut seen: std::collections::HashSet<same_file::Handle> = std::collections::HashSet::new();
     let mut total = 0;

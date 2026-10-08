@@ -1,11 +1,4 @@
-//! `rune watch`: re-run commands whenever the project's files change.
-//!
-//! Changes are found by polling file sizes and modification times — one walk of
-//! a project costs about a millisecond — so there is no watcher daemon, no
-//! platform-specific code and no missed events on network or container file
-//! systems. Because every run is a normal `rune` invocation backed by the
-//! content-addressed store, going back to code that was built before (undoing an
-//! edit, switching branches) costs nothing.
+//! `rune watch`: re-run commands on file changes, found by polling sizes and mtimes.
 
 use crate::args::WatchArgs;
 use crate::ui;
@@ -15,7 +8,6 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-/// Directories that never contain sources.
 const IGNORED_DIRS: &[&str] = &[
     "target",
     "node_modules",
@@ -27,11 +19,9 @@ const IGNORED_DIRS: &[&str] = &[
     ".vscode",
 ];
 
-/// Every relevant file's size and modification time, by path.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct State(BTreeMap<PathBuf, (u64, u128)>);
 
-/// Decides what counts as a change.
 pub struct Snapshot {
     root: PathBuf,
     extra_ignored: Vec<PathBuf>,
@@ -45,7 +35,6 @@ impl Snapshot {
         }
     }
 
-    /// The project's files now.
     pub fn state(&self) -> State {
         let mut entries = BTreeMap::new();
         let mut stack = vec![self.root.clone()];
@@ -82,10 +71,6 @@ impl Snapshot {
         State(entries)
     }
 
-    /// The files that differ between `base` and `now` and matter: new,
-    /// changed or removed, except those git ignores (output a run writes —
-    /// reports, logs, snapshots — so a run that writes them does not set off
-    /// the next one).
     pub fn changes(&self, base: &State, now: &State) -> Vec<PathBuf> {
         if base == now {
             return Vec::new();
@@ -103,20 +88,14 @@ impl Snapshot {
     }
 }
 
-/// Which of `paths` (below `root`) git ignores; none outside a repository or
-/// without git.
 fn git_ignored(root: &Path, paths: &[PathBuf]) -> HashSet<PathBuf> {
     let in_repository = root.ancestors().any(|d| d.join(".git").exists());
     if !in_repository || paths.is_empty() {
         return HashSet::new();
     }
     let mut ignored = HashSet::new();
-    // As arguments, not on stdin: git stops reading early when the directory
-    // is not a repository after all, and writing to it then would raise a
-    // SIGPIPE, which ends Rune (it lets the signal stop it, for `| head`).
+    // As arguments, not stdin: git may stop reading early and the write would raise SIGPIPE.
     for chunk in paths.chunks(256) {
-        // Relative and with `/`, as git spells paths: it echoes the ones it
-        // ignores, and quotes (so changes) any with a backslash in them.
         let asked: HashMap<String, &PathBuf> = chunk
             .iter()
             .map(|p| {
@@ -135,7 +114,6 @@ fn git_ignored(root: &Path, paths: &[PathBuf]) -> HashSet<PathBuf> {
         else {
             return HashSet::new();
         };
-        // 0: some are ignored; 1: none are; anything else: an error.
         if !out.status.success() {
             continue;
         }
@@ -148,8 +126,6 @@ fn git_ignored(root: &Path, paths: &[PathBuf]) -> HashSet<PathBuf> {
     ignored
 }
 
-/// A path as git prints it: as is, or in double quotes with C escapes when it
-/// holds a quote, a backslash or a control character (`"a\\b"` is `a\b`).
 fn git_unquote(line: &str) -> String {
     let Some(inner) = line.strip_prefix('"').and_then(|l| l.strip_suffix('"')) else {
         return line.to_string();
@@ -185,7 +161,6 @@ fn git_unquote(line: &str) -> String {
     String::from_utf8_lossy(&bytes).into_owned()
 }
 
-/// `src/lib.rs`, or `src/lib.rs and 3 more`.
 fn describe(root: &Path, changed: &[PathBuf]) -> String {
     let first = changed
         .first()
@@ -197,7 +172,6 @@ fn describe(root: &Path, changed: &[PathBuf]) -> String {
     }
 }
 
-/// Swap files, backups and lock files editors create while saving.
 fn is_editor_scratch(name: &str) -> bool {
     name.ends_with('~')
         || name.ends_with(".swp")
@@ -208,23 +182,16 @@ fn is_editor_scratch(name: &str) -> bool {
         || name == "4913" // vim's write test file
 }
 
-/// Files a run of `rune` itself creates or rewrites in the project. Reacting to
-/// them would make every run trigger the next one.
 fn is_generated_by_rune(name: &str) -> bool {
     matches!(name, "Cargo.lock" | "Rune.lock.bin")
 }
 
-/// `-x "test --lib"` → `["test", "--lib"]`.
 fn split_command(text: &str) -> Vec<String> {
     text.split_whitespace().map(str::to_string).collect()
 }
 
-/// What one round of commands did.
 enum Outcome {
-    Finished {
-        ok: bool,
-    },
-    /// These files changed while it ran; it was stopped.
+    Finished { ok: bool },
     Interrupted(Vec<PathBuf>),
 }
 
@@ -232,7 +199,6 @@ pub fn watch(args: WatchArgs) -> Result<()> {
     let ws = crate::workspace::Workspace::load(None)
         .context("`rune watch` needs to be run inside a project")?;
     let root = ws.config.project_root.clone();
-    // Rebuilds run while you type: they should never make the editor lag.
     rune_common::sysinfo::lower_priority();
     let commands: Vec<Vec<String>> = if args.exec.is_empty() {
         vec![vec!["check".to_string()]]
@@ -272,18 +238,13 @@ pub fn watch(args: WatchArgs) -> Result<()> {
             return Ok(());
         }
         if !matches!(outcome, Outcome::Interrupted(_)) {
-            // What the run wrote itself is where waiting starts from.
             let changed = wait_for_change(&snapshot, snapshot.state(), interval);
             ui::action("changed", describe(&root, &changed));
         }
-        // Editors save in bursts (write, rename, chmod); let it settle.
         settle(&snapshot, interval);
     }
 }
 
-/// Runs the commands in order, stopping at the first failure — or as soon as the
-/// files change, so a stale run is not waited for. Changes that do not matter
-/// (see [`Snapshot::changes`]) move `baseline` along.
 fn run_round(
     exe: &Path,
     commands: &[Vec<String>],
@@ -324,7 +285,6 @@ fn run_round(
     Ok(Outcome::Finished { ok: true })
 }
 
-/// Waits for a change that matters; returns the files.
 fn wait_for_change(snapshot: &Snapshot, mut baseline: State, interval: Duration) -> Vec<PathBuf> {
     loop {
         std::thread::sleep(interval);
@@ -337,7 +297,6 @@ fn wait_for_change(snapshot: &Snapshot, mut baseline: State, interval: Duration)
     }
 }
 
-/// Returns once the files have stopped changing for one interval.
 fn settle(snapshot: &Snapshot, interval: Duration) {
     let mut last = snapshot.state();
     loop {
@@ -454,7 +413,7 @@ mod tests {
                 .unwrap_or(false)
         };
         if !git(&["init", "-q"]) {
-            return; // no git here
+            return;
         }
         std::fs::write(p.path().join(".gitignore"), "*.log\nreports/\n").unwrap();
         let snap = Snapshot::new(p.path(), vec![]);

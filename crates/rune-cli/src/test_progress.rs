@@ -1,14 +1,4 @@
-//! The live line `rune test` shows while tests run:
-//!
-//! ```text
-//! ⠹ testing ━━━━━━━━━╾─────── 6/15 · 412 passed · rune-cli (test cli) 87/149 12s
-//! ```
-//!
-//! How many test binaries (and doc-test runs) are done, the tests passed so
-//! far — counted live from each binary's output as its tests finish — and
-//! what is running now, with its own progress and how long it has taken.
-//! It sits below the build's progress line while both are active, and goes
-//! through the same `MultiProgress` every printed line suspends.
+//! The live line `rune test` shows: binaries done, tests passed so far, and what is running now.
 
 use indicatif::ProgressBar;
 use std::collections::BTreeMap;
@@ -19,35 +9,25 @@ use std::time::{Duration, Instant};
 use crate::cmd_test::Counts;
 use crate::ui;
 
-/// One test process running now.
 struct Running {
     label: String,
     started: Instant,
-    /// From libtest's `running N tests` (several such lines add up).
     total: u64,
     done: u64,
     failed: u64,
-    /// Tests libtest says have run for over a minute, still unfinished.
     slow: Vec<String>,
 }
 
 #[derive(Default)]
 struct State {
     running: BTreeMap<usize, Running>,
-    /// Totals of the binaries that finished.
     passed: u64,
     failed: u64,
-    /// Binaries and doc-test runs with a final result.
     done: u64,
 }
 
-/// The line and the thread that keeps its times moving; made when the first
-/// test process starts, so it sits below the build's line, which exists by
-/// then.
 struct Shown {
     bar: ProgressBar,
-    /// Dropping it stops the ticker at once (it must not hold up the end of
-    /// the run by a tick).
     stop_ticker: Option<crossbeam_channel::Sender<()>>,
     ticker: Option<std::thread::JoinHandle<()>>,
 }
@@ -61,9 +41,6 @@ pub struct TestProgress {
 }
 
 impl TestProgress {
-    /// A display for `slots` test binaries and doc-test runs; nothing is
-    /// drawn when `enabled` is false (quiet or JSON output; indicatif draws
-    /// nothing when stderr is not a terminal either).
     pub fn new(slots: usize, enabled: bool) -> Self {
         Self {
             enabled,
@@ -82,7 +59,6 @@ impl TestProgress {
         self.shown.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Draws the line, the first time a test process starts.
     fn show(&self) {
         if !self.enabled || self.stop.load(Ordering::Relaxed) {
             return;
@@ -98,10 +74,8 @@ impl TestProgress {
         bar.set_prefix("testing");
         draw(&bar, &self.state);
         let (mut stop_ticker, mut ticker) = (None, None);
-        // Nothing to animate where nothing is drawn (not a terminal).
         if !bar.is_hidden() {
             bar.enable_steady_tick(Duration::from_millis(80));
-            // Elapsed times move on their own: redraw a few times a second.
             let (tx, rx) = crossbeam_channel::bounded::<()>(0);
             let (bar, state) = (bar.clone(), self.state.clone());
             ticker = Some(std::thread::spawn(move || {
@@ -126,7 +100,6 @@ impl TestProgress {
         }
     }
 
-    /// Process `id` (unique per run) started testing `label`.
     pub fn begin(&self, id: usize, label: &str) {
         self.lock().running.insert(
             id,
@@ -143,8 +116,6 @@ impl TestProgress {
         self.redraw();
     }
 
-    /// A line of process `id`'s output: libtest's `running N tests` and
-    /// `test name ... ok` lines move its count.
     pub fn line(&self, id: usize, line: &str) {
         let line = line.trim_end();
         let mut changed = false;
@@ -183,13 +154,11 @@ impl TestProgress {
         }
     }
 
-    /// Process `id` exited.
     pub fn end(&self, id: usize) {
         self.lock().running.remove(&id);
         self.redraw();
     }
 
-    /// A binary's (or doc-test run's) final result is in.
     pub fn slot_done(&self, counts: Counts) {
         {
             let mut st = self.lock();
@@ -200,7 +169,6 @@ impl TestProgress {
         self.redraw();
     }
 
-    /// Removes the line for good.
     pub fn finish(&self) {
         self.stop.store(true, Ordering::Relaxed);
         if let Some(Shown {
@@ -231,7 +199,6 @@ fn draw(bar: &ProgressBar, state: &Mutex<State>) {
     bar.set_message(message(bar, state));
 }
 
-/// `· 412 passed, 1 failed · rune-cli (test cli) 87/149 12s, rune-cas 3/39`
 fn message(bar: &ProgressBar, state: &Mutex<State>) -> String {
     let st = state.lock().unwrap_or_else(|e| e.into_inner());
     let live_passed: u64 = st.running.values().map(|r| r.done - r.failed).sum();
@@ -245,7 +212,6 @@ fn message(bar: &ProgressBar, state: &Mutex<State>) -> String {
     if st.running.is_empty() {
         return format!("· {head} · waiting for the build");
     }
-    // Longest-running first: that is what the run waits on.
     let mut running: Vec<&Running> = st.running.values().collect();
     running.sort_by_key(|r| r.started);
     let names: Vec<String> = running

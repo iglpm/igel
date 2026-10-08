@@ -1,41 +1,29 @@
 use rune_common::{CompilationUnit, RuneError};
 use std::collections::{HashMap, HashSet};
 
-/// Opaque identifier for a node in the build graph.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct NodeId(pub usize);
 
-/// A node in the build graph representing a compilation unit.
 pub struct BuildNode {
     pub id: NodeId,
     pub unit: CompilationUnit,
-    /// Indices of nodes this node depends on.
     pub dependencies: Vec<NodeId>,
-    /// Indices of nodes that depend on this node.
     pub dependents: Vec<NodeId>,
-    /// Explicit extern aliases for dependencies (e.g., renamed crates: dep_id -> "serde").
     pub extern_aliases: HashMap<NodeId, String>,
-    /// The subset of `dependencies` linked into the crate itself (`--extern`,
-    /// or a build-order dependency such as a binary an integration test runs).
+    /// Dependencies linked into the crate itself (as opposed to only its build script).
     pub normal_dependencies: HashSet<NodeId>,
-    /// The subset of `dependencies` that this unit's *build script* links
-    /// against (`[build-dependencies]`, compiled for the host). An edge can be
-    /// in both sets when the same unit serves both purposes.
+    /// Dependencies linked into this unit's build script (host). May overlap `normal_dependencies`.
     pub build_dependencies: HashSet<NodeId>,
-    /// Extern aliases for `build_dependencies`.
     pub build_aliases: HashMap<NodeId, String>,
-    /// Estimated compile time (for critical path scheduling).
     pub estimated_cost: f64,
 }
 
-/// The full build graph.
 pub struct BuildGraph {
     nodes: Vec<BuildNode>,
-    name_index: HashMap<String, Vec<NodeId>>, // crate name -> node IDs
+    name_index: HashMap<String, Vec<NodeId>>,
 }
 
 impl BuildGraph {
-    /// Creates a new, empty `BuildGraph`.
     pub fn new() -> Self {
         Self {
             nodes: Vec::new(),
@@ -43,7 +31,6 @@ impl BuildGraph {
         }
     }
 
-    /// Adds a new compilation unit to the graph and returns its ID.
     pub fn add_node(&mut self, unit: CompilationUnit) -> NodeId {
         let id = NodeId(self.nodes.len());
         let name = unit.crate_id.name.clone();
@@ -57,7 +44,7 @@ impl BuildGraph {
             normal_dependencies: HashSet::new(),
             build_dependencies: HashSet::new(),
             build_aliases: HashMap::new(),
-            estimated_cost: 1.0, // Default cost, can be updated later
+            estimated_cost: 1.0,
         };
 
         self.nodes.push(node);
@@ -66,7 +53,6 @@ impl BuildGraph {
         id
     }
 
-    /// Adds a dependency edge: `from` depends on `to` with optional custom extern name.
     pub fn add_edge_with_extern(&mut self, from: NodeId, to: NodeId, extern_name: Option<&str>) {
         if !self.nodes[from.0].dependencies.contains(&to) {
             self.nodes[from.0].dependencies.push(to);
@@ -82,14 +68,10 @@ impl BuildGraph {
         }
     }
 
-    /// Adds a dependency edge: `from` depends on `to`.
     pub fn add_edge(&mut self, from: NodeId, to: NodeId) {
         self.add_edge_with_extern(from, to, None);
     }
 
-    /// Adds an edge for `from`'s build script: `to` is built (for the host)
-    /// before the script is compiled, and linked into it — but not into the
-    /// crate. If `from` also depends on `to` normally, that edge stays.
     pub fn add_build_edge(&mut self, from: NodeId, to: NodeId, extern_name: Option<&str>) {
         if !self.nodes[from.0].dependencies.contains(&to) {
             self.nodes[from.0].dependencies.push(to);
@@ -103,40 +85,30 @@ impl BuildGraph {
         }
     }
 
-    /// Whether `from` links `to` into the crate itself (as opposed to only
-    /// into its build script).
     pub fn is_normal_edge(&self, from: NodeId, to: NodeId) -> bool {
         self.nodes[from.0].normal_dependencies.contains(&to)
     }
 
-    /// Returns a reference to a node.
     pub fn node(&self, id: NodeId) -> &BuildNode {
         &self.nodes[id.0]
     }
 
-    /// Returns a mutable reference to a node.
     pub fn node_mut(&mut self, id: NodeId) -> &mut BuildNode {
         &mut self.nodes[id.0]
     }
 
-    /// Returns all nodes in the graph.
     pub fn nodes(&self) -> &[BuildNode] {
         &self.nodes
     }
 
-    /// Returns the number of nodes in the graph.
     pub fn node_count(&self) -> usize {
         self.nodes.len()
     }
 
-    /// `a v0.1.0 → b v0.1.0 → a v0.1.0`: one cycle among the nodes a
-    /// topological sort could not place (those still waiting on a
-    /// dependency).
     fn describe_cycle(&self, in_degrees: &[usize]) -> String {
         let Some(start) = self.nodes.iter().find(|n| in_degrees[n.id.0] > 0) else {
             return "a dependency cycle".to_string();
         };
-        // Follow unplaced dependencies until a node repeats.
         let mut path: Vec<NodeId> = vec![start.id];
         loop {
             let cur = &self.nodes[path[path.len() - 1].0];
@@ -159,8 +131,6 @@ impl BuildGraph {
         names.join(" → ")
     }
 
-    /// Performs a topological sort of the graph using Kahn's algorithm.
-    /// Returns the nodes in a valid build order (dependencies before dependents).
     pub fn topological_sort(&self) -> Result<Vec<NodeId>, RuneError> {
         let mut in_degrees = vec![0; self.nodes.len()];
         for node in &self.nodes {
@@ -195,13 +165,7 @@ impl BuildGraph {
         Ok(sorted)
     }
 
-    /// Builds a new graph containing only `roots` and everything they
-    /// (transitively) depend on, plus the old-id → new-id mapping.
-    ///
-    /// The resolver works on the whole workspace so that the lockfile is
-    /// complete and stable, but a build only needs the part reachable from the
-    /// packages and targets actually requested: `rune build -p foo` must not
-    /// compile the dependencies of unrelated workspace members.
+    /// The subgraph reachable from `roots`, and the old-id → new-id mapping.
     pub fn subgraph(&self, roots: &[NodeId]) -> (BuildGraph, HashMap<NodeId, NodeId>) {
         let mut keep: HashSet<NodeId> = HashSet::new();
         let mut stack: Vec<NodeId> = roots.to_vec();
@@ -213,7 +177,6 @@ impl BuildGraph {
 
         let mut out = BuildGraph::new();
         let mut map: HashMap<NodeId, NodeId> = HashMap::new();
-        // Preserve original relative order so results are deterministic.
         for node in &self.nodes {
             if keep.contains(&node.id) {
                 let new_id = out.add_node(node.unit.clone());
@@ -248,12 +211,10 @@ impl BuildGraph {
         (out, map)
     }
 
-    /// Finds all node IDs that correspond to the given crate name.
     pub fn find_by_name(&self, name: &str) -> Option<&[NodeId]> {
         self.name_index.get(name).map(|v| v.as_slice())
     }
 
-    /// Returns the roots of the graph: nodes with no dependents.
     pub fn roots(&self) -> Vec<NodeId> {
         self.nodes
             .iter()
@@ -262,7 +223,6 @@ impl BuildGraph {
             .collect()
     }
 
-    /// Returns the leaves of the graph: nodes with no dependencies.
     pub fn leaves(&self) -> Vec<NodeId> {
         self.nodes
             .iter()
@@ -271,7 +231,6 @@ impl BuildGraph {
             .collect()
     }
 
-    /// Returns all nodes that are ready to build, given a set of completed node IDs.
     pub fn ready_set(&self, completed: &HashSet<NodeId>) -> Vec<NodeId> {
         self.nodes
             .iter()
@@ -324,7 +283,6 @@ mod tests {
         let b = graph.add_node(make_unit("b"));
         let c = graph.add_node(make_unit("c"));
 
-        // c depends on b, b depends on a
         graph.add_edge(b, a);
         graph.add_edge(c, b);
 
@@ -351,15 +309,15 @@ mod tests {
         let b = graph.add_node(make_unit("b"));
         let c = graph.add_node(make_unit("c"));
 
-        graph.add_edge(b, a); // b depends on a
-        graph.add_edge(c, a); // c depends on a
+        graph.add_edge(b, a);
+        graph.add_edge(c, a);
 
-        let roots = graph.roots(); // no dependents -> b, c
+        let roots = graph.roots();
         assert_eq!(roots.len(), 2);
         assert!(roots.contains(&b));
         assert!(roots.contains(&c));
 
-        let leaves = graph.leaves(); // no dependencies -> a
+        let leaves = graph.leaves();
         assert_eq!(leaves, vec![a]);
     }
 

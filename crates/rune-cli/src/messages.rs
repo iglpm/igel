@@ -1,20 +1,14 @@
-//! `--message-format=json`: the build's events as one JSON object per line on
-//! stdout, in the shape Cargo uses (`compiler-message`, `compiler-artifact`,
-//! `build-finished`), so rust-analyzer, CI annotators and editors that already
-//! understand `cargo --message-format=json` work unchanged.
+//! `--message-format=json`: Cargo's JSON message shapes, so existing tooling works unchanged.
 
 use rune_common::{CompilationUnit, CrateSource, CrateType, Profile, RuneConfig, TargetKind};
 use rune_scheduler::pipeline::PipelineEvent;
 use serde_json::{Value, json};
 use std::path::PathBuf;
 
-/// Whether a `--message-format` value asks for JSON (`json`,
-/// `json-diagnostic-short`, `json-render-diagnostics`, …).
 pub fn wants_json(format: &str) -> bool {
     format.starts_with("json")
 }
 
-/// Rejects values Rune does not know rather than silently ignoring them.
 pub fn validate(format: &str) -> Result<(), String> {
     if format.is_empty() || matches!(format, "human" | "short") || wants_json(format) {
         Ok(())
@@ -25,11 +19,9 @@ pub fn validate(format: &str) -> Result<(), String> {
     }
 }
 
-/// Cargo's package id for a unit's package.
 pub fn package_id(unit: &CompilationUnit) -> String {
     let (name, version) = (&unit.crate_id.name, &unit.crate_id.version);
     match &unit.crate_id.source {
-        // The name is left out when the directory already says it.
         CrateSource::Local
             if unit
                 .manifest_dir
@@ -116,20 +108,14 @@ fn artifact_line(
     let unit_profile = unit.effective_profile(profile);
     let mut artifacts = artifacts.to_vec();
     let mut executable = None;
-    // Binaries, and every test harness (a library's unit tests included):
-    // `cargo test --no-run --message-format json` is how test runners such as
-    // nextest find the test executables.
+    // `cargo test --no-run --message-format json` is how runners like nextest find test executables.
     if (unit.crate_type == CrateType::Bin || unit.harness) && !unit.check_only {
-        // The linked program: no extension, or the target's (`.exe`,
-        // `.wasm`) — never the debug info next to it (`.pdb`, `.dSYM`).
         if let Some(bin) = artifacts.iter_mut().find(|p| {
             matches!(
                 p.extension().and_then(|e| e.to_str()),
                 None | Some("exe" | "wasm" | "js")
             )
         }) {
-            // A binary is reported by its friendly name, as Cargo reports the
-            // uplifted `target/debug/app`; a test binary by its hashed file.
             if !unit.harness {
                 *bin = rune_scheduler::executor::bin_dir_for(config, profile, unit)
                     .join(unit.executable_name(&unit.crate_id.name));
@@ -158,7 +144,6 @@ fn artifact_line(
     Value::Object(m).to_string()
 }
 
-/// The JSON lines a pipeline event produces (usually none).
 pub fn lines_for(
     unit: &CompilationUnit,
     config: &RuneConfig,
@@ -189,9 +174,6 @@ pub fn lines_for(
     }
 }
 
-/// Cargo's `build-script-executed` line: what a package's build script
-/// reported and where its `OUT_DIR` is — what rust-analyzer reads to resolve
-/// `include!(concat!(env!("OUT_DIR"), ...))` and script-set cfgs.
 pub fn build_script_executed(
     unit: &CompilationUnit,
     output: &rune_common::BuildScriptOutput,
@@ -221,7 +203,6 @@ pub fn build_script_executed(
     .to_string()
 }
 
-/// The closing line of a build.
 pub fn build_finished(success: bool) -> String {
     json!({ "reason": "build-finished", "success": success }).to_string()
 }

@@ -1,28 +1,12 @@
-//! A small built-in pager for long output (`rune help`, `rune search`).
-//!
-//! Output that fits the terminal, or that is not going to a terminal at all
-//! (a pipe, a file, CI), is printed as it is. Otherwise it opens in the
-//! alternate screen:
-//!
-//! ```text
-//! ↑ ↓ j k        scroll a line        space / b     page down / up
-//! g / G          top / bottom         /             search (n / N: next / previous)
-//! q / esc        quit
-//! ```
-//!
-//! The mouse wheel scrolls too (terminals send it as arrow keys in the
-//! alternate screen once asked to). `RUNE_PAGER=never` turns paging off.
+//! A small built-in pager for long output. `RUNE_PAGER=never` turns paging off.
 
 use console::{Key, Term};
 use std::io::Write;
 
-/// Text to show, one entry per line (colour codes allowed).
 #[derive(Default)]
 pub struct Page {
     lines: Vec<String>,
     title: String,
-    /// On quit, print the page that was on screen to the normal screen
-    /// (`rune search`: the results stay in the scrollback, like `less -X`).
     keep_on_exit: bool,
 }
 
@@ -34,13 +18,11 @@ impl Page {
         }
     }
 
-    /// Keep what was on screen when the pager is closed.
     pub fn keep_on_exit(mut self) -> Self {
         self.keep_on_exit = true;
         self
     }
 
-    /// Appends a line (or several, separated by `\n`).
     pub fn line(&mut self, text: impl AsRef<str>) {
         let text = text.as_ref();
         if text.is_empty() {
@@ -54,8 +36,6 @@ impl Page {
         self.lines.push(String::new());
     }
 
-    /// Shows the page: interactively when it is taller than the terminal,
-    /// printed otherwise.
     pub fn show(self) {
         let term = Term::stdout();
         let enabled = std::env::var("RUNE_PAGER").map_or(true, |v| v != "never" && v != "0");
@@ -82,9 +62,7 @@ struct Pager {
     term: Term,
     top: usize,
     query: Option<String>,
-    /// Lines that match `query`, in order.
     hits: Vec<usize>,
-    /// A message for the status line (e.g. "no match").
     notice: Option<String>,
 }
 
@@ -105,7 +83,6 @@ impl Pager {
         ((rows as usize).max(3), (cols as usize).max(20))
     }
 
-    /// Rows available for text (the last one is the status line).
     fn body_rows(&self) -> usize {
         self.size().0 - 1
     }
@@ -115,7 +92,6 @@ impl Pager {
     }
 
     fn run(mut self) {
-        // Alternate screen, hidden cursor, and wheel-as-arrows.
         let _ = self.term.write_str("\x1b[?1049h\x1b[?25l\x1b[?1007h");
         loop {
             self.draw();
@@ -170,12 +146,9 @@ impl Pager {
         let _ = self.term.flush();
     }
 
-    /// A line cut to the width, with search matches highlighted.
     fn render_line(&self, line: &str, cols: usize) -> String {
         match &self.query {
             Some(q) if !q.is_empty() && matches(line, q) => {
-                // Matches are marked on the plain text (colours dropped for
-                // this line), so a match inside a coloured word shows too.
                 let plain = console::strip_ansi_codes(line).to_string();
                 let plain = console::truncate_str(&plain, cols, "…").to_string();
                 highlight(&plain, q)
@@ -221,7 +194,6 @@ impl Pager {
         format!("\x1b[7m{text}\x1b[0m")
     }
 
-    /// Reads a search query on the status line.
     fn prompt_search(&mut self) {
         let (rows, cols) = self.size();
         let mut query = String::new();
@@ -250,7 +222,6 @@ impl Pager {
         }
         let _ = self.term.write_str("\x1b[?25l");
         if query.is_empty() {
-            // `/` then Enter repeats the last search.
             self.next_hit(true);
             return;
         }
@@ -266,7 +237,6 @@ impl Pager {
         if self.hits.is_empty() {
             self.notice = Some("no match".into());
         } else {
-            // The first match at or below the top of the screen.
             let at = self.hits.iter().copied().find(|&h| h >= self.top + 2);
             self.jump_to(at.unwrap_or(self.hits[0]));
         }
@@ -281,7 +251,6 @@ impl Pager {
             });
             return;
         }
-        // The match shown at the jump position (two lines of context).
         let current = self.top + 2;
         let target = if forward {
             self.hits.iter().copied().find(|&h| h > current)
@@ -300,13 +269,11 @@ impl Pager {
         }
     }
 
-    /// Scrolls so `line` is near the top, with a little context above it.
     fn jump_to(&mut self, line: usize) {
         self.top = line.saturating_sub(2).min(self.max_top());
     }
 }
 
-/// Smart case: a query with capitals matches case-sensitively.
 fn matches(line: &str, query: &str) -> bool {
     let plain = console::strip_ansi_codes(line);
     if query.chars().any(char::is_uppercase) {
@@ -316,7 +283,6 @@ fn matches(line: &str, query: &str) -> bool {
     }
 }
 
-/// `plain` with every occurrence of `query` in reverse video.
 fn highlight(plain: &str, query: &str) -> String {
     let sensitive = query.chars().any(char::is_uppercase);
     let (hay, needle) = if sensitive {
@@ -324,8 +290,7 @@ fn highlight(plain: &str, query: &str) -> String {
     } else {
         (plain.to_lowercase(), query.to_lowercase())
     };
-    // Lowercasing can change byte lengths for some scripts; fall back to no
-    // highlighting rather than slicing in the wrong place.
+    // Lowercasing can change byte lengths; skip highlighting rather than slice wrongly.
     if hay.len() != plain.len() || needle.is_empty() {
         return plain.to_string();
     }

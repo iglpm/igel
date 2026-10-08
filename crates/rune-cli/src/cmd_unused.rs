@@ -1,15 +1,4 @@
-//! `rune unused`: dependencies a package declares but never uses.
-//!
-//! Asks the compiler rather than searching the source for names (which is
-//! fast but fooled by macros, renames and `extern crate`): the workspace's
-//! crates are checked with rustc's `unused_crate_dependencies` lint, which
-//! reports every `--extern` crate a compilation never referred to. A
-//! dependency is unused when *every* compilation that was given it — the
-//! library, binaries, tests, examples and benchmarks for `[dependencies]`;
-//! tests, examples and benchmarks for `[dev-dependencies]`; the build script
-//! for `[build-dependencies]` — reports it. This is `rune check
-//! --all-targets` with one lint added for the workspace's own crates, so the
-//! dependencies themselves come from the store as usual.
+//! `rune unused`: dependencies no compilation uses, via rustc's `unused_crate_dependencies` lint.
 
 use anyhow::{Context, Result};
 use colored::Colorize;
@@ -27,12 +16,9 @@ use crate::ui;
 
 const LINT: &str = "unused_crate_dependencies";
 
-/// One dependency entry of a member's manifest.
 #[derive(Debug, Clone)]
 struct Entry {
-    /// `[dependencies]`, `[target.'cfg(unix)'.dev-dependencies]`, …
     section: String,
-    /// The path of tables to the entry.
     table: Vec<String>,
     key: String,
     kind: Kind,
@@ -45,7 +31,6 @@ enum Kind {
     Build,
 }
 
-/// The dependency entries of a manifest.
 fn entries(doc: &DocumentMut) -> Vec<Entry> {
     let mut out = Vec::new();
     let mut add = |prefix: Vec<String>, label: String, item: &Item| {
@@ -82,8 +67,6 @@ fn entries(doc: &DocumentMut) -> Vec<Entry> {
     out
 }
 
-/// The crate names rustc reports as unused in these diagnostics (JSON lines
-/// from a compilation, or rendered text from a build script's).
 fn reported_unused(lines: &[String]) -> BTreeSet<String> {
     let mut out = BTreeSet::new();
     let mut take = |message: &str| {
@@ -113,8 +96,6 @@ fn reported_unused(lines: &[String]) -> BTreeSet<String> {
     out
 }
 
-/// The `--extern` names a unit gets for its dependencies, and for its build
-/// script's.
 fn externs(graph: &BuildGraph, id: NodeId, build: bool) -> BTreeSet<String> {
     let node = graph.node(id);
     let (set, aliases) = if build {
@@ -123,11 +104,7 @@ fn externs(graph: &BuildGraph, id: NodeId, build: bool) -> BTreeSet<String> {
         (&node.normal_dependencies, &node.extern_aliases)
     };
     set.iter()
-        .filter(|d| {
-            // A package's binaries and tests link its own library; that is not
-            // a declared dependency.
-            build || graph.node(**d).unit.manifest_dir != node.unit.manifest_dir
-        })
+        .filter(|d| build || graph.node(**d).unit.manifest_dir != node.unit.manifest_dir)
         .map(|d| {
             aliases
                 .get(d)
@@ -137,10 +114,7 @@ fn externs(graph: &BuildGraph, id: NodeId, build: bool) -> BTreeSet<String> {
         .collect()
 }
 
-/// Whether the package's Rust sources name `krate` as a path (`krate::`,
-/// `use krate`, `extern crate krate`): code the compiler did not see in this
-/// configuration — under a `cfg` for another platform or a feature that is
-/// off — may still use it.
+/// Code under a disabled `cfg` may still use it.
 fn mentioned_in_sources(dir: &std::path::Path, krate: &str) -> bool {
     let needles = [
         format!("{krate}::"),
@@ -173,23 +147,16 @@ fn mentioned_in_sources(dir: &std::path::Path, krate: &str) -> bool {
         })
 }
 
-/// What checking found for one member.
 #[derive(Default)]
 struct Findings {
     unused: Vec<Entry>,
-    /// Unused in what was compiled, but named in the sources (probably used
-    /// under a `cfg` this build did not enable): reported, never removed.
     unused_here: Vec<Entry>,
-    /// Ordinary dependencies only tests, examples or benchmarks use.
     dev_only: Vec<Entry>,
-    /// Entries no compilation was given (disabled optional dependencies,
-    /// other platforms, a kind of target the package does not have).
     unchecked: Vec<Entry>,
 }
 
 pub fn unused(args: UnusedArgs) -> Result<()> {
     let mut sess = Session::new(&args.common, "dev")?;
-    // The lint's findings are the report; other warnings belong to `check`.
     sess.show_warnings = false;
     sess.ws.config.ensure_dirs(sess.profile.output_dir_name())?;
     let targets = TargetSelection {
@@ -254,7 +221,6 @@ pub fn unused(args: UnusedArgs) -> Result<()> {
         _ => {}
     })?;
 
-    // Per member: what each of its compilations was given and left unused.
     let mut report: BTreeMap<String, (PathBuf, Findings)> = BTreeMap::new();
     let mut incomplete = Vec::new();
     for &mi in &sess.selected {
@@ -273,7 +239,6 @@ pub fn unused(args: UnusedArgs) -> Result<()> {
             incomplete.push(member.name.clone());
             continue;
         }
-        // (given, left unused) by each compilation, and by the build script.
         let mut compilations: Vec<(bool, BTreeSet<String>, BTreeSet<String>)> = Vec::new();
         for &u in &units {
             let unit = &graph.node(u).unit;

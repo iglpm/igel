@@ -1,13 +1,4 @@
-//! `rune-bench`: measures Rune against Cargo.
-//!
-//! ```text
-//! rune-bench run                         # quick suite: tiny and medium workloads
-//! rune-bench run --suite full            # + the large workload, release builds, more runs
-//! rune-bench run --project ~/src/app     # a real project (copied, never touched)
-//! rune-bench report results.json --format html > report.html
-//! rune-bench compare before.json after.json --threshold 10   # exit 1 on regressions
-//! rune-bench list                        # workloads and scenarios
-//! ```
+//! `rune-bench`: measures Rune against Cargo (`rune-bench run|report|compare|list`).
 
 mod measure;
 mod report;
@@ -268,12 +259,9 @@ fn run(a: RunArgs) -> Result<()> {
         .clone()
         .unwrap_or_else(|| PathBuf::from("rune-bench-results").join(timestamp()));
     std::fs::create_dir_all(&out)?;
-    // Each tool builds its own copy of every workload: a disk filling up
-    // half-way turns the rest of the run into failures.
     let need: u64 = workloads
         .iter()
         .map(|w| match (&w.source, w.name.as_str()) {
-            // A guess: a mid-sized project's dev build is a few GiB per tool.
             (workload::Source::Project(_), _) => 8 << 30,
             (_, "large") => 12 << 30,
             (_, "medium") => 3 << 30,
@@ -410,7 +398,6 @@ fn meta(
     }
 }
 
-/// Bytes free on the file system holding `path`.
 fn free_bytes(path: &Path) -> Option<u64> {
     let out = std::process::Command::new("df")
         .args(["-Pk"])
@@ -446,7 +433,6 @@ fn memory() -> Option<u64> {
     String::from_utf8_lossy(&out.stdout).trim().parse().ok()
 }
 
-/// `2026-10-01-1407` (UTC), without a date library.
 fn timestamp() -> String {
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

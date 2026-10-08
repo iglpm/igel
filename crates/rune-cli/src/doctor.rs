@@ -1,19 +1,11 @@
-//! `rune doctor`: looks at the machine, the toolchain and the project and says
-//! what slows builds down or makes them fragile, with the exact fix.
-//!
-//! The judgement lives in [`diagnose`], a pure function of an [`Environment`],
-//! so every recommendation is unit-tested; gathering the environment is the
-//! thin, untested part.
+//! `rune doctor`. The judgement is the pure, tested [`diagnose`]; gathering the environment is not.
 
 use std::path::Path;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Level {
-    /// Nothing to do.
     Ok,
-    /// Worth knowing.
     Note,
-    /// Costs time or risks a problem.
     Warn,
 }
 
@@ -22,7 +14,6 @@ pub struct Finding {
     pub level: Level,
     pub title: String,
     pub detail: Option<String>,
-    /// What to run or write to fix it.
     pub fix: Option<String>,
 }
 
@@ -55,40 +46,26 @@ impl Finding {
     }
 }
 
-/// Everything the diagnosis depends on.
 pub struct Environment {
-    /// `1.98.1`, from `rustc -vV`.
     pub rustc_release: Option<String>,
     pub host: Option<String>,
-    /// Whether an executable of this name is on `PATH`.
     pub on_path: Box<dyn Fn(&str) -> bool>,
-    /// Flags from `RUSTFLAGS` and the configuration files.
     pub rustflags: Vec<String>,
-    /// `target.<host>.linker` from the configuration, if set.
     pub configured_linker: Option<String>,
-    /// The manifest sets `[profile.dev] debug` to full explicitly.
     pub dev_debug_full_explicit: bool,
-    /// `build.dependency-debuginfo = true`: dependencies get full debuginfo.
     pub full_dependency_debuginfo: bool,
-    /// Where settings, the store and downloads live.
     pub home: String,
     pub home_fs: Option<String>,
     pub cas_bytes: u64,
-    /// Bytes in the store not used for 30 days.
     pub cas_idle_bytes: u64,
     pub jobs: usize,
     pub cpus: usize,
     pub rustc_wrapper: Option<String>,
-    /// The project has a `Rune.toml` manifest *and* a `Cargo.toml` manifest: Rune
-    /// reads the first, plain `cargo` reads the second.
     pub shadowed_cargo_toml: bool,
-    /// Free bytes where builds and the store write, by what lives there.
     pub disk_free: Vec<(String, u64)>,
-    /// The machine's memory in bytes, when known.
     pub memory_total: Option<u64>,
 }
 
-/// The file-system type of the mount `path` lives on, from `/proc/mounts` text.
 pub fn fs_type_of(path: &Path, mounts: &str) -> Option<String> {
     mounts
         .lines()
@@ -103,7 +80,6 @@ pub fn fs_type_of(path: &Path, mounts: &str) -> Option<String> {
         .map(|(_, fs)| fs)
 }
 
-/// `(major, minor)` of a `1.98.1`-style release.
 fn parse_release(release: &str) -> Option<(u32, u32)> {
     let mut parts = release.split(['.', '-']);
     Some((parts.next()?.parse().ok()?, parts.next()?.parse().ok()?))
@@ -122,7 +98,6 @@ pub fn diagnose(env: &Environment) -> Vec<Finding> {
     let mut out = Vec::new();
     let has = |tool: &str| (env.on_path)(tool);
 
-    // --- the tools Rune itself needs --------------------------------------
     match &env.rustc_release {
         Some(r) => out.push(Finding::ok(format!("rustc {r}"))),
         None => out.push(Finding::warn(
@@ -152,7 +127,6 @@ pub fn diagnose(env: &Environment) -> Vec<Finding> {
         ));
     }
 
-    // --- linking ------------------------------------------------------------
     let linux_x86 = env.host.as_deref() == Some("x86_64-unknown-linux-gnu");
     let already_lld = linux_x86
         && env
@@ -197,7 +171,6 @@ pub fn diagnose(env: &Environment) -> Vec<Finding> {
         ));
     }
 
-    // --- profile ---------------------------------------------------------
     if env.dev_debug_full_explicit {
         out.push(Finding::warn(
             "`[profile.dev] debug` is set to full",
@@ -215,7 +188,6 @@ pub fn diagnose(env: &Environment) -> Vec<Finding> {
         ));
     }
 
-    // --- machine ------------------------------------------------------------
     if env.jobs < env.cpus {
         out.push(Finding::warn(
             format!("only {} parallel jobs on {} CPUs", env.jobs, env.cpus),
@@ -238,8 +210,6 @@ pub fn diagnose(env: &Environment) -> Vec<Finding> {
         ));
     }
 
-    // Several compilers at once each want memory; below ~1 GiB per job the
-    // scheduler holds jobs back and builds get slower than they need to be.
     if let Some(total) = env.memory_total {
         let per_job = total / env.jobs.max(1) as u64;
         if per_job < (768 << 20) {
@@ -262,7 +232,6 @@ pub fn diagnose(env: &Environment) -> Vec<Finding> {
         }
     }
 
-    // --- manifests ----------------------------------------------------------
     if env.shadowed_cargo_toml {
         out.push(Finding::warn(
             "both `Rune.toml` and `Cargo.toml` define this project",
@@ -273,7 +242,6 @@ pub fn diagnose(env: &Environment) -> Vec<Finding> {
         ));
     }
 
-    // --- the store ------------------------------------------------------------
     out.push(Finding::ok(format!("store holds {}", human(env.cas_bytes))));
     if env.cas_idle_bytes >= (1 << 30) && env.cas_idle_bytes * 4 >= env.cas_bytes {
         out.push(Finding::warn(
@@ -435,7 +403,6 @@ mod tests {
         let f = diagnose(&e);
         let w = f.iter().find(|f| f.level == Level::Warn).unwrap();
         assert!(w.fix.as_deref().unwrap().contains("cas gc --max-age"));
-        // A small idle remainder is not worth a warning.
         e.cas_idle_bytes = 100 << 20;
         assert!(warnings(&diagnose(&e)).is_empty());
     }

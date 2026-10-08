@@ -1,12 +1,5 @@
-//! Turns a failed build script into advice.
-//!
-//! The commonest reason a crate does not build on a fresh machine is a missing
-//! system tool or development package (`pkg-config`, OpenSSL headers, `cmake`, a
-//! C compiler, `libclang`), and the failure is a page of build-script output
-//! that never says which package to install. [`hint_for_failure`] recognises
-//! the usual messages and names the package for the distribution at hand.
+//! Turns a failed build script's output into "install this package" advice.
 
-/// The package manager family, from `/etc/os-release` (or the OS).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Family {
     Debian,
@@ -19,7 +12,6 @@ pub enum Family {
 }
 
 impl Family {
-    /// Reads `ID` and `ID_LIKE` from the text of `/etc/os-release`.
     pub fn from_os_release(text: &str) -> Self {
         let mut ids = Vec::new();
         for line in text.lines() {
@@ -50,7 +42,6 @@ impl Family {
         }
     }
 
-    /// The family of the machine Rune is running on.
     pub fn current() -> Self {
         if cfg!(target_os = "macos") {
             return Self::MacOs;
@@ -84,13 +75,9 @@ struct Packages {
 }
 
 struct Rule {
-    /// What is missing, for the sentence.
     what: &'static str,
-    /// Every one of these groups must match; a group matches if any of its
-    /// (lowercase) needles occurs in the text.
     when: &'static [&'static [&'static str]],
     packages: Packages,
-    /// An extra line, e.g. an environment variable to set.
     note: Option<&'static str>,
 }
 
@@ -215,13 +202,9 @@ const RULES: &[Rule] = &[
     },
 ];
 
-/// Advice for a failed build script or C compilation, given everything it
-/// printed. `None` when nothing recognisable is in it.
 pub fn hint_for_failure(output: &str, family: Family) -> Option<String> {
     let lower = output.to_lowercase();
 
-    // The pkg-config search failing for one specific library is a different
-    // problem from pkg-config being absent, and the message names the file.
     if let Some(pc) = missing_pkg_config_package(&lower)
         && (!lower.contains("openssl") || !lower.contains("could not find directory of openssl"))
     {
@@ -259,7 +242,6 @@ pub fn hint_for_failure(output: &str, family: Family) -> Option<String> {
         })
 }
 
-/// `Package foo was not found in the pkg-config search path` → `foo`.
 fn missing_pkg_config_package(lower: &str) -> Option<String> {
     let start = lower.find("package ")? + "package ".len();
     let rest = &lower[start..];

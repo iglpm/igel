@@ -30,7 +30,6 @@ pub enum DownloadError {
 
 pub type Result<T> = std::result::Result<T, DownloadError>;
 
-/// Downloader for crate packages from crates.io.
 pub struct CrateDownloader {
     crates_dir: PathBuf,
     src_dir: PathBuf,
@@ -39,27 +38,20 @@ pub struct CrateDownloader {
     backend: DlBackend,
 }
 
-/// Where the `.crate` archives of a registry come from.
 enum DlBackend {
     CratesIo,
-    /// An alternative sparse registry: the download URL comes from its
-    /// `config.json`.
     Sparse {
         base: String,
         token: Option<String>,
         label: String,
     },
-    /// `local-registry`: `.crate` files next to the index.
     LocalRegistry(PathBuf),
-    /// `directory`: crates already unpacked; nothing to fetch or extract.
     Directory(PathBuf),
 }
 
-/// Downloads are latency-bound, so run many at once regardless of core count.
 const DOWNLOAD_CONCURRENCY: usize = 32;
 
 impl CrateDownloader {
-    /// Creates a new `CrateDownloader` with the given base cache directory.
     pub fn new(base_cache_dir: PathBuf) -> Self {
         let crates_dir = base_cache_dir.join("cache");
         let src_dir = base_cache_dir
@@ -79,8 +71,6 @@ impl CrateDownloader {
         }
     }
 
-    /// A downloader for the registry identified by `index`, honouring source
-    /// replacement and authentication from configuration.
     pub fn for_registry(index: &str) -> std::result::Result<Self, crate::index::IndexError> {
         use crate::source::{Backend, CRATES_IO, defs};
         let backend = defs().backend_for(index)?;
@@ -110,8 +100,6 @@ impl CrateDownloader {
             }
             Backend::Directory(dir) => d.backend = DlBackend::Directory(dir),
             Backend::GitIndex { url, token } => {
-                // Downloads work as for a sparse registry, from the `dl`
-                // template in the clone's `config.json`.
                 d.crates_dir = home.join("cache").join(&key);
                 d.src_dir = home.join("src").join(&key);
                 if let Ok(clone) = crate::git_index::GitIndex::open(&url, false) {
@@ -134,10 +122,6 @@ impl CrateDownloader {
         Ok(d)
     }
 
-    /// The download URL of a package of an alternative registry, from the
-    /// registry's `config.json` template: `{crate}`, `{version}`, `{prefix}`,
-    /// `{lowerprefix}` and `{sha256-checksum}` are substituted; a template
-    /// without markers gets `/{crate}/{version}/download` appended.
     fn sparse_download_url(
         &self,
         base: &str,
@@ -204,20 +188,15 @@ impl CrateDownloader {
         }
     }
 
-    /// Default downloader using `~/.rune/registry`.
     pub fn default_downloader() -> Self {
         Self::new(rune_common::settings::rune_home().join("registry"))
     }
 
-    /// Makes this downloader fail (rather than fetch) for crates that are not
-    /// already extracted or cached locally.
     pub fn offline(mut self, offline: bool) -> Self {
         self.offline = offline;
         self
     }
 
-    /// Downloads and extracts a crate tarball if not already present.
-    /// Returns the path to the extracted crate directory (which contains its `Cargo.toml`).
     pub fn download_and_extract(
         &self,
         name: &str,
@@ -227,8 +206,6 @@ impl CrateDownloader {
         let crate_folder_name = format!("{name}-{version}");
         let extracted_path = self.src_dir.join(&crate_folder_name);
 
-        // Vendored crates are already unpacked (and `cargo vendor` may name
-        // the directory with or without the version).
         if let DlBackend::Directory(dir) = &self.backend {
             for candidate in [dir.join(&crate_folder_name), dir.join(name)] {
                 if candidate.join("Cargo.toml").is_file() {
@@ -241,7 +218,6 @@ impl CrateDownloader {
             )));
         }
 
-        // Fast path: if extracted directory already exists with a Cargo.toml, reuse immediately
         if extracted_path.exists() && extracted_path.join("Cargo.toml").exists() {
             debug!(
                 "Crate {} v{} is already cached at {}",
@@ -257,7 +233,6 @@ impl CrateDownloader {
 
         let tarball_path = self.crates_dir.join(format!("{crate_folder_name}.crate"));
 
-        // Download if tarball is not already downloaded
         if !tarball_path.exists() {
             if self.offline {
                 return Err(DownloadError::Archive(format!(
@@ -306,10 +281,7 @@ impl CrateDownloader {
                 }
                 let mut finished = Finished(name, version, false);
 
-                // Stream into a temp file and rename, so an interrupted download
-                // can never be mistaken for a complete tarball later. A
-                // connection that drops mid-body is retried like one that
-                // never connected.
+                // Temp file + rename: an interrupted download is never mistaken for a complete tarball.
                 let tmp_tarball = self
                     .crates_dir
                     .join(format!(".{crate_folder_name}.{}.part", std::process::id()));
@@ -359,7 +331,6 @@ impl CrateDownloader {
             }
         }
 
-        // Verify checksum if provided
         if let Some(expected) = expected_cksum {
             let computed = compute_sha256(&tarball_path)?;
             if !computed.eq_ignore_ascii_case(expected) {
@@ -373,10 +344,7 @@ impl CrateDownloader {
             }
         }
 
-        // Extract into a private staging directory, then move the finished
-        // tree into place in one rename. Extracting straight into `src_dir`
-        // let a crash (or a concurrent `rune` process) observe a half-written
-        // crate that already had its `Cargo.toml` and treat it as complete.
+        // Extract into a staging directory and rename into place, so no one sees a half-written crate.
         let staging = self
             .src_dir
             .join(format!(".{crate_folder_name}.{}.tmp", std::process::id()));
@@ -404,7 +372,6 @@ impl CrateDownloader {
                 "could not move {crate_folder_name} into place"
             )));
         }
-        // Lost the race to another process: theirs is complete, ours is spare.
         let _ = fs::remove_dir_all(&staging);
 
         info!(
@@ -415,24 +382,10 @@ impl CrateDownloader {
         Ok(extracted_path)
     }
 
-    /// Downloads and extracts many crates concurrently.
-    ///
-    /// Cold-cache resolution of a dependency graph is dominated by network
-    /// round-trip latency, not bandwidth or CPU; fetching packages one at a
-    /// time (as a plain sequential loop would) leaves most of that latency
-    /// unhidden. Fanning the requests out across a thread pool lets the
-    /// round trips overlap, which is the same trick Cargo's own libcurl
-    /// multi-handle download queue relies on.
-    ///
-    /// Each item is `(name, version, expected_checksum)`. Returns the
-    /// extracted directory for each input, in the same order, or the first
-    /// error encountered.
     pub fn download_and_extract_many(
         &self,
         packages: &[(String, String, Option<String>)],
     ) -> Result<Vec<PathBuf>> {
-        // Already-extracted crates need only a `stat`; keep them out of the
-        // (much wider) network pool so a warm build never spins one up.
         let missing: Vec<usize> = packages
             .iter()
             .enumerate()
@@ -449,7 +402,6 @@ impl CrateDownloader {
 
         let mut results: Vec<Option<Result<PathBuf>>> = (0..packages.len()).map(|_| None).collect();
         if !missing.is_empty() {
-            // Archives already in the cache only need unpacking.
             let to_fetch = missing
                 .iter()
                 .filter(|&&i| {
@@ -500,12 +452,6 @@ impl CrateDownloader {
     }
 }
 
-/// Downloads and extracts packages from several registries at once.
-///
-/// Each item is `(name, version, checksum, registry index)`; the result is
-/// in the same order. Packages of one registry are fetched together (in
-/// parallel), each registry with its own source replacement, credentials and
-/// cache directory.
 pub fn download_and_extract_grouped(
     packages: &[(String, String, Option<String>, String)],
     offline: bool,
@@ -540,7 +486,6 @@ pub fn download_and_extract_grouped(
         .collect())
 }
 
-/// Helper function to download and extract a crate using the default cache location.
 pub fn download_and_extract_crate(
     name: &str,
     version: &str,
@@ -549,12 +494,10 @@ pub fn download_and_extract_crate(
     CrateDownloader::default_downloader().download_and_extract(name, version, expected_cksum)
 }
 
-/// The SHA-256 of a file, hex encoded (what `.cargo-checksum.json` records).
 pub fn sha256_file(path: &Path) -> std::io::Result<String> {
     compute_sha256(path).map_err(|e| std::io::Error::other(e.to_string()))
 }
 
-/// Computes the SHA-256 hash of a file as a hex string.
 fn compute_sha256(path: &Path) -> Result<String> {
     use std::io::Read;
     let mut file = File::open(path)?;
@@ -570,7 +513,6 @@ fn compute_sha256(path: &Path) -> Result<String> {
     Ok(hasher.finalize_hex())
 }
 
-/// Minimal internal SHA-256 implementation to avoid heavy extra dependencies.
 struct Sha256Hasher {
     state: [u32; 8],
     buffer: [u8; 64],

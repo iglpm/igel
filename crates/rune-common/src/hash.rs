@@ -1,41 +1,25 @@
-//! Fast hashing utilities for Rune.
-//!
-//! Provides two hashing strategies:
-//! - **xxhash3**: Ultra-fast (non-cryptographic) for content fingerprinting
-//!   and quick file change detection.
-//! - **blake3**: Fast cryptographic hash for CAS keys where collision
-//!   resistance matters.
-
 use std::fs;
 use std::io::{self, Read};
 use std::path::Path;
 
-/// Hash a byte slice with xxhash3, returning a 64-bit hash.
 #[inline]
 pub fn xxhash3(data: &[u8]) -> u64 {
     xxhash_rust::xxh3::xxh3_64(data)
 }
 
-/// Hash a byte slice with xxhash3, returning the hash as a hex string.
 #[inline]
 pub fn xxhash3_hex(data: &[u8]) -> String {
     format!("{:016x}", xxhash3(data))
 }
 
-/// Hash a file's contents with xxhash3.
-///
-/// For files ≤ 128 KiB, reads the whole file into memory.
-/// For larger files, uses a streaming approach.
 pub fn xxhash3_file(path: &Path) -> io::Result<u64> {
     let metadata = fs::metadata(path)?;
     let size = metadata.len();
 
     if size <= 128 * 1024 {
-        // Small file: read all at once for maximum speed
         let data = fs::read(path)?;
         Ok(xxhash3(&data))
     } else {
-        // Larger file: stream through hasher
         let mut file = fs::File::open(path)?;
         let mut hasher = xxhash_rust::xxh3::Xxh3::new();
         let mut buf = vec![0u8; 64 * 1024];
@@ -50,39 +34,22 @@ pub fn xxhash3_file(path: &Path) -> io::Result<u64> {
     }
 }
 
-/// Hash a file's contents with blake3, returning the hex string.
 pub fn blake3_file(path: &Path) -> io::Result<String> {
     let data = fs::read(path)?;
     Ok(blake3::hash(&data).to_hex().to_string())
 }
 
-/// Hash a byte slice with blake3, returning the hex string.
 #[inline]
 pub fn blake3_bytes(data: &[u8]) -> String {
     blake3::hash(data).to_hex().to_string()
 }
 
-/// An incremental hash builder that supports both xxhash3 and blake3.
-///
-/// Use this to build up a hash from multiple pieces of data.
-///
-/// # Example
-/// ```
-/// use rune_common::hash::HashBuilder;
-///
-/// let mut hb = HashBuilder::new();
-/// hb.update(b"crate-name");
-/// hb.update(b"1.0.0");
-/// let fingerprint = hb.finish_xxhash3();
-/// let cas_key = hb.finish_blake3();
-/// ```
 pub struct HashBuilder {
     blake3: blake3::Hasher,
     xxh3: xxhash_rust::xxh3::Xxh3,
 }
 
 impl HashBuilder {
-    /// Create a new empty `HashBuilder`.
     pub fn new() -> Self {
         Self {
             blake3: blake3::Hasher::new(),
@@ -90,23 +57,19 @@ impl HashBuilder {
         }
     }
 
-    /// Feed data into both hashers.
     pub fn update(&mut self, data: &[u8]) {
         self.blake3.update(data);
         self.xxh3.update(data);
     }
 
-    /// Finalize and return the xxhash3 digest as a hex string.
     pub fn finish_xxhash3(&self) -> String {
         format!("{:016x}", self.xxh3.digest())
     }
 
-    /// Finalize and return the blake3 digest as a hex string.
     pub fn finish_blake3(&self) -> String {
         self.blake3.finalize().to_hex().to_string()
     }
 
-    /// Finalize and return both digests.
     pub fn finish(&self) -> (String, String) {
         (self.finish_xxhash3(), self.finish_blake3())
     }
@@ -149,7 +112,6 @@ mod tests {
         assert_eq!(xxh.len(), 16);
         assert_eq!(blake.len(), 64);
 
-        // Deterministic
         let mut hb2 = HashBuilder::new();
         hb2.update(b"test");
         hb2.update(b"data");

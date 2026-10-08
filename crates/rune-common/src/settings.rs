@@ -1,19 +1,5 @@
-//! User-facing settings: the `rune config` system.
-//!
-//! Settings are layered, from lowest to highest precedence:
-//!
-//! 1. built-in defaults,
-//! 2. the **global** file, `~/.rune/config.toml` (or `$RUNE_HOME/config.toml`),
-//! 3. the **project** file, `Rune.toml` next to the project's `Cargo.toml`,
-//! 4. `RUNE_*` environment variables (e.g. `RUNE_BUILD_RELEASE_REBUILD_ALL=1`),
-//! 5. command-line flags (applied by the CLI on top of what this module returns).
-//!
-//! `Rune.toml` is a Rune-only file: Cargo ignores it, so setting a value there
-//! can never break a plain `cargo build` of the same project.
-//!
-//! Every key is declared once in [`KEYS`]. That table drives validation,
-//! `rune config list`, and the typed accessors on [`Settings`], so a key can't
-//! be documented but unsupported, or supported but undocumented.
+//! `rune config` settings, lowest to highest precedence: defaults, `~/.rune/config.toml`, `Rune.toml`,
+//! `RUNE_*` env vars, CLI flags. Every key is declared once in [`KEYS`].
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -21,25 +7,16 @@ use std::path::{Path, PathBuf};
 
 use toml_edit::{DocumentMut, Item, Table, Value as TomlValue};
 
-/// The name of the project-level settings file.
 pub const PROJECT_FILE: &str = "Rune.toml";
 
-/// What kind of value a setting holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ValueKind {
-    /// `true` / `false` (also accepts `on`/`off`, `yes`/`no`, `1`/`0` on the CLI).
     Bool,
-    /// A non-negative integer.
     Uint,
-    /// A filesystem path. Relative paths in `Rune.toml` are relative to the project.
     Path,
-    /// A byte size such as `20GB`, `512MiB`, or a plain number of bytes.
     Size,
-    /// Free text (a token, a list of URLs).
     Text,
-    /// `off`, `auto`, or a positive number (of threads).
     Threads,
-    /// A length of time: `14d`, `72h`, `2w`, `0`.
     Duration,
 }
 
@@ -57,19 +34,14 @@ impl ValueKind {
     }
 }
 
-/// How many threads rustc's parallel front end may use (`build.frontend-threads`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum FrontendThreads {
-    /// One, as rustc does by default.
     #[default]
     Off,
-    /// As many as there are idle cores when a crate starts.
     Auto,
-    /// Always this many.
     Fixed(usize),
 }
 
-/// A typed setting value.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Value {
     Bool(bool),
@@ -91,18 +63,14 @@ impl fmt::Display for Value {
     }
 }
 
-/// Static description of one setting.
 #[derive(Debug, Clone, Copy)]
 pub struct KeyDef {
-    /// Dotted key, e.g. `build.release-rebuild-all`.
     pub name: &'static str,
     pub kind: ValueKind,
-    /// Human-readable default, shown by `rune config list`.
     pub default: &'static str,
     pub description: &'static str,
 }
 
-/// Every setting Rune understands.
 pub const KEYS: &[KeyDef] = &[
     KeyDef {
         name: "build.release-rebuild-all",
@@ -182,8 +150,9 @@ pub const KEYS: &[KeyDef] = &[
         description: "Which linker links binaries, tests and dynamic libraries. `default`: the \
                       one `rustc` and `.cargo/config.toml` choose. `hyprlnk`: the linker built \
                       into Rune, about twice as fast as lld on Rune's own build; it takes \
-                      precedence over `target.<triple>.linker`. hyprlnk links \
-                      x86_64-pc-windows-msvc for now: other targets keep their linker.",
+                      precedence over `target.<triple>.linker`. hyprlnk links Windows \
+                      (`*-pc-windows-msvc`: x64, ARM64, x86), PDBs included; other targets \
+                      keep their linker.",
     },
     KeyDef {
         name: "build.target-dir",
@@ -341,12 +310,10 @@ pub const KEYS: &[KeyDef] = &[
     },
 ];
 
-/// Looks up the definition of a key.
 pub fn key_def(name: &str) -> Option<&'static KeyDef> {
     KEYS.iter().find(|k| k.name == name)
 }
 
-/// Error from reading, validating, or writing settings.
 #[derive(Debug, thiserror::Error)]
 pub enum SettingsError {
     #[error("unknown setting `{key}`{}", suggestion(.key))]
@@ -362,7 +329,6 @@ pub enum SettingsError {
 }
 
 fn suggestion(key: &str) -> String {
-    // Cheap "did you mean": a known key that ends in the same leaf name.
     let leaf = key.rsplit('.').next().unwrap_or(key);
     match KEYS.iter().find(|k| k.name.ends_with(leaf)) {
         Some(k) => format!(" (did you mean `{}`?)", k.name),
@@ -370,7 +336,6 @@ fn suggestion(key: &str) -> String {
     }
 }
 
-/// Where a value came from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Origin {
     Default,
@@ -390,35 +355,26 @@ impl fmt::Display for Origin {
     }
 }
 
-/// Which file a `set`/`unset` should touch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Scope {
     Global,
     Project,
 }
 
-/// Fully layered settings, ready to query.
 #[derive(Debug, Clone, Default)]
 pub struct Settings {
-    /// Key → (value, where it came from). Only keys that were explicitly set.
     values: BTreeMap<String, (Value, Origin)>,
     project_root: Option<PathBuf>,
 }
 
 impl Settings {
-    /// Loads global, project, and environment layers.
-    ///
-    /// A malformed *global* file is reported as an error rather than ignored:
-    /// silently falling back to defaults would make e.g. an intended
-    /// `release-rebuild-all = true` quietly not apply.
+    /// A malformed global file is an error: silently using defaults would hide intended settings.
     pub fn load(project_root: Option<&Path>) -> Result<Self, SettingsError> {
         Self::load_from(project_root, &global_config_path(), &|k| {
             std::env::var(k).ok()
         })
     }
 
-    /// Like [`Self::load`] with an explicit global file and an injectable
-    /// environment, so tests never depend on the developer's real config.
     pub fn load_from(
         project_root: Option<&Path>,
         global: &Path,
@@ -477,8 +433,6 @@ impl Settings {
                 message: format!("`{}` must be {expected}", key.name),
             })?;
             let value = match (value, path_base) {
-                // A project-relative path is stored resolved, so callers never
-                // need to know which file it came from.
                 (Value::Path(p), Some(base)) if Path::new(&p).is_relative() && !is_url_list(&p) => {
                     Value::Path(base.join(p).to_string_lossy().into_owned())
                 }
@@ -490,12 +444,10 @@ impl Settings {
         Ok(())
     }
 
-    /// The explicitly set value and its origin, if any.
     pub fn get(&self, key: &str) -> Option<&(Value, Origin)> {
         self.values.get(key)
     }
 
-    /// Overrides a value from a higher-precedence source such as a CLI flag.
     pub fn override_value(&mut self, key: &str, value: Value, origin: Origin) {
         self.values.insert(key.to_string(), (value, origin));
     }
@@ -521,14 +473,11 @@ impl Settings {
         }
     }
 
-    /// `cas.remote`: a store shared with other machines — a directory or one or
-    /// more Cairn URLs, exactly as written.
     pub fn cas_remote(&self) -> Option<String> {
         self.path("cas.remote")
             .map(|p| p.to_string_lossy().into_owned())
     }
 
-    /// `cas.remote-token`: the bearer token for a Cairn server.
     pub fn cas_remote_token(&self) -> Option<String> {
         match self.values.get("cas.remote-token") {
             Some((Value::Text(t), _)) => Some(t.clone()),
@@ -536,31 +485,23 @@ impl Settings {
         }
     }
 
-    /// `cas.remote-replicas`: copies kept across several Cairn servers.
     pub fn cas_remote_replicas(&self) -> usize {
         self.uint("cas.remote-replicas")
             .map_or(1, |n| n.max(1) as usize)
     }
 
-    /// `cas.remote-write`: publish to the shared store.
     pub fn cas_remote_write(&self) -> bool {
         self.bool("cas.remote-write", true)
     }
 
-    /// `test.cache`: remember passing test runs.
     pub fn test_cache(&self) -> bool {
         self.bool("test.cache", false)
     }
 
-    /// `build.dependency-debuginfo`: give registry/git dependencies full
-    /// debuginfo in dev builds (instead of `line-tables-only`).
     pub fn dependency_debuginfo(&self) -> bool {
         self.bool("build.dependency-debuginfo", false)
     }
 
-    /// `build.release-rebuild-all`: rebuild every crate for release builds
-    /// instead of using the content-addressable store.
-    /// `build.low-priority`.
     /// `build.feature-unification`, when set: `selected` or `workspace`.
     pub fn feature_unification(&self) -> Option<String> {
         match self.values.get("build.feature-unification") {
@@ -573,7 +514,6 @@ impl Settings {
         self.bool("build.sandbox", false)
     }
 
-    /// `build.sandbox-network`: package names.
     pub fn sandbox_network(&self) -> Vec<String> {
         match self.values.get("build.sandbox-network") {
             Some((Value::Text(t), _)) => t
@@ -593,7 +533,6 @@ impl Settings {
         self.bool("build.release-rebuild-all", false)
     }
 
-    /// `resolve.min-release-age`.
     pub fn min_release_age(&self) -> Option<std::time::Duration> {
         match self.values.get("resolve.min-release-age") {
             Some((Value::Text(t), _)) => crate::time::parse_duration(t)
@@ -603,7 +542,6 @@ impl Settings {
         }
     }
 
-    /// `build.frontend-threads`.
     pub fn frontend_threads(&self) -> FrontendThreads {
         match self.values.get("build.frontend-threads") {
             Some((Value::Text(t), _)) if t == "auto" => FrontendThreads::Auto,
@@ -616,7 +554,6 @@ impl Settings {
         }
     }
 
-    /// `build.linker`, when set: `default` or `hyprlnk`.
     pub fn linker(&self) -> Option<String> {
         match self.values.get("build.linker") {
             Some((Value::Text(t), _)) => Some(t.clone()),
@@ -624,37 +561,29 @@ impl Settings {
         }
     }
 
-    /// `build.jobs`.
     pub fn jobs(&self) -> Option<usize> {
         self.uint("build.jobs")
             .filter(|n| *n > 0)
             .map(|n| n as usize)
     }
 
-    /// `build.target-dir`, resolved against the project root.
     pub fn target_dir(&self) -> Option<PathBuf> {
         self.path("build.target-dir")
     }
 
-    /// `cas.enabled`.
     pub fn cas_enabled(&self) -> bool {
         self.bool("cas.enabled", true)
     }
 
-    /// `cas.dir`.
     pub fn cas_dir(&self) -> Option<PathBuf> {
         self.path("cas.dir")
     }
 
-    /// `cas.max-size` in bytes, as set (`None` when not set; `Some(0)` for
-    /// unlimited). See [`Self::cas_max_size_for`] for the value in force.
     pub fn cas_max_size(&self) -> Option<u64> {
         self.uint("cas.max-size")
     }
 
-    /// The store size limit in force for a store at `store`: as set, or —
-    /// when not set — a tenth of the disk it is on, between 5 and 50 GiB.
-    /// `None`: unlimited.
+    /// When unset: a tenth of the disk, between 5 and 50 GiB. `None`: unlimited.
     pub fn cas_max_size_for(&self, store: &std::path::Path) -> Option<u64> {
         match self.cas_max_size() {
             Some(0) => None,
@@ -666,7 +595,6 @@ impl Settings {
         }
     }
 
-    /// `cas.max-age` in seconds (30 days unless set; `None` when `0`).
     pub fn cas_max_age(&self) -> Option<u64> {
         match self.values.get("cas.max-age") {
             Some((Value::Text(t), _)) => crate::time::parse_duration(t).filter(|s| *s > 0),
@@ -674,7 +602,6 @@ impl Settings {
         }
     }
 
-    /// `cas.compress-after` in seconds (7 days unless set; `None` when `0`).
     pub fn cas_compress_after(&self) -> Option<u64> {
         match self.values.get("cas.compress-after") {
             Some((Value::Text(t), _)) => crate::time::parse_duration(t).filter(|s| *s > 0),
@@ -682,7 +609,6 @@ impl Settings {
         }
     }
 
-    /// `audit.ignore`: advisory IDs.
     pub fn audit_ignore(&self) -> Vec<String> {
         match self.values.get("audit.ignore") {
             Some((Value::Text(t), _)) => t
@@ -694,14 +620,12 @@ impl Settings {
         }
     }
 
-    /// `test.jobs`, when set.
     pub fn test_jobs(&self) -> Option<usize> {
         self.uint("test.jobs")
             .map(|n| n as usize)
             .filter(|n| *n > 0)
     }
 
-    /// `test.timeout` in seconds, when set and not `0`.
     pub fn test_timeout(&self) -> Option<u64> {
         match self.values.get("test.timeout") {
             Some((Value::Text(t), _)) => crate::time::parse_duration(t).filter(|s| *s > 0),
@@ -709,7 +633,6 @@ impl Settings {
         }
     }
 
-    /// `test.schedule`, when set.
     pub fn test_schedule(&self) -> Option<String> {
         match self.values.get("test.schedule") {
             Some((Value::Text(t), _)) => Some(t.clone()),
@@ -717,32 +640,26 @@ impl Settings {
         }
     }
 
-    /// `cas.verify`.
     pub fn cas_verify(&self) -> bool {
         self.bool("cas.verify", false)
     }
 
-    /// `net.offline`.
     pub fn offline(&self) -> bool {
         self.bool("net.offline", false)
     }
 
-    /// `resolve.write-cargo-lock`.
     pub fn write_cargo_lock(&self) -> bool {
         self.bool("resolve.write-cargo-lock", true)
     }
 
-    /// `test.doctests`.
     pub fn doctests(&self) -> bool {
         self.bool("test.doctests", true)
     }
 
-    /// The project root these settings were loaded for.
     pub fn project_root(&self) -> Option<&Path> {
         self.project_root.as_deref()
     }
 
-    /// One row per known key: `(definition, effective value, origin)`.
     pub fn effective(&self) -> Vec<(&'static KeyDef, String, Origin)> {
         KEYS.iter()
             .map(|def| match self.values.get(def.name) {
@@ -753,12 +670,10 @@ impl Settings {
     }
 }
 
-/// Path of the global settings file.
 pub fn global_config_path() -> PathBuf {
     rune_home().join("config.toml")
 }
 
-/// `$RUNE_HOME`, or `~/.rune`.
 pub fn rune_home() -> PathBuf {
     if let Some(dir) = std::env::var_os("RUNE_HOME") {
         return PathBuf::from(dir);
@@ -768,7 +683,6 @@ pub fn rune_home() -> PathBuf {
         .join(".rune")
 }
 
-/// Path of the settings file for a scope.
 pub fn config_path(scope: Scope, project_root: Option<&Path>) -> Option<PathBuf> {
     match scope {
         Scope::Global => Some(global_config_path()),
@@ -776,7 +690,6 @@ pub fn config_path(scope: Scope, project_root: Option<&Path>) -> Option<PathBuf>
     }
 }
 
-/// Reads the value of `key` in one specific file (not layered).
 pub fn read_from_file(path: &Path, key: &str) -> Result<Option<Value>, SettingsError> {
     let def = key_def(key).ok_or_else(|| SettingsError::UnknownKey { key: key.into() })?;
     let Ok(text) = std::fs::read_to_string(path) else {
@@ -799,8 +712,6 @@ pub fn read_from_file(path: &Path, key: &str) -> Result<Option<Value>, SettingsE
     }
 }
 
-/// Validates `raw` for `key` and writes it into `path`, creating the file if
-/// needed and preserving everything else in it (comments, ordering).
 pub fn set_in_file(path: &Path, key: &str, raw: &str) -> Result<Value, SettingsError> {
     let def = key_def(key).ok_or_else(|| SettingsError::UnknownKey { key: key.into() })?;
     let value = parse_value(def, raw)?;
@@ -811,8 +722,7 @@ pub fn set_in_file(path: &Path, key: &str, raw: &str) -> Result<Value, SettingsE
         doc[table_name] = Item::Table(Table::new());
     }
     if doc[table_name].is_array_of_tables() {
-        // `[[test]]` in a `Rune.toml` that is also the manifest: the name is taken
-        // by the list of test targets, so `[test]` settings cannot share the file.
+        // `[[test]]` targets own the name `test` in a manifest `Rune.toml`.
         return Err(SettingsError::File {
             path: path.to_path_buf(),
             message: format!(
@@ -834,7 +744,6 @@ pub fn set_in_file(path: &Path, key: &str, raw: &str) -> Result<Value, SettingsE
     Ok(value)
 }
 
-/// Removes `key` from `path`. Returns whether it was present.
 pub fn unset_in_file(path: &Path, key: &str) -> Result<bool, SettingsError> {
     key_def(key).ok_or_else(|| SettingsError::UnknownKey { key: key.into() })?;
     if !path.exists() {
@@ -847,7 +756,6 @@ pub fn unset_in_file(path: &Path, key: &str) -> Result<bool, SettingsError> {
         .and_then(|t| t.as_table_like_mut())
         .is_some_and(|t| t.remove(leaf).is_some());
     if removed {
-        // Don't leave behind an empty `[build]` header.
         if doc
             .get(table_name)
             .and_then(|t| t.as_table_like())
@@ -880,7 +788,6 @@ fn write_doc(path: &Path, doc: &DocumentMut) -> Result<(), SettingsError> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(io_err)?;
     }
-    // Write-then-rename so a crash can't leave a truncated settings file.
     let tmp = path.with_extension("toml.tmp");
     std::fs::write(&tmp, doc.to_string()).map_err(io_err)?;
     std::fs::rename(&tmp, path).map_err(io_err)
@@ -938,7 +845,6 @@ fn from_toml(def: &KeyDef, item: &Item) -> Result<Value, &'static str> {
     }
 }
 
-/// `off`, `auto` or a positive count, normalized.
 fn parse_threads(raw: &str) -> Option<Value> {
     let raw = raw.trim().to_ascii_lowercase();
     match raw.as_str() {
@@ -958,12 +864,10 @@ fn to_toml(value: &Value) -> TomlValue {
         Value::Uint(n) => TomlValue::from(*n as i64),
         Value::Path(p) => TomlValue::from(p.as_str()),
         Value::Text(t) => TomlValue::from(t.as_str()),
-        // Sizes are stored as the friendly string the user typed, normalized.
         Value::Size(n) => TomlValue::from(format_size(*n)),
     }
 }
 
-/// Parses user-typed text for a key, enforcing its kind.
 pub fn parse_value(def: &KeyDef, raw: &str) -> Result<Value, SettingsError> {
     let bad = || SettingsError::InvalidValue {
         key: def.name.to_string(),
@@ -991,9 +895,6 @@ pub fn parse_value(def: &KeyDef, raw: &str) -> Result<Value, SettingsError> {
     }
 }
 
-/// `1024`, `10GB`, `512 MiB`, `1.5G` → bytes. Decimal (`GB`) and binary
-/// (`GiB`) suffixes are both accepted; a bare `G` means binary, matching how
-/// disk usage is usually reported on Linux.
 pub fn parse_size(text: &str) -> Option<u64> {
     let text = text.trim();
     let split = text
@@ -1019,7 +920,6 @@ pub fn parse_size(text: &str) -> Option<u64> {
     Some((num * mult) as u64)
 }
 
-/// Formats bytes back to the most natural exact unit (`20GiB`, `1500MB`, ...).
 pub fn format_size(bytes: u64) -> String {
     const UNITS: [(&str, u64); 4] = [
         ("TiB", 1 << 40),
@@ -1035,7 +935,6 @@ pub fn format_size(bytes: u64) -> String {
     bytes.to_string()
 }
 
-/// `build.release-rebuild-all` → `RUNE_BUILD_RELEASE_REBUILD_ALL`.
 pub fn env_var_name(key: &str) -> String {
     format!(
         "RUNE_{}",
@@ -1049,7 +948,6 @@ pub fn env_var_name(key: &str) -> String {
     )
 }
 
-/// Whether a `cas.remote` value is one or more URLs rather than a directory.
 pub fn is_url_list(s: &str) -> bool {
     let s = s.trim_start();
     s.starts_with("http://") || s.starts_with("https://")
@@ -1078,7 +976,6 @@ mod tests {
             "[package]\nname = \"a\"\n\n[dependencies]\nserde = \"1\"\n",
         )
         .unwrap();
-        // A manifest and settings in one file: each setting lands in its own table.
         set_in_file(&path, "build.jobs", "4").unwrap();
         set_in_file(&path, "test.doctests", "false").unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
@@ -1086,12 +983,10 @@ mod tests {
             text.contains("name = \"a\"") && text.contains("serde") && text.contains("jobs = 4"),
             "{text}"
         );
-        // …and they are read back next to the manifest.
         let s = Settings::load_from(Some(dir.path()), &dir.path().join("none"), &|_| None).unwrap();
         assert_eq!(s.jobs(), Some(4));
         assert!(!s.doctests());
 
-        // `[[test]]` targets own the name `test`.
         let with_targets = dir.path().join("t").join("Rune.toml");
         std::fs::create_dir_all(with_targets.parent().unwrap()).unwrap();
         std::fs::write(
@@ -1106,7 +1001,6 @@ mod tests {
             err.contains("list of targets") && err.contains("RUNE_TEST_DOCTESTS"),
             "{err}"
         );
-        // Other settings are fine there.
         set_in_file(&with_targets, "build.jobs", "2").unwrap();
         let s = Settings::load_from(
             Some(with_targets.parent().unwrap()),
@@ -1121,7 +1015,6 @@ mod tests {
         None
     }
 
-    /// A global path that never exists, keeping tests hermetic.
     fn no_global() -> PathBuf {
         PathBuf::from("/nonexistent/rune/config.toml")
     }
@@ -1197,12 +1090,10 @@ mod tests {
         )
         .unwrap();
 
-        // Global alone.
         let s = Settings::load_from(None, &global, &no_env).unwrap();
         assert!(!s.release_rebuild_all());
         assert_eq!(s.jobs(), Some(3));
 
-        // Project beats global for the key it sets, global still supplies the rest.
         let s = Settings::load_from(Some(&proj), &global, &no_env).unwrap();
         assert!(s.release_rebuild_all());
         assert_eq!(s.jobs(), Some(3));

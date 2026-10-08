@@ -1,16 +1,8 @@
-//! End-to-end tests: run the real `rune` binary against throwaway projects.
-//!
-//! Every project gets its own `RUNE_HOME`, so tests never touch the developer's
-//! CAS, registry cache, or global settings, and use only path dependencies, so
-//! they need no network.
+//! End-to-end tests of the real `rune` binary on throwaway projects, each with its own `RUNE_HOME`.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-/// The `rune` under test, with nothing from the environment it runs in that
-/// would change what it does: flags, another compiler, a target directory
-/// (`CARGO_TARGET_DIR` set in a shell or by CI moved every test's outputs),
-/// or `RUNE_*` settings.
 fn rune_command() -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_rune"));
     for (key, _) in std::env::vars_os() {
@@ -35,14 +27,9 @@ fn rune_command() -> Command {
 
 struct Project {
     dir: tempfile::TempDir,
-    /// Outside the project: files in a package directory are build inputs.
     home_dir: tempfile::TempDir,
 }
 
-/// What `rune` learned about the compiler (`rustc -vV`, the sysroot, the
-/// host's cfg), asked once for the whole suite: every project starts with a
-/// fresh `RUNE_HOME`, and asking again in each cost a few compiler starts per
-/// test.
 fn compiler_probes() -> Option<&'static [u8]> {
     static PROBES: std::sync::OnceLock<Option<Vec<u8>>> = std::sync::OnceLock::new();
     PROBES
@@ -114,7 +101,6 @@ impl Project {
         self.rune_in(self.path(), args)
     }
 
-    /// Runs and asserts success, returning combined stdout+stderr.
     fn ok(&self, args: &[&str]) -> String {
         let out = self.rune(args);
         let text = text(&out);
@@ -127,13 +113,10 @@ impl Project {
     }
 }
 
-/// A relative path with this platform's separators, as the compiler names
-/// the files it was handed (`app/src/main.rs`, `app\src\main.rs`).
 fn native(path: &str) -> String {
     path.replace('/', std::path::MAIN_SEPARATOR_STR)
 }
 
-/// A program's file name on this platform (`demo`, `demo.exe`).
 fn exe(name: &str) -> String {
     format!("{name}{}", std::env::consts::EXE_SUFFIX)
 }
@@ -211,7 +194,6 @@ fn second_build_is_fully_cached_and_edits_recompile_only_what_changed() {
     );
     assert!(p.ok(&["build"]).contains("1 compiled"));
 
-    // Reverting restores the earlier artifact from the CAS instead of compiling.
     p.write("src/lib.rs", "pub fn add(a: u32, b: u32) -> u32 { a + b }\n\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn adds() { assert_eq!(super::add(1, 2), 3); }\n}\n");
     assert!(p.ok(&["build"]).contains("0 compiled · 1 cached"));
 }
@@ -240,8 +222,6 @@ fn only_files_a_crate_read_rebuild_it() {
     let out = p.ok(&["build"]);
     assert!(out.contains("2 compiled"), "{out}");
 
-    // Files no crate read — notes, a log, an integration test, the README —
-    // compile nothing, as with Cargo.
     p.write("base/NOTES.md", "notes");
     p.write("base/build.log", "log");
     p.write("base/tests/it.rs", "#[test]\nfn t() {}\n");
@@ -249,7 +229,6 @@ fn only_files_a_crate_read_rebuild_it() {
     let out = p.ok(&["build"]);
     assert!(out.contains("0 compiled · 2 cached"), "{out}");
 
-    // What it read, in its package or beside it, does (and its dependents).
     p.write("base/data.txt", "two");
     assert!(p.ok(&["build"]).contains("2 compiled"));
     p.write("shared.txt", "s2");
@@ -258,7 +237,6 @@ fn only_files_a_crate_read_rebuild_it() {
     assert!(p.ok(&["build"]).contains("2 compiled"));
     assert!(p.ok(&["build"]).contains("0 compiled · 2 cached"));
 
-    // A fresh checkout finds everything again by the files it read.
     std::fs::remove_dir_all(p.path().join(".rune")).unwrap();
     let out = p.ok(&["build"]);
     assert!(out.contains("0 compiled · 2 cached"), "{out}");
@@ -273,8 +251,6 @@ fn binaries_compile_in_deps_and_only_their_names_appear_in_the_profile_dir() {
     let debug = p.path().join(".rune/target/debug");
     let run = Command::new(debug.join(exe("demo"))).output().unwrap();
     assert_eq!(String::from_utf8_lossy(&run.stdout), "hi\n");
-    // The hash-named binary and anything the compiler leaves beside it
-    // (object files under `split-debuginfo=unpacked` on macOS) stay in `deps/`.
     let files: Vec<String> = std::fs::read_dir(&debug)
         .unwrap()
         .flatten()
@@ -282,7 +258,6 @@ fn binaries_compile_in_deps_and_only_their_names_appear_in_the_profile_dir() {
         .map(|e| e.file_name().to_string_lossy().into_owned())
         .collect();
     assert_eq!(files, [exe("demo")], "{files:?}");
-    // Tools reading `--message-format json` get that name too, as from Cargo.
     let json = p.ok(&["build", "--message-format", "json"]);
     let exe = json
         .lines()
@@ -293,14 +268,11 @@ fn binaries_compile_in_deps_and_only_their_names_appear_in_the_profile_dir() {
         Path::new(&exe).ends_with(Path::new(".rune/target/debug").join(self::exe("demo"))),
         "{exe}"
     );
-    // Restored from the store, the name comes back too.
     std::fs::remove_dir_all(p.path().join(".rune/target")).unwrap();
     assert!(p.ok(&["build"]).contains("0 compiled"));
     assert!(debug.join(self::exe("demo")).is_file());
 }
 
-/// A `-sys`-style crate whose build script builds a *dynamic* C library with
-/// the system compiler, as `pkg-config`/`cmake`-driven crates end up doing.
 #[cfg(unix)]
 fn native_dylib_workspace() -> Project {
     let p = Project::new();
@@ -358,14 +330,11 @@ fn native_dylib_workspace() -> Project {
 #[cfg(unix)]
 #[test]
 fn native_libraries_of_dependencies_link_and_load_two_levels_up() {
-    // The library directory is known only to `natsys`'s build script; the
-    // link that needs it happens in `app`, and so does loading it.
     let p = native_dylib_workspace();
     let out = p.ok(&["run", "-p", "app"]);
     assert!(out.contains("native says 84"), "{out}");
     let out = p.ok(&["test", "-p", "app"]);
     assert!(out.contains("1 passed"), "{out}");
-    // Restored from the store, the directories are known again.
     std::fs::remove_dir_all(p.path().join(".rune/target")).unwrap();
     let out = p.ok(&["run", "-p", "app"]);
     assert!(
@@ -453,11 +422,9 @@ fn config_aliases_and_external_subcommands_work_like_cargos() {
         ".cargo/config.toml",
         "[alias]\ngreet = \"run -q --\"\nloud = [\"greet\", \"LOUD\"]\n",
     );
-    // An alias, and an alias of an alias, with arguments passed through.
     assert!(p.ok(&["greet", "hi"]).contains("args: [\"hi\"]"));
     assert!(p.ok(&["loud", "x"]).contains("args: [\"LOUD\", \"x\"]"));
 
-    // A `cargo-<name>` program on PATH is a subcommand, told where cargo is.
     let bin = tempfile::tempdir().unwrap();
     let plugin = bin.path().join("cargo-hello");
     std::fs::write(
@@ -483,7 +450,6 @@ fn config_aliases_and_external_subcommands_work_like_cargos() {
     assert!(out.contains("plugin got: hello --flag x"), "{out}");
     assert!(out.contains("CARGO is set"), "{out}");
 
-    // Anything else is still an error.
     let out = p.rune(&["definitely-not-a-command"]);
     assert!(!out.status.success());
 }
@@ -502,13 +468,11 @@ fn release_rebuild_all_is_off_by_default_and_controlled_by_config() {
     let p = lib_project();
     p.ok(&["build", "--release"]);
 
-    // Default: a release build restores from the CAS like any other.
     p.ok(&["clean"]);
     let out = p.ok(&["build", "--release"]);
     assert!(out.contains("0 compiled · 1 cached"), "{out}");
     assert!(!out.contains("rebuilt all"), "{out}");
 
-    // Enable for this project: everything recompiles, even though it is cached.
     p.ok(&["config", "set", "build.release-rebuild-all", "true"]);
     assert!(p.read("Rune.toml").contains("release-rebuild-all = true"));
     p.ok(&["clean"]);
@@ -516,12 +480,10 @@ fn release_rebuild_all_is_off_by_default_and_controlled_by_config() {
     assert!(out.contains("1 compiled · 0 cached"), "{out}");
     assert!(out.contains("rebuilt all"), "{out}");
 
-    // Dev builds are unaffected by the setting.
     p.ok(&["build"]);
     p.ok(&["clean"]);
     assert!(p.ok(&["build"]).contains("0 compiled · 1 cached"));
 
-    // A flag overrides the setting for one run, both ways.
     p.ok(&["clean"]);
     assert!(
         p.ok(&["build", "--release", "--rebuild-all=false"])
@@ -554,7 +516,6 @@ fn global_config_applies_to_every_project_and_project_overrides_it() {
     p.ok(&["clean"]);
     assert!(p.ok(&["build", "--release"]).contains("rebuilt all"));
 
-    // The project file wins over the global one.
     p.ok(&[
         "config",
         "set",
@@ -612,7 +573,6 @@ fn default_features_apply_to_local_crates_and_flags_change_them() {
     );
     p.ok(&["test"]);
 
-    // `--no-default-features` turns `on` off, so the same test must now fail.
     let out = p.rune(&["test", "--no-default-features"]);
     assert!(!out.status.success(), "{}", text(&out));
 
@@ -686,13 +646,10 @@ fn check_after_build_reuses_the_build_and_still_checks_edits() {
     p.write("app/src/main.rs", main);
 
     p.ok(&["build"]);
-    // Nothing to do: every unit's fully built result stands in for its check,
-    // and the build's warnings are replayed.
     let out = p.ok(&["check"]);
     assert!(out.contains("0 compiled"), "{out}");
     assert!(out.contains("unused"), "{out}");
 
-    // An edit is checked for real, against the reused `.rmeta`s below it.
     p.write("mid/src/lib.rs", "pub fn m() -> u32 { base::N * 3 }\n");
     let out = p.ok(&["check"]);
     assert!(out.contains("2 compiled"), "{out}");
@@ -701,7 +658,6 @@ fn check_after_build_reuses_the_build_and_still_checks_edits() {
     assert!(!out.status.success(), "{}", text(&out));
     assert!(text(&out).contains("mismatched types"), "{}", text(&out));
 
-    // And back: build, then check once more.
     p.write("app/src/main.rs", main);
     p.ok(&["build"]);
     let out = p.ok(&["check"]);
@@ -713,12 +669,10 @@ fn package_selection_builds_only_what_was_asked_for() {
     let p = workspace();
     p.ok(&["build", "-p", "good"]);
 
-    // The whole workspace includes the broken member.
     assert!(!p.rune(&["build"]).status.success());
     assert!(!p.rune(&["build", "--workspace"]).status.success());
     p.ok(&["build", "--workspace", "--exclude", "bad"]);
 
-    // Running from inside a member selects just that member, like Cargo.
     let out = p.rune_in(&p.path().join("crates/good"), &["build"]);
     assert!(out.status.success(), "{}", text(&out));
 
@@ -747,11 +701,9 @@ fn failing_tests_exit_101_and_show_the_failure() {
     );
     assert!(t.contains("FAILED"), "{t}");
 
-    // A filter selects tests by name and can select none of the failures.
     let out = p.rune(&["test", "passes"]);
     assert!(out.status.success(), "{}", text(&out));
 
-    // Arguments after `--` reach the test binary.
     let out = p.rune(&["test", "--", "--list"]);
     assert!(text(&out).contains("passes: test"), "{}", text(&out));
 }
@@ -811,7 +763,6 @@ fn doctests_run_and_failures_are_reported() {
 
     p.write("src/lib.rs", "/// ```\n/// assert_eq!(demo::add(1, 1), 3);\n/// ```\npub fn add(a: u32, b: u32) -> u32 { a + b }\n");
     assert_eq!(p.rune(&["test"]).status.code(), Some(101));
-    // `--no-doc` skips them, and the setting can turn them off for good.
     p.ok(&["test", "--no-doc"]);
     p.ok(&["config", "set", "test.doctests", "false"]);
     p.ok(&["test"]);
@@ -922,7 +873,6 @@ fn new_and_init_scaffold_projects_that_build_and_test() {
     let run = p.rune_in(&p.path().join("myapp"), &["run"]);
     assert!(text(&run).contains("Hello, world!"), "{}", text(&run));
 
-    // Refuses to clobber, and validates names.
     assert!(!p.rune(&["new", "myapp"]).status.success());
     assert!(!p.rune(&["new", "fn"]).status.success());
     std::fs::create_dir_all(p.path().join("existing")).unwrap();
@@ -986,8 +936,6 @@ fn an_unreachable_git_dependency_fails_loudly_instead_of_resolving_to_the_wrong_
     );
     let out = p.rune(&["build"]);
     assert!(!out.status.success());
-    // The error names the dependency and its URL; it never quietly falls
-    // back to whatever crates.io has under the same name.
     let t = text(&out);
     assert!(
         t.contains("git dependency `serde`") && t.contains("example.invalid"),
@@ -1035,14 +983,9 @@ drop-me = { path = "drop" }
     );
     p.ok(&["build", "--offline"]);
 
-    // Removing something that isn't there is a warning, not a failure.
     let out = p.ok(&["remove", "nope", "--offline"]);
     assert!(out.contains("not found"), "{out}");
 }
-
-// ---------------------------------------------------------------------------
-// Build scripts, host/target roles, features per selection, configuration
-// ---------------------------------------------------------------------------
 
 fn host_triple() -> String {
     let out = Command::new("rustc").arg("-vV").output().unwrap();
@@ -1053,8 +996,6 @@ fn host_triple() -> String {
         .to_string()
 }
 
-/// A package with a build script, a library and a binary that all use the
-/// script's `OUT_DIR`.
 fn build_script_project() -> Project {
     let p = Project::new();
     p.write(
@@ -1130,7 +1071,6 @@ fn build_scripts_see_the_target_and_package_metadata_and_share_out_dir() {
         "os={os} authors=Ada <ada@example.com>:Bob desc=a demo pre=beta.1 debug=true profile=debug target={host}"
     );
     assert!(out.contains(&format!("lib: {expected}")), "{out}");
-    // The binary compiled against the *same* generated file and cfgs.
     assert!(out.contains(&format!("bin: {expected}")), "{out}");
     assert!(out.contains("cfg=true env=ok"), "{out}");
 }
@@ -1141,8 +1081,6 @@ fn projects_with_build_scripts_are_fully_cached_after_the_first_build() {
     p.ok(&["build"]);
     let again = p.ok(&["build"]);
     assert!(again.contains("0 compiled"), "{again}");
-    // Even with the local build directory gone, everything — build script
-    // output included — comes back from the store.
     std::fs::remove_dir_all(p.path().join(".rune/target")).unwrap();
     let restored = p.ok(&["run"]);
     assert!(restored.contains("0 compiled"), "{restored}");
@@ -1164,12 +1102,9 @@ fn cross_builds_use_a_target_directory_and_host_scripts() {
     assert!(bin.is_file(), "expected {}", bin.display());
     let run = Command::new(&bin).output().unwrap();
     let stdout = String::from_utf8_lossy(&run.stdout);
-    // `TARGET` is the requested target even though the script ran on the host.
     assert!(stdout.contains(&format!("target={host}")), "{stdout}");
 }
 
-/// `shared` is a normal dependency (no features) *and* a build-dependency
-/// (with `extra`): resolver 2 keeps the two feature sets apart.
 fn split_feature_project() -> Project {
     let p = Project::new();
     p.write(
@@ -1210,7 +1145,6 @@ fn build_dependencies_get_their_own_features_and_are_not_linked_into_the_crate()
     let p = split_feature_project();
     let out = p.ok(&["run"]);
     assert!(out.contains("build=true runtime=false"), "{out}");
-    // Also as a cross build: the build script's `shared` is a host unit.
     let host = host_triple();
     let out = p.ok(&["build", "--target", &host]);
     assert!(out.contains("compiled"), "{out}");
@@ -1229,9 +1163,6 @@ fn build_dependencies_get_their_own_features_and_are_not_linked_into_the_crate()
         String::from_utf8_lossy(&run.stdout)
     );
 
-    // `shared` is not `--extern`ed into the build script's dependents beyond
-    // what was declared: a crate that only build-depends on something cannot
-    // use it at runtime.
     let q = Project::new();
     q.write(
         "Cargo.toml",
@@ -1300,7 +1231,6 @@ fn features_only_count_for_the_selected_packages() {
         "shared/src/lib.rs",
         "pub fn has_x() -> bool { cfg!(feature = \"x\") }\n",
     );
-    // `a` turns `x` on; `b` does not.
     p.write(
         "a/Cargo.toml",
         "[package]\nname = \"a\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[dependencies]\nshared = { path = \"../shared\", features = [\"x\"] }\n",
@@ -1318,9 +1248,7 @@ fn features_only_count_for_the_selected_packages() {
         "fn main() { println!(\"b sees x={}\", shared::has_x()); }\n",
     );
 
-    // Selecting only `b` must not inherit `a`'s request for `x`…
     assert!(p.ok(&["run", "-p", "b"]).contains("b sees x=false"));
-    // …while building both together unifies it, as Cargo does.
     p.ok(&["build", "-p", "a", "-p", "b"]);
     let b = Command::new(p.path().join(".rune/target/debug/b"))
         .output()
@@ -1350,7 +1278,6 @@ fn library_crate_types_produce_every_requested_artifact() {
         names.iter().any(|n| {
             n.starts_with(&format!("{prefix}demo-"))
                 && n.ends_with(suffix)
-                // (MSVC's import library for the DLL is not the static one.)
                 && !n.ends_with(".dll.lib")
         })
     };
@@ -1391,11 +1318,9 @@ fn package_profile_overrides_change_how_a_dependency_is_compiled() {
         );
         p
     };
-    // Debug builds check overflow: 255 + 1 panics…
     let strict = make("");
     let out = strict.rune(&["run"]);
     assert!(!out.status.success(), "{}", text(&out));
-    // …unless the override switches the check off for that package only.
     let loose = make("[profile.dev.package.helper]\noverflow-checks = false\n");
     assert!(loose.ok(&["run"]).contains("sum=0"));
 }
@@ -1405,8 +1330,6 @@ fn package_profile_overrides_change_how_a_dependency_is_compiled() {
 fn rustc_wrappers_are_used_and_never_share_artifacts_with_unwrapped_builds() {
     use std::os::unix::fs::PermissionsExt;
     let p = lib_project();
-    // Outside the project: files in a package directory are build inputs, so
-    // a log growing inside it would (correctly) invalidate every build.
     let scratch = tempfile::tempdir().unwrap();
     let log = scratch.path().join("wrapper.log");
     let script = scratch.path().join("wrap.sh");
@@ -1434,8 +1357,6 @@ fn rustc_wrappers_are_used_and_never_share_artifacts_with_unwrapped_builds() {
         assert!(out.status.success(), "{}", text(&out));
         text(&out)
     };
-    // The wrapper changes the compilation, so the plain build's artifact is
-    // not reused: it compiles again, through the wrapper.
     let wrapped = run(&p);
     assert!(
         wrapped.contains("1 compiled"),
@@ -1443,7 +1364,6 @@ fn rustc_wrappers_are_used_and_never_share_artifacts_with_unwrapped_builds() {
     );
     assert!(log.exists(), "the wrapper was never invoked");
     let calls = std::fs::read_to_string(&log).unwrap().lines().count();
-    // Same wrapper again: now it *is* cached, and the wrapper is left alone.
     let again = run(&p);
     assert!(
         again.contains("0 compiled") && again.contains("1 cached"),
@@ -1474,7 +1394,6 @@ fn cargo_config_env_rustflags_and_target_tables_apply() {
         "fn main() {\n    println!(\"{} build={} target={}\", env!(\"GREETING\"), cfg!(from_build_flags), cfg!(from_target_flags));\n}\n",
     );
     let out = p.ok(&["run"]);
-    // `[target.<triple>].rustflags` wins over `[build].rustflags`, as in Cargo.
     assert!(
         out.contains("hello from config build=false target=true"),
         "{out}"
@@ -1546,10 +1465,6 @@ fn a_failing_build_script_shows_its_stderr_and_error_directive() {
     assert!(t.contains("configuration is wrong"), "{t}");
 }
 
-// ---------------------------------------------------------------------------
-// Git dependencies (against local repositories: no network)
-// ---------------------------------------------------------------------------
-
 fn git(dir: &Path, args: &[&str]) -> String {
     let out = Command::new("git")
         .args(args)
@@ -1574,7 +1489,6 @@ fn git(dir: &Path, args: &[&str]) -> String {
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
-/// A repository whose one package prints its version constant.
 fn upstream(version_text: &str) -> tempfile::TempDir {
     let repo = tempfile::tempdir().unwrap();
     let d = repo.path();
@@ -1633,23 +1547,19 @@ fn git_dependencies_build_lock_the_exact_commit_and_move_only_on_update() {
 
     assert!(p.ok(&["run"]).contains("gitdep says v1"));
 
-    // The lockfile records the resolved commit, not just a branch.
     let lock = p.read("Cargo.lock");
     assert!(
         lock.contains(&format!("git+{}#{first}", url(repo.path()))),
         "{lock}"
     );
 
-    // A second build is fully cached: nothing is recompiled or refetched.
     let again = p.ok(&["build"]);
     assert!(again.contains("0 compiled"), "{again}");
 
-    // The upstream moves on; a plain build stays on the locked commit…
     let second = commit_version(repo.path(), "v2", "second");
     assert_ne!(first, second);
     assert!(p.ok(&["run"]).contains("gitdep says v1"));
 
-    // …until the user asks to update.
     p.ok(&["update"]);
     let run = p.ok(&["run"]);
     assert!(run.contains("gitdep says v2"), "{run}");
@@ -1681,7 +1591,6 @@ fn git_dependencies_can_be_pinned_by_tag_branch_and_rev_and_the_key_follows_the_
     let by_rev = git_app(&format!("{{ git = {u:?}, rev = {first:?} }}"));
     assert!(by_rev.ok(&["run"]).contains("gitdep says v1"));
 
-    // A missing reference is a clear error, not a fallback to something else.
     let missing = git_app(&format!("{{ git = {u:?}, branch = \"nope\" }}"));
     let out = missing.rune(&["build"]);
     assert!(!out.status.success());
@@ -1690,8 +1599,6 @@ fn git_dependencies_can_be_pinned_by_tag_branch_and_rev_and_the_key_follows_the_
 
 #[test]
 fn git_repositories_with_their_own_workspace_inherit_from_it() {
-    // A repo that is a workspace: members use `version.workspace = true`,
-    // `[workspace.dependencies]` and depend on each other by path.
     let repo = tempfile::tempdir().unwrap();
     let d = repo.path();
     git(d, &["init", "--quiet", "--initial-branch=main"]);
@@ -1737,7 +1644,6 @@ fn git_repositories_with_their_own_workspace_inherit_from_it() {
     );
     let out = p.ok(&["run"]);
     assert!(out.contains("answer=42"), "{out}");
-    // The version came from the repository's `[workspace.package]`.
     assert!(
         p.read("Cargo.lock")
             .contains("name = \"wrapper\"\nversion = \"2.5.0\"")
@@ -1780,7 +1686,6 @@ fn git_submodules_are_checked_out_and_part_of_the_source() {
         .current_dir(p.path())
         .env("RUNE_HOME", p.home())
         .env("NO_COLOR", "1")
-        // Let git's submodule clone read a local (file://) repository.
         .env("GIT_CONFIG_COUNT", "1")
         .env("GIT_CONFIG_KEY_0", "protocol.file.allow")
         .env("GIT_CONFIG_VALUE_0", "always")
@@ -1794,12 +1699,6 @@ fn git_submodules_are_checked_out_and_part_of_the_source() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// [patch], [replace]
-// ---------------------------------------------------------------------------
-
-/// `app` depends on `foo` directly and through `mid`; `foo` is a registry
-/// requirement that a patch redirects to a local fork.
 fn patch_project(patch_section: &str) -> Project {
     let p = Project::new();
     p.write(
@@ -1838,13 +1737,11 @@ fn patches_replace_a_dependency_for_every_dependent() {
     );
     let out = p.ok(&["run"]);
     assert!(out.contains("direct=the fork via_mid=the fork"), "{out}");
-    // A patch that matches nothing is reported; the one in use is not.
     assert!(
         out.contains("patch `nobody-uses-this`") && out.contains("was not used"),
         "{out}"
     );
     assert!(!out.contains("patch `foo`"), "{out}");
-    // One `foo`, the fork: a local package in the lockfile, at its own version.
     let lock = p.read("Cargo.lock");
     assert!(
         lock.contains("name = \"foo\"\nversion = \"1.5.0\"\n"),
@@ -1852,7 +1749,6 @@ fn patches_replace_a_dependency_for_every_dependent() {
     );
     assert!(!lock.contains("crates.io-index"), "{lock}");
 
-    // Editing the fork rebuilds what depends on it (its key changed).
     p.write(
         "foo-fork/src/lib.rs",
         "pub fn says() -> &'static str { \"the edited fork\" }\n",
@@ -1866,7 +1762,6 @@ fn patches_replace_a_dependency_for_every_dependent() {
 
 #[test]
 fn replace_and_configuration_patches_work_too() {
-    // The deprecated `[replace]`, for one exact version.
     let p = patch_project("[replace]\n\"foo:1.5.0\" = { path = \"foo-fork\" }\n");
     p.write(
         "Cargo.toml",
@@ -1880,7 +1775,6 @@ fn replace_and_configuration_patches_work_too() {
     );
     assert!(p.ok(&["run"]).contains("direct=the fork"));
 
-    // `[patch]` from `.cargo/config.toml`, without touching the manifest.
     let q = patch_project("");
     q.write(
         ".cargo/config.toml",
@@ -1889,17 +1783,10 @@ fn replace_and_configuration_patches_work_too() {
     assert!(q.ok(&["run"]).contains("via_mid=the fork"));
 }
 
-// ---------------------------------------------------------------------------
-// Alternative registries and source replacement (local, no network)
-// ---------------------------------------------------------------------------
-
-/// Packs `name-version/` into a `.crate` and returns its bytes and SHA-256.
 fn make_crate(name: &str, version: &str, lib_rs: &str) -> (Vec<u8>, String) {
     make_crate_with(name, version, &[("src/lib.rs", lib_rs)])
 }
 
-/// Like [`make_crate`], with any files (paths relative to the package; a
-/// `Cargo.toml` among them replaces the minimal one).
 fn make_crate_with(name: &str, version: &str, files: &[(&str, &str)]) -> (Vec<u8>, String) {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().join(format!("{name}-{version}"));
@@ -1969,7 +1856,6 @@ fn a_local_registry_replaces_crates_io_but_the_lockfile_keeps_the_identity() {
     let out = p.ok(&["run"]);
     assert!(out.contains("foo says hello from the registry"), "{out}");
     let lock = p.read("Cargo.lock");
-    // The package is still a crates.io package, verified by its checksum.
     assert!(
         lock.contains("registry+https://github.com/rust-lang/crates.io-index"),
         "{lock}"
@@ -1977,10 +1863,8 @@ fn a_local_registry_replaces_crates_io_but_the_lockfile_keeps_the_identity() {
     assert!(lock.contains(&format!("checksum = \"{sum}\"")), "{lock}");
 }
 
-/// `(name, version, [(dependency, requirement)])`.
 type RegistryCrate<'a> = (&'a str, &'a str, &'a [(&'a str, &'a str)]);
 
-/// A local registry holding these crates.
 fn local_registry(crates: &[RegistryCrate]) -> tempfile::TempDir {
     let reg = tempfile::tempdir().unwrap();
     let mut index: std::collections::BTreeMap<String, String> = Default::default();
@@ -2002,7 +1886,6 @@ fn local_registry(crates: &[RegistryCrate]) -> tempfile::TempDir {
     reg
 }
 
-/// Writes a local registry's index: each crate's lines where Cargo puts them.
 fn write_index(reg: &Path, index: &std::collections::BTreeMap<String, String>) {
     for (name, lines) in index {
         let dir = match name.len() {
@@ -2016,7 +1899,6 @@ fn write_index(reg: &Path, index: &std::collections::BTreeMap<String, String>) {
     }
 }
 
-/// One dependency of a registry index entry.
 fn index_dep(alias: &str, package: Option<&str>, req: &str, optional: bool) -> String {
     let package = package.map_or(String::new(), |p| format!("\"package\":\"{p}\","));
     format!(
@@ -2026,16 +1908,6 @@ fn index_dep(alias: &str, package: Option<&str>, req: &str, optional: bool) -> S
 
 #[test]
 fn an_optional_dependency_nothing_switches_on_may_be_missing_from_the_lockfile() {
-    // Resolving versions, Rune over-approximates which optional dependencies
-    // are on; its lockfile then leaves out what no feature switches on, as
-    // Cargo's does. A build must not take that for a lockfile missing a
-    // dependency. jolter has both shapes:
-    //
-    // * `hb` 1 and 2 each switch their optional `fh` on by default; `im`
-    //   uses `hb` 2 without its defaults (`indexmap` → `hashbrown` 0.17, which
-    //   leaves out `foldhash` 0.2, while `hashbrown` 0.15 has `foldhash` 0.1);
-    // * `cb` has two optional dependencies on `by`, the 1.x one switched on,
-    //   the renamed 0.5 one not (`combine` → `bytes`, `bytes_05`).
     let reg = tempfile::tempdir().unwrap();
     let mut index: std::collections::BTreeMap<String, String> = Default::default();
     let mut publish = |name: &str, version: &str, extra: &str, deps: &str, features: &str, lib| {
@@ -2113,7 +1985,6 @@ fn an_optional_dependency_nothing_switches_on_may_be_missing_from_the_lockfile()
             "im 1.0.0"
         ]
     );
-    // From the lockfile it wrote, too.
     let again = p.ok(&["build"]);
     assert!(again.contains("0 compiled"), "{again}");
     assert!(
@@ -2122,7 +1993,6 @@ fn an_optional_dependency_nothing_switches_on_may_be_missing_from_the_lockfile()
     );
 }
 
-/// An app depending on `deps` from `reg` (replacing crates.io).
 fn app_with(reg: &tempfile::TempDir, deps: &str) -> Project {
     let p = Project::new();
     p.write(
@@ -2140,7 +2010,6 @@ fn app_with(reg: &tempfile::TempDir, deps: &str) -> Project {
     p
 }
 
-/// `name version` of every package in `Cargo.lock`.
 fn locked(p: &Project) -> Vec<String> {
     let lock: toml::Table = p.read("Cargo.lock").parse().unwrap();
     let mut out: Vec<String> = lock["package"]
@@ -2161,8 +2030,6 @@ fn locked(p: &Project) -> Vec<String> {
 
 #[test]
 fn one_version_per_compatible_range_like_cargo() {
-    // The first requirement alone would take `a 1.1.0`; `b` needs exactly
-    // `1.0.0`, and one `1.x` is all Cargo allows.
     let reg = local_registry(&[
         ("a", "1.0.0", &[]),
         ("a", "1.1.0", &[]),
@@ -2175,7 +2042,6 @@ fn one_version_per_compatible_range_like_cargo() {
 
 #[test]
 fn resolution_backtracks_to_an_older_release_that_fits() {
-    // The newest `b` needs an `a` the app's pin rules out; an older `b` fits.
     let reg = local_registry(&[
         ("a", "1.0.0", &[]),
         ("a", "1.1.0", &[]),
@@ -2189,8 +2055,6 @@ fn resolution_backtracks_to_an_older_release_that_fits() {
 
 #[test]
 fn resolution_backtracks_several_crates_when_one_is_not_enough() {
-    // Both newest `b` and newest `c` need an `a` the app's pin rules out:
-    // no single requirement is the odd one out, both must move back.
     let reg = local_registry(&[
         ("a", "1.0.0", &[]),
         ("a", "1.1.0", &[]),
@@ -2215,18 +2079,15 @@ fn update_precise_and_dry_run_move_one_package_like_cargo() {
     p.ok(&["build"]);
     assert_eq!(locked(&p), ["app 0.1.0", "foo 1.2.0"]);
 
-    // A dry run reports and changes nothing.
     let out = p.ok(&["update", "-p", "foo", "--precise", "1.0.0", "--dry-run"]);
     assert!(out.contains("foo v1.2.0 -> v1.0.0"), "{out}");
     assert_eq!(locked(&p), ["app 0.1.0", "foo 1.2.0"]);
 
     p.ok(&["update", "-p", "foo", "--precise", "1.0.0"]);
     assert_eq!(locked(&p), ["app 0.1.0", "foo 1.0.0"]);
-    // …and the build uses it without resolving again.
     assert!(p.ok(&["build"]).contains("compiled"));
     assert_eq!(locked(&p), ["app 0.1.0", "foo 1.0.0"]);
 
-    // A version the requirements rule out is an error, and changes nothing.
     let out = p.rune(&["update", "foo", "--precise", "2.0.0"]);
     assert!(!out.status.success());
     assert!(
@@ -2236,7 +2097,6 @@ fn update_precise_and_dry_run_move_one_package_like_cargo() {
     );
     assert_eq!(locked(&p), ["app 0.1.0", "foo 1.0.0"]);
 
-    // Updating it normally goes back to the newest.
     p.ok(&["update", "foo"]);
     assert_eq!(locked(&p), ["app 0.1.0", "foo 1.2.0"]);
 }
@@ -2244,8 +2104,6 @@ fn update_precise_and_dry_run_move_one_package_like_cargo() {
 #[test]
 fn add_lists_the_features_it_turns_on_like_cargo() {
     let reg = local_registry(&[("foo", "1.0.0", &[])]);
-    // Features, two optional dependencies (one hidden behind `dep:`), and
-    // what the index says about the release.
     let optional = |name: &str| {
         format!(
             "{{\"name\":\"{name}\",\"req\":\"1\",\"features\":[],\"optional\":true,\"default_features\":true,\"target\":null,\"kind\":\"normal\"}}"
@@ -2283,7 +2141,6 @@ fn add_lists_the_features_it_turns_on_like_cargo() {
 fn add_supports_renames_platforms_workspace_deps_and_replaced_sources() {
     let reg = local_registry(&[("foo", "1.0.0", &[]), ("foo", "1.4.2", &[])]);
     let p = app_with(&reg, "");
-    // The index comes from the replaced source, not crates.io.
     p.ok(&["add", "foo", "--rename", "bar", "--target", "cfg(unix)"]);
     let manifest = p.read("Cargo.toml");
     assert!(
@@ -2291,12 +2148,10 @@ fn add_supports_renames_platforms_workspace_deps_and_replaced_sources() {
             && manifest.contains("bar = { version = \"1.4.2\", package = \"foo\" }"),
         "{manifest}"
     );
-    // `--dry-run` changes nothing.
     let out = p.ok(&["add", "foo@1.0", "--dev", "--dry-run"]);
     assert!(out.contains("would add"), "{out}");
     assert_eq!(p.read("Cargo.toml"), manifest);
 
-    // In a workspace that declares it, a member inherits it.
     let w = Project::new();
     w.write(
         "Cargo.toml",
@@ -2327,7 +2182,6 @@ fn clippy_lints_members_while_build_scripts_see_the_real_rustc() {
     }
     let p = Project::new();
     p.write("Cargo.toml", LIB_MANIFEST);
-    // What libc's and serde's build scripts do.
     p.write(
         "build.rs",
         r#"fn main() {
@@ -2342,13 +2196,11 @@ fn clippy_lints_members_while_build_scripts_see_the_real_rustc() {
         "src/main.rs",
         "fn five() -> i32 { return 5; }\nfn main() { println!(\"{}\", five()); }\n",
     );
-    // A warn-level lint: reported, but not fatal…
     let out = p.ok(&["clippy"]);
     assert!(
         out.contains("needless_return") || out.contains("unneeded `return`"),
         "{out}"
     );
-    // …until `-D warnings` says so.
     let out = p.rune(&["clippy", "--", "-D", "warnings"]);
     assert!(!out.status.success(), "{}", text(&out));
 }
@@ -2376,9 +2228,6 @@ fn trim_paths_keeps_this_machines_paths_out_of_the_binary() {
         );
     }
 
-    // Without it, the workspace's own paths are still relative to its root,
-    // as with Cargo (it compiles them from there), so panics name
-    // `src/main.rs` either way.
     p.write("Cargo.toml", LIB_MANIFEST);
     p.ok(&["build", "--release"]);
     let run = Command::new(&exe).output().unwrap();
@@ -2405,12 +2254,10 @@ fn compiler_messages_name_workspace_files_relative_to_the_root() {
     assert!(text.contains(&native("--> app/src/main.rs:1:26")), "{text}");
     let root = rune_common::fsutil::canonicalize(p.path()).unwrap();
     assert!(!text.contains(root.to_str().unwrap()), "{text}");
-    // One verdict, after the compiler's message.
     let verdict = text.find("could not compile app v0.1.0").expect(&text);
     assert!(verdict > text.find("mismatched types").unwrap(), "{text}");
     assert_eq!(text.matches("could not compile").count(), 1, "{text}");
 
-    // `rune fix` finds the files through those relative paths.
     p.write(
         "app/src/main.rs",
         "#![warn(unused_parens)]\nfn main() { let x = (1); let _ = x; }\n",
@@ -2443,7 +2290,6 @@ fn explain_says_what_changed_since_the_last_build() {
     p.ok(&["build"]);
     assert!(p.ok(&["explain"]).contains("nothing would be compiled"));
 
-    // A file edited and one added: named, and the dependent follows.
     p.write("core/src/lib.rs", "pub fn f() -> u8 { 2 }\n");
     p.write("core/src/extra.rs", "\n");
     let out = p.ok(&["explain"]);
@@ -2454,7 +2300,6 @@ fn explain_says_what_changed_since_the_last_build() {
     assert!(out.contains("a dependency changed: core"), "{out}");
     assert!(out.contains("2 of 2 units would be compiled"), "{out}");
 
-    // After building, it is all in the store again.
     p.ok(&["build"]);
     assert!(p.ok(&["explain"]).contains("nothing would be compiled"));
 }
@@ -2464,7 +2309,6 @@ fn fmt_check_after_the_separator_works_as_in_ci() {
     let p = Project::new();
     p.write("Cargo.toml", LIB_MANIFEST);
     p.write("src/main.rs", "fn main(){let x=1;println!(\"{}\",x);}\n");
-    // `cargo fmt --all -- --check`, the usual CI step.
     let out = p.rune(&["fmt", "--all", "--", "--check"]);
     assert!(!out.status.success(), "{}", text(&out));
     assert!(
@@ -2490,7 +2334,6 @@ fn install_from_a_registry_lists_upgrades_and_uninstalls_like_cargo() {
     std::fs::create_dir_all(reg.path().join("index/to/ol")).unwrap();
     std::fs::write(reg.path().join("index/to/ol/tool"), index).unwrap();
 
-    // No project: the configuration of the working directory applies.
     let p = Project::new();
     p.write(
         ".cargo/config.toml",
@@ -2510,7 +2353,6 @@ fn install_from_a_registry_lists_upgrades_and_uninstalls_like_cargo() {
     assert_eq!(run_tool(), "tool 1.0.0");
     let list = p.ok(&["install", "--list", "--root", root_arg]);
     assert!(list.contains("tool v1.0.0:\n    tool"), "{list}");
-    // Cargo's tracking file, so `cargo install --list` agrees.
     let tracking = std::fs::read_to_string(root.join(".crates.toml")).unwrap();
     assert!(
         tracking.contains(
@@ -2520,7 +2362,6 @@ fn install_from_a_registry_lists_upgrades_and_uninstalls_like_cargo() {
     );
     assert!(root.join(".crates2.json").is_file());
 
-    // The same version again is a no-op; a newer one replaces it.
     let again = p.ok(&["install", "tool@1.0.0", "--root", root_arg]);
     assert!(again.contains("already installed"), "{again}");
     p.ok(&["install", "tool", "--root", root_arg]);
@@ -2536,7 +2377,6 @@ fn install_from_a_registry_lists_upgrades_and_uninstalls_like_cargo() {
     let out = p.rune(&["uninstall", "tool", "--root", root_arg]);
     assert!(!out.status.success());
     assert!(text(&out).contains("not installed"), "{}", text(&out));
-    // Nothing is left behind from the scratch build.
     let scratch = p.home().join("install");
     assert!(
         !scratch.exists() || std::fs::read_dir(&scratch).unwrap().next().is_none(),
@@ -2546,8 +2386,6 @@ fn install_from_a_registry_lists_upgrades_and_uninstalls_like_cargo() {
 
 #[test]
 fn a_cargo_lock_changed_outside_rune_is_respected_not_reverted() {
-    // `git pull` / `git checkout` / `cargo update --precise` change
-    // `Cargo.lock` behind Rune's back; its binary cache must not win.
     let reg = tempfile::tempdir().unwrap();
     let mut index = String::new();
     let mut sums = Vec::new();
@@ -2573,7 +2411,6 @@ fn a_cargo_lock_changed_outside_rune_is_respected_not_reverted() {
     );
     assert!(p.ok(&["run"]).contains("foo says one-one"));
 
-    // The lockfile now pins 1.0.0, as after checking out an older commit.
     let older = p
         .read("Cargo.lock")
         .replace("version = \"1.1.0\"", "version = \"1.0.0\"")
@@ -2582,7 +2419,6 @@ fn a_cargo_lock_changed_outside_rune_is_respected_not_reverted() {
     let out = p.ok(&["run"]);
     assert!(out.contains("foo says one-oh"), "{out}");
     assert_eq!(p.read("Cargo.lock"), older);
-    // `fetch` and `tree` do not move it either.
     p.ok(&["fetch"]);
     assert!(p.ok(&["tree"]).contains("foo v1.0.0"));
     assert_eq!(p.read("Cargo.lock"), older);
@@ -2613,8 +2449,6 @@ fn vendored_directories_replace_crates_io_for_offline_builds() {
     );
 }
 
-/// A minimal sparse registry: serves `config.json`, one index file and one
-/// `.crate`, and answers 401 unless the request carries the expected token.
 fn serve_registry(token: &'static str, crate_bytes: Vec<u8>, index_line: String) -> u16 {
     use std::io::{Read, Write};
     use std::net::TcpListener;
@@ -2626,7 +2460,6 @@ fn serve_registry(token: &'static str, crate_bytes: Vec<u8>, index_line: String)
             let index_line = index_line.clone();
             std::thread::spawn(move || {
                 let mut stream = stream;
-                // Read the request head (up to the blank line).
                 let mut head = Vec::new();
                 let mut byte = [0u8; 1];
                 while !head.ends_with(b"\r\n\r\n") {
@@ -2676,15 +2509,12 @@ fn serve_registry(token: &'static str, crate_bytes: Vec<u8>, index_line: String)
     port
 }
 
-/// What the publishing mock registry holds: `(name, version)` → crate bytes,
-/// and each crate's index lines.
 #[derive(Default)]
 struct MockRegistry {
     crates: std::collections::HashMap<(String, String), Vec<u8>>,
     index: std::collections::BTreeMap<String, Vec<serde_json::Value>>,
 }
 
-/// A registry with a web API: reads are open, `/api/v1/…` writes need `token`.
 fn serve_publishing_registry(
     token: &'static str,
 ) -> (u16, std::sync::Arc<std::sync::Mutex<MockRegistry>>) {
@@ -2867,11 +2697,9 @@ fn a_locked_release_newer_than_the_cached_index_is_fetched_not_downgraded() {
         ".cargo/config.toml",
         &format!("[registries.mock]\nindex = \"sparse+http://127.0.0.1:{port}/\"\n"),
     );
-    // The index is cached here with 1.0.0 only.
     p.ok(&["build"]);
     assert!(p.read("Cargo.lock").contains("version = \"1.0.0\""));
 
-    // Another tool (`cargo update`) moved the lockfile to a newer release.
     let new_sum = add("1.0.1");
     let lock = p
         .read("Cargo.lock")
@@ -2882,8 +2710,6 @@ fn a_locked_release_newer_than_the_cached_index_is_fetched_not_downgraded() {
     let lock = p.read("Cargo.lock");
     assert!(lock.contains("version = \"1.0.1\""), "{lock}");
 
-    // Offline, a pinned release the cache does not know is an error with
-    // what to do, not a quiet downgrade.
     let new_sum = add("1.0.2");
     p.write(
         "Cargo.lock",
@@ -2940,7 +2766,6 @@ fn packages_are_published_installed_yanked_and_owned_through_a_registry_api() {
     git(&["add", "-A"]);
     git(&["commit", "-qm", "init"]);
 
-    // Credentials go to a CARGO_HOME of the test's own.
     let cargo_home = tempfile::tempdir().unwrap();
     let rune = |args: &[&str]| {
         rune_command()
@@ -2963,7 +2788,6 @@ fn packages_are_published_installed_yanked_and_owned_through_a_registry_api() {
         text(&out)
     };
 
-    // Without a token the registry refuses, with a clear message.
     let out = rune(&[
         "publish",
         "-p",
@@ -2988,7 +2812,6 @@ fn packages_are_published_installed_yanked_and_owned_through_a_registry_api() {
 
     let out = ok(&["publish", "-p", "mocklib", "--registry", "mock"]);
     assert!(out.contains("uploaded mocklib v0.3.0"), "{out}");
-    // The app depends on the library through the registry now.
     ok(&["publish", "-p", "mockapp", "--registry", "mock"]);
     {
         let st = state.lock().unwrap();
@@ -2996,7 +2819,6 @@ fn packages_are_published_installed_yanked_and_owned_through_a_registry_api() {
         assert_eq!(app["deps"][0]["name"], "mocklib");
         assert_eq!(app["deps"][0]["req"], "^0.3.0");
         assert!(app["deps"][0]["registry"].is_null(), "{app}");
-        // The uploaded manifest has no path dependency left.
         let bytes = st.crates[&("mockapp".to_string(), "0.3.0".to_string())].clone();
         let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(&bytes[..]));
         let manifest = archive
@@ -3014,7 +2836,6 @@ fn packages_are_published_installed_yanked_and_owned_through_a_registry_api() {
         assert!(manifest.contains("version = \"0.3.0\""), "{manifest}");
     }
 
-    // Anyone can install it from there.
     let root = p.path().join("bin-root");
     ok(&[
         "install",
@@ -3055,8 +2876,6 @@ fn registry_tokens_come_from_external_credential_providers() {
         .or_default()
         .push(serde_json::json!({"name": "foo", "vers": "1.0.0", "deps": [], "cksum": "00", "features": {}, "yanked": false}));
     let p = Project::new();
-    // A provider per Cargo's credential protocol, and nothing in
-    // credentials.toml.
     p.write(
         "provider.sh",
         "#!/bin/sh\necho '{\"v\":[1]}'\nread req\necho '{\"Ok\":{\"kind\":\"get\",\"token\":\"tok-from-provider\",\"cache\":\"session\",\"operation_independent\":true}}'\n",
@@ -3088,8 +2907,6 @@ fn registry_tokens_come_from_external_credential_providers() {
 
 #[test]
 fn git_based_registry_indexes_resolve_download_and_lock_like_cargo() {
-    // The index is a git repository; the `.crate` files come from the `dl`
-    // URL its `config.json` names.
     let (port, state) = serve_publishing_registry("unused");
     let (bytes, sum) = make_crate("foo", "1.0.0", FOO_LIB);
     state
@@ -3141,7 +2958,6 @@ fn git_based_registry_indexes_resolve_download_and_lock_like_cargo() {
         "{lock}"
     );
     assert!(lock.contains(&format!("checksum = \"{sum}\"")), "{lock}");
-    // And again from the lockfile, offline.
     std::fs::remove_dir_all(p.path().join(".rune")).unwrap();
     assert!(p.ok(&["run", "--offline"]).contains("foo says"));
 }
@@ -3161,7 +2977,6 @@ fn authenticated_alternative_registries_resolve_download_and_are_part_of_the_ide
         &format!("[registries.corp]\nindex = {index:?}\n"),
     );
 
-    // Without credentials: a clear error that names the registry.
     let out = p.rune(&["build"]);
     assert!(!out.status.success());
     assert!(
@@ -3170,7 +2985,6 @@ fn authenticated_alternative_registries_resolve_download_and_are_part_of_the_ide
         text(&out)
     );
 
-    // With a token from the environment, exactly as Cargo reads it.
     let with_token = rune_command()
         .args(["run"])
         .current_dir(p.path())
@@ -3186,8 +3000,6 @@ fn authenticated_alternative_registries_resolve_download_and_are_part_of_the_ide
         text(&with_token)
     );
 
-    // The registry is recorded in the lockfile: `foo 1.0.0` from `corp` is not
-    // `foo 1.0.0` from crates.io.
     let lock = p.read("Cargo.lock");
     assert!(lock.contains(&format!("source = \"{index}\"")), "{lock}");
     assert!(!lock.contains("crates.io-index"), "{lock}");
@@ -3205,11 +3017,6 @@ fn an_undefined_registry_is_an_error_not_a_fallback_to_crates_io() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// External inputs: env!, rerun-if-*, files outside the package
-// ---------------------------------------------------------------------------
-
-/// Runs `rune run` with one extra environment variable (or none).
 fn run_with_env(p: &Project, var: &str, value: Option<&str>) -> String {
     let mut cmd = rune_command();
     cmd.args(["run"])
@@ -3238,7 +3045,6 @@ fn option_env_reads_are_part_of_the_cache_key() {
     );
     let a = run_with_env(&p, "RUNE_TEST_BUILD_TAG", Some("a"));
     assert!(a.contains("tag=a") && a.contains("1 compiled"), "{a}");
-    // A different value must not be served from the artifact built for `a`…
     let b = run_with_env(&p, "RUNE_TEST_BUILD_TAG", Some("b"));
     assert!(
         b.contains("tag=b") && b.contains("1 compiled"),
@@ -3246,7 +3052,6 @@ fn option_env_reads_are_part_of_the_cache_key() {
     );
     let unset = run_with_env(&p, "RUNE_TEST_BUILD_TAG", None);
     assert!(unset.contains("tag=none"), "{unset}");
-    // …but going back to a value seen before is a cache hit, not a rebuild.
     let a_again = run_with_env(&p, "RUNE_TEST_BUILD_TAG", Some("a"));
     assert!(
         a_again.contains("tag=a") && a_again.contains("0 compiled"),
@@ -3287,19 +3092,16 @@ fn build_script_rerun_if_env_changed_and_external_files_invalidate_the_cache() {
 
     let first = run_with_env(&p, "RUNE_TEST_SCRIPT_VAR", Some("1"));
     assert!(first.contains("seen=1/first"), "{first}");
-    // The declared environment variable changed.
     let second = run_with_env(&p, "RUNE_TEST_SCRIPT_VAR", Some("2"));
     assert!(
         second.contains("seen=2/first"),
         "stale build-script result: {second}"
     );
-    // Back to a known state: cached.
     let third = run_with_env(&p, "RUNE_TEST_SCRIPT_VAR", Some("1"));
     assert!(
         third.contains("seen=1/first") && third.contains("0 compiled"),
         "{third}"
     );
-    // The declared file outside the package changed.
     std::fs::write(&header, "second").unwrap();
     let fourth = run_with_env(&p, "RUNE_TEST_SCRIPT_VAR", Some("1"));
     assert!(
@@ -3307,10 +3109,6 @@ fn build_script_rerun_if_env_changed_and_external_files_invalidate_the_cache() {
         "stale build-script result: {fourth}"
     );
 }
-
-// ---------------------------------------------------------------------------
-// runner, rustdoc identity
-// ---------------------------------------------------------------------------
 
 #[cfg(unix)]
 #[test]
@@ -3346,13 +3144,11 @@ fn target_runners_wrap_cross_runs() {
         ),
     );
 
-    // Native runs don't use the runner…
     let out = p.ok(&["run"]);
     assert!(
         out.contains("hello from the binary") && !log.exists(),
         "{out}"
     );
-    // …cross runs (even to the same triple) do.
     let out = p.ok(&["run", "--target", &host]);
     assert!(out.contains("hello from the binary"), "{out}");
     assert!(
@@ -3391,16 +3187,10 @@ fn documentation_is_regenerated_only_when_its_identity_changes() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// The manifest is not hashed; its semantics are
-// ---------------------------------------------------------------------------
-
 #[test]
 fn editing_an_unrelated_manifest_section_does_not_rebuild_the_package() {
     let p = lib_project();
     p.ok(&["build"]);
-    // A comment, and a development dependency the library never uses: neither
-    // changes what compiling the library produces.
     p.write(
         "Cargo.toml",
         &format!("# an edit that changes nothing\n{LIB_MANIFEST}\n[dev-dependencies]\nhelper = {{ path = \"helper\" }}\n"),
@@ -3421,7 +3211,6 @@ fn editing_an_unrelated_manifest_section_does_not_rebuild_the_package() {
 fn manifest_edits_that_change_the_compilation_still_rebuild() {
     let p = lib_project();
     p.ok(&["build"]);
-    // A feature the crate's own code tests for, turned on by default.
     p.write(
         "src/lib.rs",
         "#[cfg(feature = \"extra\")]\npub fn extra() {}\npub fn add(a: u32, b: u32) -> u32 { a + b }\n",
@@ -3450,8 +3239,6 @@ fn a_crate_that_includes_its_own_manifest_notices_when_it_changes() {
         "fn main() { println!(\"manifest says: {}\", include_str!(\"../Cargo.toml\").lines().find(|l| l.starts_with(\"description\")).unwrap()); }\n",
     );
     assert!(p.ok(&["run"]).contains("description = \"first\""));
-    // The manifest is not part of the package hash, but the compiler *read*
-    // it, so it became a declared input of this unit.
     p.write(
         "Cargo.toml",
         "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\ndescription = \"second\"\n",
@@ -3465,8 +3252,6 @@ fn a_crate_that_includes_its_own_manifest_notices_when_it_changes() {
 
 #[test]
 fn a_build_script_may_not_modify_an_immutable_package_source() {
-    // A git dependency (immutable, shared by every project) whose build
-    // script scribbles in its own directory instead of `OUT_DIR`.
     let repo = upstream("v1");
     let d = repo.path();
     std::fs::write(
@@ -3491,8 +3276,6 @@ fn a_build_script_may_not_modify_an_immutable_package_source() {
     );
 }
 
-/// A chain of path crates (each with a build script) below one binary: enough
-/// units, and enough shared files, for concurrent builds to collide.
 fn chain_project(len: usize) -> Project {
     let p = Project::new();
     let members: Vec<String> = (0..len).map(|i| format!("\"c{i}\"")).collect();
@@ -3552,8 +3335,6 @@ fn chain_project(len: usize) -> Project {
 #[test]
 fn concurrent_builds_of_one_project_all_succeed_and_share_the_work() {
     let p = chain_project(8);
-    // Six processes start at once on an empty target directory and CAS: what an
-    // editor's background check and a terminal build do to each other.
     let outputs: Vec<Output> = std::thread::scope(|s| {
         let handles: Vec<_> = (0..6).map(|_| s.spawn(|| p.rune(&["build"]))).collect();
         handles.into_iter().map(|h| h.join().unwrap()).collect()
@@ -3565,7 +3346,6 @@ fn concurrent_builds_of_one_project_all_succeed_and_share_the_work() {
             text(out)
         );
     }
-    // Nothing was left half-written: the result runs, and is fully cached.
     let ran = p.ok(&["run", "-p", "app"]);
     assert!(ran.contains("value=56"), "{ran}");
     assert!(p.ok(&["build"]).contains("0 compiled"));
@@ -3615,12 +3395,8 @@ fn deps_only_builds_dependencies_and_leaves_the_workspace_alone() {
 
     let out = p.ok(&["build", "--deps-only", "--offline"]);
     assert!(out.contains("1 compiled"), "only `foo` builds: {out}");
-    // The application itself was not built…
     assert!(!p.path().join(".rune/target/debug/app").exists());
 
-    // …so a normal build has just the application left to do, and the
-    // dependency comes from what `--deps-only` produced (a container layer or
-    // CI cache keyed on Cargo.lock would hold exactly this).
     let out = p.ok(&["build", "--offline"]);
     assert!(
         out.contains("1 compiled") && out.contains("1 cached"),
@@ -3629,7 +3405,6 @@ fn deps_only_builds_dependencies_and_leaves_the_workspace_alone() {
     assert!(p.ok(&["run", "--offline"]).contains("foo says hello"));
 }
 
-/// stdout of a `--message-format json` run, parsed line by line.
 fn json_lines(out: &Output) -> Vec<serde_json::Value> {
     String::from_utf8_lossy(&out.stdout)
         .lines()
@@ -3639,7 +3414,6 @@ fn json_lines(out: &Output) -> Vec<serde_json::Value> {
 
 #[test]
 fn test_no_run_json_names_every_test_executable_like_cargo() {
-    // What `cargo nextest` (and IDEs) run to find the test binaries.
     let p = lib_project();
     p.write("tests/it.rs", "#[test] fn it() {}\n");
     let out = p.rune(&[
@@ -3692,7 +3466,6 @@ fn message_format_json_reports_diagnostics_artifacts_and_the_end_of_the_build() 
         );
         assert_eq!(lines.last().unwrap()["success"], true);
 
-        // The warning is replayed on a cache hit, in rustc's own structure.
         let msg = lines
             .iter()
             .find(|l| l["reason"] == "compiler-message")
@@ -3771,7 +3544,6 @@ fn watch_runs_again_when_a_file_changes_and_shows_the_new_result() {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    // Everything it prints, as it prints it.
     let all = Arc::new(Mutex::new(String::new()));
     let readers: Vec<_> = [
         Box::new(child.stdout.take().unwrap()) as Box<dyn Read + Send>,
@@ -3795,9 +3567,6 @@ fn watch_runs_again_when_a_file_changes_and_shows_the_new_result() {
     .collect();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
 
-    // Once the first run is over, edit: the second run must see a new
-    // warning that the first did not have. (Waiting for a fixed time instead
-    // failed on a loaded machine, where the first run took longer.)
     while !all.lock().unwrap().contains("waiting for changes") {
         assert!(
             std::time::Instant::now() < deadline,
@@ -3873,7 +3642,6 @@ fn git_in(dir: &Path, args: &[&str]) {
 
 #[test]
 fn affected_lists_the_changed_packages_and_everything_that_depends_on_them() {
-    // app -> c2 -> c1 -> c0
     let p = chain_project(3);
     git_in(p.path(), &["init", "-q", "-b", "main"]);
     git_in(p.path(), &["add", "-A"]);
@@ -3892,14 +3660,12 @@ fn affected_lists_the_changed_packages_and_everything_that_depends_on_them() {
 
     assert!(affected(&[]).is_empty(), "a clean tree affects nothing");
 
-    // An uncommitted edit in the middle of the chain.
     p.write(
         "c1/src/lib.rs",
         "include!(concat!(env!(\"OUT_DIR\"), \"/gen.rs\"));\npub fn value() -> u32 { 1 + GEN }\n",
     );
     assert_eq!(affected(&[]), ["app", "c1", "c2"]);
 
-    // A new, untracked file counts.
     p.write("c0/src/extra.rs", "");
     assert_eq!(affected(&[]), ["app", "c0", "c1", "c2"]);
     assert_eq!(
@@ -3909,7 +3675,6 @@ fn affected_lists_the_changed_packages_and_everything_that_depends_on_them() {
     let json: Vec<String> = serde_json::from_str(&p.ok(&["affected", "--format", "json"])).unwrap();
     assert_eq!(json, ["app", "c0", "c1", "c2"]);
 
-    // Committed, and compared with the parent: the same set; with HEAD: nothing.
     git_in(p.path(), &["add", "-A"]);
     git_in(p.path(), &["commit", "-q", "-m", "change"]);
     assert!(affected(&[]).is_empty());
@@ -3919,7 +3684,6 @@ fn affected_lists_the_changed_packages_and_everything_that_depends_on_them() {
 #[test]
 fn scripts_run_with_clean_output_arguments_exit_codes_and_path_dependencies() {
     let p = Project::new();
-    // A dependency the script names by path, so the test needs no network.
     p.write(
         "dep/Cargo.toml",
         "[package]\nname = \"greeter\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
@@ -3946,19 +3710,15 @@ fn scripts_run_with_clean_output_arguments_exit_codes_and_path_dependencies() {
     };
     let out = run(&["a", "-b", "--c"]);
     assert!(out.status.success(), "{}", text(&out));
-    // Nothing of Rune's own on stdout: it is the script's output, verbatim.
     assert_eq!(String::from_utf8_lossy(&out.stdout), "hello, a+-b+--c\n");
 
-    // Second run: same result, and nothing is rebuilt.
     assert_eq!(
         String::from_utf8_lossy(&run(&["again"]).stdout),
         "hello, again\n"
     );
 
-    // The exit code of the script is Rune's.
     assert_eq!(run(&["fail"]).status.code(), Some(7));
 
-    // Editing the script rebuilds it.
     p.write(
         "hello.rs",
         &format!(
@@ -3991,8 +3751,6 @@ fn a_script_with_a_compile_error_reports_it_with_the_right_line_number() {
 fn cached_tests_are_skipped_until_something_that_matters_changes() {
     let p = Project::new();
     p.write("Cargo.toml", LIB_MANIFEST);
-    // The marker lives outside the package: each *execution* of the test binary
-    // appends a line, so its line count says how often it really ran.
     let marker = p.home().join("marker.txt");
     let body = |pass: bool, extra: &str| {
         format!(
@@ -4015,16 +3773,13 @@ fn cached_tests_are_skipped_until_something_that_matters_changes() {
     };
 
     p.write("src/lib.rs", &body(true, ""));
-    // Without the flag nothing is ever skipped.
     assert!(test(&[]).0);
     assert!(test(&[]).0);
     assert_eq!(runs(), 2);
 
-    // With it: the first run executes and remembers…
     let (ok, t) = test(&["--cached"]);
     assert!(ok && !t.contains("cached"), "{t}");
     assert_eq!(runs(), 3);
-    // …the next does not run the binary at all…
     let (ok, t) = test(&["--cached"]);
     assert!(ok && t.contains("cached"), "{t}");
     assert!(
@@ -4032,13 +3787,10 @@ fn cached_tests_are_skipped_until_something_that_matters_changes() {
         "the remembered counts are shown: {t}"
     );
     assert_eq!(runs(), 3, "the binary was not executed");
-    // …unless you insist,
     assert!(test(&["--cached=false"]).0);
     assert_eq!(runs(), 4);
-    // …or the arguments differ,
     assert!(test(&["--cached", "--", "--test-threads=1"]).0);
     assert_eq!(runs(), 5);
-    // …or the code changed.
     p.write("src/lib.rs", &body(true, "+ 1"));
     let (ok, t) = test(&["--cached"]);
     assert!(ok && !t.contains("cached"), "{t}");
@@ -4046,12 +3798,10 @@ fn cached_tests_are_skipped_until_something_that_matters_changes() {
     assert!(test(&["--cached"]).1.contains("cached"));
     assert_eq!(runs(), 6);
 
-    // A fixture file inside the package counts as an input.
     p.write("fixtures/data.txt", "one");
     assert!(!test(&["--cached"]).1.contains("cached"));
     assert_eq!(runs(), 7);
 
-    // Failures are never remembered: a failing test runs every time.
     p.write("src/lib.rs", &body(false, ""));
     for expected in [8, 9] {
         let (ok, t) = test(&["--cached"]);
@@ -4077,7 +3827,6 @@ fn a_shared_store_lets_another_machine_skip_what_was_already_built() {
     let shared = tempfile::tempdir().unwrap();
     let remote: &std::ffi::OsStr = shared.path().as_os_str();
 
-    // "CI": builds and publishes. Eight units, several with build scripts.
     let ci = chain_project(6);
     let out = rune_with_env(&ci, &["build"], &[("RUNE_CAS_REMOTE", remote)]);
     assert!(out.status.success(), "{}", text(&out));
@@ -4091,7 +3840,6 @@ fn a_shared_store_lets_another_machine_skip_what_was_already_built() {
         "CI published to the shared store"
     );
 
-    // A developer: another checkout, another path, empty local store, read-only remote.
     let dev = chain_project(6);
     assert_ne!(ci.path(), dev.path());
     let out = rune_with_env(
@@ -4108,17 +3856,14 @@ fn a_shared_store_lets_another_machine_skip_what_was_already_built() {
         t.contains("0 compiled"),
         "everything came from the shared store: {t}"
     );
-    // …and what was restored actually works, build-script output included.
     let ran = rune_with_env(&dev, &["run", "-p", "app"], &[]);
     assert!(text(&ran).contains("value=42"), "{}", text(&ran));
 
-    // Without the remote the same checkout would have had to compile.
     let alone = chain_project(6);
     let t = text(&rune_with_env(&alone, &["build"], &[]));
     assert!(!t.contains("0 compiled"), "{t}");
 }
 
-/// `app → mid → dep`, all in the workspace; `app` also uses `dep` directly.
 fn layered_project() -> Project {
     let p = Project::new();
     p.write(
@@ -4149,7 +3894,6 @@ fn layered_project() -> Project {
     p
 }
 
-/// Runs `rune` in `p` with the store of `home`, asserting success.
 fn ok_with_home(p: &Project, home: &Path, args: &[&str]) -> String {
     let out = rune_with_env(p, args, &[("RUNE_HOME", home.as_os_str())]);
     let t = text(&out);
@@ -4163,16 +3907,10 @@ fn ok_with_home(p: &Project, home: &Path, args: &[&str]) -> String {
 
 #[test]
 fn a_crate_compiled_against_another_build_of_its_dependency_is_never_restored_beside_it() {
-    // rustc does not always produce the same crate from the same inputs (a
-    // workspace crate's identity includes the directory it is compiled in),
-    // and it loads a crate only next to the very build of each dependency it
-    // was compiled against. Three checkouts share one store.
     let home = tempfile::tempdir().unwrap();
     let first = layered_project();
     ok_with_home(&first, home.path(), &["build"]);
 
-    // A second checkout changes `mid` and rebuilds everything: its own build
-    // of `dep` is not the stored one, and `mid` is compiled against it.
     let second = layered_project();
     second.write(
         "mid/src/lib.rs",
@@ -4180,9 +3918,6 @@ fn a_crate_compiled_against_another_build_of_its_dependency_is_never_restored_be
     );
     ok_with_home(&second, home.path(), &["build", "--rebuild-all"]);
 
-    // A third with the same change restores `dep` from the first checkout and
-    // compiles `app` against it and `mid`: had the second checkout's `mid`
-    // been stored, rustc would find no `dep` it fits ("can't find crate").
     let third = layered_project();
     third.write(
         "mid/src/lib.rs",
@@ -4197,7 +3932,6 @@ fn a_crate_compiled_against_another_build_of_its_dependency_is_never_restored_be
     assert!(run.contains("value=42"), "{run}");
 }
 
-/// The manifests of every stored build of `krate` in the store under `home`.
 fn stored_manifests(home: &Path, krate: &str) -> Vec<PathBuf> {
     walkdir::WalkDir::new(home.join("cas").join("objects"))
         .into_iter()
@@ -4215,9 +3949,6 @@ fn stored_manifests(home: &Path, krate: &str) -> Vec<PathBuf> {
 
 #[test]
 fn a_stored_crate_that_does_not_fit_its_dependencies_is_compiled_again_and_replaced() {
-    // What an older Rune, or two processes racing, may have left in a store:
-    // an entry compiled against a build of its dependency that is not the
-    // stored one.
     let home = tempfile::tempdir().unwrap();
     let first = layered_project();
     ok_with_home(&first, home.path(), &["build"]);
@@ -4236,14 +3967,11 @@ fn a_stored_crate_that_does_not_fit_its_dependencies_is_compiled_again_and_repla
         std::fs::write(path, m.to_string()).unwrap();
     }
 
-    // Another checkout restores `dep` but compiles `mid` again (and `app`,
-    // which is compiled against it), instead of failing to compile `app`.
     let second = layered_project();
     let out = ok_with_home(&second, home.path(), &["build"]);
     assert!(out.contains("2 compiled"), "{out}");
     let run = ok_with_home(&second, home.path(), &["run", "-p", "app"]);
     assert!(run.contains("value=42"), "{run}");
-    // The entry now records the build it fits, so the next checkout reuses it.
     for path in stored_manifests(home.path(), "mid") {
         let m = std::fs::read_to_string(path).unwrap();
         assert!(!m.contains("another build"), "{m}");
@@ -4253,13 +3981,8 @@ fn a_stored_crate_that_does_not_fit_its_dependencies_is_compiled_again_and_repla
     assert!(out.contains("0 compiled"), "{out}");
 }
 
-// ---------------------------------------------------------------------------
-// Rune.toml as a manifest
-// ---------------------------------------------------------------------------
-
 const RUNE_MANIFEST: &str = "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n";
 
-/// A project with a `Rune.toml` manifest and no `Cargo.toml` at all.
 fn rune_only_project() -> Project {
     let p = Project::new();
     p.write("Rune.toml", RUNE_MANIFEST);
@@ -4283,7 +4006,6 @@ fn a_project_with_only_a_rune_toml_builds_runs_and_tests() {
     let t = p.ok(&["test"]);
     assert!(t.contains("1 passed"), "{t}");
     p.ok(&["check"]);
-    // Rune never invents a Cargo.toml for a project that does not have one.
     assert!(!p.path().join("Cargo.toml").exists());
     assert!(
         p.path().join("Cargo.lock").exists(),
@@ -4301,14 +4023,12 @@ fn the_manifest_and_rune_settings_can_share_one_rune_toml() {
         ),
     );
     p.write("src/lib.rs", "pub fn f() {}\n");
-    // The settings in the manifest file are the project's settings…
     let listing = p.ok(&["config", "list", "--show-origin"]);
     assert!(
         listing.contains("build.jobs") && listing.contains("Rune.toml"),
         "{listing}"
     );
     assert_eq!(p.ok(&["config", "get", "build.jobs"]).trim(), "3");
-    // …`rune config set` writes into the same file and keeps the manifest.
     p.ok(&["config", "set", "build.jobs", "5"]);
     let text = p.read("Rune.toml");
     assert!(
@@ -4322,13 +4042,11 @@ fn the_manifest_and_rune_settings_can_share_one_rune_toml() {
 fn editing_settings_in_the_manifest_file_does_not_rebuild_but_editing_the_package_does() {
     let p = rune_only_project();
     assert!(p.ok(&["build"]).contains("1 compiled"));
-    // A setting is not part of any unit's identity…
     p.write(
         "Rune.toml",
         &format!("{RUNE_MANIFEST}\n[build]\njobs = 2\n"),
     );
     assert!(p.ok(&["build"]).contains("0 compiled"));
-    // …a manifest field that matters is.
     p.write(
         "Rune.toml",
         "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2018\"\n\n[build]\njobs = 2\n",
@@ -4367,7 +4085,6 @@ fn a_workspace_can_mix_cargo_and_rune_manifests_and_path_dependencies_can_be_run
         "lib-rune/src/lib.rs",
         "pub fn name() -> &'static str { \"rune\" }\n",
     );
-    // Not a workspace member: a plain path dependency next door.
     p.write(
         "shared/Rune.toml",
         "[package]\nname = \"shared\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
@@ -4397,7 +4114,6 @@ fn a_workspace_can_mix_cargo_and_rune_manifests_and_path_dependencies_can_be_run
             && manifests.contains(&"Cargo.toml".to_string()),
         "{manifests:?}"
     );
-    // The workspace root is found from a member directory, too.
     let out = p.rune_in(&p.path().join("lib-rune"), &["build"]);
     assert!(out.status.success(), "{}", text(&out));
 }
@@ -4437,7 +4153,6 @@ fn when_both_files_are_manifests_rune_toml_wins_and_a_settings_only_one_does_not
     );
     assert!(p.ok(&["run"]).contains("from-rune"));
 
-    // Only settings in Rune.toml: Cargo.toml stays the manifest (how it always was).
     p.write("Rune.toml", "[build]\njobs = 2\n");
     assert!(p.ok(&["run"]).contains("from-cargo"));
 }
@@ -4521,7 +4236,6 @@ fn new_and_init_can_create_a_rune_toml_project() {
     let run = p.rune_in(&dir, &["run"]);
     assert!(text(&run).contains("Hello, world!"), "{}", text(&run));
 
-    // `init` in a directory that already has a settings-only Rune.toml keeps the settings.
     let existing = p.path().join("existing");
     std::fs::create_dir_all(&existing).unwrap();
     std::fs::write(existing.join("Rune.toml"), "[build]\njobs = 7\n").unwrap();
@@ -4544,7 +4258,6 @@ fn new_and_init_can_create_a_rune_toml_project() {
     );
     assert!(p.rune_in(&existing, &["build"]).status.success());
 
-    // And it refuses to overwrite a project that already has a manifest.
     let again = p.rune_in(
         &existing,
         &["init", "--manifest", "cargo", "--no-gitignore"],
@@ -4613,17 +4326,10 @@ fn doctor_warns_when_rune_toml_shadows_a_cargo_toml() {
         p.ok(&["doctor"])
             .contains("both `Rune.toml` and `Cargo.toml` define this project")
     );
-    // A settings-only Rune.toml next to a Cargo.toml is the normal case: no warning.
     p.write("Rune.toml", "[build]\njobs = 2\n");
     assert!(!p.ok(&["doctor"]).contains("both `Rune.toml`"));
 }
 
-// ---------------------------------------------------------------------------
-// Build scripts as their own step
-// ---------------------------------------------------------------------------
-
-/// A build script that appends `<name> <event> <nanoseconds>` to the file
-/// named by `RUNE_T_STAMPS`, optionally sleeping in between.
 fn stamping_script(name: &str, sleep_ms: u64, extra: &str) -> String {
     format!(
         r#"use std::io::Write;
@@ -4658,8 +4364,6 @@ fn stamps(path: &Path) -> std::collections::HashMap<String, u128> {
 
 #[test]
 fn a_build_script_runs_while_its_packages_dependencies_are_still_compiling() {
-    // `app`'s script needs nothing from `slow` (an ordinary dependency), so it
-    // must not wait for `slow`'s script to finish.
     let p = Project::new();
     p.write(
         "Cargo.toml",
@@ -4672,9 +4376,7 @@ fn a_build_script_runs_while_its_packages_dependencies_are_still_compiling() {
         "slow/Cargo.toml",
         "[package]\nname = \"slow\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
     );
-    // `slow`'s script ends only once `app`'s has started (or after a minute,
-    // which fails the test): a fixed delay raced the compilers on a loaded
-    // machine.
+    // `slow`'s script waits for `app`'s to start: a fixed delay raced the compilers on a loaded machine.
     let slow_script = stamping_script("slow", 0, "").replace(
         "    stamp(\"start\");\n",
         "    stamp(\"start\");\n    \
@@ -4742,16 +4444,11 @@ fn check_only_type_checks_the_ordinary_dependencies_of_a_crate_with_a_build_scri
         !has("libplain-", ".rlib"),
         "an ordinary dependency was compiled to machine code by `check`: {deps:?}"
     );
-    // The build script links `helper`, so that one is really built.
     assert!(has("libhelper-", ".rlib"), "{deps:?}");
 }
 
 #[test]
 fn a_dependency_that_learns_an_outside_input_late_still_rekeys_its_dependents() {
-    // `base`'s script is slow and declares an environment variable; `app`'s
-    // script has long finished by then. `app` must still be stored under a
-    // key that includes `base`'s input: an identical second build is fully
-    // cached, and changing the variable rebuilds both.
     let p = Project::new();
     p.write(
         "Cargo.toml",
@@ -4808,11 +4505,6 @@ fn a_dependency_that_learns_an_outside_input_late_still_rekeys_its_dependents() 
     assert!(back.contains("0 compiled"), "{back}");
 }
 
-// ---------------------------------------------------------------------------
-// outdated / upgrade
-// ---------------------------------------------------------------------------
-
-/// Adds `"rust_version":"<rv>"` to one release in a local registry's index.
 fn require_rust(reg: &tempfile::TempDir, name: &str, version: &str, rv: &str) {
     let path = reg.path().join("index/1").join(name);
     let text = std::fs::read_to_string(&path).unwrap().replace(
@@ -4833,7 +4525,6 @@ fn outdated_lists_what_the_lockfile_and_the_manifest_hold_back() {
     let p = app_with(&reg, "a = \"1.0\"\nb = \"0.3\"\n");
     p.write("Cargo.lock", "");
     std::fs::remove_file(p.path().join("Cargo.lock")).unwrap();
-    // Lock the old release on purpose.
     p.ok(&["generate-lockfile"]);
     p.ok(&["update", "-p", "a", "--precise", "1.0.0"]);
 
@@ -4877,7 +4568,6 @@ fn upgrade_raises_requirements_keeping_the_manifests_formatting() {
     p.ok(&["generate-lockfile"]);
     p.ok(&["update", "-p", "a", "--precise", "1.0.0"]);
 
-    // Compatible: `a` to 1.2, `bb` stays (0.4 is a breaking release).
     let out = p.ok(&["upgrade"]);
     let manifest = p.read("Cargo.toml");
     assert!(
@@ -4894,7 +4584,6 @@ fn upgrade_raises_requirements_keeping_the_manifests_formatting() {
         locked(&p)
     );
 
-    // Incompatible, one dependency: only `bb`, table form kept.
     p.ok(&["upgrade", "--incompatible", "bb"]);
     let manifest = p.read("Cargo.toml");
     assert!(
@@ -4908,7 +4597,6 @@ fn upgrade_raises_requirements_keeping_the_manifests_formatting() {
         locked(&p)
     );
 
-    // A dry run writes nothing.
     let before = p.read("Cargo.toml");
     p.ok(&["upgrade", "--incompatible", "--dry-run"]);
     assert_eq!(p.read("Cargo.toml"), before);
@@ -4976,7 +4664,6 @@ fn upgrade_edits_workspace_dependencies_where_members_inherit_them() {
         p.read("app/Cargo.toml")
             .contains("a = { workspace = true }")
     );
-    // `-p app` only looks at the member's own manifest, which inherits.
     assert!(p.ok(&["upgrade", "-p", "app"]).contains("already allows"));
 }
 
@@ -5007,10 +4694,6 @@ fn out_dir_holds_only_what_the_script_generated_and_script_errors_are_shown() {
         "the compiler's error is shown:\n{msg}"
     );
 }
-
-// ---------------------------------------------------------------------------
-// unused
-// ---------------------------------------------------------------------------
 
 #[test]
 fn unused_dependencies_are_found_by_asking_the_compiler() {
@@ -5111,10 +4794,6 @@ fn a_dependency_used_only_under_another_cfg_is_reported_but_never_removed() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// sbom
-// ---------------------------------------------------------------------------
-
 #[test]
 fn sbom_lists_what_ships_with_checksums_purls_and_edges() {
     let reg = local_registry(&[
@@ -5174,7 +4853,6 @@ fn sbom_lists_what_ships_with_checksums_purls_and_edges() {
         .unwrap();
     assert_eq!(edges_of_a["dependsOn"][0], "pkg:cargo/b@1.1.0");
 
-    // Development dependencies on request.
     let with_dev: serde_json::Value =
         serde_json::from_slice(&p.rune(&["sbom", "--dev"]).stdout).unwrap();
     assert_eq!(with_dev["components"].as_array().unwrap().len(), 4);
@@ -5236,7 +4914,6 @@ fn exec_surface_lists_build_scripts_and_proc_macros_with_their_chain() {
     assert_eq!(macros["via"], serde_json::json!(["app", "mid", "macros"]));
 }
 
-/// Sets `pubtime` of one release in a local registry's index.
 fn published(reg: &tempfile::TempDir, name: &str, version: &str, when: &str) {
     let path = reg.path().join("index/1").join(name);
     let text = std::fs::read_to_string(&path).unwrap().replace(
@@ -5270,24 +4947,16 @@ fn a_minimum_release_age_keeps_brand_new_releases_out_until_they_mature() {
         text(&out)
     };
     let out = with_age(&["generate-lockfile"]);
-    // `a` has a mature release; `b` has none, so the young one is taken with
-    // a warning rather than failing the resolution.
     assert_eq!(locked(&p), ["a 1.0.0", "app 0.1.0", "b 2.0.0"]);
     assert!(
         out.contains("younger than resolve.min-release-age"),
         "{out}"
     );
-    // Without the setting, the newest wins.
     p.ok(&["update"]);
     assert_eq!(locked(&p), ["a 1.1.0", "app 0.1.0", "b 2.0.0"]);
-    // A locked young version stays locked when the setting comes back.
     with_age(&["build"]);
     assert_eq!(locked(&p), ["a 1.1.0", "app 0.1.0", "b 2.0.0"]);
 }
-
-// ---------------------------------------------------------------------------
-// test runner: retries, flaky tests, JUnit
-// ---------------------------------------------------------------------------
 
 #[test]
 fn retries_mark_flaky_tests_and_junit_reports_every_test() {
@@ -5333,7 +5002,6 @@ mod tests {
     assert!(xml.contains("name=\"skipped\">\n      <skipped/>"), "{xml}");
     assert!(xml.contains("name=\"solid\"/>"), "{xml}");
 
-    // With the real failure gone, a flaky failure alone does not fail the run.
     std::fs::remove_file(p.path().join("first-run-done")).unwrap();
     p.write(
         "src/lib.rs",
@@ -5342,7 +5010,6 @@ mod tests {
     let out = p.rune(&["test", "--retries", "1"]);
     assert!(out.status.success(), "{}", text(&out));
     assert!(text(&out).contains("flaky test(s)"), "{}", text(&out));
-    // Without retries, it fails as before.
     std::fs::remove_file(p.path().join("first-run-done")).unwrap();
     assert_eq!(p.rune(&["test"]).status.code(), Some(101));
 }
@@ -5368,14 +5035,12 @@ mod tests {
     assert_eq!(out.status.code(), Some(101));
     assert!(text(&out).contains("rune test --failed"), "{}", text(&out));
 
-    // Only the failed tests run, by exact name; the other binary not at all.
     let out = p.rune(&["test", "--failed"]);
     let msg = text(&out);
     assert_eq!(out.status.code(), Some(101), "{msg}");
     assert!(msg.contains("0 passed; 2 failed"), "{msg}");
     assert!(!msg.contains("other"), "{msg}");
 
-    // A fixed test passes once, then is forgotten; the rest still runs.
     p.write(
         "src/lib.rs",
         &lib.replace("super::one(), 2", "super::one(), 1"),
@@ -5386,7 +5051,6 @@ mod tests {
     assert!(msg.contains("0 passed; 1 failed"), "{msg}");
     assert!(!msg.contains("test tests::broken "), "{msg}");
 
-    // All fixed: nothing is remembered, and `--failed` runs everything.
     p.write(
         "src/lib.rs",
         &lib.replace("super::one(), 2", "super::one(), 1")
@@ -5419,10 +5083,6 @@ fn test_results_are_json_lines_with_message_format_json() {
     assert_eq!(suite["tests"][0]["status"], "passed");
 }
 
-// ---------------------------------------------------------------------------
-// cas export / import, affected --partition
-// ---------------------------------------------------------------------------
-
 #[test]
 fn a_store_bundle_carries_a_build_to_a_fresh_machine() {
     let p = build_script_project();
@@ -5441,7 +5101,6 @@ fn a_store_bundle_carries_a_build_to_a_fresh_machine() {
     ]);
     assert!(out.contains("wrote"), "{out}");
 
-    // A fresh store and a clean checkout: everything comes from the bundle.
     let fresh = tempfile::tempdir().unwrap();
     std::fs::remove_dir_all(p.path().join(".rune")).unwrap();
     let rune = |args: &[&str]| {
@@ -5458,8 +5117,6 @@ fn a_store_bundle_carries_a_build_to_a_fresh_machine() {
     assert!(rune(&["cas", "import", bundle.to_str().unwrap()]).contains("imported"));
     let build = rune(&["build"]);
     assert!(build.contains(" 0 compiled"), "{build}");
-    // After an edit the package compiles again, but its build script's
-    // result comes from the bundle too: the script is not compiled.
     let main = std::fs::read_to_string(p.path().join("src/main.rs")).unwrap();
     std::fs::write(p.path().join("src/main.rs"), main.clone() + "\n// edited\n").unwrap();
     let edited = rune(&["build"]);
@@ -5486,7 +5143,6 @@ fn a_store_bundle_carries_a_build_to_a_fresh_machine() {
 
 #[test]
 fn affected_partitions_split_the_packages_between_machines() {
-    // app -> c2 -> c1 -> c0; an edit to c0 affects all four.
     let p = chain_project(3);
     git_in(p.path(), &["init", "-q", "-b", "main"]);
     git_in(p.path(), &["add", "-A"]);
@@ -5507,12 +5163,6 @@ fn affected_partitions_split_the_packages_between_machines() {
     assert!(text(&bad).contains("N/M"), "{}", text(&bad));
 }
 
-// ---------------------------------------------------------------------------
-// build scripts rerun only when what they watch changes
-// ---------------------------------------------------------------------------
-
-/// A package whose build script counts its runs in `runs.log` (outside the
-/// package) and reads `schema.txt` into a generated constant.
 fn watching_script_project(watch: bool) -> Project {
     let p = Project::new();
     p.write("Cargo.toml", LIB_MANIFEST);
@@ -5577,7 +5227,6 @@ fn a_build_script_reruns_only_when_a_file_it_watches_changes() {
         .join(exe("build_script_build"));
     let compiled_at = std::fs::metadata(&bin).unwrap().modified().unwrap();
 
-    // The crate's own sources are not something the script reads.
     p.write("src/lib.rs", &(p.read("src/lib.rs") + "pub fn more() {}\n"));
     assert_eq!(
         build_counting_runs(&p),
@@ -5585,7 +5234,6 @@ fn a_build_script_reruns_only_when_a_file_it_watches_changes() {
         "an unwatched edit must not run the script"
     );
 
-    // A watched input: the script runs again, but is not compiled again.
     std::thread::sleep(std::time::Duration::from_millis(20));
     p.write("schema.txt", "v2\n");
     assert_eq!(build_counting_runs(&p), 2);
@@ -5594,7 +5242,6 @@ fn a_build_script_reruns_only_when_a_file_it_watches_changes() {
         compiled_at
     );
 
-    // A module of the script: compiled and run again.
     p.write(
         "build/helper.rs",
         "pub fn decorate(s: &str) -> String { format!(\"<<{s}>>\") }\n",
@@ -5605,7 +5252,6 @@ fn a_build_script_reruns_only_when_a_file_it_watches_changes() {
         compiled_at
     );
 
-    // Going back to an earlier state finds its result in the store.
     p.write("schema.txt", "v1\n");
     p.write(
         "build/helper.rs",
@@ -5621,10 +5267,6 @@ fn a_build_script_that_watches_nothing_reruns_on_any_change_like_cargo() {
     p.write("src/lib.rs", &(p.read("src/lib.rs") + "pub fn more() {}\n"));
     assert_eq!(build_counting_runs(&p), 2);
 }
-
-// ---------------------------------------------------------------------------
-// rune graph
-// ---------------------------------------------------------------------------
 
 #[test]
 fn graph_draws_the_package_graph_as_dot_and_mermaid() {
@@ -5668,7 +5310,6 @@ fn graph_units_lists_the_build_plan_with_keys_and_cache_state() {
         ["app", "c0", "c1"]
     );
     assert!(units.iter().all(|u| u["cached"] == false), "{before:#}");
-    // Dependencies point at other units, by index.
     let c1 = units.iter().find(|u| u["package"] == "c1").unwrap();
     let to = c1["dependencies"][0]["index"].as_u64().unwrap() as usize;
     assert_eq!(units[to]["package"], "c0");
@@ -5678,7 +5319,6 @@ fn graph_units_lists_the_build_plan_with_keys_and_cache_state() {
     let after = plan(&p);
     let units = after["units"].as_array().unwrap();
     assert!(units.iter().all(|u| u["cached"] == true), "{after:#}");
-    // The keys are the ones the build used, so they are stable.
     assert_eq!(plan(&p)["units"], after["units"]);
 }
 
@@ -5713,13 +5353,8 @@ fn a_dependencys_build_script_warnings_stay_quiet_but_the_workspaces_show() {
     );
     let out = p.ok(&["build"]);
     assert!(out.contains("from the workspace"), "{out}");
-    // As with Cargo, a registry package's script warnings are not shown.
     assert!(!out.contains("from the dependency"), "{out}");
 }
-
-// ---------------------------------------------------------------------------
-// rune tree: sections, platforms, edges, features
-// ---------------------------------------------------------------------------
 
 #[test]
 fn tree_shows_what_a_build_here_uses_like_cargo_tree() {
@@ -5745,7 +5380,6 @@ fn tree_shows_what_a_build_here_uses_like_cargo_tree() {
         );
         p.write(&format!("{name}/src/lib.rs"), "");
     }
-    // `win` is for the other kind of platform than this one.
     let (elsewhere, elsewhere_triple) = if cfg!(windows) {
         ("unix", "x86_64-unknown-linux-gnu")
     } else {
@@ -5777,7 +5411,6 @@ fn tree_shows_what_a_build_here_uses_like_cargo_tree() {
     assert!(lines[3].starts_with("└── bld v0.1.0"), "{tree}");
     assert_eq!(lines[4], "[dev-dependencies]", "{tree}");
     assert!(lines[5].starts_with("└── devd v0.1.0"), "{tree}");
-    // Not for this machine, but for the platform it is for.
     assert!(!tree.contains("win v0.1.0"), "{tree}");
     assert!(stdout(&["tree", "-p", "app", "--target", "all"]).contains("win v0.1.0"));
     assert!(stdout(&["tree", "-p", "app", "--target", elsewhere_triple]).contains("win v0.1.0"));
@@ -5789,7 +5422,6 @@ fn tree_shows_what_a_build_here_uses_like_cargo_tree() {
         .collect();
     assert_eq!(names, ["app", "lib1"], "{normal}");
 
-    // Why is lib1's `std` on? Its `default`, which app did not turn off.
     let why = stdout(&["tree", "-e", "features", "-i", "lib1", "--prefix", "depth"]);
     let lines: Vec<&str> = why.lines().collect();
     let std = lines
@@ -5817,18 +5449,14 @@ fn test_builds_the_examples_first_and_runs_those_marked_test() {
          [[example]]\nname = \"checked\"\ntest = true\n",
     );
     p.write("src/lib.rs", "pub fn one() -> u32 { 1 }\n");
-    // A plain example: built, never run by `test`.
     p.write(
         "examples/tool.rs",
         "fn main() { println!(\"tool ran\"); }\n",
     );
-    // `test = true`: its #[test]s run.
     p.write(
         "examples/checked.rs",
         "fn main() {}\n#[test]\nfn example_test() { assert_eq!(demo::one(), 1); }\n",
     );
-    // An integration test that starts the example, as `once_cell`'s does:
-    // it must exist by the time the test runs.
     p.write(
         "tests/runs_example.rs",
         r#"#[test]
@@ -5876,7 +5504,6 @@ fn panic_abort_profiles_still_test_with_unwinding_like_cargo() {
     let out = p.ok(&["test"]);
     assert!(out.contains("✓ 2 passed"), "{out}");
 
-    // An ordinary build keeps the profile's `panic = "abort"`.
     p.ok(&["build"]);
     use std::os::unix::process::ExitStatusExt;
     let status = Command::new(p.path().join(".rune/target/debug/app"))
@@ -5900,7 +5527,6 @@ fn store_entries_unused_for_a_month_are_removed_in_the_background() {
             .map(|e| e.into_path())
             .collect()
     };
-    // An old version of the code, then the current one.
     p.write("src/lib.rs", "pub fn f() {}\n");
     p.ok(&["build"]);
     let old = manifests();
@@ -5911,7 +5537,6 @@ fn store_entries_unused_for_a_month_are_removed_in_the_background() {
     let stamp = cas.join("last-gc");
     assert!(stamp.exists(), "a new store only gets its stamp");
 
-    // The old version's entries were stored and last used 40 days ago.
     let days_ago =
         |d: u64| std::time::SystemTime::now() - std::time::Duration::from_secs(d * 86_400);
     for m in &old {
@@ -5934,12 +5559,10 @@ fn store_entries_unused_for_a_month_are_removed_in_the_background() {
             .set_modified(days_ago(40))
             .unwrap();
     }
-    // Not due yet (the last run was today): nothing happens.
     p.ok(&["build"]);
     std::thread::sleep(std::time::Duration::from_millis(300));
     assert!(old.iter().all(|m| m.exists()));
 
-    // A day after the last run, the next build starts one in the background.
     std::fs::OpenOptions::new()
         .write(true)
         .open(&stamp)
@@ -5975,7 +5598,6 @@ fn a_cached_dependencys_script_output_still_reaches_rebuilt_dependents() {
         "app/Cargo.toml",
         "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\nsys = { path = \"../sys\" }\n",
     );
-    // Reruns on any change of its package, and needs `sys`'s metadata.
     p.write(
         "app/build.rs",
         "fn main() {\n    let g = std::env::var(\"DEP_SYSX_GREETING\").expect(\"DEP_SYSX_GREETING\");\n    println!(\"cargo::rustc-env=GREETING={g}\");\n}\n",
@@ -5985,8 +5607,6 @@ fn a_cached_dependencys_script_output_still_reaches_rebuilt_dependents() {
         "fn main() { println!(\"{}\", env!(\"GREETING\")); }\n",
     );
     p.ok(&["build"]);
-    // Only `app` changes: `sys` comes from the store, its script does not
-    // run again, and `app`'s script must still see what it reported.
     p.write(
         "app/src/main.rs",
         "fn main() { println!(\"{} again\", env!(\"GREETING\")); }\n",
@@ -5994,7 +5614,6 @@ fn a_cached_dependencys_script_output_still_reaches_rebuilt_dependents() {
     let out = p.ok(&["run", "-p", "app"]);
     assert!(out.contains("hello again"), "{out}");
 
-    // The same on a machine that got the store from a bundle.
     let bundle = p.home().join("bundle.tar");
     p.ok(&["cas", "export", "-o", bundle.to_str().unwrap()]);
     let fresh = tempfile::tempdir().unwrap();
@@ -6031,7 +5650,6 @@ fn json_messages_report_build_scripts_for_rust_analyzer() {
             .filter(|v| v["reason"] == "build-script-executed")
             .collect()
     };
-    // Fresh, and again when everything comes from the store: once each time.
     for _ in 0..2 {
         let lines = executed(&p);
         assert_eq!(lines.len(), 1, "{lines:?}");
@@ -6059,7 +5677,6 @@ fn a_declared_target_without_its_file_is_reported_like_cargo() {
          [[example]]\nname = \"gone\"\npath = \"examples/gone.rs\"\n",
     );
     p.write("src/lib.rs", "");
-    // Not asked for: no error (plain `build` does not build examples).
     p.ok(&["build"]);
     let out = p.rune(&["test"]);
     assert!(!out.status.success());
@@ -6089,9 +5706,6 @@ fn a_links_package_with_integration_tests_is_not_its_own_conflict() {
 
 #[test]
 fn a_workspace_crate_does_not_stand_in_for_its_published_release() {
-    // `helper` (a dev-dependency) depends on the published `core_lib 1.0.0`;
-    // the workspace develops `core_lib 1.1.0`. As with Cargo, `helper` gets
-    // the published release, not the local one.
     let reg = local_registry(&[
         ("core_lib", "1.0.0", &[]),
         ("helper", "1.0.0", &[("core_lib", "^1.0")]),
@@ -6149,8 +5763,6 @@ fn a_target_that_is_not_installed_is_reported_before_building() {
         text(&out)
     );
 
-    // A real target without its standard library: what to run, not
-    // rustc's "can't find crate for `core`" in every crate.
     let sysroot = String::from_utf8(
         Command::new("rustc")
             .args(["--print", "sysroot"])
@@ -6222,7 +5834,6 @@ fn features_says_which_are_on_and_who_turned_them_on() {
     assert!(!out.contains("unused"), "{out}");
     assert!(p.ok(&["features", "lib", "--all"]).contains("- unused"));
 
-    // Without an argument: what the workspace's packages declare.
     let out = p.ok(&["features"]);
     assert!(out.contains("turbo") && out.contains("lib/simd"), "{out}");
 
@@ -6237,11 +5848,6 @@ fn features_says_which_are_on_and_who_turned_them_on() {
 
 #[test]
 fn a_lockfile_from_another_resolution_is_never_trusted() {
-    // Two `rune` processes at once (an editor's `rune check` and a build),
-    // or a manifest saved while a resolution runs, could leave the lockfile
-    // of one resolution next to the fingerprint of another: the next build
-    // then trusted a lockfile without the new dependency, and rustc said
-    // "undeclared crate". Recreate exactly that pairing.
     let reg = local_registry(&[("foo", "1.0.0", &[])]);
     let p = app_with(&reg, "");
     p.ok(&["build"]);
@@ -6254,7 +5860,6 @@ fn a_lockfile_from_another_resolution_is_never_trusted() {
     p.write("src/main.rs", "fn main() { foo::f(); }\n");
     p.ok(&["build"]);
     let new = std::fs::read(&lock_path).unwrap();
-    // `RUNELOCK\x03`, a u16 fingerprint length, the fingerprint, the lock.
     assert_eq!(&new[..9], b"RUNELOCK\x03");
     let header = |b: &[u8]| 11 + u16::from_le_bytes([b[9], b[10]]) as usize;
     let mut spliced = new[..header(&new)].to_vec();
@@ -6264,13 +5869,10 @@ fn a_lockfile_from_another_resolution_is_never_trusted() {
     p.write("src/main.rs", "fn main() { foo::f(); foo::f(); }\n");
     let out = p.ok(&["build"]);
     assert!(!out.contains("undeclared"), "{out}");
-    // …and the lockfile is whole again.
     let fixed = std::fs::read(&lock_path).unwrap();
     assert_eq!(fixed, std::fs::read(&lock_path).unwrap());
     assert!(p.read("Cargo.lock").contains("name = \"foo\""));
 
-    // A truncated lockfile (an interrupted write before writes were atomic)
-    // is simply resolved again.
     std::fs::write(&lock_path, &fixed[..fixed.len() / 2]).unwrap();
     p.write("src/main.rs", "fn main() { foo::f(); }\n");
     p.ok(&["build"]);
@@ -6299,25 +5901,20 @@ fn workspace_feature_unification_shares_dependency_builds_across_selections() {
         "crates/a/src/main.rs",
         "fn main() { println!(\"extra={}\", shared::extra()); }\n",
     );
-    // `b` asks for the feature — and does not compile, so it must never be
-    // built when only `a` is selected.
     p.write(
         "crates/b/Cargo.toml",
         "[package]\nname = \"b\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[dependencies]\nshared = { path = \"../shared\", features = [\"extra\"] }\n",
     );
     p.write("crates/b/src/lib.rs", "this does not compile\n");
 
-    // By default only the selected package's requests count.
     assert!(p.ok(&["run", "-p", "a"]).contains("extra=false"));
 
-    // Rune's setting: `b`'s request counts, `b` itself is not built.
     p.write(
         "Rune.toml",
         "[build]\nfeature-unification = \"workspace\"\n",
     );
     assert!(p.ok(&["run", "-p", "a"]).contains("extra=true"));
 
-    // Cargo's config key does the same.
     p.write("Rune.toml", "");
     p.write(
         ".cargo/config.toml",
@@ -6358,7 +5955,6 @@ fn pinned_workspaces_survive_cleanup_and_idle_entries_are_compressed() {
         .map(|e| e.into_path())
         .collect();
     assert!(!manifests.is_empty());
-    // Everything was stored and last used 40 days ago.
     let then = std::time::SystemTime::now() - std::time::Duration::from_secs(40 * 86_400);
     let age = || {
         for m in &manifests {
@@ -6388,7 +5984,6 @@ fn pinned_workspaces_survive_cleanup_and_idle_entries_are_compressed() {
     assert!(out.contains("pinned"), "{out}");
     assert!(p.ok(&["cas", "pins"]).contains("entries"));
 
-    // Pinned: kept, but compressed.
     let out = p.ok(&["cas", "gc", "--max-age", "30d", "--compress-idle", "7d"]);
     assert!(out.contains("0 entries"), "{out}");
     assert!(out.contains("kept for pinned"), "{out}");
@@ -6401,12 +5996,10 @@ fn pinned_workspaces_survive_cleanup_and_idle_entries_are_compressed() {
     };
     assert!(manifests.iter().any(compressed), "{out}");
 
-    // A fresh build restores from the compressed entries.
     p.ok(&["clean"]);
     assert!(p.ok(&["build"]).contains("0 compiled · 1 cached"));
     assert!(!manifests.iter().any(compressed));
 
-    // Unpinned, old entries go.
     age();
     assert!(p.ok(&["cas", "unpin"]).contains("unpinned"));
     p.ok(&["cas", "gc", "--max-age", "30d"]);
@@ -6428,16 +6021,13 @@ fn tests_can_be_scheduled_one_batch_at_a_time_across_binaries() {
 
     let whole = p.ok(&["test", "--no-doc"]);
     let split = p.ok(&["test", "--no-doc", "--schedule", "tests"]);
-    // The same totals either way: every test ran exactly once.
     assert!(split.contains("12 passed, 1 ignored"), "{split}");
     assert!(split.contains("14 passed · 1 ignored"), "{split}");
     assert!(whole.contains("14 passed · 1 ignored"), "{whole}");
 
-    // A filter: the rest counts as filtered out, once.
     let out = p.ok(&["test", "--no-doc", "--schedule", "tests", "t1"]);
     assert!(out.contains("3 passed"), "{out}"); // t1, t10, t11
 
-    // A failure in one batch fails the binary, and the setting works too.
     p.write("Rune.toml", "[test]\nschedule = \"tests\"\n");
     p.write(
         "tests/other.rs",
@@ -6451,8 +6041,6 @@ fn tests_can_be_scheduled_one_batch_at_a_time_across_binaries() {
 
 #[test]
 fn resolution_moves_back_from_a_release_whose_dependency_does_not_exist() {
-    // The newest `b` needs a `c` that was never published; Cargo takes the
-    // older `b`.
     let reg = local_registry(&[
         ("b", "1.0.0", &[("c", "^1.0")]),
         ("b", "1.1.0", &[("c", "^2.0")]),
@@ -6473,7 +6061,6 @@ fn an_impossible_version_choice_is_explained() {
     let p = app_with(&reg, "a = \"=1.0.0\"\nb = \"1\"\n");
     let out = p.rune(&["build"]);
     let t = text(&out);
-    // Cargo refuses; Rune explains, then builds with both versions.
     assert!(t.contains("b 1.0.0 depends on a 1.1.0"), "{t}");
     assert!(t.contains("side by side"), "{t}");
     assert!(out.status.success(), "{t}");
@@ -6483,8 +6070,6 @@ fn an_impossible_version_choice_is_explained() {
 #[test]
 fn the_sandbox_confines_build_scripts() {
     let p = lib_project();
-    // Some systems (Ubuntu 23.10+ with AppArmor) do not allow the
-    // namespaces the sandbox needs.
     let probe = p.rune(&["__sandbox", "--", "true"]);
     if !probe.status.success() {
         eprintln!("skipped: {}", text(&probe));
@@ -6514,14 +6099,12 @@ fn main() {{
         "src/lib.rs",
         "include!(concat!(env!(\"OUT_DIR\"), \"/generated.rs\"));\n",
     );
-    // Without the sandbox a build script can write anywhere.
     let out = p.ok(&["build"]);
     assert!(out.contains("planted=true"), "{out}");
     std::fs::remove_file(&outside).unwrap();
 
     p.write("Rune.toml", "[build]\nsandbox = true\n");
     let out = p.ok(&["build", "--rebuild-all"]);
-    // OUT_DIR works; nothing else is writable, and there is no network.
     assert!(out.contains("planted=false"), "{out}");
     assert!(out.contains("net_unreachable=true"), "{out}");
     assert!(!outside.exists());
@@ -6559,7 +6142,6 @@ fn audit_reports_advisories_for_locked_versions() {
             "null",
         ),
     );
-    // GitHub's copy of the same advisory is not reported twice.
     write(
         "GHSA-43w2-9j62-hq99.json",
         advisory(
@@ -6580,7 +6162,6 @@ fn audit_reports_advisories_for_locked_versions() {
             "\"unmaintained\"",
         ),
     );
-    // Fixed before the locked version: not reported.
     write(
         "RUSTSEC-2019-0001.json",
         advisory(
@@ -6615,10 +6196,8 @@ fn audit_reports_advisories_for_locked_versions() {
     );
     assert!(t.contains("1 vulnerability found · 1 warning"), "{t}");
 
-    // Accepted: only the warning is left, which does not fail…
     let out = p.rune(&["audit", "--db", db_arg, "--ignore", "RUSTSEC-2021-0003"]);
     assert!(out.status.success(), "{}", text(&out));
-    // …unless warnings are denied.
     let out = p.rune(&[
         "audit",
         "--db",
@@ -6647,7 +6226,6 @@ fn audit_reports_advisories_for_locked_versions() {
     );
 }
 
-/// Whether the toolchain has llvm-cov (the `llvm-tools` component).
 fn have_llvm_tools() -> bool {
     let sysroot = Command::new("rustc")
         .args(["--print", "sysroot"])
@@ -6680,7 +6258,6 @@ fn coverage_counts_what_tests_run_including_programs_they_start() {
         "src/main.rs",
         "fn main() {\n    println!(\"{}\", cov::used(-3));\n}\n",
     );
-    // The integration test runs the program; its coverage counts too.
     p.write(
         "tests/run.rs",
         "#[test]\nfn runs() {\n    let out = std::process::Command::new(env!(\"CARGO_BIN_EXE_cov\")).output().unwrap();\n    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), \"3\");\n}\n",
@@ -6694,14 +6271,11 @@ fn coverage_counts_what_tests_run_including_programs_they_start() {
     ]);
     assert!(out.contains("src/lib.rs"), "{out}");
     assert!(out.contains("src/main.rs"), "{out}");
-    // `used` ran only through the program, with a negative number.
     assert!(out.contains("not run: 3, 9-11"), "{out}");
     let lcov = p.read("lcov.info");
     assert!(lcov.contains("FNDA:1,cov::used"), "{lcov}");
     assert!(lcov.contains("FNDA:0,cov::unused"), "{lcov}");
 
-    // A failing test: no report unless asked to keep going; the exit code
-    // is the test runner's.
     p.write("tests/fail.rs", "#[test]\nfn fails() { panic!(\"no\") }\n");
     let out = p.rune(&["coverage"]);
     assert_eq!(out.status.code(), Some(101), "{}", text(&out));
@@ -6714,8 +6288,6 @@ fn coverage_counts_what_tests_run_including_programs_they_start() {
     let out = p.rune(&["coverage", "--fail-under", "99"]);
     assert_eq!(out.status.code(), Some(1), "{}", text(&out));
     assert!(text(&out).contains("is below the required 99 %"));
-    // The instrumented build has a directory of its own: the ordinary one
-    // is left alone, and plain builds are not instrumented afterwards.
     assert!(p.path().join(".rune/target/coverage/build/debug").is_dir());
     p.ok(&["build"]);
     let scratch = tempfile::tempdir().unwrap();
@@ -6733,7 +6305,6 @@ fn coverage_counts_what_tests_run_including_programs_they_start() {
 
 #[test]
 fn manifest_mistakes_cargo_refuses_are_refused_with_the_reason() {
-    // A dependency cycle is an error naming the cycle (it used to hang).
     let p = Project::new();
     p.write("Cargo.toml", "[workspace]\nmembers = [\"a\", \"b\"]\n");
     p.write(
@@ -6754,7 +6325,6 @@ fn manifest_mistakes_cargo_refuses_are_refused_with_the_reason() {
         text(&out)
     );
 
-    // No library and no binary.
     let p = Project::new();
     p.write(
         "Cargo.toml",
@@ -6767,7 +6337,6 @@ fn manifest_mistakes_cargo_refuses_are_refused_with_the_reason() {
         text(&out)
     );
 
-    // A feature naming nothing.
     p.write(
         "Cargo.toml",
         "[package]\nname = \"f\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[features]\ndefault = [\"nope\"]\n",
@@ -6781,7 +6350,6 @@ fn manifest_mistakes_cargo_refuses_are_refused_with_the_reason() {
         "{}",
         text(&out)
     );
-    // `dep:` on a dependency that is not optional.
     p.write(
         "Cargo.toml",
         "[package]\nname = \"f\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[dependencies]\nx = { path = \"x\" }\n[features]\nextra = [\"dep:x\"]\n",
@@ -6797,7 +6365,6 @@ fn manifest_mistakes_cargo_refuses_are_refused_with_the_reason() {
         "{}",
         text(&out)
     );
-    // Optional dependencies (also target-specific ones) are fine.
     p.write(
         "Cargo.toml",
         "[package]\nname = \"f\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[target.'cfg(unix)'.dependencies]\nx = { path = \"x\", optional = true }\n[features]\nextra = [\"dep:x\", \"x/std\"]\nplain = [\"x\"]\n",
@@ -6807,7 +6374,6 @@ fn manifest_mistakes_cargo_refuses_are_refused_with_the_reason() {
         "[package]\nname = \"x\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[features]\nstd = []\n",
     );
     p.ok(&["build", "--features", "extra"]);
-    // …but not a feature of a dependency that it does not have.
     p.write(
         "x/Cargo.toml",
         "[package]\nname = \"x\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
@@ -6820,7 +6386,6 @@ fn manifest_mistakes_cargo_refuses_are_refused_with_the_reason() {
         text(&out)
     );
 
-    // Two members with one name.
     let p = Project::new();
     p.write("Cargo.toml", "[workspace]\nmembers = [\"a\", \"b\"]\n");
     for d in ["a", "b"] {
@@ -6837,7 +6402,6 @@ fn manifest_mistakes_cargo_refuses_are_refused_with_the_reason() {
         text(&out)
     );
 
-    // Names of the standard library's crates.
     let p = Project::new();
     let out = p.rune(&["new", "test"]);
     assert!(!out.status.success());
@@ -6850,9 +6414,6 @@ fn manifest_mistakes_cargo_refuses_are_refused_with_the_reason() {
 
 #[test]
 fn build_script_results_are_never_shared_between_different_packages() {
-    // Two unrelated projects with a package of the same name and version, in
-    // one store. Both scripts watch a file; each must be keyed by its own
-    // script and its own files, never by the record of the other's run.
     let p = Project::new();
     let manifest = "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n";
     p.write("one/Cargo.toml", manifest);
@@ -6882,13 +6443,11 @@ fn build_script_results_are_never_shared_between_different_packages() {
     assert_eq!(run("one"), "from one");
     assert_eq!(run("two"), "[]");
 
-    // The same script in a third checkout reads its own file.
     for f in ["Cargo.toml", "build.rs", "src/main.rs"] {
         p.write(&format!("three/{f}"), &p.read(&format!("one/{f}")));
     }
     p.write("three/data.txt", "from three");
     assert_eq!(run("three"), "from three");
-    // …and one with the same file contents reuses the result.
     for f in ["Cargo.toml", "build.rs", "src/main.rs", "data.txt"] {
         p.write(&format!("four/{f}"), &p.read(&format!("one/{f}")));
     }
@@ -6948,13 +6507,6 @@ fn default_run_and_metadata_nodes_match_cargo() {
     assert_eq!(pkg["targets"].as_array().unwrap().len(), 2);
 }
 
-// ---------------------------------------------------------------------------
-// Test runner stability
-// ---------------------------------------------------------------------------
-
-/// A package with three integration tests, each holding `lock` (a file in
-/// the package created exclusively) for a moment, as tests sharing a port
-/// or a database do: two binaries running at once fail.
 fn exclusive_tests_project() -> Project {
     let p = Project::new();
     p.write(
@@ -6998,12 +6550,10 @@ fn holds_the_shared_resource() {{
 #[test]
 fn test_binaries_run_one_at_a_time_unless_asked_otherwise() {
     let p = exclusive_tests_project();
-    // Several times: running binaries at once failed only now and then.
     for _ in 0..3 {
         let out = p.ok(&["test"]);
         assert!(out.contains("3 passed"), "{out}");
     }
-    // `--test-jobs` (or `test.jobs`) runs binaries side by side.
     let forget = || {
         for name in ["a", "b", "c"] {
             let _ = std::fs::remove_file(p.path().join(format!("{name}.here")));
@@ -7024,8 +6574,6 @@ fn test_binaries_run_one_at_a_time_unless_asked_otherwise() {
 #[cfg(unix)]
 #[test]
 fn a_test_that_leaves_a_process_running_does_not_hold_up_the_run() {
-    // The child keeps the test binary's output open long after the binary
-    // is gone; waiting for the pipe to close would wait for it.
     let p = Project::new();
     p.write(
         "Cargo.toml",
@@ -7072,14 +6620,11 @@ fn package_env() {
 
 #[test]
 fn a_target_directory_or_store_inside_the_package_is_not_its_source() {
-    // Every build changed the files in `out/`, which counted as the
-    // package's sources: nothing was ever cached.
     let p = lib_project();
     p.ok(&["build", "--target-dir", "out"]);
     let out = p.ok(&["build", "--target-dir", "out"]);
     assert!(out.contains("0 compiled"), "{out}");
     assert!(p.path().join("out/CACHEDIR.TAG").is_file());
-    // The same for a store kept in the project (a CI caching `RUNE_HOME`).
     let home = p.path().join(".ci-home");
     let out = rune_with_env(&p, &["build"], &[("RUNE_HOME", home.as_os_str())]);
     assert!(out.status.success(), "{}", text(&out));
@@ -7111,7 +6656,6 @@ fn a_hung_test_is_stopped_by_the_timeout_and_named() {
     assert!(all.contains("still running or not started: hangs"), "{all}");
     assert!(all.contains("1 passed · 1 failed"), "{all}");
 
-    // The same from the setting; a bad duration is an error, not "no limit".
     p.ok(&["config", "set", "test.timeout", "2s"]);
     let out = p.rune(&["test"]);
     assert_eq!(out.status.code(), Some(101), "{}", text(&out));
@@ -7125,8 +6669,6 @@ fn a_hung_test_is_stopped_by_the_timeout_and_named() {
 
 #[test]
 fn doc_tests_run_after_the_test_binaries_and_quiet_still_shows_the_result() {
-    // The doc-test run is ready long before the unit tests link; run first,
-    // its failure would stop the run before the unit tests' failure is seen.
     let p = Project::new();
     p.write(
         "Cargo.toml",
@@ -7161,7 +6703,6 @@ fn a_mistyped_command_suggests_the_real_one() {
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(err.contains("no such command: `buidl`"), "{err}");
     assert!(err.contains("did you mean `rune build`?"), "{err}");
-    // Not the one-letter alias clap would also offer.
     assert!(!err.contains("`rune b`"), "{err}");
 
     let out = rune_command().args(["build", "--relase"]).output().unwrap();

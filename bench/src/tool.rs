@@ -1,6 +1,4 @@
-//! The two build tools under test and how each is started: same arguments
-//! (Rune takes Cargo's), each in its own copy of the project, with nothing
-//! from the caller's environment that would make the comparison unfair.
+//! The two tools under test, each in its own copy with a scrubbed environment.
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -9,24 +7,17 @@ use std::process::Command;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Tool {
-    /// `rune` or `cargo`.
     pub name: String,
     pub bin: PathBuf,
-    /// `rune 2027.0.0 (…)`, `cargo 1.98.1 (…)`.
     pub version: String,
 }
 
-/// Where one tool works on one workload.
 pub struct Ctx<'a> {
     pub tool: &'a Tool,
-    /// The tool's own copy of the workload's sources.
     pub dir: PathBuf,
-    /// Rune's home (store, caches, settings) for this run of the benchmarks.
     pub home: PathBuf,
 }
 
-/// Variables that would point a tool at shared state, wrap the compiler, or
-/// change its output: removed for every command.
 const SCRUB: &[&str] = &[
     "CARGO_TARGET_DIR",
     "CARGO_BUILD_TARGET_DIR",
@@ -47,10 +38,7 @@ impl Tool {
                 which(name).with_context(|| format!("`{name}` is not on PATH (pass --{name})"))?
             }
         };
-        // Commands run inside the workloads' copies: a relative path would
-        // not be found there.
-        // (Absolute, but symlinks kept: `cargo` is usually a link to
-        // `rustup`, which looks at the name it was started by.)
+        // Absolute, but symlinks kept: `cargo` is usually a link to `rustup`, which looks at its name.
         let bin = if bin.is_absolute() {
             bin
         } else {
@@ -93,8 +81,6 @@ impl Tool {
         c
     }
 
-    /// Everything a build wrote into the project: what a fresh checkout
-    /// does not have.
     pub fn output_dir(&self, ctx: &Ctx) -> PathBuf {
         if self.is_rune() {
             ctx.dir.join(".rune")
@@ -103,13 +89,10 @@ impl Tool {
         }
     }
 
-    /// Back to a fresh checkout: no build output in the project.
     pub fn remove_output(&self, ctx: &Ctx) -> Result<()> {
         remove(&self.output_dir(ctx))
     }
 
-    /// Back to a fresh machine: no build output and, for Rune, an empty
-    /// store. (Downloaded crates and registry indexes stay, for both.)
     pub fn remove_caches(&self, ctx: &Ctx) -> Result<()> {
         self.remove_output(ctx)?;
         if self.is_rune() {
@@ -118,8 +101,6 @@ impl Tool {
         Ok(())
     }
 
-    /// Bytes of build output in the project, and in all (with Rune's
-    /// store, its hard links counted once).
     pub fn disk_use(&self, ctx: &Ctx) -> (u64, u64) {
         let out_dir = self.output_dir(ctx);
         let out = crate::measure::dir_size(&out_dir);
@@ -132,13 +113,11 @@ impl Tool {
     }
 }
 
-/// Removes a directory tree, read-only files (Rune's store) included.
 pub fn remove(path: &Path) -> Result<()> {
     match std::fs::remove_dir_all(path) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-            // The store keeps its objects read-only.
             make_writable(path);
             std::fs::remove_dir_all(path).with_context(|| format!("removing {}", path.display()))
         }

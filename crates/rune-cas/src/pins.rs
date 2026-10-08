@@ -1,9 +1,4 @@
-//! Pinned projects: store entries a project's builds need, which garbage
-//! collection never removes.
-//!
-//! `rune cas pin` records the keys of the project's builds under
-//! `<store>/pins/<id>.json`. A pin whose project directory is gone no longer
-//! protects anything, and is dropped by the next collection.
+//! Pinned projects: entries their builds need are never garbage-collected.
 
 use crate::store::CasStore;
 use serde::{Deserialize, Serialize};
@@ -11,11 +6,9 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-/// One pinned project.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Pin {
     pub project: PathBuf,
-    /// Seconds since the epoch.
     pub pinned_at: u64,
     pub keys: Vec<String>,
 }
@@ -28,7 +21,6 @@ fn pin_path(store: &CasStore, project: &Path) -> PathBuf {
         .join(format!("{}.json", &id[..16]))
 }
 
-/// Pins `keys` for `project`, replacing an earlier pin of it.
 pub fn pin(store: &CasStore, project: &Path, keys: Vec<String>) -> std::io::Result<()> {
     let path = pin_path(store, project);
     fs::create_dir_all(path.parent().expect("pins dir"))?;
@@ -48,12 +40,10 @@ pub fn pin(store: &CasStore, project: &Path, keys: Vec<String>) -> std::io::Resu
     fs::rename(tmp, path)
 }
 
-/// Removes the pin of `project`. `false` if it was not pinned.
 pub fn unpin(store: &CasStore, project: &Path) -> bool {
     fs::remove_file(pin_path(store, project)).is_ok()
 }
 
-/// Every pin whose project still exists.
 pub fn list(store: &CasStore) -> Vec<Pin> {
     let Ok(dir) = fs::read_dir(store.root().join("pins")) else {
         return Vec::new();
@@ -68,7 +58,6 @@ pub fn list(store: &CasStore) -> Vec<Pin> {
     pins
 }
 
-/// Removes pins whose project directory is gone.
 pub fn prune(store: &CasStore) {
     let Ok(dir) = fs::read_dir(store.root().join("pins")) else {
         return;
@@ -84,7 +73,6 @@ pub fn prune(store: &CasStore) {
     }
 }
 
-/// The keys every live pin protects.
 pub fn pinned_keys(store: &CasStore) -> HashSet<String> {
     list(store).into_iter().flat_map(|p| p.keys).collect()
 }

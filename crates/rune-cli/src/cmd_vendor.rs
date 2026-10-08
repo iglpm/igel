@@ -1,10 +1,4 @@
-//! `rune vendor`: every registry and git dependency, unpacked into one
-//! directory, with the configuration that makes builds (Rune's and Cargo's)
-//! read them from there — offline builds, audits, air-gapped CI.
-//!
-//! Each package gets a `.cargo-checksum.json` (`files`: SHA-256 of every file;
-//! `package`: the registry checksum, `null` for git), which is what Cargo
-//! verifies a vendored crate against.
+//! `rune vendor`: registry and git dependencies unpacked into one directory with `.cargo-checksum.json`.
 
 use crate::args::VendorArgs;
 use crate::graph;
@@ -35,7 +29,6 @@ pub fn vendor(args: VendorArgs) -> Result<()> {
         );
     }
 
-    // Registry packages, all downloaded at once.
     let registry: Vec<(String, String, Option<String>, String)> = resolved
         .packages
         .values()
@@ -118,7 +111,6 @@ pub fn vendor(args: VendorArgs) -> Result<()> {
         format!("{} packages into {}", packages.len(), dest.display()),
     );
 
-    // What to put in `.cargo/config.toml`.
     let shown = pathdiff(&dest, ws.root());
     let mut config = String::from("[source.crates-io]\nreplace-with = \"vendored-sources\"\n");
     for source in git_sources.values() {
@@ -140,7 +132,6 @@ pub fn vendor(args: VendorArgs) -> Result<()> {
     Ok(())
 }
 
-/// `(name, version, source dir, registry checksum, git source)`.
 type Vendored = (String, String, PathBuf, Option<String>, Option<GitSource>);
 
 #[derive(Clone)]
@@ -158,8 +149,6 @@ impl GitSource {
     }
 }
 
-/// Copies a package, recording each file's SHA-256 under its relative path.
-/// VCS files are left out: they would confuse the project's own repository.
 fn copy_package(
     src: &Path,
     dest: &Path,
@@ -206,7 +195,6 @@ fn make_writable_and_remove(dir: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// `path` relative to `base` when it is inside it, else as is.
 fn pathdiff(path: &Path, base: &Path) -> String {
     path.strip_prefix(base)
         .map(|p| p.display().to_string())

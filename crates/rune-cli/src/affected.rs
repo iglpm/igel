@@ -1,30 +1,24 @@
-//! `rune affected`: which workspace packages a set of changed files can
-//! influence — the packages that own them, and everything that depends on those,
-//! transitively. What CI needs to build and test only what a change touches.
+//! `rune affected`: the packages owning changed files and everything that depends on them.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-/// A workspace package as far as this analysis cares.
 pub struct Pkg {
     pub name: String,
     pub dir: PathBuf,
-    /// Names of packages it depends on (any kind), workspace-internal or not.
     pub deps: Vec<String>,
 }
 
-/// Files that change how *everything* in the workspace is built.
 fn changes_everything(rel: &Path) -> bool {
     let name = rel.file_name().and_then(|n| n.to_str()).unwrap_or("");
     let in_cargo_dir = rel.components().any(|c| c.as_os_str() == ".cargo");
-    matches!(name, "Cargo.lock" | "rust-toolchain" | "rust-toolchain.toml" | "Rune.toml")
-        || (in_cargo_dir && matches!(name, "config" | "config.toml"))
-        // The root manifest: `[workspace.dependencies]`, `[profile]`, `[patch]`.
+    matches!(
+        name,
+        "Cargo.lock" | "rust-toolchain" | "rust-toolchain.toml" | "Rune.toml"
+    ) || (in_cargo_dir && matches!(name, "config" | "config.toml"))
         || rel == Path::new("Cargo.toml")
 }
 
-/// The sorted names of the affected packages. `changed` holds paths relative to
-/// `root` (or absolute).
 pub fn affected(pkgs: &[Pkg], root: &Path, changed: &[PathBuf]) -> Vec<String> {
     let mut hit: HashSet<usize> = HashSet::new();
     let mut everything = false;
@@ -39,7 +33,6 @@ pub fn affected(pkgs: &[Pkg], root: &Path, changed: &[PathBuf]) -> Vec<String> {
             everything = true;
             break;
         }
-        // The deepest package directory containing the file owns it.
         let owner = pkgs
             .iter()
             .enumerate()
@@ -58,7 +51,6 @@ pub fn affected(pkgs: &[Pkg], root: &Path, changed: &[PathBuf]) -> Vec<String> {
             .collect();
     }
 
-    // Reverse edges, then everything reachable from the changed packages.
     let by_name: HashMap<&str, usize> = pkgs
         .iter()
         .enumerate()
@@ -87,16 +79,13 @@ pub fn affected(pkgs: &[Pkg], root: &Path, changed: &[PathBuf]) -> Vec<String> {
         .collect()
 }
 
-/// `N/M`: shard `N` (1-based) of `M`.
 pub fn parse_partition(s: &str) -> Option<(usize, usize)> {
     let (n, m) = s.split_once('/')?;
     let (n, m): (usize, usize) = (n.trim().parse().ok()?, m.trim().parse().ok()?);
     (m > 0 && (1..=m).contains(&n)).then_some((n, m))
 }
 
-/// The packages of shard `n` of `m`: every `m`-th of the sorted list, starting
-/// at the `n`-th, so shards differ in size by at most one and the same input
-/// always splits the same way on every CI machine.
+/// Every `m`-th of the sorted list from the `n`-th: deterministic across CI machines.
 pub fn partition(names: &[String], n: usize, m: usize) -> Vec<String> {
     let mut sorted: Vec<&String> = names.iter().collect();
     sorted.sort();
@@ -135,7 +124,6 @@ mod tests {
         }
     }
 
-    /// a <- b <- c, and an unrelated d; e is nested inside a's directory.
     fn workspace() -> Vec<Pkg> {
         vec![
             pkg("a", "crates/a", &["serde"]),
@@ -192,14 +180,13 @@ mod tests {
         ] {
             assert_eq!(run(&[f]), ["a", "b", "c", "d", "e"], "{f}");
         }
-        // …but a package's own manifest only affects that package's cone.
         assert_eq!(run(&["crates/d/Cargo.toml"]), ["d"]);
     }
 
     #[test]
     fn absolute_paths_work_and_dependency_cycles_terminate() {
         let mut pkgs = workspace();
-        pkgs[0].deps.push("c".into()); // a <-> b <-> c cycle through dev-dependencies
+        pkgs[0].deps.push("c".into());
         let got = affected(
             &pkgs,
             Path::new("/ws"),

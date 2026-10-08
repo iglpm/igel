@@ -1,6 +1,3 @@
-//! What is measured. Every scenario is the same command for both tools, run
-//! from the same state, so the comparison is like for like.
-
 use anyhow::{Result, bail};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -10,9 +7,7 @@ use crate::workload::{Workload, apply_edit};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
-    /// Wall time of a command.
     Time,
-    /// Bytes on disk after a cold build.
     Disk,
 }
 
@@ -28,19 +23,13 @@ pub struct Scenario {
     pub id: &'static str,
     pub category: &'static str,
     pub title: &'static str,
-    /// One sentence: what situation this is.
     pub about: &'static str,
     pub kind: Kind,
-    /// Expensive (a build from scratch): fewer runs, no warm-up.
     pub heavy: bool,
-    /// Only in the `full` suite.
     pub full_only: bool,
     pub needs: Needs,
-    /// The command measured.
     pub args: &'static [&'static str],
-    /// Brings the project into the starting state, once.
     pub prepare: fn(&Ctx, &Workload) -> Result<()>,
-    /// Before each run (warm-ups included): `i` counts runs.
     pub before: fn(&Ctx, &Workload, usize) -> Result<()>,
 }
 
@@ -51,8 +40,6 @@ fn nothing_each(_: &Ctx, _: &Workload, _: usize) -> Result<()> {
     Ok(())
 }
 
-/// Runs a setup command, failing loudly: a scenario must not measure from a
-/// broken state.
 pub fn setup(ctx: &Ctx, args: &[&str]) -> Result<()> {
     let out = crate::measure::run(
         &mut ctx.tool.command(ctx, args),
@@ -78,8 +65,7 @@ pub fn setup(ctx: &Ctx, args: &[&str]) -> Result<()> {
     Ok(())
 }
 
-/// Edit states that never repeat within a benchmark run (a repeated state
-/// would be a legitimate cache hit, not an edit).
+/// Edit states never repeat (a repeated state would be a legitimate cache hit).
 static NEXT_EDIT: AtomicU64 = AtomicU64::new(1_000);
 
 fn fresh_edit() -> u64 {
@@ -93,7 +79,6 @@ fn edit(ctx: &Ctx, file: Option<&Path>, n: u64) -> Result<()> {
     }
 }
 
-/// Writes a file no crate reads (`NOTES.md`) into the package of `file`.
 fn touch_unread(ctx: &Ctx, file: Option<&Path>, n: u64) -> Result<()> {
     let Some(file) = file else {
         bail!("this workload names no file to edit");
@@ -110,7 +95,6 @@ fn touch_unread(ctx: &Ctx, file: Option<&Path>, n: u64) -> Result<()> {
     Ok(())
 }
 
-/// The catalogue, in report order.
 pub fn all() -> Vec<Scenario> {
     vec![
         Scenario {
@@ -327,7 +311,6 @@ pub fn all() -> Vec<Scenario> {
                 edit(ctx, w.core_edit.as_deref(), 2)?;
                 setup(ctx, &["build"])
             },
-            // State 2 is built: switch to 1, then 2, then 1, …
             before: |ctx, w, i| edit(ctx, w.core_edit.as_deref(), 1 + (i % 2) as u64),
         },
         Scenario {
@@ -402,7 +385,6 @@ mod tests {
         ids.sort();
         ids.dedup();
         assert_eq!(ids.len(), all.len());
-        // A category's scenarios are listed together.
         let mut seen: Vec<&str> = Vec::new();
         for s in &all {
             if seen.last() != Some(&s.category) {

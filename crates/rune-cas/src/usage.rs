@@ -6,18 +6,14 @@ use std::fs;
 use std::time::{SystemTime, UNIX_EPOCH};
 use walkdir::WalkDir;
 
-/// Space taken by every stored version of one crate.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PackageUsage {
     pub name: String,
-    /// Stored entries (one per distinct build configuration).
     pub entries: u64,
     pub bytes: u64,
-    /// Seconds since the most recent use of any of its entries.
     pub idle_secs: u64,
 }
 
-/// Entries and bytes that were last used at least `min_idle_secs` ago.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IdleBucket {
     pub min_idle_secs: u64,
@@ -29,19 +25,14 @@ pub struct IdleBucket {
 pub struct Usage {
     pub entries: u64,
     pub bytes: u64,
-    /// Biggest first.
     pub packages: Vec<PackageUsage>,
-    /// Cumulative: everything idle for a day is also idle for an hour.
     pub idle: Vec<IdleBucket>,
 }
 
 const DAY: u64 = 86_400;
 
-/// Idle thresholds reported by [`usage`]: one hour, a day, a week, a month.
 pub const IDLE_THRESHOLDS: [u64; 4] = [3_600, DAY, 7 * DAY, 30 * DAY];
 
-/// Measures the store. Age is time since last *use* (a cache hit refreshes the
-/// manifest's modification time), which is what `rune cas gc --max-age` goes by.
 pub fn usage(store: &CasStore) -> Usage {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)

@@ -1,43 +1,18 @@
-//! Registry sources: crates.io, alternative registries, mirrors, vendored
-//! directories, and local registries.
-//!
-//! A package's *identity* names the registry it was published to — `foo 1.0.0`
-//! from registry A is not `foo 1.0.0` from registry B unless proven equal — and
-//! that identity is what the lockfile and cache keys record. Where the bytes
-//! are actually *fetched from* is a separate matter, decided by configuration:
-//!
-//! ```toml
-//! [registries.corp]
-//! index = "sparse+https://registry.corp.example/index/"
-//!
-//! [source.crates-io]
-//! replace-with = "vendored"          # offline builds, mirrors, vendoring
-//! [source.vendored]
-//! directory = "vendor"               # or: local-registry = "..", registry = ".."
-//! ```
-//!
-//! [`RegistryDefs`] reads that configuration; [`Backend`] is one concrete way to
-//! get an index and packages.
+//! Registry sources. A package's identity names the registry it was published to; where its bytes are
+//! fetched from (`[source]` replacement, vendoring, mirrors) is configuration.
 
 use crate::index::{CrateIndex, IndexDependency, IndexError, IndexRecord, SparseIndexClient};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-/// The canonical identity of crates.io.
 pub const CRATES_IO: &str = rune_common::CRATES_IO_INDEX;
 
-/// Everything the configuration says about registries and sources.
 #[derive(Debug, Clone, Default)]
 pub struct RegistryDefs {
-    /// `[registries.NAME].index`.
     names: HashMap<String, String>,
-    /// `[registries.NAME].token` (and `[registry].token` as `crates-io`).
     config_tokens: HashMap<String, String>,
-    /// `[registries.NAME].credential-provider` (and `[registry]`'s).
     providers: HashMap<String, crate::credential::Provider>,
-    /// `registry.global-credential-providers`, highest precedence last.
     global_providers: Vec<crate::credential::Provider>,
-    /// `[source.NAME]`.
     sources: HashMap<String, SourceDef>,
 }
 
@@ -48,27 +23,18 @@ struct SourceDef {
     directory: Option<PathBuf>,
     local_registry: Option<PathBuf>,
     git: Option<String>,
-    /// `branch`/`tag`/`rev` of a git source, as a lockfile query
-    /// (`branch=main`).
     git_query: Option<String>,
 }
 
-/// A concrete place to read an index and packages from.
 #[derive(Debug, Clone)]
 pub enum Backend {
-    /// A sparse HTTP index (crates.io or an alternative registry).
     Sparse { url: String, token: Option<String> },
-    /// `local-registry`: `dir/index/**` and `dir/<name>-<version>.crate`.
     LocalRegistry(PathBuf),
-    /// `directory`: unpacked crates side by side (`cargo vendor`).
     Directory(PathBuf),
-    /// A git repository holding the index (`registry+https://…`).
     GitIndex { url: String, token: Option<String> },
 }
 
 impl RegistryDefs {
-    /// Reads the `[registries]`, `[source]` (and credentials) parts of a merged
-    /// configuration table.
     pub fn from_config(root: &toml::Table) -> RegistryDefs {
         let mut defs = RegistryDefs::default();
         if let Some(regs) = root.get("registries").and_then(|v| v.as_table()) {
@@ -132,9 +98,6 @@ impl RegistryDefs {
         defs
     }
 
-    /// The directory a git dependency is read from instead of its repository,
-    /// when a `[source."git+…"]` with this URL and reference is replaced by a
-    /// `directory` source (what `cargo vendor` / `rune vendor` configure).
     pub fn git_replacement(&self, url: &str, query: Option<&str>) -> Option<PathBuf> {
         let same_url = |a: &str, b: &str| {
             let norm = |u: &str| u.trim_end_matches('/').trim_end_matches(".git").to_string();
@@ -154,7 +117,6 @@ impl RegistryDefs {
         None
     }
 
-    /// The identity (index URL) of the registry named `name`; `None` is crates.io.
     pub fn index_for_name(&self, name: Option<&str>) -> Result<String, IndexError> {
         match name {
             None | Some("crates-io") => Ok(CRATES_IO.to_string()),
@@ -167,7 +129,6 @@ impl RegistryDefs {
         }
     }
 
-    /// The source name configuration uses for a registry identity.
     fn source_name(&self, index: &str) -> String {
         if index == CRATES_IO {
             return "crates-io".to_string();
@@ -179,8 +140,6 @@ impl RegistryDefs {
             .unwrap_or_else(|| index.to_string())
     }
 
-    /// Where the packages of the registry identified by `index` come from,
-    /// after applying `replace-with`.
     pub fn backend_for(&self, index: &str) -> Result<Backend, IndexError> {
         let original = self.source_name(index);
         let mut name = original.clone();
@@ -237,9 +196,6 @@ impl RegistryDefs {
         })
     }
 
-    /// The token for the web API of the registry with this index (publishing,
-    /// yanking, owners): for crates.io `CARGO_REGISTRY_TOKEN`, then its
-    /// credential providers; for others as for the index.
     pub fn api_token(&self, index: &str) -> Result<Option<String>, IndexError> {
         if index != CRATES_IO {
             return self.token_for(index);
@@ -250,15 +206,10 @@ impl RegistryDefs {
         self.provider_token("crates-io", index)
     }
 
-    /// The name configuration knows the registry with this index by
-    /// (`crates-io` for crates.io).
     pub fn name_of(&self, index: &str) -> String {
         self.source_name(index)
     }
 
-    /// The credential providers that apply to a registry, in the order they
-    /// are asked: its own, else the global ones (last first), else
-    /// `cargo:token`.
     pub fn providers_for(&self, name: &str) -> Vec<crate::credential::Provider> {
         if let Some(p) = self.providers.get(name) {
             return vec![p.clone()];
@@ -269,8 +220,6 @@ impl RegistryDefs {
         vec![crate::credential::Provider::Token]
     }
 
-    /// The index URL credential providers are given for a registry: crates.io's
-    /// canonical one, a git index without its `registry+`.
     pub fn provider_index_url(index: &str) -> String {
         if index == CRATES_IO {
             "https://github.com/rust-lang/crates.io-index".to_string()
@@ -279,9 +228,6 @@ impl RegistryDefs {
         }
     }
 
-    /// The authentication token for the registry with this index, if any:
-    /// `CARGO_REGISTRIES_<NAME>_TOKEN`, then its credential providers.
-    /// Anonymous registries (and crates.io's index) need none.
     fn token_for(&self, index: &str) -> Result<Option<String>, IndexError> {
         let Some((name, _)) = self.names.iter().find(|(_, v)| v.as_str() == index) else {
             return Ok(None);
@@ -302,12 +248,10 @@ impl RegistryDefs {
         self.provider_token(name, index)
     }
 
-    /// Asks the registry's credential providers, in order, once per process.
     fn provider_token(&self, name: &str, index: &str) -> Result<Option<String>, IndexError> {
         static CACHE: std::sync::OnceLock<std::sync::Mutex<HashMap<String, Option<String>>>> =
             std::sync::OnceLock::new();
         let cache = CACHE.get_or_init(Default::default);
-        // Everything the answer depends on.
         let key = format!(
             "{name}\0{index}\0{:?}\0{:?}",
             self.providers_for(name),
@@ -340,8 +284,6 @@ impl RegistryDefs {
     }
 }
 
-/// `sparse+https://x/` and `https://x/` (git index) keep their spelling;
-/// only stray whitespace and a missing trailing slash on sparse URLs go.
 fn normalize_index(index: &str) -> String {
     let index = index.trim();
     if index.starts_with("sparse+") && !index.ends_with('/') {
@@ -349,14 +291,11 @@ fn normalize_index(index: &str) -> String {
     } else if index.starts_with("sparse+") || index.starts_with("registry+") {
         index.to_string()
     } else {
-        // Without `sparse+`, an index URL names a git repository; Cargo
-        // spells such a registry `registry+<url>` (in lockfiles too).
+        // Cargo spells a git index `registry+<url>`.
         format!("registry+{}", index.trim_end_matches('/'))
     }
 }
 
-/// `$CARGO_HOME/credentials.toml`: `[registries.NAME] token = "..."`, or
-/// `[registry] token` for crates.io.
 fn read_credentials_file(name: &str) -> Option<String> {
     read_credentials(|table| {
         let entry = if name == "crates-io" {
@@ -371,15 +310,12 @@ fn read_credentials_file(name: &str) -> Option<String> {
     })
 }
 
-/// `$CARGO_HOME` (else `~/.cargo`): where Cargo keeps credentials.
 pub fn cargo_home() -> Option<PathBuf> {
     std::env::var_os("CARGO_HOME")
         .map(PathBuf::from)
         .or_else(|| home::home_dir().map(|h| h.join(".cargo")))
 }
 
-/// The first answer `pick` finds in `credentials.toml` (or the older
-/// `credentials`).
 fn read_credentials(pick: impl Fn(&toml::Table) -> Option<String>) -> Option<String> {
     let home = cargo_home()?;
     ["credentials.toml", "credentials"].iter().find_map(|file| {
@@ -388,38 +324,24 @@ fn read_credentials(pick: impl Fn(&toml::Table) -> Option<String>) -> Option<Str
     })
 }
 
-// ---------------------------------------------------------------------------
-// Process-wide configuration
-// ---------------------------------------------------------------------------
-
 static DEFS: std::sync::OnceLock<std::sync::Mutex<RegistryDefs>> = std::sync::OnceLock::new();
 
-/// Installs the registry configuration for this process.
 pub fn configure(defs: RegistryDefs) {
     let cell = DEFS.get_or_init(Default::default);
     *cell.lock().unwrap() = defs;
 }
 
-/// The installed registry configuration.
 pub fn defs() -> RegistryDefs {
     DEFS.get_or_init(Default::default).lock().unwrap().clone()
 }
 
-// ---------------------------------------------------------------------------
-// Index access
-// ---------------------------------------------------------------------------
-
-/// Reads the index of one registry, whatever backs it.
 pub enum IndexClient {
     Sparse(SparseIndexClient),
-    /// A local registry or vendored directory, read straight from disk.
     Disk(DiskIndex),
-    /// A clone of a git-based index.
     Git(crate::git_index::GitIndex),
 }
 
 impl IndexClient {
-    /// A client for the registry identified by `index`.
     pub fn for_registry(index: &str, offline: bool) -> Result<IndexClient, IndexError> {
         Ok(match defs().backend_for(index)? {
             Backend::Sparse { url, token } => {
@@ -449,8 +371,6 @@ impl IndexClient {
         }
     }
 
-    /// The yanked versions of `name` known locally (a cached index entry is
-    /// not refreshed). Only the lines that say `"yanked":true` are parsed.
     pub fn yanked_versions(&self, name: &str) -> Vec<String> {
         if let IndexClient::Sparse(c) = self
             && let Some(text) = c.cached_text(name)
@@ -515,8 +435,6 @@ impl DiskIndex {
     }
 }
 
-/// Builds the index of a vendored crate from the manifests on disk: every
-/// `dir/<name>-<version>/` (or `dir/<name>/`) that declares `name`.
 fn directory_index(dir: &Path, name: &str) -> Result<CrateIndex, IndexError> {
     let mut versions = Vec::new();
     for entry in std::fs::read_dir(dir)?.flatten() {
@@ -536,7 +454,6 @@ fn directory_index(dir: &Path, name: &str) -> Result<CrateIndex, IndexError> {
         let Some(vers) = pkg.get("version").and_then(|v| v.as_str()) else {
             continue;
         };
-        // `.cargo-checksum.json` carries the registry checksum of the package.
         let cksum = std::fs::read_to_string(path.join(".cargo-checksum.json"))
             .ok()
             .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
@@ -685,7 +602,6 @@ mod tests {
             Backend::Directory(p) => assert_eq!(p, PathBuf::from("/v")),
             other => panic!("{other:?}"),
         }
-        // Unreplaced registries are untouched.
         let d2 = defs("[registries.a]\nindex = \"sparse+https://a/\"\n");
         assert!(matches!(
             d2.backend_for("sparse+https://a/").unwrap(),
@@ -727,8 +643,6 @@ mod tests {
     #[test]
     fn git_indexes_are_read_from_a_clone_and_named_like_cargo() {
         let d = defs("[registries.corp]\nindex = \"https://git.example.com/index\"\n");
-        // A URL without `sparse+` is a git index, identified as Cargo writes
-        // it in lockfiles.
         let index = d.index_for_name(Some("corp")).unwrap();
         assert_eq!(index, "registry+https://git.example.com/index");
         assert!(matches!(

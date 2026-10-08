@@ -1,16 +1,5 @@
-//! Git dependencies.
-//!
-//! A git dependency names a moving target — a branch, a tag, the default
-//! branch — but a build needs one exact revision. This module fetches a
-//! repository into a shared database, resolves the reference to a **commit**,
-//! and checks that commit out (submodules included) into a directory that is
-//! immutable from then on. The commit (and the state of the submodules) is
-//! the package's *source identity*: it, not the URL or the branch name, goes
-//! into cache keys and the lockfile.
-//!
-//! Rune drives the `git` command line rather than embedding a git library, so
-//! authentication (ssh agents, credential helpers, `insteadOf` rewrites)
-//! behaves exactly as it does for the user's own `git`.
+//! Git dependencies, fetched with the `git` CLI (so auth behaves like the user's git) and checked out
+//! immutably per commit. The commit, not the branch, is the package's source identity.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -35,15 +24,11 @@ pub enum GitError {
 
 pub type Result<T> = std::result::Result<T, GitError>;
 
-/// What a manifest asks for.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum GitRef {
-    /// Whatever the remote's `HEAD` is.
     DefaultBranch,
     Branch(String),
     Tag(String),
-    /// A commit hash (possibly abbreviated) or another ref such as
-    /// `refs/pull/1/head`.
     Rev(String),
 }
 
@@ -57,7 +42,6 @@ impl GitRef {
         }
     }
 
-    /// The inverse of [`GitRef::lock_query`].
     pub fn from_query(query: Option<&str>) -> GitRef {
         match query.and_then(|q| q.split_once('=')) {
             Some(("branch", b)) => GitRef::Branch(b.to_string()),
@@ -67,7 +51,6 @@ impl GitRef {
         }
     }
 
-    /// The `branch=..`/`tag=..`/`rev=..` part of a lockfile source.
     pub fn lock_query(&self) -> Option<String> {
         match self {
             GitRef::DefaultBranch => None,
@@ -78,21 +61,16 @@ impl GitRef {
     }
 }
 
-/// A repository checked out at one exact commit.
 #[derive(Debug, Clone)]
 pub struct GitCheckout {
     pub url: String,
     pub reference: GitRef,
-    /// The resolved 40-hex commit.
     pub commit: String,
-    /// The working tree; never modified after creation.
     pub dir: PathBuf,
-    /// `path=commit` of every submodule, sorted and comma-joined.
     pub submodules: String,
 }
 
 impl GitCheckout {
-    /// The lockfile `source` for a package from this checkout.
     pub fn lock_source(&self) -> String {
         match self.reference.lock_query() {
             Some(q) => format!("git+{}?{q}#{}", self.url, self.commit),
@@ -101,7 +79,6 @@ impl GitCheckout {
     }
 }
 
-/// Splits a lockfile git source into `(url, query, commit)`.
 pub fn parse_lock_source(source: &str) -> Option<(String, Option<String>, String)> {
     let rest = source.strip_prefix("git+")?;
     let (rest, commit) = rest.rsplit_once('#')?;
@@ -111,16 +88,11 @@ pub fn parse_lock_source(source: &str) -> Option<(String, Option<String>, String
     }
 }
 
-/// Process-wide behaviour of git dependencies.
 #[derive(Debug, Clone, Default)]
 pub struct GitOptions {
-    /// Never touch the network.
     pub offline: bool,
-    /// Ignore `pins` and move to the newest commit each reference points to
-    /// (`rune update`).
     pub update: bool,
-    /// `(url, lock query, commit)` from the lockfile: a build resolves a
-    /// reference to *this* commit rather than to wherever a branch has moved.
+    /// Lockfile pins: a build resolves a reference to this commit rather than wherever a branch moved.
     pub pins: Vec<(String, Option<String>, String)>,
 }
 
@@ -135,18 +107,15 @@ fn memo() -> &'static Mutex<HashMap<(String, GitRef), GitCheckout>> {
     MEMO.get_or_init(Default::default)
 }
 
-/// Sets the process-wide options and forgets earlier resolutions.
 pub fn configure(opts: GitOptions) {
     *options().lock().unwrap() = opts;
     memo().lock().unwrap().clear();
 }
 
-/// Every checkout resolved so far in this process.
 pub fn resolved_checkouts() -> Vec<GitCheckout> {
     memo().lock().unwrap().values().cloned().collect()
 }
 
-/// The checkout whose working tree contains `dir`.
 pub fn locate_dir(dir: &Path) -> Option<GitCheckout> {
     memo()
         .lock()
@@ -197,10 +166,6 @@ fn has_commit(db: &Path, commit: &str) -> bool {
     .is_ok()
 }
 
-/// Resolves `reference` of `url` to a commit and checks it out.
-///
-/// The result is remembered for the life of the process, so every part of a
-/// build agrees on which commit a branch meant.
 pub fn checkout(url: &str, reference: &GitRef) -> Result<GitCheckout> {
     let key = (url.to_string(), reference.clone());
     if let Some(hit) = memo().lock().unwrap().get(&key) {
@@ -218,8 +183,6 @@ pub fn checkout(url: &str, reference: &GitRef) -> Result<GitCheckout> {
         })
         .flatten();
 
-    // Vendored: the packages are in a directory; the lockfile's pin stays
-    // the identity.
     if let Some(dir) = crate::source::defs().git_replacement(url, reference.lock_query().as_deref())
     {
         let commit = pinned.clone().ok_or_else(|| GitError::Command {
@@ -277,8 +240,6 @@ pub fn checkout(url: &str, reference: &GitRef) -> Result<GitCheckout> {
 fn fetch(db: &Path, url: &str, reference: &GitRef) -> Result<()> {
     match reference {
         GitRef::Rev(r) if !is_hex(r) => {
-            // A ref such as `refs/pull/1/head`: not covered by the branch and
-            // tag globs below.
             run_git(Some(db), &["fetch", "--force", "--quiet", url, r])?;
         }
         _ => {
@@ -318,13 +279,11 @@ fn resolve_commit(db: &Path, url: &str, reference: &GitRef) -> Result<String> {
             if let Ok(c) = rev_parse(&format!("{r}^{{commit}}")) {
                 return Ok(c);
             }
-            // Not reachable from a branch or tag: try fetching it directly.
             run_git(Some(db), &["fetch", "--force", "--quiet", url, r])
                 .and_then(|_| rev_parse("FETCH_HEAD^{commit}"))
                 .map_err(|_| missing(format!("revision `{r}`")))
         }
         GitRef::DefaultBranch => {
-            // Ask the remote what its HEAD is, then use our copy of that branch.
             let listing = run_git(None, &["ls-remote", "--symref", url, "HEAD"])?;
             let branch = listing
                 .lines()
@@ -342,8 +301,6 @@ fn resolve_commit(db: &Path, url: &str, reference: &GitRef) -> Result<String> {
     }
 }
 
-/// Makes `dir` a checkout of `commit` (a no-op if it already is one) and
-/// returns the state of its submodules.
 fn materialize(db: &Path, dir: &Path, commit: &str) -> Result<String> {
     let marker = dir.join(".rune-git-identity");
     if let Ok(text) = std::fs::read_to_string(&marker) {
@@ -376,8 +333,6 @@ fn materialize(db: &Path, dir: &Path, commit: &str) -> Result<String> {
             Some(&staging),
             &["checkout", "--quiet", "--force", "--detach", commit],
         )?;
-        // Submodules are part of the source: a package can `include!` from
-        // them or build C code out of them.
         if staging.join(".gitmodules").is_file() {
             run_git(
                 Some(&staging),
@@ -413,7 +368,6 @@ fn materialize(db: &Path, dir: &Path, commit: &str) -> Result<String> {
                     "could not move the checkout of {commit} into place"
                 ))));
             }
-            // Lost a race to another process: theirs is complete, ours is spare.
             let _ = std::fs::remove_dir_all(&staging);
             Ok(subs)
         }
@@ -424,9 +378,6 @@ fn materialize(db: &Path, dir: &Path, commit: &str) -> Result<String> {
     }
 }
 
-/// The directory of the package called `name` inside a checkout: the
-/// repository root if that is it, else the shallowest manifest (in path
-/// order) that declares it — like Cargo, which searches the whole repository.
 pub fn find_package(checkout: &GitCheckout, name: &str) -> Result<PathBuf> {
     let declares = |dir: &Path| -> bool {
         std::fs::read_to_string(rune_common::manifest_file::manifest_in(dir))

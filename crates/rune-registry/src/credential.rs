@@ -1,15 +1,5 @@
-//! Credential providers, as Cargo defines them: where a registry token comes
-//! from, and where `rune login` puts it.
-//!
-//! * `cargo:token` — `token` in configuration, else `credentials.toml`
-//!   (the default);
-//! * `cargo:token-from-stdout <cmd> <args…>` — the first line a command prints;
-//! * `cargo:macos-keychain` — the macOS keychain (service
-//!   `cargo-registry:<index-url>`, as Cargo's provider stores it);
-//! * `cargo:libsecret` — the Secret Service on Linux (`secret-tool`);
-//! * `cargo:wincred` — Windows Credential Manager (not available in Rune yet);
-//! * anything else — an external provider program speaking Cargo's JSON
-//!   credential protocol (`<program> <args…> --cargo-plugin`).
+//! Cargo's credential providers (`cargo:token`, `cargo:token-from-stdout`, keychain, libsecret,
+//! external `--cargo-plugin` programs).
 
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
@@ -25,8 +15,6 @@ pub enum Provider {
 }
 
 impl Provider {
-    /// Parses a `credential-provider` value: `"cargo:token"`, `"cmd arg"`,
-    /// or `["cmd", "arg"]`.
     pub fn parse(value: &toml::Value) -> Option<Provider> {
         let parts: Vec<String> = match value {
             toml::Value::String(s) => s.split_whitespace().map(str::to_string).collect(),
@@ -48,19 +36,11 @@ impl Provider {
     }
 }
 
-/// The registry a credential is for, as providers see it.
 pub struct Registry<'a> {
-    /// How configuration names it (`crates-io` for crates.io).
     pub name: &'a str,
-    /// The index URL Cargo gives providers: crates.io's canonical
-    /// `https://github.com/rust-lang/crates.io-index`, `sparse+…` for sparse
-    /// registries, the plain URL for git-based ones.
     pub index_url: &'a str,
 }
 
-/// The token a provider has for `registry`, `Ok(None)` when it has none.
-/// `config_token` is `[registries.NAME] token` from configuration, which
-/// `cargo:token` prefers over `credentials.toml`.
 pub fn get(
     provider: &Provider,
     registry: &Registry,
@@ -132,9 +112,6 @@ pub fn get(
     }
 }
 
-/// Stores `token` with a provider (`rune login`). `Ok(false)` means the
-/// provider does not store tokens itself (`cargo:token` writes
-/// `credentials.toml`, which the caller does).
 pub fn store(provider: &Provider, registry: &Registry, token: &str) -> Result<bool, String> {
     match provider {
         Provider::Token => Ok(false),
@@ -192,8 +169,6 @@ pub fn store(provider: &Provider, registry: &Registry, token: &str) -> Result<bo
     }
 }
 
-/// Removes the token from a provider (`rune logout`); `Ok(false)` as for
-/// [`store`].
 pub fn erase(provider: &Provider, registry: &Registry) -> Result<bool, String> {
     match provider {
         Provider::Token | Provider::TokenFromStdout(_) => Ok(false),
@@ -244,9 +219,7 @@ enum Reply {
     NotFound,
 }
 
-/// One request to an external provider, per Cargo's credential protocol
-/// (version 1): the provider greets with `{"v":[1]}`, reads one request line
-/// and answers `{"Ok": …}` or `{"Err": …}`.
+/// Cargo's credential protocol, version 1.
 fn external(
     cmd: &[String],
     registry: &Registry,
@@ -331,8 +304,6 @@ mod tests {
     fn external_providers_speak_the_json_protocol() {
         let dir = tempfile::tempdir().unwrap();
         let script = dir.path().join("provider");
-        // Greets, reads one request, answers with a token that names the
-        // registry it was asked about.
         std::fs::write(
             &script,
             "#!/bin/sh\necho '{\"v\":[1]}'\nread req\ncase \"$req\" in\n  *'\"kind\":\"get\"'*) echo '{\"Ok\":{\"kind\":\"get\",\"token\":\"tok-for-corp\",\"cache\":\"session\",\"operation_independent\":true}}' ;;\n  *) echo '{\"Err\":{\"kind\":\"other\",\"message\":\"only get\"}}' ;;\nesac\n",

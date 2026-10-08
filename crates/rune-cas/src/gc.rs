@@ -5,12 +5,8 @@ use tracing::{debug, info};
 use walkdir::WalkDir;
 
 pub struct GcConfig {
-    /// Maximum total size in bytes. Entries are evicted LRU until under this limit.
     pub max_size_bytes: Option<u64>,
-    /// Maximum age in seconds. Entries older than this are evicted.
     pub max_age_secs: Option<u64>,
-    /// Compress (zstd) the artifacts of entries kept but unused for this
-    /// many seconds.
     pub compress_idle_secs: Option<u64>,
 }
 
@@ -20,13 +16,11 @@ pub struct GcReport {
     pub bytes_freed: u64,
     pub entries_remaining: u64,
     pub bytes_remaining: u64,
-    /// Entries kept because a pinned project needs them.
     pub entries_pinned: u64,
     pub entries_compressed: u64,
     pub bytes_compressed_away: u64,
 }
 
-/// Run garbage collection on the CAS store.
 pub fn run_gc(store: &CasStore, config: &GcConfig) -> crate::store::Result<GcReport> {
     info!("Running CAS garbage collection");
 
@@ -42,7 +36,6 @@ pub fn run_gc(store: &CasStore, config: &GcConfig) -> crate::store::Result<GcRep
 
     let mut report = GcReport::default();
 
-    // 1. Gather all entries
     let mut entries = Vec::new();
     for entry in WalkDir::new(&objects_dir).min_depth(2).max_depth(2) {
         let entry = match entry {
@@ -56,8 +49,7 @@ pub fn run_gc(store: &CasStore, config: &GcConfig) -> crate::store::Result<GcRep
                 && let Ok(content) = fs::read_to_string(&manifest_path)
                 && let Ok(mut manifest) = serde_json::from_str::<ArtifactManifest>(&content)
             {
-                // Last *use*, not last store: a cache hit bumps the
-                // manifest's mtime (see `CasStore::link_to`).
+                // Last *use*, not last store: a cache hit bumps the manifest's mtime.
                 let used = fs::metadata(&manifest_path)
                     .and_then(|m| m.modified())
                     .ok()
@@ -70,16 +62,13 @@ pub fn run_gc(store: &CasStore, config: &GcConfig) -> crate::store::Result<GcRep
         }
     }
 
-    // Sort entries by stored_at ascending (oldest first) for LRU eviction
     entries.sort_by_key(|(_, m)| m.stored_at);
 
-    // Entries a pinned project needs are never removed.
     crate::pins::prune(store);
     let pinned = crate::pins::pinned_keys(store);
     let is_pinned = |m: &ArtifactManifest| pinned.contains(&m.cache_key);
     report.entries_pinned = entries.iter().filter(|(_, m)| is_pinned(m)).count() as u64;
 
-    // 2. Remove entries older than max_age_secs
     let mut current_total_size: u64 = entries.iter().map(|(_, m)| m.disk_size()).sum();
     let mut remaining_entries = Vec::new();
 
@@ -109,7 +98,6 @@ pub fn run_gc(store: &CasStore, config: &GcConfig) -> crate::store::Result<GcRep
         }
     }
 
-    // 3. Remove oldest entries if still over max_size_bytes
     if let Some(max_size) = config.max_size_bytes {
         for (path, manifest) in remaining_entries.iter() {
             if current_total_size <= max_size {
@@ -127,13 +115,11 @@ pub fn run_gc(store: &CasStore, config: &GcConfig) -> crate::store::Result<GcRep
         }
     }
 
-    // Recalculate remaining
     let mut final_remaining: Vec<_> = remaining_entries
         .into_iter()
         .filter(|(p, _)| p.exists())
         .collect();
 
-    // 4. Compress what has gone unused for a while.
     if let Some(idle) = config.compress_idle_secs {
         for (path, manifest) in final_remaining.iter_mut() {
             if manifest.compressed || now.saturating_sub(manifest.stored_at) <= idle {
@@ -155,7 +141,6 @@ pub fn run_gc(store: &CasStore, config: &GcConfig) -> crate::store::Result<GcRep
     report.entries_remaining = final_remaining.len() as u64;
     report.bytes_remaining = final_remaining.iter().map(|(_, m)| m.disk_size()).sum();
 
-    // Update stats
     store.flush_stats();
     if let Ok(mut stats) = store.stats() {
         stats.total_entries = report.entries_remaining;
@@ -186,8 +171,6 @@ mod tests {
             .unwrap();
         store.put("key2", "bar", "1.0", &[file]).unwrap();
 
-        // Age key1 by ten seconds instead of sleeping: rewrite its manifest
-        // (and mtime, which GC treats as last use) into the past.
         let manifest_path = store.object_dir("key1").join("manifest.json");
         let mut manifest: ArtifactManifest =
             serde_json::from_str(&fs::read_to_string(&manifest_path).unwrap()).unwrap();
@@ -198,7 +181,7 @@ mod tests {
 
         let config = GcConfig {
             max_size_bytes: None,
-            max_age_secs: Some(1), // Evict older than 1s
+            max_age_secs: Some(1),
             compress_idle_secs: None,
         };
 
@@ -250,20 +233,17 @@ mod tests {
         .unwrap();
         assert_eq!(report.entries_removed, 0);
         assert_eq!(report.entries_pinned, 1);
-        // Both old entries compressed; the fresh one is left alone.
         assert_eq!(report.entries_compressed, 2);
         let idle = store.object_dir("idle");
         assert!(!idle.join("libfoo.rlib").exists());
         assert!(idle.join("libfoo.rlib.zst").exists());
         assert!(report.bytes_remaining < 2 * data.len() as u64);
 
-        // The next use decompresses it and links the original bytes.
         let out = dir.path().join("target");
         store.link_to("idle", &out).unwrap();
         assert_eq!(fs::read_to_string(out.join("libfoo.rlib")).unwrap(), data);
         assert!(!idle.join("libfoo.rlib.zst").exists());
 
-        // Without the pin, the old entry goes.
         crate::pins::unpin(&store, &project);
         let report = run_gc(
             &store,

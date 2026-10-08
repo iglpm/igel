@@ -1,7 +1,4 @@
-//! # rune-fingerprint
-//!
-//! Content-hash based dirty detection for the Rune build system.
-//! Uses xxhash3 for fast file hashing with mtime as a cache optimization.
+//! Content-hash based dirty detection.
 
 pub mod cache;
 pub mod hasher;

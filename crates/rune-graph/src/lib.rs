@@ -1,7 +1,4 @@
-//! # rune-graph
-//!
-//! Dependency graph construction, topological sort, feature unification,
-//! and critical path computation for the Rune build system.
+//! Build graph, topological sort, feature unification and critical paths.
 
 pub mod critical_path;
 pub mod dag;

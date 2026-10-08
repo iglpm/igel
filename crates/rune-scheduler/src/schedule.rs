@@ -1,42 +1,27 @@
-//! What a build's schedule looked like, and why it took as long as it did.
-//!
-//! Every step the executor runs (a unit's compilation, or its build script)
-//! is recorded with the moments it became ready, started, produced metadata
-//! and finished, and what it waited for. From that, [`ScheduleReport`] finds
-//! the *chain that determined the build's length*: starting from the step
-//! that finished last, repeatedly the prerequisite that was ready last. When
-//! the machine sat mostly idle, that chain is the answer to "why didn't Rune
-//! use all my cores?" — the crates on it had to be built one after another.
+//! The recorded schedule of a build and the chain of steps that determined its length.
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::path::Path;
 
-/// A step of the build: a unit's compilation or its build script.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct StepId {
     pub node: usize,
     pub script: bool,
 }
 
-/// When a step could start: after a prerequisite finished, or (for a library
-/// used through pipelining) after it wrote its metadata.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Gate {
     End(StepId),
     Metadata(StepId),
 }
 
-/// One step's timeline, in seconds since the build began.
 #[derive(Debug, Clone)]
 pub struct Step {
     pub label: String,
-    /// `lib`, `bin`, `test`, `proc-macro`, `build-script`, …
     pub kind: &'static str,
-    /// When everything it needed was available.
     pub ready: f64,
     pub start: f64,
-    /// When its `.rmeta` existed (libraries).
     pub metadata: Option<f64>,
     pub end: f64,
     pub gates: Vec<Gate>,
@@ -51,30 +36,21 @@ impl Step {
     }
 }
 
-/// One link of the chain that determined the build's length.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Link {
     pub label: String,
     pub kind: &'static str,
-    /// Seconds this step contributed: from its start until the moment the
-    /// next link could begin (its end, or its metadata for a pipelined
-    /// dependent).
     pub secs: f64,
-    /// Seconds it was ready but waited for a free job slot.
     pub waited: f64,
 }
 
-/// A summary of one build's schedule.
 #[derive(Debug, Clone)]
 pub struct ScheduleReport {
-    /// From the first step's start to the last step's end.
     pub wall: f64,
-    /// Sum of every step's duration.
     pub busy: f64,
     pub cpus: usize,
     pub jobs: usize,
     pub steps: usize,
-    /// First link first.
     pub chain: Vec<Link>,
 }
 
@@ -106,9 +82,6 @@ impl ScheduleReport {
                 secs: (until - step.start).max(0.0),
                 waited: (step.start - step.ready).max(0.0),
             });
-            // The prerequisite that was available last is what this step
-            // waited for; one that finished before the build (a cache hit)
-            // was not recorded and never is.
             let prev = step
                 .gates
                 .iter()
@@ -136,7 +109,6 @@ impl ScheduleReport {
         }
     }
 
-    /// Steps running at once, on average.
     pub fn parallelism(&self) -> f64 {
         if self.wall > 0.0 {
             self.busy / self.wall
@@ -145,14 +117,10 @@ impl ScheduleReport {
         }
     }
 
-    /// Seconds spent on the chain.
     pub fn chain_secs(&self) -> f64 {
         self.chain.iter().map(|l| l.secs).sum()
     }
 
-    /// One line for a build that left most cores idle because a chain of
-    /// crates had to be built one after another; `None` for a build that was
-    /// short or kept the machine busy.
     pub fn hint(&self) -> Option<String> {
         let cores = self.cpus.min(self.jobs).max(1) as f64;
         if self.wall < 10.0
@@ -179,7 +147,6 @@ impl ScheduleReport {
         ))
     }
 
-    /// The chain, one line per link, for `--timings`.
     pub fn describe_chain(&self) -> String {
         let mut out = String::new();
         let _ = writeln!(
@@ -201,7 +168,6 @@ impl ScheduleReport {
     }
 }
 
-/// Places steps on lanes (rows) so that no two overlap on one lane.
 fn lanes(steps: &HashMap<StepId, Step>) -> Vec<(StepId, usize)> {
     let mut order: Vec<(&StepId, &Step)> = steps.iter().collect();
     order.sort_by(|a, b| a.1.start.total_cmp(&b.1.start));
@@ -221,7 +187,6 @@ fn lanes(steps: &HashMap<StepId, Step>) -> Vec<(StepId, usize)> {
     out
 }
 
-/// A Chrome trace (`chrome://tracing`, Perfetto) of the schedule.
 pub fn write_chrome_trace(path: &Path, steps: &HashMap<StepId, Step>) {
     let events: Vec<serde_json::Value> = lanes(steps)
         .into_iter()
@@ -261,8 +226,6 @@ fn escape(s: &str) -> String {
         .replace('"', "&quot;")
 }
 
-/// A self-contained HTML page: the summary, the chain, a timeline of every
-/// step (the chain highlighted) and how many ran at once.
 pub fn write_html(path: &Path, steps: &HashMap<StepId, Step>, report: &ScheduleReport) {
     let placed = lanes(steps);
     let lane_count = placed.iter().map(|(_, l)| l + 1).max().unwrap_or(1);
@@ -312,7 +275,6 @@ pub fn write_html(path: &Path, steps: &HashMap<StepId, Step>, report: &ScheduleR
         }
     }
 
-    // Steps running at each moment, sampled every 1/400 of the build.
     let samples = 400;
     let mut concurrency = String::new();
     let graph_h = 90.0;
@@ -450,7 +412,6 @@ mod tests {
         let r = ScheduleReport::analyze(&steps, 8, 8);
         let labels: Vec<&str> = r.chain.iter().map(|l| l.label.as_str()).collect();
         assert_eq!(labels, ["a", "c", "d"]);
-        // `a` only counts until its metadata let `c` start.
         assert!((r.chain[0].secs - 2.0).abs() < 1e-9);
         assert!((r.chain[1].secs - 7.0).abs() < 1e-9);
         assert!((r.chain[2].waited - 0.5).abs() < 1e-9);

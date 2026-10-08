@@ -1,34 +1,16 @@
-//! Which file holds a directory's manifest: `Cargo.toml` or `Rune.toml`.
-//!
-//! Rune reads Cargo's manifest format from either file, so a project can be
-//! plain Cargo, Rune-only, or both:
-//!
-//! * `Rune.toml` **is a manifest** when it has a `[package]` or `[workspace]`
-//!   table. It may then also carry Rune's own settings (`[build]`, `[cas]`, …)
-//!   in the same file.
-//! * A `Rune.toml` without either table is a **settings file** (what it was
-//!   before manifests could live there): the manifest is the `Cargo.toml` next to
-//!   it.
-//! * If both files are manifests, `Rune.toml` wins.
-//!
-//! Every place that used to say `dir.join("Cargo.toml")` asks this module.
+//! Which file holds a directory's manifest: a `Rune.toml` with `[package]`/`[workspace]` (wins), else
+//! `Cargo.toml`. A `Rune.toml` without them is only a settings file.
 
 use std::path::{Path, PathBuf};
 
 pub const CARGO_TOML: &str = "Cargo.toml";
 pub const RUNE_TOML: &str = "Rune.toml";
 
-/// Whether a file name can be a manifest.
 pub fn is_manifest_file_name(name: &str) -> bool {
     name == CARGO_TOML || name == RUNE_TOML
 }
 
-/// Whether the text of a `Rune.toml` is a manifest rather than only settings.
-///
-/// Decided by the presence of a top-level `package` or `workspace` table. A file
-/// that does not parse is judged by its headers instead, so that a manifest with
-/// a typo is reported as a broken manifest, not silently passed over for a
-/// `Cargo.toml` that happens to sit beside it.
+/// A file that doesn't parse is judged by its headers, so a broken manifest is reported, not skipped.
 pub fn text_is_manifest(text: &str) -> bool {
     match text.parse::<toml::Table>() {
         Ok(table) => table.contains_key("package") || table.contains_key("workspace"),
@@ -39,10 +21,8 @@ pub fn text_is_manifest(text: &str) -> bool {
     }
 }
 
-/// The manifest of the package or workspace rooted at `dir`, if it has one.
 pub fn find_manifest(dir: &Path) -> Option<PathBuf> {
     let rune = dir.join(RUNE_TOML);
-    // One `stat` for the common case of a plain Cargo project.
     if rune.is_file() && std::fs::read_to_string(&rune).is_ok_and(|t| text_is_manifest(&t)) {
         return Some(rune);
     }
@@ -50,13 +30,10 @@ pub fn find_manifest(dir: &Path) -> Option<PathBuf> {
     cargo.is_file().then_some(cargo)
 }
 
-/// Whether `dir` holds a manifest.
 pub fn has_manifest(dir: &Path) -> bool {
     find_manifest(dir).is_some()
 }
 
-/// The manifest of `dir`, or where a new `Cargo.toml` would go: for messages,
-/// and for callers that then report the file as missing.
 pub fn manifest_in(dir: &Path) -> PathBuf {
     find_manifest(dir).unwrap_or_else(|| dir.join(CARGO_TOML))
 }
@@ -98,7 +75,6 @@ mod tests {
             ("Rune.toml", "[build]\njobs = 4\n[cas]\nverify = true\n"),
         ]);
         assert_eq!(name_of(&d).as_deref(), Some("Cargo.toml"));
-        // …and with no Cargo.toml there is no manifest at all.
         let only = dir_with(&[("Rune.toml", "[build]\njobs = 4\n")]);
         assert_eq!(name_of(&only), None);
         assert!(!has_manifest(only.path()));

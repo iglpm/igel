@@ -1,20 +1,5 @@
-//! The compiler a build uses, and everything about it that can change output.
-//!
-//! An artifact is only reusable when it was produced by an *equivalent*
-//! compiler, so this module models the toolchain explicitly instead of
-//! hashing `rustc -vV` and hoping:
-//!
-//! * which `rustc` runs (`RUSTC`, `build.rustc`, a `rust-toolchain(.toml)`
-//!   resolved through `rustup`), and which `rustdoc`;
-//! * `RUSTC_WRAPPER` / `build.rustc-wrapper` (`sccache`, `clippy-driver`, …) and
-//!   `RUSTC_WORKSPACE_WRAPPER`, kept apart from the compiler and from each
-//!   other, because each can change what gets compiled;
-//! * the target: its `cfg` set as the compiler reports it, and for a custom
-//!   target JSON the *normalized specification*, not just its file name;
-//! * the effective `rustflags`, linker and runner for each role.
-//!
-//! [`Toolchain::identity`] folds the compiler side into one string that goes
-//! into every cache key.
+//! The compiler a build uses and everything about it that can change output; [`Toolchain::identity`]
+//! goes into every cache key.
 
 use crate::cargo_config::CargoConfig;
 use crate::cfgexpr::{self, Cfg};
@@ -23,42 +8,23 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Mutex, OnceLock};
 
-/// A discovered compiler installation plus its wrappers.
 #[derive(Debug, Clone)]
 pub struct Toolchain {
-    /// The compiler as configured (`RUSTC`, `build.rustc`, a toolchain file,
-    /// or plain `rustc` from `PATH`) — what the identity names.
     pub rustc: PathBuf,
-    /// The binary actually started: for a `rustc` found on `PATH`, the
-    /// toolchain's own `rustc` in its sysroot, not a `rustup` proxy. Cargo
-    /// does the same: a proxy costs ~7 ms per start, and resolves the
-    /// toolchain again each time — from the directory it is started in, so a
-    /// dependency shipping its own `rust-toolchain.toml` could get another
-    /// compiler, and a `rustup update` during a build would mix two.
+    /// The real `rustc` in the sysroot, not a `rustup` proxy (slow, and resolves the toolchain per directory).
     pub exec: PathBuf,
     pub rustdoc: PathBuf,
-    /// `RUSTC_WRAPPER` / `build.rustc-wrapper`.
     pub wrapper: Option<PathBuf>,
-    /// `RUSTC_WORKSPACE_WRAPPER` / `build.rustc-workspace-wrapper`: applied to
-    /// workspace members only.
     pub workspace_wrapper: Option<PathBuf>,
-    /// The full `rustc -vV` output.
     pub verbose_version: String,
-    /// The host triple `rustc` reports.
     pub host: String,
     pub version: semver::Version,
-    /// The compiler's sysroot, when it could be determined.
     pub sysroot: Option<PathBuf>,
-    /// Which entry of the probe cache describes this compiler.
     probe_key: String,
     identity: String,
 }
 
 impl Toolchain {
-    /// Why this compiler cannot be used, when it cannot: not installed, or a
-    /// `rustup` without a toolchain for here. Asked once before building, so
-    /// the answer is a sentence instead of an I/O error from the first
-    /// compiler start.
     pub fn unusable_reason(&self) -> Option<String> {
         if !self.verbose_version.is_empty() {
             return None;
@@ -96,13 +62,10 @@ impl Toolchain {
         }
     }
 
-    /// Discovers the toolchain for a project rooted at `project_root`.
     pub fn discover(cfg: &CargoConfig, project_root: &Path) -> Toolchain {
         Self::discover_with_cache(cfg, project_root, &probe_cache_path())
     }
 
-    /// [`Self::discover`], keeping compiler probes in `cache` (see
-    /// [`ProbeCache`]).
     pub fn discover_with_cache(cfg: &CargoConfig, project_root: &Path, cache: &Path) -> Toolchain {
         let non_empty = |v: Option<std::ffi::OsString>| v.filter(|s| !s.is_empty());
 
@@ -116,8 +79,6 @@ impl Toolchain {
 
         let probe = ProbeCache::open(cache).probe(&rustc);
         let sysroot = (!probe.sysroot.is_empty()).then(|| PathBuf::from(&probe.sysroot));
-        // An explicitly configured compiler is started exactly as given (it
-        // may be a script); `rustc` from `PATH` is resolved to the real one.
         let exec = sysroot
             .as_ref()
             .filter(|_| !explicit)
@@ -129,14 +90,12 @@ impl Toolchain {
             .map(PathBuf::from)
             .or_else(|| cfg.string(&["build", "rustdoc"]).map(PathBuf::from))
             .or_else(|| {
-                // `rustdoc` lives next to the `rustc` it belongs to.
                 let dir = exec.parent().filter(|d| !d.as_os_str().is_empty())?;
                 let sibling = dir.join(exe_name("rustdoc"));
                 sibling.is_file().then_some(sibling)
             })
             .unwrap_or_else(|| PathBuf::from("rustdoc"));
 
-        // An empty variable means "no wrapper", overriding the config file.
         let wrapper = match std::env::var_os("RUSTC_WRAPPER") {
             Some(v) if v.is_empty() => None,
             Some(v) => Some(PathBuf::from(v)),
@@ -184,15 +143,11 @@ impl Toolchain {
         tc
     }
 
-    /// A string that differs whenever the compiler, its wrappers, or the
-    /// compiler's own implementation differ.
     pub fn identity(&self) -> &str {
         &self.identity
     }
 
-    /// The identity relevant to one unit. `RUSTC_WORKSPACE_WRAPPER` only
-    /// wraps workspace members, so a dependency's artifacts must survive a
-    /// change to it while a member's must not.
+    /// `RUSTC_WORKSPACE_WRAPPER` only affects workspace members' identities.
     pub fn identity_for(&self, workspace_member: bool) -> String {
         if workspace_member {
             self.identity.clone()
@@ -212,10 +167,7 @@ impl Toolchain {
         out.push('\n');
         out.push_str(&self.verbose_version);
         out.push('\n');
-        // The version output is the same for two builds of the same commit,
-        // and empty-ish for a locally linked development toolchain. The
-        // compiler's actual implementation lives in `librustc_driver`, so
-        // fingerprint that file too.
+        // The version output doesn't identify a local dev toolchain: fingerprint `librustc_driver` too.
         out.push_str("driver=");
         out.push_str(
             &self
@@ -237,8 +189,6 @@ impl Toolchain {
         out
     }
 
-    /// Whether the compiler accepts `-Z` flags: a nightly or locally built
-    /// one (or any, with `RUSTC_BOOTSTRAP=1` set by the user).
     pub fn accepts_unstable_flags(&self) -> bool {
         let release = self
             .verbose_version
@@ -250,9 +200,6 @@ impl Toolchain {
             || std::env::var("RUSTC_BOOTSTRAP").is_ok_and(|v| v == "1")
     }
 
-    /// Whether a `rust-version` requirement (`1.85`, `1.85.0`) is met.
-    /// Pre-release suffixes on the toolchain (`-nightly`) are ignored, as
-    /// Cargo ignores them for this check.
     pub fn satisfies_msrv(&self, msrv: &str) -> bool {
         match parse_rust_version(msrv) {
             Some(min) => {
@@ -267,9 +214,6 @@ impl Toolchain {
         }
     }
 
-    /// A `Command` that runs the compiler, through the configured wrappers.
-    /// The workspace wrapper only applies when `workspace_member` is set.
-    /// `wrapper workspace-wrapper rustc args…`, as Cargo orders them.
     pub fn rustc_command(&self, workspace_member: bool) -> Command {
         let mut chain: Vec<&Path> = Vec::new();
         if let Some(w) = &self.wrapper {
@@ -287,7 +231,6 @@ impl Toolchain {
     }
 }
 
-/// `1.85` → `1.85.0`.
 pub fn parse_rust_version(s: &str) -> Option<semver::Version> {
     let mut parts = s.trim().split('.');
     let major = parts.next()?.parse().ok()?;
@@ -298,13 +241,10 @@ pub fn parse_rust_version(s: &str) -> Option<semver::Version> {
 
 static GLOBAL: OnceLock<Toolchain> = OnceLock::new();
 
-/// Installs the process-wide toolchain. The first call wins.
 pub fn set_global(tc: Toolchain) {
     let _ = GLOBAL.set(tc);
 }
 
-/// The process-wide toolchain, discovering one from the environment if none
-/// was installed.
 pub fn global() -> &'static Toolchain {
     GLOBAL.get_or_init(|| {
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
@@ -312,10 +252,6 @@ pub fn global() -> &'static Toolchain {
     })
 }
 
-/// `rustup which rustc` in `dir`, if a `rust-toolchain(.toml)` applies there.
-/// Resolving to the concrete binary makes the choice explicit — and
-/// fingerprintable — instead of depending on the `rustc` proxy's working
-/// directory.
 fn rustup_rustc(dir: &Path) -> Option<PathBuf> {
     let mut cur = Some(dir);
     let mut found = false;
@@ -341,7 +277,6 @@ fn rustup_rustc(dir: &Path) -> Option<PathBuf> {
     (!path.is_empty()).then(|| PathBuf::from(path))
 }
 
-/// Finds `program` on `PATH` (or returns it as is when it has a directory).
 pub fn find_program(program: &Path) -> Option<PathBuf> {
     if program.components().count() > 1 || program.is_absolute() {
         return program.is_file().then(|| program.to_path_buf());
@@ -352,8 +287,6 @@ pub fn find_program(program: &Path) -> Option<PathBuf> {
         .find(|p| p.is_file())
 }
 
-/// Path plus size and mtime of a tool: enough to notice it was replaced or
-/// updated, without reading it.
 pub fn program_fingerprint(program: &Path) -> String {
     match find_program(program).and_then(|p| std::fs::metadata(&p).ok().map(|m| (p, m))) {
         Some((p, m)) => format!(
@@ -370,7 +303,6 @@ pub fn program_fingerprint(program: &Path) -> String {
     }
 }
 
-/// Size and mtime of the compiler's implementation (`librustc_driver`).
 fn driver_fingerprint(sysroot: &Path) -> String {
     let mut parts = Vec::new();
     if let Ok(entries) = std::fs::read_dir(sysroot.join("lib")) {
@@ -395,10 +327,7 @@ fn driver_fingerprint(sysroot: &Path) -> String {
     parts.join(",")
 }
 
-/// The first line of `program --version`, remembered by the program's path,
-/// size and mtime (`$RUNE_HOME/cache/tools.json`): the same binary gives the
-/// same answer, and starting a C compiler just to ask costs more than a whole
-/// no-op build.
+/// Cached by path, size and mtime: starting a C compiler costs more than a no-op build.
 pub fn tool_version(program: &Path) -> String {
     let fingerprint = program_fingerprint(program);
     let path = crate::settings::rune_home()
@@ -446,45 +375,29 @@ pub fn tool_version(program: &Path) -> String {
     version
 }
 
-/// `rustc` or `rustc.exe`.
 fn exe_name(name: &str) -> String {
     format!("{name}{}", std::env::consts::EXE_SUFFIX)
 }
 
-/// Where compiler probes are kept.
 fn probe_cache_path() -> PathBuf {
     crate::settings::rune_home()
         .join("cache")
         .join("toolchains.json")
 }
 
-/// What asking a compiler about itself found.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 struct Probe {
-    /// Which entry this is (see [`ProbeCache::resolution_key`]).
     #[serde(skip)]
     key: String,
-    /// `rustc -vV`.
     verbose_version: String,
-    /// `rustc --print sysroot`.
     sysroot: String,
-    /// Sizes and mtimes of the sysroot's `rustc` and `librustc_driver`: the
-    /// entry is only believed while these are unchanged.
     files: String,
-    /// `rustc --print=cfg` output by target, specification and flags.
     #[serde(default)]
     cfg: std::collections::BTreeMap<String, String>,
 }
 
-/// Compiler probes (`rustc -vV`, `--print sysroot`, `--print=cfg`) kept across
-/// runs. Each one starts the compiler — through a `rustup` proxy about
-/// 15–20 ms — and every Rune command needs several, which used to be most of
-/// a no-op build's time. The answers change only when the compiler does, so
-/// an entry is keyed by what decides which compiler `rustc` is (its path,
-/// size and mtime; rustup's settings, `RUSTUP_TOOLCHAIN` and the working
-/// directory, which select a proxy's toolchain) and trusted only while the
-/// toolchain's own files are unchanged — `rustup update` misses and probes
-/// again.
+/// Compiler probes cached across runs, keyed by what selects the compiler and trusted only while the
+/// toolchain's files are unchanged.
 struct ProbeCache {
     path: PathBuf,
 }
@@ -512,7 +425,6 @@ impl ProbeCache {
         }
     }
 
-    /// What selects the compiler a `rustc` invocation runs.
     fn resolution_key(rustc: &Path) -> String {
         let mut hb = crate::hash::HashBuilder::new();
         hb.update(rustc.to_string_lossy().as_bytes());
@@ -535,7 +447,6 @@ impl ProbeCache {
         {
             hb.update(b"\0settings=");
             hb.update(text.as_bytes());
-            // A `rustup override` for this directory or one above it.
             if let (Some(cwd), Ok(parsed)) = (&cwd, text.parse::<toml::Table>())
                 && let Some(overrides) = parsed.get("overrides").and_then(|o| o.as_table())
                 && let Some((dir, toolchain)) = overrides
@@ -549,9 +460,7 @@ impl ProbeCache {
                 hb.update(toolchain.to_string().as_bytes());
             }
         }
-        // Which toolchain a proxy picks in this directory: an override (above)
-        // or the nearest `rust-toolchain(.toml)`. Not the directory itself, so
-        // every project and checkout without either shares the probe.
+        // Directories without an override or toolchain file share the probe.
         if let Some(cwd) = &cwd {
             for dir in cwd.ancestors() {
                 let file = ["rust-toolchain.toml", "rust-toolchain"]
@@ -570,7 +479,6 @@ impl ProbeCache {
         hb.finish_blake3()
     }
 
-    /// Fingerprint of the files that make up the compiler in `sysroot`.
     fn sysroot_files(sysroot: &Path) -> String {
         let rustc = sysroot.join("bin").join(exe_name("rustc"));
         format!(
@@ -580,8 +488,6 @@ impl ProbeCache {
         )
     }
 
-    /// The probe of `rustc`: remembered, or asked of the compiler (the two
-    /// questions in parallel).
     fn probe(&self, rustc: &Path) -> Probe {
         let key = Self::resolution_key(rustc);
         if let Some(mut hit) = self.load().remove(&key)
@@ -600,8 +506,6 @@ impl ProbeCache {
                 .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
                 .unwrap_or_default()
         };
-        // The host's cfg set too: nearly every command needs it next, and
-        // asking now, beside the other two, saves a compiler start in a row.
         let (verbose_version, sysroot, host_cfg) = std::thread::scope(|s| {
             let sysroot = s.spawn(|| ask(&["--print", "sysroot"]));
             let cfg = s.spawn(|| ask(&["--print=cfg"]));
@@ -623,7 +527,6 @@ impl ProbeCache {
             sysroot,
             cfg: Default::default(),
         };
-        // Only a complete answer is worth remembering.
         if !probe.sysroot.is_empty() && !probe.verbose_version.is_empty() {
             let _guard = PROBE_LOCK.lock().unwrap();
             let mut all = self.load();
@@ -632,7 +535,6 @@ impl ProbeCache {
             {
                 probe.cfg = old.cfg.clone();
             }
-            // Filed as `TargetInfo::query` asks for the host without flags.
             if let Some(host) = probe
                 .verbose_version
                 .lines()
@@ -645,7 +547,6 @@ impl ProbeCache {
                     .or_insert(host_cfg);
             }
             all.insert(key, probe.clone());
-            // Bounded: projects come and go, toolchains get updated.
             while all.len() > 64 {
                 let Some(k) = all.keys().next().cloned() else {
                     break;
@@ -677,28 +578,17 @@ impl ProbeCache {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Targets
-// ---------------------------------------------------------------------------
-
-/// A compilation target as the compiler sees it.
 #[derive(Debug, Clone)]
 pub struct TargetInfo {
-    /// The triple, or a custom target specification's file stem.
     pub name: String,
-    /// What to pass to `--target` (a triple, or the path of a custom JSON).
     pub arg: String,
-    /// For a custom specification: a hash of its *normalized* content.
     pub spec_hash: Option<String>,
-    /// Everything `rustc --print=cfg` defines for this target.
     pub cfgs: Vec<Cfg>,
 }
 
 static TARGET_CACHE: OnceLock<Mutex<HashMap<String, TargetInfo>>> = OnceLock::new();
 
 impl TargetInfo {
-    /// Queries the compiler for `target` (`None` = the host) under `rustflags`
-    /// (which can change the cfg set, e.g. `-C target-feature=+crt-static`).
     pub fn query(tc: &Toolchain, target: Option<&str>, rustflags: &[String]) -> TargetInfo {
         let arg = target
             .map(str::to_string)
@@ -730,8 +620,6 @@ impl TargetInfo {
                 .success()
                 .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
         };
-        // The answer depends on the compiler, the target (a custom one by its
-        // content) and the flags; the probe cache remembers it across runs.
         let probe_cfg_key = format!(
             "{arg}|{}|{}",
             spec_hash.as_deref().unwrap_or(""),
@@ -758,13 +646,10 @@ impl TargetInfo {
         info
     }
 
-    /// Whether a manifest platform string (`cfg(unix)` or a triple) applies.
     pub fn matches(&self, platform: &str) -> bool {
         cfgexpr::platform_matches(platform, &self.name, &self.cfgs)
     }
 
-    /// `CARGO_CFG_*` for a build script: every cfg, values of a repeated key
-    /// joined with commas. `debug_assertions` follows the profile.
     pub fn cargo_cfg_env(&self, debug_assertions: bool) -> Vec<(String, String)> {
         let mut map: std::collections::BTreeMap<String, Vec<String>> = Default::default();
         for (k, v) in &self.cfgs {
@@ -818,34 +703,20 @@ fn parse_cfg_output(text: &str) -> Vec<Cfg> {
         .collect()
 }
 
-/// Hash of a custom target specification with keys sorted, so reformatting
-/// the JSON doesn't invalidate artifacts but changing any field does.
 fn normalized_spec_hash(path: &Path) -> Option<String> {
     let text = std::fs::read_to_string(path).ok()?;
     let value: serde_json::Value = serde_json::from_str(&text).ok()?;
-    // `serde_json::Value` objects are ordered maps, so re-serializing sorts keys.
     let canonical = serde_json::to_string(&value).ok()?;
     Some(crate::hash::blake3_bytes(canonical.as_bytes()))
 }
 
-// ---------------------------------------------------------------------------
-// Flags, linker, runner
-// ---------------------------------------------------------------------------
-
-/// The build roles of a unit that can have different flags.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
-    /// Compiled for the target platform.
     Target,
-    /// A build script, proc-macro, or something only they use.
     Host,
 }
 
-/// Effective `rustflags` for a role, following Cargo's precedence: the first
-/// of `CARGO_ENCODED_RUSTFLAGS`, `RUSTFLAGS`, the matching `target.*.rustflags`
-/// tables, `build.rustflags` that is set wins. When cross-compiling
-/// (`cross`), host artifacts ignore the first, second and last of those, so
-/// `RUSTFLAGS=-Ctarget-cpu=…` aimed at the device doesn't break build scripts.
+/// Cargo's rustflags precedence. Cross builds keep RUSTFLAGS for the device away from host artifacts.
 pub fn rustflags(cfg: &CargoConfig, target: &TargetInfo, role: Role, cross: bool) -> Vec<String> {
     let host_in_cross = role == Role::Host && cross;
     if !host_in_cross {
@@ -864,7 +735,6 @@ pub fn rustflags(cfg: &CargoConfig, target: &TargetInfo, role: Role, cross: bool
     let mut from_targets: Vec<String> = Vec::new();
     let mut any = false;
     for (key, table) in &tables {
-        // The environment can override a specific triple's flags.
         let env_flags = (!key.starts_with("cfg("))
             .then(|| std::env::var(CargoConfig::env_name(&["target", key, "rustflags"])).ok())
             .flatten();
@@ -914,16 +784,13 @@ fn target_string(cfg: &CargoConfig, target: &TargetInfo, key: &str) -> Option<St
             _ => {}
         }
     }
-    // `CARGO_TARGET_<TRIPLE>_LINKER` works without any config file.
     std::env::var(CargoConfig::env_name(&["target", &target.name, key])).ok()
 }
 
-/// `target.<triple>.linker`.
 pub fn linker(cfg: &CargoConfig, target: &TargetInfo) -> Option<PathBuf> {
     target_string(cfg, target, "linker").map(PathBuf::from)
 }
 
-/// `target.<triple>.runner`, split into program and arguments.
 pub fn runner(cfg: &CargoConfig, target: &TargetInfo) -> Option<Vec<String>> {
     target_string(cfg, target, "runner")
         .map(|s| s.split_whitespace().map(str::to_string).collect())
@@ -1009,7 +876,6 @@ mod tests {
         assert_eq!(cmd.get_program().to_string_lossy(), "sccache");
         assert_eq!(args[0], "clippy-driver");
         assert_eq!(args[1], tc.exec.to_string_lossy());
-        // Dependencies (not workspace members) skip the workspace wrapper.
         let cmd = tc.rustc_command(false);
         let args: Vec<_> = cmd
             .get_args()
@@ -1018,7 +884,6 @@ mod tests {
         assert_eq!(args, [tc.exec.to_string_lossy().into_owned()]);
     }
 
-    /// A fake `rustc` that counts how often it is started.
     #[cfg(unix)]
     fn fake_rustc(dir: &Path) -> (PathBuf, PathBuf) {
         use std::os::unix::fs::PermissionsExt;
@@ -1070,8 +935,6 @@ mod tests {
         let again = cache.probe(&rustc);
         assert_eq!(again.verbose_version, first.verbose_version);
         assert_eq!(starts(), 3, "a second probe must not start the compiler");
-        // The toolchain is updated in place (`rustup update`): probe again.
-        // (The new library's size differs, so no waiting for the clock.)
         std::fs::write(
             dir.path().join("sysroot/lib/librustc_driver-abc.so"),
             "v2 is longer",
@@ -1133,7 +996,6 @@ mod tests {
                 vec![]
             },
         };
-        // These tests must not see the developer's own RUSTFLAGS.
         if std::env::var_os("RUSTFLAGS").is_some()
             || std::env::var_os("CARGO_ENCODED_RUSTFLAGS").is_some()
         {
@@ -1157,12 +1019,10 @@ mod tests {
             ),
             ["-Cwasm"]
         );
-        // Nothing matches: fall back to build.rustflags…
         assert_eq!(
             rustflags(&cfg, &info("riscv64-none", false), Role::Target, false),
             ["-Cbuild"]
         );
-        // …but a host artifact in a cross build doesn't get it.
         assert!(rustflags(&cfg, &info("riscv64-none", false), Role::Host, true).is_empty());
         assert_eq!(
             linker(&cfg, &info("wasm32-unknown-unknown", false)),

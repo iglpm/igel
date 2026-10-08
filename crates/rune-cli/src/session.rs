@@ -1,5 +1,4 @@
-//! A resolved command invocation: workspace, profile, flags, and the machinery
-//! to drive the build executor.
+//! A resolved command invocation: workspace, profile, flags, and driving the build executor.
 
 use anyhow::{Result, bail};
 use colored::Colorize;
@@ -17,8 +16,6 @@ use crate::graph::FeatureArgs;
 use crate::ui;
 use crate::workspace::Workspace;
 
-/// Everything a build-like command needs, derived from flags, settings, and
-/// the workspace on disk.
 pub struct Session {
     pub ws: Workspace,
     pub profile: Profile,
@@ -30,29 +27,17 @@ pub struct Session {
     pub selected: Vec<usize>,
     pub verbose: bool,
     pub quiet: bool,
-    /// Print the compiler's warnings as units finish (commands that report
-    /// on warnings themselves, like `rune unused`, turn this off).
     pub show_warnings: bool,
-    /// `--message-format json`: events go to stdout as JSON lines.
     pub json: bool,
     pub force_rebuild: bool,
     pub ignore_rust_version: bool,
-    /// Directories of native libraries that build scripts produced inside the
-    /// build directory (`cargo::rustc-link-search=…/out`): a program run by
-    /// `rune run`/`rune test` finds its dynamic libraries there, as with Cargo.
     pub native_dirs: std::sync::Mutex<Vec<std::path::PathBuf>>,
-    /// Extra environment for every program `rune run`/`rune test` starts.
     pub run_env: Vec<(String, String)>,
-    /// `build.sandbox`, checked to work here.
     pub sandbox: Option<rune_scheduler::executor::SandboxPolicy>,
-    /// Seconds of work that follow a unit's build (see
-    /// `BuildExecutor::with_extra_costs`).
     pub extra_costs: std::collections::HashMap<rune_graph::NodeId, f64>,
 }
 
 impl Session {
-    /// `default_profile` is what the command builds with absent `--release`
-    /// and `--profile` (`dev`, `test`, or `bench`).
     pub fn new(common: &CommonArgs, default_profile: &str) -> Result<Self> {
         if common.timings {
             rune_common::timing::enable();
@@ -101,8 +86,6 @@ impl Session {
 
         let jobs = common.jobs.unwrap_or(ws.config.jobs).max(1);
 
-        // `build.release-rebuild-all` applies to release-like profiles; the
-        // flag overrides the setting either way for a single invocation.
         let force_rebuild = match common.rebuild_all {
             Some(v) => v,
             None => profile.is_release() && ws.config.settings.release_rebuild_all(),
@@ -141,7 +124,6 @@ impl Session {
             jobs,
             offline,
             locked,
-            // `--target`, else `CARGO_BUILD_TARGET` / `build.target`.
             target,
             features,
             selected,
@@ -162,7 +144,6 @@ impl Session {
         &self.ws.config
     }
 
-    /// The CAS, unless disabled by `cas.enabled = false`.
     pub fn cas(&self) -> Option<CasStore> {
         if !self.ws.config.settings.cas_enabled() {
             return None;
@@ -218,9 +199,6 @@ impl Session {
         executor
     }
 
-    /// Says so before building when the disk the build writes to is nearly
-    /// full: compilers and linkers that run out of space fail in confusing
-    /// ways (a linker can die with a bus error).
     pub fn warn_if_disk_is_low(&self) {
         const LOW: u64 = 1 << 30;
         let config = self.config();
@@ -240,9 +218,7 @@ impl Session {
         }
     }
 
-    /// A compiler that runs out of disk space rarely says so (rustc and the
-    /// linker crash with a bus error): when a build failed and the disk is
-    /// full, name that as the likely cause.
+    /// rustc and linkers rarely say they ran out of disk: name it as the likely cause.
     fn explain_failure_by_disk(&self, failures: &[(String, String)]) {
         const NEARLY_FULL: u64 = 64 << 20;
         let dir = &self.config().target_dir;
@@ -262,9 +238,6 @@ impl Session {
         }
     }
 
-    /// Evicts old CAS entries if `cas.max-size` is set and exceeded, and —
-    /// at most once a day — starts `rune cas gc --max-age` in the background
-    /// for entries unused for `cas.max-age`.
     pub fn maybe_gc(&self) {
         let Some(cas) = self.cas() else { return };
         let settings = &self.ws.config.settings;
@@ -287,16 +260,12 @@ impl Session {
         }
     }
 
-    /// Prints the profile name the way summaries show it.
     pub fn profile_label(&self) -> String {
         self.profile.name.clone()
     }
 }
 
-/// Starts `rune cas gc --max-age --compress-idle` for the store at `root` in the background
-/// when the last run was more than a day ago; the build does not wait for it.
-/// A store seen for the first time only gets its stamp: nothing in it can
-/// have gone unused for long, and short-lived stores (tests, CI) never pay.
+/// Background `rune cas gc` at most once a day; a store seen for the first time only gets its stamp.
 fn spawn_daily_gc(root: &std::path::Path, max_age_secs: Option<u64>, compress: Option<u64>) {
     let stamp = root.join("last-gc");
     let due = match std::fs::metadata(&stamp).and_then(|m| m.modified()) {
@@ -311,7 +280,6 @@ fn spawn_daily_gc(root: &std::path::Path, max_age_secs: Option<u64>, compress: O
     if !due {
         return;
     }
-    // Claim the day first, so concurrent builds do not all start one.
     let _ = std::fs::write(&stamp, b"");
     let Ok(exe) = std::env::current_exe() else {
         return;
@@ -324,7 +292,6 @@ fn spawn_daily_gc(root: &std::path::Path, max_age_secs: Option<u64>, compress: O
     if let Some(idle) = compress {
         cmd.arg("--compress-idle").arg(idle.to_string());
     }
-    // Compressing is background work: never at the expense of the user's.
     let _ = cmd
         .env("RUNE_CAS_DIR", root)
         .env("RUNE_BACKGROUND", "1")
@@ -335,9 +302,6 @@ fn spawn_daily_gc(root: &std::path::Path, max_age_secs: Option<u64>, compress: O
 }
 
 impl Session {
-    /// A command that runs `exe`: directly, or — when cross-compiling and
-    /// `[target.<triple>] runner` is configured — through that runner (`qemu-aarch64`,
-    /// `wine`, a device shim), exactly like `cargo run`/`cargo test` do.
     pub fn command_for(&self, exe: &std::path::Path) -> std::process::Command {
         if let Some(target) = &self.target {
             let tc = rune_common::toolchain::global();
@@ -351,7 +315,6 @@ impl Session {
         std::process::Command::new(exe)
     }
 
-    /// `RUSTDOCFLAGS` / `build.rustdocflags` / `target.<triple>.rustdocflags`.
     pub fn rustdoc_flags(&self) -> Vec<String> {
         if let Ok(v) = std::env::var("RUSTDOCFLAGS") {
             return v.split_whitespace().map(str::to_string).collect();
@@ -367,9 +330,7 @@ impl Session {
     }
 }
 
-/// Resolves a profile name. `test` and `bench` fall back to `dev`/`release`
-/// unless the manifest customizes them, so plain `rune build` and `rune test`
-/// share compiled dependencies through the CAS.
+/// `test`/`bench` fall back to `dev`/`release` unless customized, so they share compiled dependencies.
 fn profile_by_name(ws: &Workspace, name: &str) -> Result<Profile> {
     let tables = &ws.root_manifest.profile;
     let effective = match name {
@@ -380,9 +341,6 @@ fn profile_by_name(ws: &Workspace, name: &str) -> Result<Profile> {
     resolve_profile(effective, tables).map_err(|e| anyhow::anyhow!("{e}"))
 }
 
-/// The target directory `--target-dir`, `RUNE_TARGET_DIR` or
-/// `CARGO_TARGET_DIR` ask for, if any (else `build.target-dir` or
-/// `.rune/target`).
 pub fn target_dir_override(common: &CommonArgs) -> Result<Option<std::path::PathBuf>> {
     if let Some(dir) = &common.target_dir {
         return Ok(Some(if dir.is_absolute() {
@@ -400,9 +358,6 @@ pub fn target_dir_override(common: &CommonArgs) -> Result<Option<std::path::Path
     }
 }
 
-/// Runs the executor over `graph`, calling `on_event` on this thread for every
-/// pipeline event as it arrives. Draws the standard progress bar and prints
-/// compiler warnings unless the session is quiet.
 pub fn drive(
     sess: &Session,
     graph: &BuildGraph,
@@ -449,8 +404,6 @@ pub fn drive(
                         .script_owner
                         .clone()
                         .unwrap_or_else(|| rune_scheduler::executor::script_key(unit));
-                    // Once per script, however many of its package's units
-                    // report it.
                     if scripts_reported.insert(owner.clone()) {
                         let out_dir = sess
                             .config()
@@ -505,8 +458,6 @@ pub fn drive(
             .map_err(|e| anyhow::anyhow!(e.to_string()))
     })?;
 
-    // The compiler's own messages; the one-line verdict naming the crates
-    // comes last, from `ensure_success`, like Cargo's.
     for (_, error) in &failures {
         if !sess.json {
             ui::err(error.trim_end());
@@ -522,10 +473,6 @@ pub fn drive(
     Ok((result, failures))
 }
 
-/// A build for a target whose standard library is not installed fails in
-/// every crate with rustc's "can't find crate for `core`"; say what to do
-/// instead, before anything is compiled. Custom targets (a `.json` spec) and
-/// `-Zbuild-std`, which builds the standard library itself, are left alone.
 fn check_target_installed(ws: &Workspace, target: &str) -> Result<()> {
     if target.ends_with(".json")
         || ws
@@ -578,10 +525,8 @@ fn check_target_installed(ws: &Workspace, target: &str) -> Result<()> {
     }
 }
 
-/// The crates the last build could not compile (`name vX.Y.Z`).
 static FAILED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 
-/// Bails, naming the crates that did not compile, if a build had failures.
 pub fn ensure_success(result: &BuildResult) -> Result<()> {
     if result.success {
         return Ok(());
@@ -612,7 +557,6 @@ pub fn ensure_success(result: &BuildResult) -> Result<()> {
     }
 }
 
-/// `RUSTFLAGS` (or `CARGO_ENCODED_RUSTFLAGS`) as individual arguments.
 pub fn rustflags_from_env_public() -> Vec<String> {
     rune_scheduler::executor::rustflags_from_env()
 }

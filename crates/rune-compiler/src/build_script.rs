@@ -1,12 +1,4 @@
-//! Compiling and running `build.rs`, and understanding what it reports.
-//!
-//! A build script is a separate program that runs *on the host* before its
-//! package compiles. Cargo defines its contract precisely: the environment it
-//! sees (`TARGET`, `HOST`, `OUT_DIR`, `CARGO_CFG_*`, `CARGO_FEATURE_*`,
-//! `CARGO_PKG_*`, `DEP_*`, ...) and the `cargo::` lines it may print. Crates
-//! from `cc`, `bindgen` and `pkg-config` users to `ring` and `openssl-sys`
-//! depend on every detail, so this module follows the contract rather than an
-//! approximation of it.
+//! Compiling and running `build.rs` following Cargo's contract (environment and `cargo::` directives).
 
 use rune_common::{BuildScriptOutput, LinkArg, LinkArgScope, LinkLib, LinkSearch, PackageMeta};
 use std::io::{BufRead, BufReader, Read};
@@ -46,50 +38,35 @@ pub type Result<T> = std::result::Result<T, BuildScriptError>;
 
 pub struct BuildScriptRunner;
 
-/// Environment for build script execution.
 #[derive(Debug, Clone)]
 pub struct BuildScriptEnv {
     pub manifest_dir: PathBuf,
     pub out_dir: PathBuf,
-    /// `TARGET`: the triple the *package* is built for.
     pub target: String,
-    /// `HOST`: the machine running the build.
     pub host: String,
     pub opt_level: String,
-    /// `DEBUG`.
     pub debug: bool,
     pub debug_assertions: bool,
-    /// `PROFILE`: `release` or `debug`.
     pub profile: String,
     pub num_jobs: u32,
     pub rustc: PathBuf,
     pub rustdoc: PathBuf,
     pub rustc_wrapper: Option<PathBuf>,
     pub rustc_workspace_wrapper: Option<PathBuf>,
-    /// `RUSTC_LINKER`.
     pub linker: Option<PathBuf>,
     pub pkg_name: String,
     pub pkg_version: String,
-    /// `CARGO_PKG_AUTHORS`, `_DESCRIPTION`, ...
     pub meta: PackageMeta,
     pub features: Vec<String>,
-    /// `CARGO_CFG_*`, computed from the compiler's cfg set for `target`.
     pub target_cfg_env: Vec<(String, String)>,
-    /// `(links, key, value)` → `DEP_<LINKS>_<KEY>=<value>`.
     pub dep_metadata: Vec<(String, String, String)>,
-    /// The crate's own `links` manifest field, if set. Cargo exposes this to
-    /// the build script as `CARGO_MANIFEST_LINKS`; crates like `ring` assert
-    /// it matches an expected value and unconditionally `.unwrap()` it.
+    /// Exposed as `CARGO_MANIFEST_LINKS`; crates like `ring` unwrap it.
     pub links: Option<String>,
-    /// The effective rustflags (`CARGO_ENCODED_RUSTFLAGS`).
     pub rustflags: Vec<String>,
-    /// `[env]` entries from configuration: `(name, value, force)`.
     pub config_env: Vec<(String, String, bool)>,
 }
 
 impl BuildScriptEnv {
-    /// The variables both compiling and running a script see, mirroring what
-    /// Cargo sets on the package's own `rustc` invocation.
     fn apply_package_env(&self, cmd: &mut Command) {
         cmd.env("CARGO_PKG_NAME", &self.pkg_name);
         cmd.env("CARGO_PKG_VERSION", &self.pkg_version);
@@ -139,7 +116,6 @@ impl BuildScriptEnv {
 }
 
 impl BuildScriptRunner {
-    /// Compile a build.rs into a binary.
     pub fn compile(
         rustc_path: &Path,
         build_rs_path: &Path,
@@ -161,9 +137,6 @@ impl BuildScriptRunner {
         )
     }
 
-    /// Like [`Self::compile`], but takes the compiler command (so wrappers
-    /// configured for the build apply) and lets the caller adjust it before it
-    /// runs (e.g. to hand it a jobserver).
     #[allow(clippy::too_many_arguments)]
     pub fn compile_with(
         cmd: Command,
@@ -188,10 +161,6 @@ impl BuildScriptRunner {
         .map(|(bin, _)| bin)
     }
 
-    /// Like [`Self::compile_with`], also returning what the compiler printed
-    /// on success (warnings). Its output is captured, not passed through: on
-    /// failure it is part of the error, so it is shown once, with the failure,
-    /// rather than written into whatever else is on the terminal.
     #[allow(clippy::too_many_arguments)]
     pub fn compile_reporting(
         mut cmd: Command,
@@ -210,32 +179,21 @@ impl BuildScriptRunner {
         cmd.arg("--edition").arg(edition);
         cmd.arg("--out-dir")
             .arg(rune_common::fsutil::simplified(out_dir));
-        // The dep-info lists the files the script is compiled from, which is
-        // what decides whether the compiled script can be reused.
         cmd.arg("--emit=dep-info,link");
 
-        // Add dependency search path
         cmd.arg("-L")
             .arg(format!("dependency={}", deps_dir.display()));
 
-        // Add explicit extern dependencies
         for (crate_name, path) in extern_deps {
             cmd.arg("--extern")
                 .arg(format!("{crate_name}={}", path.display()));
         }
 
         if let Some(e) = env {
-            // `build.rs` is part of the same package as the crate it builds,
-            // and is compiled with that package's own active feature set —
-            // plenty of real-world build scripts branch on
-            // `cfg!(feature = "...")` directly (e.g. `aws-lc-rs`'s picks its
-            // backend crate this way) rather than only reading the
-            // `CARGO_FEATURE_*` env vars set at *run* time.
+            // Build scripts see the package's features as cfgs too (`aws-lc-rs` branches on `cfg!(feature)`).
             for feature in &e.features {
                 cmd.arg("--cfg").arg(format!("feature=\"{feature}\""));
             }
-            // A build script is a host program: it gets the host's flags
-            // and linker, not the device's.
             cmd.args(&e.rustflags);
             if let Some(linker) = &e.linker {
                 let (exe, env) = rune_common::linker::for_rustc(&linker.to_string_lossy());
@@ -272,14 +230,10 @@ impl BuildScriptRunner {
         Ok((binary, printed))
     }
 
-    /// Execute a compiled build script and parse its stdout.
     pub fn execute(binary: &Path, env: &BuildScriptEnv) -> Result<BuildScriptOutput> {
         Self::execute_with(binary, env, &|_| {})
     }
 
-    /// Like [`Self::execute`], but lets the caller adjust the command before it
-    /// runs — notably to pass a jobserver so C compilers driven by the script
-    /// (via the `cc` crate) share the build's parallelism budget.
     pub fn execute_with(
         binary: &Path,
         env: &BuildScriptEnv,
@@ -288,9 +242,6 @@ impl BuildScriptRunner {
         Self::execute_command(Command::new(binary), env, configure)
     }
 
-    /// Like [`Self::execute_with`], for a command that runs the script
-    /// (through a sandbox, say) and gets the script's arguments and
-    /// environment added.
     pub fn execute_command(
         mut cmd: Command,
         env: &BuildScriptEnv,
@@ -298,10 +249,7 @@ impl BuildScriptRunner {
     ) -> Result<BuildScriptOutput> {
         configure(&mut cmd);
 
-        // Cargo always runs a build script with its crate's manifest
-        // directory as the current directory, and build scripts routinely
-        // rely on that to resolve relative paths (e.g. openssl-sys's
-        // `build/expando.c`).
+        // Cargo runs build scripts in the manifest directory; scripts rely on it for relative paths.
         cmd.current_dir(rune_common::fsutil::simplified(&env.manifest_dir));
 
         env.apply_package_env(&mut cmd);
@@ -322,19 +270,15 @@ impl BuildScriptRunner {
             Some(w) => cmd.env("RUSTC_WORKSPACE_WRAPPER", w),
             None => cmd.env_remove("RUSTC_WORKSPACE_WRAPPER"),
         };
-        // The built-in linker is no program a build script could run.
         if let Some(linker) = &env.linker
             && !rune_common::linker::is_embedded(&linker.to_string_lossy())
         {
             cmd.env("RUSTC_LINKER", linker);
         }
-        // Flags meant for the compiler are handed over encoded so that
-        // arguments containing spaces survive; the plain variable would apply
-        // them to any nested cargo/rustc invocation the script makes.
+        // Encoded so arguments with spaces survive and nested cargo/rustc invocations don't inherit them.
         cmd.env("CARGO_ENCODED_RUSTFLAGS", env.rustflags.join("\x1f"));
         cmd.env_remove("RUSTFLAGS");
 
-        // `CARGO_CFG_*` describes the *target*, not the machine Rune runs on.
         for (k, v) in &env.target_cfg_env {
             cmd.env(k, v);
         }
@@ -357,8 +301,7 @@ impl BuildScriptRunner {
         let mut child = cmd.spawn()?;
         let stdout = child.stdout.take().unwrap();
         let mut stderr = child.stderr.take().unwrap();
-        // Drain stderr concurrently: a chatty script would otherwise fill the
-        // pipe and stall while we're still reading stdout.
+        // Drain stderr concurrently so a chatty script can't stall on a full pipe.
         let stderr_reader = std::thread::spawn(move || {
             let mut text = String::new();
             let _ = stderr.read_to_string(&mut text);
@@ -381,8 +324,6 @@ impl BuildScriptRunner {
         let status = child.wait()?;
         let stderr_text = stderr_reader.join().unwrap_or_default();
 
-        // Keep what the script said next to its output directory, like Cargo,
-        // so a failed build can be inspected afterwards.
         if let Some(dir) = env.out_dir.parent() {
             let _ = std::fs::write(dir.join("output"), &raw_stdout);
             let _ = std::fs::write(dir.join("stderr"), &stderr_text);
@@ -401,10 +342,7 @@ impl BuildScriptRunner {
         Ok(output)
     }
 
-    /// Parses one directive. `modern` is the `cargo::key=value` spelling, in
-    /// which unknown keys are errors and metadata must be spelled
-    /// `cargo::metadata=key=value`; the legacy `cargo:key=value` treats every
-    /// unknown key as metadata.
+    /// `modern` is the `cargo::` spelling (unknown keys are errors); legacy `cargo:` treats them as metadata.
     pub fn parse_instruction(instruction: &str, modern: bool, output: &mut BuildScriptOutput) {
         let Some((key, value)) = instruction.split_once('=') else {
             return;
@@ -494,13 +432,11 @@ impl BuildScriptRunner {
                         .push((k.trim().to_string(), v.trim().to_string()));
                 }
             }
-            // Legacy spelling: everything else is `cargo:KEY=VALUE` metadata.
             _ if !modern => output.metadata.push((key.to_string(), value.to_string())),
             _ => warn!("Unknown build script directive `cargo::{key}`"),
         }
     }
 
-    /// `cargo::rustc-flags=-l foo -L /path`: only `-l` and `-L` are allowed.
     fn parse_rustc_flags(value: &str, output: &mut BuildScriptOutput) {
         let mut tokens = value.split_whitespace();
         while let Some(tok) = tokens.next() {

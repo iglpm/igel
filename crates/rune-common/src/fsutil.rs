@@ -1,11 +1,4 @@
-//! File-system helpers that keep concurrent Rune processes from breaking each
-//! other: atomic replacement of build outputs and per-unit advisory locks.
-//!
-//! Two `rune` processes on one project (an editor's background check and a
-//! terminal build, CI shards, two agents in one checkout) share the target
-//! directory and the content-addressable store. Cargo serialises them with one
-//! lock on the whole directory; Rune instead makes every step safe to overlap
-//! and only makes processes wait when they would build the *same unit*.
+//! Helpers that let concurrent Rune processes overlap safely: atomic replacement and per-unit locks.
 
 use std::fs::{self, File, OpenOptions};
 use std::io;
@@ -14,10 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 pub use dunce::simplified;
 
-/// The 8.3 short spelling of an existing path (`C:\Users\me\DOCUME~1\...`),
-/// when it differs from `path`. Tools driven by build scripts (CMake, notably)
-/// report paths this way, so a path recognized by its long spelling alone
-/// can be missed. Always `None` off Windows.
+/// The 8.3 short spelling of a path (CMake reports paths this way). `None` off Windows.
 pub fn short_path(path: &Path) -> Option<PathBuf> {
     #[cfg(windows)]
     {
@@ -51,11 +41,7 @@ pub fn short_path(path: &Path) -> Option<PathBuf> {
     }
 }
 
-/// [`dunce::canonicalize`], remembered for the rest of the process for
-/// absolute paths: planning asks about the same few directories (the
-/// workspace's packages) hundreds of times, and every answer costs a system
-/// call per path component. (A relative path depends on the working
-/// directory, so it is always asked again.)
+/// Memoized for absolute paths: planning asks about the same directories hundreds of times.
 pub fn canonicalize(path: impl AsRef<Path>) -> io::Result<PathBuf> {
     use std::collections::HashMap;
     use std::sync::{Mutex, OnceLock};
@@ -76,11 +62,7 @@ pub fn canonicalize(path: impl AsRef<Path>) -> io::Result<PathBuf> {
     Ok(resolved)
 }
 
-/// `path` (absolute) as a `file:` URL, spelled as Cargo spells it in package
-/// ids: `file:///home/me/app`, `file:///C:/Users/me/app` — forward slashes,
-/// three of them before a drive, and characters a URL path cannot hold
-/// percent-encoded (`My%20Projects`). Tools read package ids as URLs; a
-/// Windows path pasted after `file://` is not one.
+/// `file:` URL spelled as Cargo spells package ids (`file:///C:/...`, percent-encoded).
 pub fn file_url(path: &Path) -> String {
     let text = path.to_string_lossy();
     let text = text.strip_prefix(r"\\?\").unwrap_or(&text);
@@ -103,7 +85,6 @@ pub fn file_url(path: &Path) -> String {
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// A name next to `dest` that no other process or thread will pick.
 fn temp_sibling(dest: &Path) -> PathBuf {
     let name = dest
         .file_name()
@@ -116,21 +97,15 @@ fn temp_sibling(dest: &Path) -> PathBuf {
     ))
 }
 
-/// Writes `path` whole or not at all: a temporary file renamed over it, so a
-/// concurrent reader never sees half of it.
 pub fn write_atomic(path: &Path, contents: &[u8]) -> io::Result<()> {
     let tmp = temp_sibling(path);
     fs::write(&tmp, contents)?;
     fs::rename(&tmp, path)
 }
 
-/// The name of a [cache directory tag](https://bford.info/cachedir/).
 pub const CACHEDIR_TAG: &str = "CACHEDIR.TAG";
 
-/// Marks `dir` as a cache directory, as Cargo marks its target directory:
-/// backup tools skip it, and so does Rune when it hashes a package's files
-/// (a target directory or store that lives inside a package, `--target-dir
-/// out` or a CI's `RUNE_HOME=$PWD/.cache`, must not count as its source).
+/// Marks `dir` as a cache directory so backup tools and package hashing skip it.
 pub fn tag_cache_dir(dir: &Path) {
     let tag = dir.join(CACHEDIR_TAG);
     if !tag.exists() {
@@ -144,11 +119,7 @@ pub fn tag_cache_dir(dir: &Path) {
     }
 }
 
-/// Makes `dest` a hard link to `src` (or a copy, where linking is impossible),
-/// replacing whatever was there **atomically**: a reader that opens `dest` at
-/// any moment sees either the old file or the new one, never a missing file.
-/// (Removing `dest` first, as one might, leaves a window in which another
-/// process's compiler finds nothing.)
+/// Hard link (or copy) replacing `dest` atomically: readers never see a missing file.
 pub fn replace_with_link(src: &Path, dest: &Path) -> io::Result<()> {
     let tmp = temp_sibling(dest);
     let staged = match fs::hard_link(src, &tmp) {
@@ -164,12 +135,7 @@ pub fn replace_with_link(src: &Path, dest: &Path) -> io::Result<()> {
     })
 }
 
-/// [`fs::rename`], also when `to` is a read-only file — as every output Rune
-/// restores or stores is. On Unix a rename replaces it regardless. Windows
-/// refuses ("Access is denied"), and every switch back to an earlier build of
-/// a unit (another branch, an edit undone) failed to restore it and compiled
-/// it instead; there the replacement is still atomic where the file system
-/// allows, and otherwise moves the old file aside for the moment it takes.
+/// [`fs::rename`] that also replaces read-only files (Windows refuses by default).
 pub fn rename_over(from: &Path, to: &Path) -> io::Result<()> {
     match fs::rename(from, to) {
         #[cfg(windows)]
@@ -197,14 +163,11 @@ mod windows {
     const FILE_SHARE_READ: u32 = 0x1;
     const FILE_SHARE_WRITE: u32 = 0x2;
     const FILE_SHARE_DELETE: u32 = 0x4;
-    /// `FILE_INFO_BY_HANDLE_CLASS::FileRenameInfoEx`.
     const FILE_RENAME_INFO_EX: i32 = 22;
     const FILE_RENAME_FLAG_REPLACE_IF_EXISTS: u32 = 0x1;
     const FILE_RENAME_FLAG_POSIX_SEMANTICS: u32 = 0x2;
     const FILE_RENAME_FLAG_IGNORE_READONLY_ATTRIBUTE: u32 = 0x40;
 
-    /// `FILE_RENAME_INFO` (the `Flags` member of its union), followed in the
-    /// same allocation by the rest of `FileName`.
     #[repr(C)]
     struct FileRenameInfo {
         flags: u32,
@@ -223,13 +186,10 @@ mod windows {
         ) -> i32;
     }
 
-    /// Replaces the read-only `to` with `from`.
     pub(super) fn rename_over_read_only(from: &Path, to: &Path) -> io::Result<()> {
         rename_ignoring_read_only(from, to).or_else(|_| rename_moving_aside(from, to))
     }
 
-    /// One atomic rename that ignores the read-only attribute (Windows 10
-    /// 1809 and later, on NTFS).
     pub(super) fn rename_ignoring_read_only(from: &Path, to: &Path) -> io::Result<()> {
         let file = OpenOptions::new()
             .access_mode(DELETE)
@@ -238,7 +198,6 @@ mod windows {
         let name: Vec<u16> = std::path::absolute(to)?.as_os_str().encode_wide().collect();
         let name_bytes = name.len() * 2;
         let size = std::mem::size_of::<FileRenameInfo>() + name_bytes;
-        // `u64`s: aligned for the struct, which holds a pointer.
         let mut buffer = vec![0u64; size.div_ceil(8)];
         let info = buffer.as_mut_ptr().cast::<FileRenameInfo>();
         // SAFETY: `buffer` is zeroed, suitably aligned, and large enough for
@@ -272,9 +231,6 @@ mod windows {
         Ok(())
     }
 
-    /// Elsewhere: the old file steps aside (a rename may move a read-only
-    /// file, only not replace one), the new one takes its name, and the old
-    /// one is deleted.
     pub(super) fn rename_moving_aside(from: &Path, to: &Path) -> io::Result<()> {
         let aside = super::temp_sibling(to);
         fs::rename(to, &aside)?;
@@ -287,37 +243,25 @@ mod windows {
     }
 }
 
-/// An exclusive advisory lock on a file, released when dropped (or when the
-/// process dies — the kernel drops it, so a crash never leaves a stale lock).
+/// Released when dropped or when the process dies, so a crash never leaves a stale lock.
 #[derive(Debug)]
 pub struct FileLock {
     _file: Option<File>,
 }
 
-/// How a lock was obtained.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Acquired {
-    /// Nobody held it.
     Immediately,
-    /// Someone else held it and has released it since: whatever they were
-    /// producing may be ready now.
     AfterWaiting,
 }
 
-/// The outcome of [`FileLock::try_exclusive`].
 #[derive(Debug)]
 pub enum TryLock {
-    /// The lock is ours (or locking is unavailable here, and we proceed
-    /// unlocked, as [`FileLock::exclusive`] does).
     Locked(FileLock),
-    /// Another process holds it.
     Busy,
 }
 
 impl FileLock {
-    /// Takes an exclusive lock on `path` if nobody holds it, without waiting.
-    /// A scheduler uses this so that a unit another process is building does
-    /// not tie up one of its own job slots while it waits.
     pub fn try_exclusive(path: &Path) -> TryLock {
         if let Some(parent) = path.parent() {
             let _ = fs::create_dir_all(parent);
@@ -349,10 +293,7 @@ impl FileLock {
         }
     }
 
-    /// Takes an exclusive lock on `path` (created if needed), blocking until it
-    /// is available. Locking is best effort: if the lock file cannot be
-    /// created or locked (read-only directory, unsupported file system), the
-    /// caller proceeds unlocked rather than failing the build.
+    /// Best effort: if locking is impossible here, the caller proceeds unlocked.
     pub fn exclusive(path: &Path) -> (Self, Acquired) {
         if let Some(parent) = path.parent() {
             let _ = fs::create_dir_all(parent);
@@ -381,7 +322,6 @@ impl FileLock {
         }
         #[cfg(not(unix))]
         {
-            // The standard library's locks (`LockFileEx` on Windows).
             match file.try_lock() {
                 Ok(()) => (Self { _file: Some(file) }, Acquired::Immediately),
                 Err(std::fs::TryLockError::WouldBlock) => match file.lock() {
@@ -409,7 +349,6 @@ mod tests {
         fs::write(&dest, "old").unwrap();
         replace_with_link(&src, &dest).unwrap();
         assert_eq!(fs::read_to_string(&dest).unwrap(), "new");
-        // No temporary files are left behind.
         let leftovers: Vec<_> = fs::read_dir(dir.path())
             .unwrap()
             .flatten()
@@ -443,8 +382,6 @@ mod tests {
 
     #[test]
     fn a_read_only_destination_is_replaced_too() {
-        // Restored and stored outputs are read-only, and hard links to a
-        // shared object: replacing one must neither fail nor touch the object.
         let dir = tempfile::tempdir().unwrap();
         let object = dir.path().join("object");
         let dest = dir.path().join("dest");
@@ -464,7 +401,6 @@ mod tests {
             .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
             .collect();
         assert!(leftovers.is_empty(), "{leftovers:?}");
-        // And once more over the now read-only replacement.
         let newer = dir.path().join("newer");
         fs::write(&newer, "newer").unwrap();
         rename_over(&newer, &dest).unwrap();
@@ -488,7 +424,6 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn moving_a_read_only_file_aside_replaces_it_too() {
-        // Where the file system cannot rename over a read-only file at once.
         let dir = tempfile::tempdir().unwrap();
         let dest = dir.path().join("dest");
         let src = dir.path().join("src");

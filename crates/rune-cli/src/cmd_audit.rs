@@ -1,11 +1,4 @@
-//! `rune audit`: known vulnerabilities, and warnings (unmaintained, unsound,
-//! yanked), in the packages the workspace locks.
-//!
-//! The advisories are the RustSec database (plus GitHub's and OSV's own
-//! reports for crates.io, among them malicious packages) as published by
-//! OSV: one zip of JSON documents, fetched when it changed (an `ETag` check)
-//! and kept under `$RUNE_HOME/advisory-db`, so an audit also works offline.
-//! `--db` reads a zip or a directory of OSV JSON files instead.
+//! `rune audit`: RustSec/OSV advisories for locked packages, cached under `$RUNE_HOME/advisory-db`.
 
 use anyhow::{Context, Result, bail};
 use colored::Colorize;
@@ -21,15 +14,9 @@ use crate::args::AuditArgs;
 use crate::ui;
 use crate::workspace::Workspace;
 
-/// Where the database comes from (`RUNE_ADVISORY_DB_URL` overrides it).
 const DEFAULT_DB_URL: &str = "https://osv-vulnerabilities.storage.googleapis.com/crates.io/all.zip";
 
-/// A copy younger than this is used without asking whether it changed.
 const FRESH_FOR: Duration = Duration::from_secs(3600);
-
-// ---------------------------------------------------------------------------
-// The OSV format (the parts an audit needs)
-// ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct Osv {
@@ -96,10 +83,8 @@ pub(crate) struct OsvSeverity {
     pub score: String,
 }
 
-/// What an advisory says about a package.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) enum Kind {
-    /// A malicious release (`MAL-…`).
     Malicious,
     Vulnerability,
     Unsound,
@@ -140,7 +125,6 @@ impl Osv {
         }
     }
 
-    /// The advisory's own page.
     fn url(&self) -> String {
         if self.id.starts_with("RUSTSEC-") {
             return format!("https://rustsec.org/advisories/{}", self.id);
@@ -152,7 +136,6 @@ impl Osv {
             .unwrap_or_else(|| format!("https://osv.dev/vulnerability/{}", self.id))
     }
 
-    /// GitHub's rating (`HIGH`), for advisories without a CVSS 3 score.
     fn rated(&self) -> Option<String> {
         self.database_specific
             .get("severity")
@@ -170,15 +153,9 @@ impl Osv {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Versions
-// ---------------------------------------------------------------------------
-
-/// `1`, `1.2`, `1.2.3-rc.1` — the index and advisories are not always strict.
 pub(crate) fn lenient_version(s: &str) -> Option<Version> {
     let s = s.trim();
     if s == "0" {
-        // OSV's "since the beginning".
         return Some(Version::parse("0.0.0-0").unwrap());
     }
     if let Ok(v) = Version::parse(s) {
@@ -197,8 +174,7 @@ pub(crate) fn lenient_version(s: &str) -> Option<Version> {
     Version::parse(&padded).ok()
 }
 
-/// Whether `v` falls in an OSV range: events in version order switch it on
-/// (`introduced`) and off (`fixed`, or past `last_affected`).
+/// Events in version order switch the range on (`introduced`) and off (`fixed`, past `last_affected`).
 pub(crate) fn in_range(range: &OsvRange, v: &Version) -> bool {
     let mut events: Vec<(Version, &str)> = range
         .events
@@ -230,7 +206,6 @@ fn affects(a: &OsvAffected, v: &Version) -> bool {
             .any(|r| in_range(r, v))
 }
 
-/// The releases that fixed it, oldest first.
 fn fixed_versions(a: &OsvAffected) -> Vec<Version> {
     let mut v: Vec<Version> = a
         .ranges
@@ -244,8 +219,6 @@ fn fixed_versions(a: &OsvAffected) -> Vec<Version> {
     v
 }
 
-/// Cargo's compatible range of a version: the same major, the same minor for
-/// `0.x`, the same patch for `0.0.x`.
 fn compatible(a: &Version, b: &Version) -> bool {
     match (a.major, a.minor) {
         (0, 0) => b.major == 0 && b.minor == 0 && b.patch == a.patch,
@@ -254,12 +227,6 @@ fn compatible(a: &Version, b: &Version) -> bool {
     }
 }
 
-// ---------------------------------------------------------------------------
-// CVSS
-// ---------------------------------------------------------------------------
-
-/// The CVSS 3.x base score of a vector
-/// (`CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H` → 9.8).
 pub(crate) fn cvss3_score(vector: &str) -> Option<f64> {
     if !vector.starts_with("CVSS:3") {
         return None;
@@ -318,7 +285,6 @@ pub(crate) fn cvss3_score(vector: &str) -> Option<f64> {
     } else {
         (impact + exploitability).min(10.0)
     };
-    // The specification's "round up" to one decimal.
     let int = (raw * 100_000.0).round() as i64;
     Some(if int % 10_000 == 0 {
         int as f64 / 100_000.0
@@ -337,15 +303,9 @@ fn severity_of(score: f64) -> &'static str {
     }
 }
 
-// ---------------------------------------------------------------------------
-// The database
-// ---------------------------------------------------------------------------
-
-/// The advisories, and where they came from.
 pub(crate) struct Database {
     pub advisories: Vec<Osv>,
     pub source: String,
-    /// When the copy used was fetched (seconds since the epoch).
     pub fetched: Option<u64>,
 }
 
@@ -353,7 +313,6 @@ fn cache_dir() -> PathBuf {
     rune_common::settings::rune_home().join("advisory-db")
 }
 
-/// Reads OSV documents from a zip file or a directory of `.json` files.
 pub(crate) fn read_advisories(path: &Path) -> Result<Vec<Osv>> {
     if path.is_dir() {
         let files: Vec<PathBuf> = walkdir::WalkDir::new(path)
@@ -373,7 +332,6 @@ pub(crate) fn read_advisories(path: &Path) -> Result<Vec<Osv>> {
 
 fn parse_zip(bytes: &[u8]) -> Result<Vec<Osv>> {
     let entries = zip_entries(bytes)?;
-    // Decompressing and parsing some thousands of documents: in parallel.
     Ok(entries
         .par_iter()
         .filter(|e| e.name.ends_with(".json"))
@@ -384,7 +342,6 @@ fn parse_zip(bytes: &[u8]) -> Result<Vec<Osv>> {
         .collect())
 }
 
-/// One member of a zip archive.
 struct ZipEntry {
     name: String,
     method: u16,
@@ -428,9 +385,7 @@ fn u32le(b: &[u8], at: usize) -> Result<u32> {
     ))
 }
 
-/// The members of a zip archive, from its central directory.
 fn zip_entries(zip: &[u8]) -> Result<Vec<ZipEntry>> {
-    // The end-of-central-directory record: in the last 64 KiB + 22 bytes.
     let from = zip.len().saturating_sub(65_535 + 22);
     let eocd = (from..zip.len().saturating_sub(21))
         .rev()
@@ -465,7 +420,6 @@ fn zip_entries(zip: &[u8]) -> Result<Vec<ZipEntry>> {
     Ok(entries)
 }
 
-/// The cached database, refreshed first unless offline or fresh.
 fn load_database(args: &AuditArgs, offline: bool) -> Result<Database> {
     if let Some(path) = &args.db {
         return Ok(Database {
@@ -497,7 +451,6 @@ fn load_database(args: &AuditArgs, offline: bool) -> Result<Database> {
                 rune_common::fsutil::write_atomic(&zip_path, &f.body)?;
                 std::fs::write(&etag_path, f.etag.unwrap_or_default())?;
             }
-            // Unchanged: remember that it was checked.
             Ok(None) => {
                 let _ = filetime::set_file_mtime(&etag_path, filetime::FileTime::now());
             }
@@ -543,7 +496,6 @@ fn describe_age(path: &Path) -> String {
     }
 }
 
-/// Drops withdrawn advisories and the GitHub/OSV copies of RustSec ones.
 fn deduplicate(all: Vec<Osv>) -> Vec<Osv> {
     let rustsec: HashSet<String> = all
         .iter()
@@ -559,11 +511,6 @@ fn deduplicate(all: Vec<Osv>) -> Vec<Osv> {
         .collect()
 }
 
-// ---------------------------------------------------------------------------
-// Findings
-// ---------------------------------------------------------------------------
-
-/// An advisory that applies to a locked package.
 struct Finding<'a> {
     advisory: &'a Osv,
     kind: Kind,
@@ -571,13 +518,11 @@ struct Finding<'a> {
     version: Version,
     fixed: Vec<Version>,
     functions: Vec<String>,
-    /// Chains from a workspace member to the package.
     paths: Vec<Vec<String>>,
     score: Option<f64>,
 }
 
 impl Finding<'_> {
-    /// What to do about it.
     fn fix(&self) -> String {
         let newer: Vec<&Version> = self.fixed.iter().filter(|f| **f > self.version).collect();
         if let Some(v) = newer.iter().find(|f| compatible(&self.version, f)) {
@@ -678,7 +623,6 @@ pub fn audit(args: AuditArgs) -> Result<()> {
             ))
     });
 
-    // Yanked releases, from the index copies resolution keeps.
     let mut yanked: Vec<(String, Version)> = Vec::new();
     if !args.no_yanked {
         let names: Vec<String> = {

@@ -1,19 +1,11 @@
-//! `rune fix` and `rune clippy --fix`: applying the compiler's suggestions.
-//!
-//! rustc (and clippy) attach suggested edits to their JSON diagnostics. The
-//! ones marked `MachineApplicable` are safe to apply without review; like
-//! `rustfix`, a suggestion whose edits span several places is applied whole
-//! or not at all, overlapping edits are skipped, and the build is re-checked
-//! until nothing more applies. Rune already keeps every local crate's
-//! diagnostics (replaying them from the store on a cache hit), so no
-//! compiler wrapper is needed.
+//! `rune fix` / `rune clippy --fix`: applies `MachineApplicable` suggestions like rustfix (whole or not
+//! at all, overlaps skipped, re-checked until nothing applies).
 
 use anyhow::{Context, Result, bail};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-/// One edit: replace `start..end` (bytes) of a file with `text`.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct Edit {
     start: usize,
@@ -21,9 +13,6 @@ struct Edit {
     text: String,
 }
 
-/// The machine-applicable suggestions in `diagnostics` (rustc JSON, one
-/// diagnostic per string), grouped per file. Only files under one of `roots`
-/// are touched: never a dependency's sources.
 fn suggestions(
     diagnostics: &[String],
     roots: &[PathBuf],
@@ -55,12 +44,10 @@ fn suggestions(
             {
                 continue;
             }
-            // One solution: all its edits, which must be in one file here.
             let mut file: Option<PathBuf> = None;
             let mut edits = Vec::new();
             let mut ok = true;
             for s in &spans {
-                // Relative to the directory the compiler ran in.
                 let path = base.join(s["file_name"].as_str().unwrap_or_default());
                 if file.as_ref().is_some_and(|f| *f != path) {
                     ok = false;
@@ -88,8 +75,6 @@ fn suggestions(
                 continue;
             }
             edits.sort();
-            // The same crate compiled twice (library and its tests) reports
-            // the same suggestion twice.
             if seen.insert((file.clone(), edits.clone())) {
                 out.entry(file).or_default().push(edits);
             }
@@ -98,14 +83,12 @@ fn suggestions(
     out
 }
 
-/// Applies the suggestions; returns how many were applied.
 pub fn apply(diagnostics: &[String], roots: &[PathBuf], base: &std::path::Path) -> Result<usize> {
     let mut applied = 0;
     for (file, mut solutions) in suggestions(diagnostics, roots, base) {
         let text = std::fs::read_to_string(&file)
             .with_context(|| format!("cannot read {}", file.display()))?;
         solutions.sort_by_key(|s| s.first().map(|e| e.start).unwrap_or(0));
-        // Keep solutions whose edits overlap nothing kept before them.
         let mut taken: Vec<(usize, usize)> = Vec::new();
         let mut edits: Vec<Edit> = Vec::new();
         for solution in solutions {
@@ -159,8 +142,6 @@ fn display(path: &Path) -> String {
         .unwrap_or_else(|| path.display().to_string())
 }
 
-/// Refuses to rewrite files with uncommitted changes, as `cargo fix` does:
-/// the fixes should be reviewable as their own diff.
 pub fn check_vcs(
     root: &Path,
     allow_dirty: bool,
@@ -234,10 +215,8 @@ mod tests {
         let f = file.to_str().unwrap();
         let diags = vec![
             diag(f, &[(0, 7, "")], "MachineApplicable"),
-            // Twice, as from a library and its tests: applied once.
             diag(f, &[(0, 7, "")], "MachineApplicable"),
             diag(f, &[(7, 14, "")], "MaybeIncorrect"),
-            // Two edits of one suggestion.
             diag(f, &[(17, 18, "g"), (19, 19, "x: u8")], "MachineApplicable"),
         ];
         let n = apply(&diags, &[dir.path().to_path_buf()], dir.path()).unwrap();

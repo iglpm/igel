@@ -1,12 +1,4 @@
-//! `rune sbom`: a software bill of materials for the workspace, in CycloneDX
-//! 1.5 or SPDX 2.3 JSON.
-//!
-//! Every package that goes into what the workspace builds is listed with its
-//! package URL (`pkg:cargo/serde@1.0.228`, with the repository and commit for
-//! git packages), the registry checksum Cargo verifies it by, its declared
-//! licence, and what it depends on. Development dependencies of the
-//! workspace's own packages are left out unless asked for: they are not part
-//! of what is shipped.
+//! `rune sbom`: CycloneDX 1.5 or SPDX 2.3 JSON.
 
 use anyhow::Result;
 use std::collections::{BTreeSet, HashSet};
@@ -17,8 +9,6 @@ use crate::graph::{self, EdgeKind, InventoryPackage};
 use crate::ui;
 use crate::workspace::Workspace;
 
-/// `pkg:cargo/name@version`, qualified with the registry or git source when
-/// it is not crates.io.
 pub fn purl(p: &InventoryPackage) -> String {
     let base = format!("pkg:cargo/{}@{}", p.name, p.version);
     let encode = |s: &str| {
@@ -51,13 +41,10 @@ pub fn purl(p: &InventoryPackage) -> String {
     }
 }
 
-/// Seconds since 1970 as `YYYY-MM-DDTHH:MM:SSZ`.
 pub fn rfc3339(secs: u64) -> String {
     rune_common::time::format_rfc3339(secs)
 }
 
-/// A version-4-shaped UUID derived from `seed` (reproducible for the same
-/// seed).
 fn uuid(seed: &str) -> String {
     let h = blake3::hash(seed.as_bytes());
     let mut b: [u8; 16] = h.as_bytes()[..16].try_into().unwrap();
@@ -74,8 +61,6 @@ fn uuid(seed: &str) -> String {
     )
 }
 
-/// The packages to list: the selected members and everything they reach,
-/// through development dependencies only when `dev`.
 pub(crate) fn reachable(pkgs: &[InventoryPackage], roots: &[usize], dev: bool) -> Vec<usize> {
     let mut seen: BTreeSet<usize> = BTreeSet::new();
     let mut stack = roots.to_vec();
@@ -92,7 +77,6 @@ pub(crate) fn reachable(pkgs: &[InventoryPackage], roots: &[usize], dev: bool) -
     seen.into_iter().collect()
 }
 
-/// Packages only needed to build (reached only through build-dependencies).
 fn build_only(pkgs: &[InventoryPackage], roots: &[usize], listed: &[usize]) -> HashSet<usize> {
     let mut runtime: HashSet<usize> = HashSet::new();
     let mut stack = roots.to_vec();

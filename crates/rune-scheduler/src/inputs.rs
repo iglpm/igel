@@ -1,24 +1,6 @@
-//! External inputs of a build: what a unit read that is not in its source.
-//!
-//! A unit's cache key covers its source, its dependencies and its
-//! configuration, but a build script or a macro can also read the *outside
-//! world*: an environment variable, a header under `/usr/include`, a system
-//! library found through `pkg-config`, the C compiler it drives. Reusing an
-//! artifact after one of those changed would be reusing a wrong answer, and the
-//! spec's rule is that correctness beats hit rate.
-//!
-//! Nobody can know a unit's outside reads before running it, so Rune *learns*
-//! them from what the unit declares:
-//!
-//! * a build script's `rerun-if-env-changed` and `rerun-if-changed`, and the
-//!   native libraries it asks the linker for;
-//! * `env!` / `option_env!` reads, which `rustc` reports in its dep-info;
-//! * the native tools (`cc`, `ar`) any build script may drive.
-//!
-//! After a build these are stored as [`DeclaredInputs`] next to the unit's
-//! *base* key. The **effective** key is the base key plus the *current values*
-//! of those inputs — so an artifact is only ever found again when everything it
-//! depended on still has the value it had.
+//! External inputs: what a unit read beyond its source (env vars, system files, native libs, C tools).
+//! Learned from build script declarations and dep-info, stored beside the base key; the effective key
+//! adds their current values, so an artifact is found again only when they are unchanged.
 
 use rune_common::BuildScriptOutput;
 use rune_common::hash::HashBuilder;
@@ -26,15 +8,10 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-/// What a unit was observed to depend on beyond its source and dependencies.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeclaredInputs {
-    /// Environment variables whose values matter (`None` value = unset).
     pub env: Vec<String>,
-    /// Files or directories whose contents matter, as absolute paths.
     pub files: Vec<PathBuf>,
-    /// Native library files the build linked against, from outside the package
-    /// (fingerprinted by size and modification time).
     pub native: Vec<PathBuf>,
 }
 
@@ -43,7 +20,6 @@ impl DeclaredInputs {
         self.env.is_empty() && self.files.is_empty() && self.native.is_empty()
     }
 
-    /// Merges another set in (sorted, without duplicates).
     pub fn merge(&mut self, other: DeclaredInputs) {
         self.env.extend(other.env);
         self.files.extend(other.files);
@@ -56,14 +32,10 @@ impl DeclaredInputs {
         self.native.dedup();
     }
 
-    /// The current value of every declared input, as one hash.
     pub fn fingerprint(&self) -> String {
         self.fingerprint_in(None)
     }
 
-    /// Like [`Self::fingerprint`], with relative paths read below `root`
-    /// (the package they belong to) and hashed under their relative name, so
-    /// the same package in another checkout gets the same key.
     pub fn fingerprint_in(&self, root: Option<&Path>) -> String {
         let mut hb = HashBuilder::new();
         for name in &self.env {
@@ -95,21 +67,12 @@ impl DeclaredInputs {
     }
 }
 
-/// What a build script's result was found to depend on, recorded after it
-/// runs (`<script base>-script-record`) and used to key its next lookup.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ScriptRecord {
-    /// Declared files (inside the package too), environment variables, native
-    /// libraries, and the script's own source files.
     pub inputs: DeclaredInputs,
-    /// It declared `rerun-if-changed`: then only those files matter, not every
-    /// file of the package.
     pub watches_files: bool,
 }
 
-/// The record of a script run: what it declared (`rerun-if-*`), the native
-/// libraries it points the linker at, and `sources`, the files its own
-/// compilation read.
 pub fn script_record(
     out: &BuildScriptOutput,
     manifest_dir: &Path,
@@ -127,16 +90,12 @@ pub fn script_record(
         } else {
             manifest_dir.join(p)
         };
-        // What it writes itself is an output, not an input.
         if !abs.starts_with(out_dir) {
             inputs.files.push(abs);
         }
     }
     inputs.files.extend(sources.iter().cloned());
-    // Files of the package itself are recorded relative to it: the record is
-    // shared by every package with the same script base (another checkout, or
-    // another project with a package of the same name), and each must be keyed
-    // by its own files — never by the absolute paths of the one that ran first.
+    // Relative to the package: the record is shared by every package with the same script base.
     for f in &mut inputs.files {
         if let Ok(rel) = f.strip_prefix(manifest_dir) {
             *f = rel.to_path_buf();
@@ -149,13 +108,7 @@ pub fn script_record(
     }
 }
 
-/// The key a build script's result is stored under. `base` covers everything
-/// the script can observe apart from files: the unit's configuration, its
-/// build-dependencies and the `DEP_*` values it receives. A script that
-/// declared `rerun-if-changed` is then keyed by the contents of exactly
-/// those files (and its own sources), so editing the rest of the package
-/// does not run it again; one that declared nothing is keyed by every file
-/// of the package, as Cargo reruns it on any change (`package_hash`).
+/// Keyed by `base` plus the contents of the `rerun-if-changed` files, or of every package file if none.
 pub fn script_result_key(
     base: &str,
     record: Option<&ScriptRecord>,
@@ -164,8 +117,6 @@ pub fn script_result_key(
     script_result_key_in(base, record, None, package_hash)
 }
 
-/// [`script_result_key`] for the package in `manifest_dir`, whose files the
-/// record names relative to it.
 pub fn script_result_key_in(
     base: &str,
     record: Option<&ScriptRecord>,
@@ -196,26 +147,13 @@ pub fn script_result_key_in(
     }
 }
 
-/// The files a local crate's compilation read, from rustc's dep-info: its
-/// modules and whatever `include_str!`/`include_bytes!` pulled in. Recorded
-/// after it compiles (under `<read record key>-read`) and used to key its
-/// next lookup by exactly these files' contents, so a change to a file it
-/// never read — an integration test, the README, a log — does not compile
-/// it again (and everything above it), as with Cargo.
+/// The files a local crate's compilation read (dep-info), keying its next lookup by exactly these.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReadRecord {
-    /// Relative to the package directory (with `..` for files beside it), so
-    /// another checkout finds the same record; absolute when the file shares
-    /// nothing but the root with the package.
     pub files: Vec<PathBuf>,
 }
 
 impl ReadRecord {
-    /// The record of a dep-info file written by a rustc that ran in `cwd`
-    /// (which its relative paths are relative to), for the package in
-    /// `manifest_dir`. Files below `target_dir` (code a build script
-    /// generated into `OUT_DIR`) are left out: the script's result covers
-    /// them.
     pub fn from_dep_info(
         dep_info: &Path,
         cwd: &Path,
@@ -234,7 +172,6 @@ impl ReadRecord {
         Self { files }
     }
 
-    /// Where each recorded file is now.
     pub fn paths(&self, manifest_dir: &Path) -> Vec<(String, PathBuf)> {
         self.files
             .iter()
@@ -248,7 +185,6 @@ impl ReadRecord {
     }
 }
 
-/// `path` without `.` and `..` components (lexically).
 fn normalize(path: &Path) -> PathBuf {
     use std::path::Component;
     let mut out = PathBuf::new();
@@ -266,8 +202,6 @@ fn normalize(path: &Path) -> PathBuf {
     out
 }
 
-/// `path` relative to the directory `base`, through their common ancestor;
-/// `path` itself when they share no more than the root.
 pub fn relative_to(path: &Path, base: &Path) -> PathBuf {
     let (path, base) = (normalize(path), normalize(base));
     let p: Vec<_> = path.components().collect();
@@ -290,7 +224,6 @@ pub fn relative_to(path: &Path, base: &Path) -> PathBuf {
     out
 }
 
-/// The source files a rustc dep-info file lists (`path:` lines).
 pub fn dep_info_sources(dep_info: &Path) -> Vec<PathBuf> {
     let Ok(text) = std::fs::read_to_string(dep_info) else {
         return Vec::new();
@@ -303,17 +236,12 @@ pub fn dep_info_sources(dep_info: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
-/// The key a unit is stored and looked up under: its base key plus the
-/// current values of what it declared, plus — for a unit with a build script —
-/// the identity of the native toolchain the script may drive.
 pub fn effective_key(
     base: &str,
     inputs: Option<&DeclaredInputs>,
     has_build_script: bool,
 ) -> String {
-    // "No inputs recorded" and "an empty set of inputs" are the same thing and
-    // must give the same key: the first build of a unit learns its inputs
-    // *after* it was keyed with none, and it must find itself again.
+    // No recorded inputs and an empty set must give the same key.
     let declared = inputs.filter(|i| !i.is_empty());
     if declared.is_none() && !has_build_script {
         return base.to_string();
@@ -331,7 +259,6 @@ pub fn effective_key(
     hb.finish_blake3()
 }
 
-/// Content hash of a file, or of every file below a directory (sorted).
 pub(crate) fn hash_path(path: &Path) -> String {
     match std::fs::metadata(path) {
         Ok(m) if m.is_file() => rune_common::hash::xxhash3_file(path)
@@ -377,7 +304,6 @@ fn stat_fingerprint(path: &Path) -> String {
     }
 }
 
-/// What a build script's output tells us about its outside reads.
 pub fn from_script_output(
     out: &BuildScriptOutput,
     manifest_dir: &Path,
@@ -393,24 +319,18 @@ pub fn from_script_output(
         } else {
             manifest_dir.join(p)
         };
-        // Inside the package the package-wide hash already covers it (or the
-        // package is immutable); only outside files add information — and the
-        // manifest, which that hash deliberately leaves out.
         let is_manifest = abs == rune_common::manifest_file::manifest_in(manifest_dir);
         if is_manifest || (!abs.starts_with(manifest_dir) && !abs.starts_with(out_dir)) {
             inputs.files.push(abs);
         }
     }
-    // A script that declares no `rerun-if-changed` is rerun by Cargo whenever
-    // *any* file of the package changes — the manifest included.
+    // Without `rerun-if-changed`, Cargo reruns a script on any package change, manifest included.
     if out.rerun_if_changed.is_empty() {
         inputs
             .files
             .push(rune_common::manifest_file::manifest_in(manifest_dir));
     }
 
-    // Native libraries found outside the package: the linker will read them,
-    // and a system update can change them.
     let outside = |p: &Path| !p.starts_with(manifest_dir) && !p.starts_with(out_dir);
     let mut dirs: Vec<PathBuf> = out
         .link_search
@@ -468,9 +388,6 @@ pub fn from_script_output(
     inputs
 }
 
-/// Environment variables `rustc` reports reading (`env!`, `option_env!`) in a
-/// dep-info file, excluding the ones Rune itself provides (their values are
-/// already determined by the unit's key).
 pub fn env_reads_from_dep_info(dep_info: &Path, provided: &dyn Fn(&str) -> bool) -> Vec<String> {
     let Ok(text) = std::fs::read_to_string(dep_info) else {
         return Vec::new();
@@ -486,10 +403,6 @@ pub fn env_reads_from_dep_info(dep_info: &Path, provided: &dyn Fn(&str) -> bool)
     names
 }
 
-/// Whether a dep-info file lists the package manifest as something the
-/// compiler read (`include_str!("../Cargo.toml")`).
-/// Relative paths in it are relative to `base`, the directory the compiler
-/// ran in.
 pub fn reads_manifest(dep_info: &Path, manifest: &Path, base: &Path) -> bool {
     let Ok(text) = std::fs::read_to_string(dep_info) else {
         return false;
@@ -507,9 +420,7 @@ pub fn reads_manifest(dep_info: &Path, manifest: &Path, base: &Path) -> bool {
         })
 }
 
-/// Variables that change what rustc emits for an Apple target without rustc
-/// listing them in its dep-info: the minimum OS version written into every
-/// object file, and the SDK binaries are linked against.
+/// Variables that change Apple output without appearing in dep-info.
 const APPLE_ENVIRONMENT: [&str; 6] = [
     "MACOSX_DEPLOYMENT_TARGET",
     "IPHONEOS_DEPLOYMENT_TARGET",
@@ -519,9 +430,6 @@ const APPLE_ENVIRONMENT: [&str; 6] = [
     "SDKROOT",
 ];
 
-/// The [`APPLE_ENVIRONMENT`] variables that are set, for a unit compiled for
-/// `triple`; nothing for other targets, or when none is set (so keys do not
-/// change where they don't matter).
 pub fn apple_environment(triple: &str) -> &'static [(&'static str, String)] {
     static SET: OnceLock<Vec<(&'static str, String)>> = OnceLock::new();
     if !triple.contains("-apple-") {
@@ -535,11 +443,7 @@ pub fn apple_environment(triple: &str) -> &'static [(&'static str, String)] {
     })
 }
 
-/// The C toolchain a build script may drive, as one string: the compiler
-/// (`$CC`, else `cc`) and archiver, by path, size, mtime and `--version`.
-/// Cached for the process. It only enters keys of units *with* build scripts;
-/// a system compiler update therefore rebuilds `cc`-driven crates and nothing
-/// else — a false negative, which the spec accepts, never a stale artifact.
+/// The C toolchain a build script may drive; only in keys of units with build scripts.
 pub fn native_tools_identity() -> &'static str {
     static ID: OnceLock<String> = OnceLock::new();
     ID.get_or_init(|| {
@@ -576,11 +480,7 @@ pub fn native_tools_identity() -> &'static str {
     })
 }
 
-/// On macOS, `/usr/bin/cc` is a shim into the active developer directory
-/// (Command Line Tools or Xcode, `xcode-select`): updating those changes the
-/// compiler and the SDK without changing the shim. So the real `clang` and
-/// the SDK are fingerprinted too — by path, size and mtime, without starting
-/// `xcrun` (which would cost every build tens of milliseconds).
+/// `/usr/bin/cc` is a shim: fingerprint the real `clang` and SDK (without starting `xcrun`).
 fn apple_developer_identity(developer_dir: &Path, sdkroot: Option<&Path>) -> String {
     let canonical =
         |p: &Path| rune_common::fsutil::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
@@ -605,7 +505,6 @@ fn apple_developer_identity(developer_dir: &Path, sdkroot: Option<&Path>) -> Str
         ],
     };
     for sdk in sdks.iter().filter(|s| s.exists()) {
-        // `MacOSX.sdk` is a link to the versioned SDK (`MacOSX26.1.sdk`).
         let settings = sdk.join("SDKSettings.json");
         out.push_str(&format!(
             "sdk={}|{}\n",
@@ -635,7 +534,6 @@ mod tests {
             relative_to(&p("/w/pkg/src/../../other/x.rs"), &p("/w/pkg")),
             p("../other/x.rs")
         );
-        // Nothing in common but the root: kept as it is.
         assert_eq!(
             relative_to(&p("/usr/include/x.h"), &p("/w/pkg")),
             p("/usr/include/x.h")
@@ -651,7 +549,6 @@ mod tests {
         )
         .unwrap();
         let record = ReadRecord::from_dep_info(&d, &p("/w"), &p("/w/pkg"), &p("/w/.rune/target"));
-        // (`/w/../elsewhere` shares nothing with `/w/pkg` but the root.)
         assert_eq!(
             record.files,
             [
@@ -692,7 +589,6 @@ mod tests {
                 .into())
         );
 
-        // Without `rerun-if-changed`, every file of the package counts.
         let quiet = script_record(
             &BuildScriptOutput::default(),
             dir.path(),
@@ -727,11 +623,9 @@ mod tests {
         let before = apple_developer_identity(dev.path(), None);
         assert!(before.contains("clang="), "{before}");
         assert!(before.contains("sdk="), "{before}");
-        // An update to the command line tools: a new compiler binary.
         std::fs::write(&clang, "clang 18, a longer binary").unwrap();
         let after = apple_developer_identity(dev.path(), None);
         assert_ne!(before, after);
-        // An explicit SDKROOT replaces the default SDK.
         let other = dev.path().join("Other.sdk");
         std::fs::create_dir_all(&other).unwrap();
         let chosen = apple_developer_identity(dev.path(), Some(&other));
@@ -768,8 +662,6 @@ mod tests {
     #[test]
     fn empty_inputs_leave_a_plain_key_alone() {
         assert_eq!(effective_key("base", None, false), "base");
-        // Unrecorded and recorded-as-empty are one and the same, or a unit
-        // could never find what it stored after its first build.
         assert_eq!(
             effective_key("base", None, true),
             effective_key("base", Some(&DeclaredInputs::default()), true)
@@ -778,7 +670,6 @@ mod tests {
             effective_key("base", Some(&DeclaredInputs::default()), false),
             "base"
         );
-        // A build script always brings the native toolchain into the key.
         assert_ne!(effective_key("base", None, true), "base");
     }
 
@@ -846,11 +737,9 @@ mod tests {
             "only files outside the package add information"
         );
 
-        // The manifest is the exception: it is left out of the package hash.
         out.rerun_if_changed.push(PathBuf::from("Cargo.toml"));
         let with_manifest = from_script_output(&out, &pkg, &out_dir);
         assert!(with_manifest.files.contains(&pkg.join("Cargo.toml")));
-        // And a script with no `rerun-if-changed` at all depends on it too.
         let silent = from_script_output(&BuildScriptOutput::default(), &pkg, &out_dir);
         assert_eq!(silent.files, [pkg.join("Cargo.toml")]);
     }

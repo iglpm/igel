@@ -1,28 +1,14 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 
-/// Dynamic feature resolver and unifier across all workspace and registry packages.
 #[derive(Debug, Clone, Default)]
 pub struct DynamicFeatureResolver {
-    /// Crate name -> declared features mapping (from manifest or registry index).
-    /// e.g. "serde": { "default": ["std"], "derive": ["serde_derive"], "std": [] }
     declared_features: HashMap<String, HashMap<String, Vec<String>>>,
-    /// Crate name -> set of explicitly requested features.
     requested_features: HashMap<String, BTreeSet<String>>,
-    /// Crate name -> whether default-features are enabled.
     use_default_features: HashMap<String, bool>,
-    /// Crate name -> {local dependency alias -> real package name}, for
-    /// dependencies declared with `package = "..."` (e.g. rustls depends on
-    /// `rustls-webpki` under the local name `webpki`). A `[features]` table
-    /// always spells cross-crate activations (`dep:alias`, `alias/feat`)
-    /// using the *local* alias, but the activated package is registered
-    /// under its *real* name — without this map, `webpki/ring` would try to
-    /// activate a package literally named "webpki", which doesn't exist,
-    /// and the real `rustls-webpki` package would silently never see the
-    /// feature it was supposed to get.
+    /// Local dependency aliases (`package = "..."` renames): `[features]` spells activations with the alias.
     package_aliases: HashMap<String, HashMap<String, String>>,
 }
 
-/// The final resolved feature set for a single package.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ResolvedPackageFeatures {
     pub package_name: String,
@@ -36,7 +22,6 @@ impl DynamicFeatureResolver {
         Self::default()
     }
 
-    /// Registers the declared feature map for a package.
     pub fn register_package_features(
         &mut self,
         package_name: &str,
@@ -46,9 +31,6 @@ impl DynamicFeatureResolver {
             .insert(package_name.to_string(), features);
     }
 
-    /// Registers this package's local dependency aliases (from `package =
-    /// "..."` renames), so `alias/feature` and `dep:alias` activations
-    /// inside its own `[features]` table resolve to the real package.
     pub fn register_package_aliases(
         &mut self,
         package_name: &str,
@@ -63,8 +45,6 @@ impl DynamicFeatureResolver {
             .extend(aliases);
     }
 
-    /// Resolves a dependency name as written inside `pkg`'s own `[features]`
-    /// table (which may be a local alias) to the real package name.
     fn resolve_alias(&self, pkg: &str, dep_name: &str) -> String {
         let bare_pkg = pkg.split_whitespace().next().unwrap_or(pkg);
         self.package_aliases
@@ -75,7 +55,6 @@ impl DynamicFeatureResolver {
             .unwrap_or_else(|| dep_name.to_string())
     }
 
-    /// Requests features for a package.
     pub fn request_features(
         &mut self,
         package_name: &str,
@@ -99,15 +78,10 @@ impl DynamicFeatureResolver {
         }
     }
 
-    /// Resolves and unifies all feature dependencies transitively.
     pub fn resolve(&self) -> HashMap<String, ResolvedPackageFeatures> {
         let mut unified: HashMap<String, BTreeSet<String>> = HashMap::new();
         let mut activated_deps: HashMap<String, BTreeSet<String>> = HashMap::new();
 
-        // Every declared key is either a bare package name or `"name version"`.
-        // Index them by bare name once, instead of scanning (and formatting a
-        // prefix string for) every declared key at each lookup below — those
-        // scans made the whole computation quadratic in the package count.
         let mut by_bare: HashMap<&str, Vec<&String>> = HashMap::new();
         for key in self.declared_features.keys() {
             by_bare.entry(bare_name(key)).or_default().push(key);
@@ -116,7 +90,6 @@ impl DynamicFeatureResolver {
             keys.sort(); // deterministic choice when several versions exist
         }
 
-        // 1. Initialize with requested features
         for (pkg, reqs) in &self.requested_features {
             let matching_keys: Vec<&String> = by_bare
                 .get(pkg.as_str())
@@ -137,7 +110,6 @@ impl DynamicFeatureResolver {
             }
         }
 
-        // 2. Add defaults for all declared packages where default-features is enabled
         for (target_pkg, decl) in &self.declared_features {
             let prefix = bare_name(target_pkg);
             let use_default = self
@@ -149,18 +121,7 @@ impl DynamicFeatureResolver {
 
             if use_default && decl.contains_key("default") {
                 let active = unified.entry(target_pkg.clone()).or_default();
-                // `default` is itself an ordinary named feature, not just a
-                // label for the list it expands to — Cargo always marks it
-                // active by name in addition to its expansion. A crate can
-                // (and some, like `document-features`, do) declare `default
-                // = []` purely so `#[cfg(feature = "default")]` can detect
-                // "was this crate pulled in with default features on" with
-                // no actual sub-features to go with it; only inserting the
-                // (here empty) expansion left the literal `"default"` string
-                // missing from the active set whenever a crate did this,
-                // which is indistinguishable from default-features having
-                // been turned off for any check gated on `feature =
-                // "default"` specifically.
+                // `default` is itself a feature (crates may declare `default = []` to detect it).
                 active.insert("default".to_string());
                 for d in &decl["default"] {
                     active.insert(d.clone());
@@ -168,13 +129,6 @@ impl DynamicFeatureResolver {
             }
         }
 
-        // 3. Expand feature dependencies until a fixed point.
-        //
-        // Processing one `(package, feature)` pair only ever *inserts* into the
-        // monotonically growing `unified`/`activated_deps` sets, based on
-        // static declarations — so doing it twice is a no-op. Remember which
-        // pairs are done and only visit new ones, rather than cloning and
-        // re-walking the entire map every round.
         let mut done: HashSet<(String, String)> = HashSet::new();
         loop {
             let mut work: Vec<(String, Vec<String>)> = Vec::new();
@@ -191,7 +145,6 @@ impl DynamicFeatureResolver {
             if work.is_empty() {
                 break;
             }
-            // Deterministic processing order.
             work.sort_by(|a, b| a.0.cmp(&b.0));
 
             for (pkg, feats) in work {
@@ -210,7 +163,6 @@ impl DynamicFeatureResolver {
                 let Some(decl) = decl_opt else { continue };
 
                 for feat in &feats {
-                    // In Cargo, activating a feature `foo` can directly activate optional dependency `foo`
                     activated_deps
                         .entry(pkg.clone())
                         .or_default()
@@ -226,7 +178,6 @@ impl DynamicFeatureResolver {
                         continue;
                     };
                     for sub in sub_features {
-                        // Handle `dep:crate_name` or `crate_name/feature_name`
                         if let Some(dep_pkg) = sub.strip_prefix("dep:") {
                             activated_deps
                                 .entry(pkg.clone())
@@ -239,26 +190,14 @@ impl DynamicFeatureResolver {
                                     .insert(dep_pkg.to_string());
                             }
                         } else if let Some((dep_pkg, dep_feat)) = sub.split_once('/') {
-                            // Optional dep with feature: `dep_pkg?/feat` or `dep_pkg/feat`
                             let clean_dep = dep_pkg.strip_suffix('?').unwrap_or(dep_pkg);
                             activated_deps
                                 .entry(pkg.clone())
                                 .or_default()
                                 .insert(clean_dep.to_string());
 
-                            // `clean_dep` is spelled using pkg's own local
-                            // alias for the dependency (e.g. rustls writes
-                            // `webpki/ring` for its `rustls-webpki`
-                            // dependency, renamed via `package =
-                            // "rustls-webpki"`); resolve it to the real
-                            // package name before looking up which package to
-                            // activate the feature on, or the activation
-                            // lands on a key nothing is ever registered under
-                            // and silently vanishes.
                             let real_dep = self.resolve_alias(&pkg, clean_dep);
 
-                            // Target package keys by name or package id (e.g.
-                            // "proc-macro2 1.0.107").
                             unified
                                 .entry(real_dep.clone())
                                 .or_default()
@@ -272,7 +211,6 @@ impl DynamicFeatureResolver {
                                 }
                             }
                         } else {
-                            // Normal sub-feature of same crate
                             unified.entry(pkg.clone()).or_default().insert(sub.clone());
                             if bare_pkg != pkg {
                                 unified
@@ -286,10 +224,7 @@ impl DynamicFeatureResolver {
             }
         }
 
-        // 4. Construct result. Iterate in key order: when several versions of
-        // a package exist, the entry synthesized for their bare name comes from
-        // whichever is visited first, and that must not depend on `HashMap`
-        // iteration order.
+        // Key order: with several versions, the bare-name entry must not depend on `HashMap` order.
         let mut result = HashMap::new();
         let mut unified: Vec<(String, BTreeSet<String>)> = unified.into_iter().collect();
         unified.sort_by(|a, b| a.0.cmp(&b.0));
@@ -322,7 +257,6 @@ impl DynamicFeatureResolver {
                 });
             }
 
-            // Declared keys of the form "{pkg} <version>".
             if let Some(keys) = by_bare.get(pkg.as_str()) {
                 for decl_key in keys.iter().filter(|k| k.as_str() != pkg) {
                     result.entry((*decl_key).clone()).or_insert_with(|| {
@@ -338,7 +272,6 @@ impl DynamicFeatureResolver {
     }
 }
 
-/// `"serde 1.0.210"` → `"serde"`; a bare name is returned unchanged.
 fn bare_name(key: &str) -> &str {
     key.split_whitespace().next().unwrap_or(key)
 }
@@ -372,8 +305,7 @@ mod tests {
         );
     }
 
-    /// The original quadratic implementation, kept verbatim as an oracle: the
-    /// optimized [`DynamicFeatureResolver::resolve`] must agree with it.
+    /// The original quadratic implementation, kept as an oracle.
     fn resolve_reference(r: &DynamicFeatureResolver) -> HashMap<String, ResolvedPackageFeatures> {
         let mut unified: HashMap<String, BTreeSet<String>> = HashMap::new();
         let mut activated_deps: HashMap<String, BTreeSet<String>> = HashMap::new();
@@ -557,7 +489,6 @@ mod tests {
         result
     }
 
-    /// Tiny deterministic PRNG so the property test needs no dependencies.
     struct Lcg(u64);
     impl Lcg {
         fn next(&mut self) -> u64 {
@@ -572,8 +503,6 @@ mod tests {
         }
     }
 
-    /// Builds a random feature graph. With `multi_version`, some packages exist
-    /// in two versions (as in a real dependency graph).
     fn random_resolver(
         seed: u64,
         multi_version: bool,
@@ -587,7 +516,6 @@ mod tests {
 
             let mut ids = Vec::new();
             for name in &names {
-                // Some packages appear in two versions, as in a real graph.
                 let versions = if multi_version && rng.below(4) == 0 {
                     vec!["1.0.0", "2.0.0"]
                 } else {
@@ -659,11 +587,7 @@ mod tests {
 
     #[test]
     fn optimized_resolver_matches_the_reference_on_random_graphs() {
-        // The reference is only deterministic when every package has a single
-        // version: for a bare name that exists in several versions it picks
-        // whichever declaration a `HashMap` yields first, and that arbitrary
-        // choice then propagates to other packages. So compare on
-        // single-version graphs, and check determinism separately.
+        // The reference is only deterministic for single-version graphs.
         for seed in 0..400u64 {
             let (r, _, _) = random_resolver(seed, false);
             let fast = r.resolve();

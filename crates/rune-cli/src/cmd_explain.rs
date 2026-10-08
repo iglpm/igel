@@ -1,7 +1,4 @@
-//! `rune explain`: which units a build would compile, and why — what changed
-//! in each since it was last built here (files, dependencies, toolchain,
-//! flags, features…). Every build records what each unit's key was made of
-//! (`.rune/fingerprints/identities.json`); this compares that with now.
+//! `rune explain`: why units would be recompiled, comparing recorded key parts with now.
 
 use crate::args::BuildArgs;
 use crate::cmd_build::{plan_for, selection};
@@ -71,8 +68,6 @@ pub fn explain(args: BuildArgs) -> Result<()> {
     Ok(())
 }
 
-/// What differs between two identities of a unit, and whether it is only
-/// that dependencies changed.
 fn describe(prev: &UnitIdentity, cur: &UnitIdentity) -> (Vec<String>, bool) {
     let parts: BTreeSet<&String> = prev.parts.keys().chain(cur.parts.keys()).collect();
     let mut reasons = Vec::new();
@@ -106,8 +101,7 @@ fn describe(prev: &UnitIdentity, cur: &UnitIdentity) -> (Vec<String>, bool) {
             },
         });
     }
-    // What a build script read is looked up under the rest of the key, so
-    // it "changes" whenever anything else does: only a cause on its own.
+    // A build script's outside inputs are keyed under the rest of the key: only a cause on its own.
     const OUTSIDE: &str = "outside inputs (environment variables and files it read) changed";
     if reasons.len() > 1 || !deps.is_empty() {
         reasons.retain(|r| r != OUTSIDE);
@@ -130,7 +124,6 @@ fn describe(prev: &UnitIdentity, cur: &UnitIdentity) -> (Vec<String>, bool) {
     (reasons, only_dependencies)
 }
 
-/// `src/a.rs (modified), src/b.rs (added)`, at most eight.
 fn file_changes(prev: &UnitIdentity, cur: &UnitIdentity) -> String {
     let mut changes = Vec::new();
     let names: BTreeSet<&String> = prev.files.keys().chain(cur.files.keys()).collect();

@@ -1,12 +1,5 @@
 //! `[lints]` tables → `rustc` lint flags.
-//!
-//! Cargo turns `[lints.rust]`, `[lints.clippy]` and `[lints.rustdoc]` (or
-//! `[lints] workspace = true`, inheriting `[workspace.lints]`) into
-//! `-A/-W/-D/-F` flags. Ignoring them silently changes what a crate accepts —
-//! `unsafe_code = "forbid"` would stop being enforced — so they are honored
-//! for local packages.
 
-/// Lint flags plus the `--check-cfg` values a `[lints.rust]` table declares.
 pub fn lint_args(own: Option<&toml::Value>, workspace: Option<&toml::Value>) -> Vec<String> {
     let table = match own.and_then(|v| v.as_table()) {
         Some(t) if t.get("workspace").and_then(|v| v.as_bool()) == Some(true) => {
@@ -71,8 +64,7 @@ pub fn lint_args(own: Option<&toml::Value>, workspace: Option<&toml::Value>) -> 
         }
     }
 
-    // Lower priority first, so higher-priority flags come later and win; name
-    // order makes the result deterministic.
+    // Lower priority first, so higher-priority flags come later and win.
     lints.sort_by(|a, b| (a.priority, &a.name).cmp(&(b.priority, &b.name)));
     let mut out: Vec<String> = Vec::new();
     for l in lints {

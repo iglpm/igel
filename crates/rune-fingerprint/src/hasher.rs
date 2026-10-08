@@ -18,7 +18,6 @@ pub enum HasherError {
 
 type Result<T> = std::result::Result<T, HasherError>;
 
-/// All inputs that go into a crate's fingerprint.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FingerprintInputs {
     pub source_hash: String,
@@ -32,7 +31,6 @@ pub struct FingerprintInputs {
     pub target: Option<String>,
 }
 
-/// The result of fingerprinting a crate.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CrateFingerprint {
     pub inputs: FingerprintInputs,
@@ -42,13 +40,10 @@ pub struct CrateFingerprint {
 
 static COMPILER_VERSION: OnceLock<String> = OnceLock::new();
 
-/// Retrieves and caches the compiler version output from `rustc -vV`.
 pub fn get_compiler_version() -> String {
     COMPILER_VERSION
         .get_or_init(|| {
-            // The compiler actually used: `RUSTC` may name a wrapper such as
-            // `clippy-driver`, whose output must never be confused with plain
-            // `rustc`'s in the cache.
+            // `RUSTC` may be a wrapper (`clippy-driver`) whose output must not be confused with rustc's.
             let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
             Command::new(&rustc)
                 .arg("-vV")
@@ -65,17 +60,8 @@ pub fn get_compiler_version() -> String {
         .clone()
 }
 
-/// Directories that are known *not* to be inputs of a package: build output,
-/// version-control metadata, editor state, and dependency caches of other
-/// ecosystems. `.cargo/` is here because its build-relevant content
-/// (`rustflags`, `[env]`, linker, wrappers, ...) is already part of every
-/// unit's key as *values*, so hashing the file too would only invalidate
-/// builds when a comment changes.
-///
-/// Notably absent: hidden directories in general. A crate can legitimately
-/// `include_str!(".version")` or read `.config/settings.toml` from its build
-/// script, so an arbitrary dot-file or dot-directory is an input until proven
-/// otherwise.
+/// Never inputs. `.cargo/` is excluded because its relevant values are already in every unit's key.
+/// Hidden files in general are inputs (`include_str!(".version")`).
 const IGNORED_DIRS: &[&str] = &[
     "target",
     ".git",
@@ -88,9 +74,6 @@ const IGNORED_DIRS: &[&str] = &[
     "node_modules",
 ];
 
-/// Files that are editor and OS droppings rather than inputs: swap files,
-/// backup files and Finder metadata. They churn constantly and no build reads
-/// them.
 fn is_editor_dropping(name: &str) -> bool {
     name.ends_with('~')
         || name == ".DS_Store"
@@ -100,24 +83,8 @@ fn is_editor_dropping(name: &str) -> bool {
             && (name.ends_with(".swp") || name.ends_with(".swo") || name.ends_with(".swx")))
 }
 
-/// Computes a hash over every input file of the package rooted at `package_dir`.
-///
-/// This is deliberately broader than "the `.rs` files under `src/`": a crate
-/// can `include_str!`/`include_bytes!` a data file, read a schema at build
-/// time, or keep its library root somewhere other than `src/`, and any of
-/// those changing must invalidate the cache. So every regular file in the
-/// package is hashed, except:
-///
-/// * known non-input directories (see [`IGNORED_DIRS`]), directories tagged
-///   as caches (`CACHEDIR.TAG`: a target directory by another name) and
-///   editor droppings (swap and backup files) — but *not* hidden files or
-///   directories in general,
-/// * nested packages (a subdirectory with its own `Cargo.toml` is a different
-///   crate with its own cache key — workspace members live in such directories),
-/// * lock files and `Rune.toml`, which don't affect compilation of this crate.
-///
-/// A file's hash is re-used from `cache` while its modification time and size
-/// are unchanged, so a warm run only `stat`s the tree.
+/// Hash every input file of the package: all regular files except ignored/cache directories, editor
+/// droppings, nested packages, lock files and `Rune.toml`. Unchanged mtime+size reuses the cached hash.
 pub fn compute_package_hash(package_dir: &Path, cache: &mut FingerprintCache) -> Result<String> {
     if let Some(hash) = cache.package_hashes.get(package_dir) {
         return Ok(hash.clone());
@@ -145,12 +112,9 @@ fn compute_package_hash_uncached(
             if IGNORED_DIRS.contains(&name.as_ref()) {
                 return false;
             }
-            // A target directory or store by another name (`--target-dir
-            // out`, `RUNE_HOME=$PWD/.cache`): output, not source.
             if e.path().join(rune_common::fsutil::CACHEDIR_TAG).is_file() {
                 return false;
             }
-            // A nested package is not part of this one.
             !rune_common::manifest_file::has_manifest(e.path())
         });
     for entry in walker.filter_map(|e| e.ok()) {
@@ -161,19 +125,10 @@ fn compute_package_hash_uncached(
         if is_editor_dropping(&name) {
             continue;
         }
-        // The manifest itself is not an input: every compilation-relevant
-        // value in it (features, dependencies and their aliases, targets,
-        // profiles, lints, metadata) is already part of the unit's key, so
-        // hashing the file too would only rebuild a package when a comment or
-        // an unrelated section changes. When something *does* read the file
-        // (`include_str!("../Cargo.toml")`, a build script), it is recorded as
-        // a declared input by whoever observed the read.
+        // The manifest's relevant values are already in the unit's key; observed reads are declared inputs.
         if rune_common::manifest_file::is_manifest_file_name(&name) && entry.depth() == 1 {
             continue;
         }
-        // Lock files and Rune's own settings file don't affect compilation;
-        // editing them (e.g. `rune config set ...`) must not invalidate the
-        // cache of the package they sit in.
         if name == "Cargo.lock" || name == "Rune.lock.bin" || name == "Rune.toml" {
             continue;
         }
@@ -185,8 +140,6 @@ fn compute_package_hash_uncached(
     hash_files(package_dir, files, cache)
 }
 
-/// One file's content hash, reused from `cache` while its modification time
-/// and size are unchanged; `None` when it does not exist (or is not a file).
 pub fn file_hash(path: &Path, cache: &mut FingerprintCache) -> Option<u64> {
     let meta = std::fs::metadata(path).ok().filter(|m| m.is_file())?;
     let mtime = meta
@@ -214,10 +167,6 @@ pub fn file_hash(path: &Path, cache: &mut FingerprintCache) -> Option<u64> {
     Some(hash)
 }
 
-/// Computes a hash of all `.rs` files under `source_root`.
-///
-/// Kept for callers that want just a source-tree hash; see
-/// [`compute_package_hash`] for what cache keys use.
 pub fn compute_source_hash(
     source_dir: &Path,
     source_root: &Path,
@@ -245,8 +194,6 @@ fn hash_files(
 ) -> Result<String> {
     files.sort();
 
-    // Stat + (if changed) hash every file in parallel. `cache` is only read
-    // here; results are folded back in sequentially below.
     let cache_ref: &FingerprintCache = cache;
     let one = |path: PathBuf| {
         let (mtime, size) = std::fs::metadata(&path)
@@ -277,8 +224,7 @@ fn hash_files(
             hash,
         }
     };
-    // A thread pool costs more than it saves on a small package (and its
-    // idle workers spin, making a quick command's time erratic).
+    // A thread pool costs more than it saves on a small package.
     let hashed: Vec<FileEntry> = if files.len() < 64 {
         files.into_iter().map(one).collect()
     } else {
@@ -297,7 +243,6 @@ fn hash_files(
     Ok(hb.finish_blake3())
 }
 
-/// Computes the final crate fingerprint from its inputs.
 pub fn compute_fingerprint(inputs: FingerprintInputs) -> CrateFingerprint {
     let mut hb = HashBuilder::new();
 
@@ -382,14 +327,11 @@ mod tests {
 
         let mut cache = FingerprintCache::new();
         let base = compute_package_hash(d, &mut cache).unwrap();
-        // The memo is per-run; a real second run starts from a fresh cache.
         let rehash = |cache: &mut FingerprintCache| {
             cache.package_hashes.clear();
             compute_package_hash(d, cache).unwrap()
         };
 
-        // Ignored: build output, VCS and tool directories, editor droppings,
-        // nested package, lockfile, and the manifest itself.
         write(
             d,
             "Cargo.toml",
@@ -404,12 +346,10 @@ mod tests {
         write(d, "Cargo.lock", "# lock");
         assert_eq!(rehash(&mut cache), base);
 
-        // Seen: a data file outside `src/` (think `include_str!("../data/schema.json")`).
         write(d, "data/schema.json", "{\"changed\":true}");
         let after_data = rehash(&mut cache);
         assert_ne!(after_data, base);
 
-        // Seen: hidden files and directories are inputs like any other.
         write(d, ".version", "2");
         let after_dotfile = rehash(&mut cache);
         assert_ne!(after_dotfile, after_data);
@@ -430,8 +370,6 @@ mod tests {
         write(d, "src/lib.rs", "aaaa");
         let mut cache = FingerprintCache::new();
         let first = compute_package_hash(d, &mut cache).unwrap();
-        // Same length, written immediately: only a sub-second mtime (or a
-        // content hash) can tell these apart.
         write(d, "src/lib.rs", "bbbb");
         cache.package_hashes.clear();
         assert_ne!(compute_package_hash(d, &mut cache).unwrap(), first);
@@ -451,7 +389,6 @@ mod tests {
         cache.save_if_changed(&cache_path).unwrap();
         let first_write = std::fs::metadata(&cache_path).unwrap().modified().unwrap();
 
-        // Reload, nothing changed: no rewrite.
         std::thread::sleep(std::time::Duration::from_millis(20));
         let mut cache = FingerprintCache::load(&cache_path).unwrap();
         compute_package_hash(&d, &mut cache).unwrap();
@@ -461,7 +398,6 @@ mod tests {
             first_write
         );
 
-        // A deleted file's entry is dropped on the next save.
         std::fs::remove_file(d.join("src/b.rs")).unwrap();
         let mut cache = FingerprintCache::load(&cache_path).unwrap();
         compute_package_hash(&d, &mut cache).unwrap();

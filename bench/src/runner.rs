@@ -1,9 +1,4 @@
-//! Runs the scenarios for every tool on every workload.
-//!
-//! Each tool works in its own copy of a workload, so neither sees the
-//! other's output. Runs alternate between the tools (rune, cargo, cargo,
-//! rune, …) so that a machine getting warmer or busier over time does not
-//! favour whichever went first.
+//! Runs every scenario for both tools on every workload, alternating tools between runs.
 
 use anyhow::Result;
 use std::io::Write as _;
@@ -24,7 +19,6 @@ pub struct Config {
     pub timeout: Duration,
     pub work: PathBuf,
     pub verbose: bool,
-    /// Show each run as it happens (on a terminal).
     pub live: bool,
 }
 
@@ -198,7 +192,6 @@ fn measure_scenario(ctxs: &[Ctx], w: &Workload, s: &Scenario, cfg: &Config) -> V
         .collect()
 }
 
-/// One line per finished scenario: both tools' medians and the verdict.
 fn print_line(results: &Results, workload: &str, s: &Scenario) {
     let get = |tool: &str| results.find(workload, s.id, tool);
     let show = |m: Option<&Measurement>| match m {

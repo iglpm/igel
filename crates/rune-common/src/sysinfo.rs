@@ -1,31 +1,23 @@
-//! What the machine has to offer a build: cores and memory.
+//! Cores and memory available to a build.
 
-/// Physical memory, in bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Memory {
     pub total: u64,
-    /// What can be given to new processes without swapping (Linux's
-    /// `MemAvailable`; on macOS, the share the kernel's memory-pressure level
-    /// reports as available).
     pub available: u64,
 }
 
 impl Memory {
-    /// Below this, starting another compiler risks swapping (or the
-    /// out-of-memory killer): a tenth of the machine, at least 1 GiB and at
-    /// most 4 GiB — a large crate's `rustc` can take a gigabyte or two.
+    /// Below this, another compiler risks swapping: a tenth of memory, between 1 and 4 GiB.
     pub fn reserve(&self) -> u64 {
         const GIB: u64 = 1 << 30;
         (self.total / 10).clamp(GIB, 4 * GIB)
     }
 
-    /// Whether memory is short enough to hold back new work.
     pub fn is_short(&self) -> bool {
         self.available < self.reserve()
     }
 }
 
-/// The machine's memory, where the platform says.
 pub fn memory() -> Option<Memory> {
     imp::memory()
 }
@@ -79,9 +71,6 @@ mod imp {
 
     pub fn memory() -> Option<Memory> {
         let total: u64 = sysctl("hw.memsize")?;
-        // The percentage of memory the kernel considers available (what
-        // Activity Monitor's "memory pressure" is derived from); unlike free
-        // pages, it counts the file cache and compressible memory.
         let level: u32 = sysctl("kern.memorystatus_level")?;
         Some(Memory {
             total,
@@ -94,7 +83,6 @@ mod imp {
 mod imp {
     use super::Memory;
 
-    /// `MEMORYSTATUSEX`.
     #[repr(C)]
     struct MemoryStatus {
         length: u32,
@@ -127,8 +115,6 @@ mod imp {
         };
         // SAFETY: a `MEMORYSTATUSEX` with its length set, as the call needs.
         let ok = unsafe { GlobalMemoryStatusEx(&mut status) };
-        // Available physical memory counts the standby (file cache) list,
-        // which Windows hands out without paging anything.
         (ok != 0 && status.total_phys > 0).then_some(Memory {
             total: status.total_phys,
             available: status.avail_phys,
@@ -145,8 +131,6 @@ mod imp {
     }
 }
 
-/// Lowers this process's scheduling priority (and so its children's): they
-/// get the cores nothing else wants. Best effort.
 pub fn lower_priority() {
     #[cfg(unix)]
     // SAFETY: plain system call on this process.
@@ -155,19 +139,14 @@ pub fn lower_priority() {
     }
 }
 
-/// The size in bytes of the filesystem holding `path`.
 pub fn disk_size(path: &std::path::Path) -> Option<u64> {
     filesystem(path).map(|(total, _)| total)
 }
 
-/// The bytes an unprivileged process can still write on the filesystem
-/// holding `path`.
 pub fn disk_available(path: &std::path::Path) -> Option<u64> {
     filesystem(path).map(|(_, available)| available)
 }
 
-/// Total and available bytes of the filesystem holding `path` (or its
-/// nearest existing ancestor).
 fn filesystem(path: &std::path::Path) -> Option<(u64, u64)> {
     #[cfg(unix)]
     {
@@ -192,11 +171,7 @@ fn filesystem(path: &std::path::Path) -> Option<(u64, u64)> {
     }
 }
 
-/// Runs `f`, which writes to a pipe whose reader may have gone (a child
-/// process's stdin), with SIGPIPE blocked on this thread: a reader that
-/// went away is then an `EPIPE` error from the write, not the end of Rune —
-/// which keeps SIGPIPE's default action so that `rune tree | head` stops
-/// quietly.
+/// Runs `f` with SIGPIPE blocked, so a vanished pipe reader is `EPIPE` rather than the end of Rune.
 pub fn without_sigpipe<T>(f: impl FnOnce() -> T) -> T {
     #[cfg(unix)]
     // SAFETY: plain signal-mask calls on this thread's own mask, with
@@ -208,8 +183,6 @@ pub fn without_sigpipe<T>(f: impl FnOnce() -> T) -> T {
         let mut old: libc::sigset_t = std::mem::zeroed();
         libc::pthread_sigmask(libc::SIG_BLOCK, &set, &mut old);
         let out = f();
-        // A SIGPIPE raised meanwhile is pending: take it, so that unblocking
-        // does not deliver it after all.
         let mut pending: libc::sigset_t = std::mem::zeroed();
         if libc::sigismember(&old, libc::SIGPIPE) == 0
             && libc::sigpending(&mut pending) == 0
@@ -233,24 +206,16 @@ mod tests {
     #[test]
     fn writing_to_a_child_that_exited_is_an_error_not_the_end() {
         use std::io::Write;
-        // SIGPIPE's default action, as `rune` sets it.
-        // SAFETY: changes the disposition of one signal; other tests in this
-        // process do not rely on SIGPIPE being ignored.
         unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
         let mut child = std::process::Command::new("true")
             .stdin(std::process::Stdio::piped())
             .spawn()
             .unwrap();
-        // (`wait` would close its stdin: take it first.)
         let mut stdin = child.stdin.take().unwrap();
         child.wait().unwrap();
-        // More than a pipe holds: a process another test forks meanwhile may
-        // hold the reading end for a moment, and the write must outlast it.
         let data = vec![0u8; 1 << 20];
         let err = without_sigpipe(|| stdin.write_all(&data).and_then(|_| stdin.flush()));
         assert_eq!(err.unwrap_err().kind(), std::io::ErrorKind::BrokenPipe);
-        // Still alive, and the signal was taken: nothing arrives later.
-        // SAFETY: as above.
         unsafe { libc::signal(libc::SIGPIPE, libc::SIG_IGN) };
     }
 

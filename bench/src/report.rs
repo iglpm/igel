@@ -1,6 +1,4 @@
-//! Turning results into something to read: a terminal summary, Markdown
-//! (for a pull request or the docs), a self-contained HTML page with charts,
-//! and a comparison of two runs that flags regressions.
+//! Terminal summary, Markdown, HTML and run-to-run comparison.
 
 use std::fmt::Write as _;
 
@@ -28,7 +26,6 @@ fn spread(m: &Measurement) -> String {
     format!("±{:.0} %", m.summary.cv() * 100.0)
 }
 
-/// `3.2× faster` / `1.5× less disk`, from Rune's point of view.
 fn verdict(rune: &Measurement, cargo: &Measurement) -> Option<(f64, String)> {
     let c = stats::compare(&rune.summary, &cargo.summary)?;
     let text = if c.within_noise && rune.unit != "bytes" {
@@ -45,7 +42,6 @@ fn verdict(rune: &Measurement, cargo: &Measurement) -> Option<(f64, String)> {
     Some((c.speedup, text))
 }
 
-/// Geometric mean of Rune's speedups over `pairs` (time measurements only).
 fn geomean(pairs: &[(f64, &Measurement)]) -> Option<f64> {
     let logs: Vec<f64> = pairs
         .iter()
@@ -55,7 +51,6 @@ fn geomean(pairs: &[(f64, &Measurement)]) -> Option<f64> {
     (!logs.is_empty()).then(|| (logs.iter().sum::<f64>() / logs.len() as f64).exp())
 }
 
-/// Every (workload, scenario) where both tools have a result.
 fn pairs(results: &Results) -> Vec<(&Measurement, &Measurement, f64, String)> {
     let mut out = Vec::new();
     for w in results.workloads() {
@@ -71,10 +66,6 @@ fn pairs(results: &Results) -> Vec<(&Measurement, &Measurement, f64, String)> {
     }
     out
 }
-
-// ---------------------------------------------------------------------------
-// Terminal
-// ---------------------------------------------------------------------------
 
 pub fn terminal(results: &Results) -> String {
     let mut out = String::new();
@@ -120,10 +111,6 @@ pub fn terminal(results: &Results) -> String {
     }
     out
 }
-
-// ---------------------------------------------------------------------------
-// Markdown
-// ---------------------------------------------------------------------------
 
 pub fn markdown(results: &Results) -> String {
     let mut out = String::from("# Rune vs Cargo\n\n");
@@ -237,10 +224,6 @@ fn environment_lines(results: &Results) -> Vec<String> {
     lines
 }
 
-// ---------------------------------------------------------------------------
-// HTML
-// ---------------------------------------------------------------------------
-
 fn esc(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
@@ -248,8 +231,6 @@ fn esc(s: &str) -> String {
         .replace('"', "&quot;")
 }
 
-/// One chart row: two bars on the row's own scale (scenarios differ by
-/// orders of magnitude, so each compares only the two tools).
 fn bars(r: Option<&Measurement>, c: Option<&Measurement>) -> String {
     let rv = r.map(|m| m.summary.median).unwrap_or(0.0);
     let cv = c.map(|m| m.summary.median).unwrap_or(0.0);
@@ -288,7 +269,6 @@ pub fn html(results: &Results) -> String {
             esc(&stats::describe(g))
         );
     }
-    // Per category, over all workloads.
     let mut cats: Vec<(String, Vec<(f64, &Measurement)>)> = Vec::new();
     for (r, _, s, _) in &all {
         match cats.iter_mut().find(|(c, _)| *c == r.category) {
@@ -417,12 +397,6 @@ ul.env {{ padding-left:18px; color:var(--muted); font-size:13px; }}
     )
 }
 
-// ---------------------------------------------------------------------------
-// Comparing two runs
-// ---------------------------------------------------------------------------
-
-/// How `tool` changed between two runs: a table, and how many measurements
-/// got slower by more than `threshold` (0.10 = 10 %) beyond their noise.
 pub fn compare(old: &Results, new: &Results, tool: &str, threshold: f64) -> (String, usize) {
     let mut out = String::new();
     let mut regressions = 0;
@@ -445,8 +419,7 @@ pub fn compare(old: &Results, new: &Results, tool: &str, threshold: f64) -> (Str
             continue;
         }
         let ratio = n.summary.median / o.summary.median;
-        // The other tool, measured in the same runs, says how much the
-        // machine itself changed between them (another load, another CPU).
+        // The other tool, measured in the same runs, says how much the machine itself changed.
         let control = old
             .find(&n.workload, &n.scenario, control_tool)
             .zip(new.find(&n.workload, &n.scenario, control_tool))
@@ -454,8 +427,7 @@ pub fn compare(old: &Results, new: &Results, tool: &str, threshold: f64) -> (Str
             .map(|(co, cn)| cn.summary.median / co.summary.median);
         let change = ratio / control.unwrap_or(1.0) - 1.0;
         let noise = noise(&o.summary).max(noise(&n.summary));
-        // Every run slower than every earlier one, not just the middle one:
-        // with three runs a side, a median moves by more than this by chance.
+        // Every run slower than every earlier one: with three runs, a median moves this much by chance.
         let apart = |a: &Summary, b: &Summary| a.max < b.min;
         let flag = if change > threshold.max(noise) && apart(&o.summary, &n.summary) {
             regressions += 1;
@@ -482,7 +454,6 @@ pub fn compare(old: &Results, new: &Results, tool: &str, threshold: f64) -> (Str
     (out, regressions)
 }
 
-/// How much a median can move by chance: twice the relative spread.
 fn noise(s: &Summary) -> f64 {
     if s.n < 3 { 0.0 } else { 2.0 * s.cv() }
 }
@@ -560,7 +531,6 @@ mod tests {
         let noisy_old = results(vec![m("w", "noop", "rune", &[0.7, 1.0, 1.3])]);
         let (_, n) = compare(&noisy_old, &slower, "rune", 0.10);
         assert_eq!(n, 0, "within the old run's own spread");
-        // A slower median whose runs overlap the earlier ones is not one.
         let overlapping = results(vec![m("w", "noop", "rune", &[1.05, 1.3, 1.31])]);
         let (_, n) = compare(&old, &overlapping, "rune", 0.10);
         assert_eq!(n, 1, "{:?}", Summary::of(&[1.05, 1.3, 1.31]));

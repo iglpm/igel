@@ -1,13 +1,4 @@
-//! # rune-common
-//!
-//! Shared types, error definitions, and utilities for the Rune build system.
-//!
-//! This crate provides the foundational types used across all Rune crates:
-//! - [`CrateId`] — unique identification for a crate
-//! - [`Edition`], [`CrateType`], [`Profile`] — compilation parameters
-//! - [`TargetTriple`] — platform targeting
-//! - [`hash`] — fast content hashing utilities (xxhash3 + blake3)
-//! - [`RuneError`] — shared error types
+//! Shared types, errors and utilities.
 
 pub mod cargo_config;
 pub mod cfgexpr;

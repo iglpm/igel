@@ -1,4 +1,4 @@
-//! Discovery and loading of the Cargo workspace a command operates on.
+//! Discovery and loading of the workspace a command operates on.
 
 use anyhow::{Context, Result, bail};
 use rune_common::cargo_config::CargoConfig;
@@ -7,11 +7,9 @@ use rune_common::{Edition, PackageMeta, RuneConfig, settings::Settings};
 use rune_manifest::{Manifest, WorkspaceManifest};
 use std::path::{Path, PathBuf};
 
-/// One package of the workspace (or a path dependency outside of it).
 #[derive(Debug, Clone)]
 pub struct Member {
     pub dir: PathBuf,
-    /// The file the manifest was read from (`Cargo.toml` or `Rune.toml`).
     pub manifest_path: PathBuf,
     pub manifest: Manifest,
     pub name: String,
@@ -60,15 +58,11 @@ impl Member {
         })
     }
 
-    /// `name version` — the id used by the resolver and lockfile.
     pub fn id(&self) -> String {
         format!("{} {}", self.name, self.version)
     }
 }
 
-/// What Cargo refuses in a package manifest, refused the same way: a
-/// package without a library or binary, and features naming what does not
-/// exist.
 fn validate(manifest: &Manifest, path: &Path) -> Result<()> {
     if manifest.lib.is_none() && manifest.bin.is_empty() {
         bail!(
@@ -77,7 +71,6 @@ fn validate(manifest: &Manifest, path: &Path) -> Result<()> {
             path.display()
         );
     }
-    // Every dependency, by the name the package uses, and whether optional.
     let mut deps: std::collections::HashMap<&str, bool> = std::collections::HashMap::new();
     for d in manifest.dependencies.values() {
         let optional = deps.entry(d.name.as_str()).or_insert(false);
@@ -130,24 +123,16 @@ fn validate(manifest: &Manifest, path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// A loaded workspace: the root manifest, every member, and user settings.
 pub struct Workspace {
     pub config: RuneConfig,
-    /// `[patch]` / `[replace]` from the root manifest and configuration.
     pub patches: rune_resolver::Patches,
-    /// `.cargo/config.toml` files (and `CARGO_*` overrides) that apply.
     pub cargo_config: CargoConfig,
     pub root_manifest: Manifest,
-    /// Every workspace member (a lone package is a one-member workspace),
-    /// sorted by directory.
     pub members: Vec<Member>,
-    /// Index into `members` of the package the command was started in.
     pub current: Option<usize>,
 }
 
 impl Workspace {
-    /// Finds and loads the workspace containing `manifest_path`, or the
-    /// nearest manifest (`Cargo.toml` or `Rune.toml`) at or above the current directory.
     pub fn load(manifest_path: Option<&Path>) -> Result<Self> {
         let start_manifest = match manifest_path {
             Some(p) => {
@@ -190,25 +175,18 @@ impl Workspace {
         let settings = Settings::load(Some(&root_dir))?;
         let config = RuneConfig::new(&root_dir).with_settings(settings);
 
-        // Configuration files are found from the working directory upward,
-        // as Cargo does. The compiler (`RUSTC`, wrappers, `rust-toolchain`)
-        // is fixed for the whole process from here on.
         let cwd = std::env::current_dir().unwrap_or_else(|_| root_dir.clone());
         let cargo_config = CargoConfig::load(&cwd);
         if let Some(e) = cargo_config.error() {
             anyhow::bail!(e);
         }
         apply_profile_config(&mut root_manifest.profile, &cargo_config, std::env::vars())?;
-        // `[http]`/`[net]`: CA bundles, proxy, timeouts and retries for every
-        // request this process makes.
         rune_common::net::configure(rune_common::net::HttpConfig::from_config(&cargo_config));
         toolchain::set_global(Toolchain::discover(&cargo_config, &root_dir));
-        // Alternative registries, mirrors and vendored sources.
         rune_registry::source::configure(rune_registry::source::RegistryDefs::from_config(
             cargo_config.root(),
         ));
 
-        // Root package first (if any), then members; deduplicated by directory.
         let ws_manifest = root_manifest.workspace.as_ref();
         let mut dirs: Vec<PathBuf> = Vec::new();
         if root_manifest.package.is_some() {
@@ -273,14 +251,12 @@ impl Workspace {
         self.root_manifest.workspace.as_ref()
     }
 
-    /// Finds a member by package name.
     pub fn member_named(&self, name: &str) -> Option<usize> {
         self.members.iter().position(|m| m.name == name)
     }
 
-    /// Selects packages exactly as Cargo does: `-p` wins, then `--workspace`,
-    /// then the package the command was run in, and for a virtual workspace
-    /// `default-members` or else every member.
+    /// Selects packages as Cargo does: `-p`, then `--workspace`, then the current package, then
+    /// `default-members` or every member.
     pub fn select(
         &self,
         packages: &[String],
@@ -356,9 +332,7 @@ fn find_manifest_upwards(start: &Path) -> Option<PathBuf> {
     }
 }
 
-/// Walks up from a member looking for the `[workspace]` that contains it.
 fn find_workspace_root(member_dir: &Path, member: &Manifest) -> Option<PathBuf> {
-    // An explicit `package.workspace = "../.."` wins.
     if let Some(explicit) = member.package.as_ref().and_then(|p| p.workspace.as_ref()) {
         let dir = member_dir.join(explicit);
         return rune_common::fsutil::canonicalize(&dir).ok();
@@ -383,9 +357,6 @@ fn find_workspace_root(member_dir: &Path, member: &Manifest) -> Option<PathBuf> 
     }
 }
 
-/// Finds the directory a project's `Rune.toml` belongs in: the workspace root
-/// if there is one, else the nearest package. Cheaper and more forgiving than
-/// [`Workspace::load`] (no member parsing), for commands like `rune config`.
 pub fn find_project_root(manifest_path: Option<&Path>) -> Option<PathBuf> {
     let nearest = match manifest_path {
         Some(p) => rune_common::fsutil::canonicalize(p).ok()?,
@@ -399,10 +370,7 @@ pub fn find_project_root(manifest_path: Option<&Path>) -> Option<PathBuf> {
     Some(find_workspace_root(&dir, &manifest).unwrap_or(dir))
 }
 
-/// `[profile.*]` from configuration and `CARGO_PROFILE_<NAME>_<KEY>` from
-/// the environment, over the manifest's own profile tables (in that order of
-/// precedence, as with Cargo): key by key, nested tables (`package.*`,
-/// `build-override`) merged too.
+/// `[profile.*]` from config and `CARGO_PROFILE_*` env over the manifest's, key by key, as Cargo does.
 fn apply_profile_config(
     profiles: &mut std::collections::HashMap<String, rune_manifest::cargo_toml::ProfileOverride>,
     config: &CargoConfig,
@@ -414,10 +382,6 @@ fn apply_profile_config(
         .cloned()
         .unwrap_or_default();
 
-    // Environment: `CARGO_PROFILE_RELEASE_LTO=true`,
-    // `CARGO_PROFILE_DEV_BUILD_OVERRIDE_OPT_LEVEL=3`. A name is matched
-    // against the known profiles, longest first (`release-lto` before
-    // `release`).
     let mut names: Vec<String> = ["dev", "release", "test", "bench"]
         .iter()
         .map(|s| s.to_string())
@@ -497,7 +461,6 @@ fn deep_merge(base: &mut toml::Value, over: toml::Value) {
     }
 }
 
-/// Reads a manifest; errors name the file once.
 pub fn read_manifest(path: &Path) -> anyhow::Result<Manifest> {
     Manifest::from_path(path).map_err(|e| {
         if e.names_path() {
@@ -545,14 +508,12 @@ mod profile_config_tests {
         ];
         apply_profile_config(&mut profiles, &config, env.into_iter()).unwrap();
         let release = &profiles["release"];
-        // Config beats the manifest, the environment beats both.
         assert_eq!(release.opt_level, Some(toml::Value::Integer(3)));
         assert_eq!(release.extra.get("lto"), Some(&toml::Value::Boolean(false)));
         assert_eq!(
             release.extra.get("codegen-units"),
             Some(&toml::Value::Integer(1))
         );
-        // Nested tables merge rather than replace.
         let foo = &release.package["foo"];
         assert_eq!(foo.opt_level, Some(toml::Value::Integer(1)));
         assert_eq!(foo.debug, Some(toml::Value::Boolean(true)));

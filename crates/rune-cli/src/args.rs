@@ -1,5 +1,3 @@
-//! Command-line argument definitions.
-
 use clap::{Args, Parser, Subcommand};
 use std::path::PathBuf;
 
@@ -940,8 +938,6 @@ pub struct TreeArgs {
 }
 
 impl CommonArgs {
-    /// Every option at its default, with the manifest and offline flags of
-    /// `m` — for commands that build a plan without taking build options.
     pub fn defaults_for(m: &ManifestArgs) -> CommonArgs {
         use clap::{FromArgMatches, Parser};
         #[derive(Parser)]

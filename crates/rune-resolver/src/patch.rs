@@ -1,37 +1,19 @@
-//! `[patch]` and `[replace]`: substituting a dependency's source.
-//!
-//! ```toml
-//! [patch.crates-io]
-//! serde = { path = "../serde" }          # a fork checked out next door
-//!
-//! [patch."https://github.com/org/repo"]
-//! inner = { git = "https://github.com/me/inner" }
-//! ```
-//!
-//! A patch replaces *every* dependency on that package from that source —
-//! including those of registry crates deep in the graph — provided the
-//! patched package's version satisfies the requirement. Patches come from the
-//! workspace root manifest and from configuration (`[patch]` in
-//! `.cargo/config.toml`, which wins), and alter the resolved graph and hence
-//! every unit key above the patched package.
+//! `[patch]` and `[replace]`: substituting a dependency's source everywhere in the graph, when the
+//! patched version satisfies the requirement. Configuration patches win over the manifest's.
 
 use rune_manifest::dependency::DependencySpec;
 use rune_manifest::{Manifest, WorkspaceManifest};
 use semver::{Version, VersionReq};
 use std::path::{Path, PathBuf};
 
-/// Where the patched dependency would otherwise come from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PatchSource {
     CratesIo,
-    /// An alternative registry, by its configured name or index URL.
     Registry(String),
-    /// A git repository URL.
     Git(String),
 }
 
 impl PatchSource {
-    /// Interprets a `[patch.<key>]` table name.
     pub fn from_key(key: &str) -> PatchSource {
         match key {
             "crates-io"
@@ -50,13 +32,10 @@ impl PatchSource {
 pub struct PatchEntry {
     pub source: PatchSource,
     pub name: String,
-    /// `path` (absolute) or `git`, as written.
     pub spec: DependencySpec,
-    /// `[replace]` targets exactly one version.
     pub exact: Option<Version>,
 }
 
-/// Every patch that applies to a build.
 #[derive(Debug, Clone, Default)]
 pub struct Patches {
     entries: Vec<PatchEntry>,
@@ -71,12 +50,9 @@ impl Patches {
         &self.entries
     }
 
-    /// Collects patches from the workspace root manifest (paths relative to
-    /// `root`) and from configuration, which takes precedence.
     pub fn collect(root: &Path, manifest: &Manifest, config: Option<&toml::Table>) -> Patches {
         let mut entries = Vec::new();
 
-        // Configuration first: `find` returns the first match.
         if let Some(cfg) = config {
             for (source, table) in cfg {
                 let Some(table) = table.as_table() else {
@@ -110,11 +86,9 @@ impl Patches {
             }
         }
 
-        // The deprecated `[replace]` table: `"name:version" = { ... }`.
         let mut replaces: Vec<_> = manifest.replace.iter().collect();
         replaces.sort_by(|a, b| a.0.cmp(b.0));
         for (key, spec) in replaces {
-            // `name:version`, or `url#name:version` for other sources.
             let tail = key.rsplit('#').next().unwrap_or(key);
             if let Some((name, version)) = tail.rsplit_once(':')
                 && let Ok(v) = version.parse::<Version>()
@@ -130,11 +104,7 @@ impl Patches {
         Patches { entries }
     }
 
-    /// The patch for a dependency on `name` from `source`, if any. It is only
-    /// *used* if the patched package's version satisfies `req` (checked by
-    /// [`PatchEntry::locate`]).
-    /// The directory of the `[patch."<url>"]` entry for git dependency
-    /// `name`, when there is one whose version fits `req`.
+    /// The directory of the `[patch."<url>"]` entry for git dependency `name`, if its version fits `req`.
     pub fn git_patch_dir(
         &self,
         url: &str,
@@ -173,8 +143,6 @@ fn absolutize(mut spec: DependencySpec, root: &Path) -> DependencySpec {
 }
 
 impl PatchEntry {
-    /// The directory of the patched package, with its version, when it
-    /// satisfies `req` (and the entry's exact version, for `[replace]`).
     pub fn locate(&self, req: &VersionReq) -> Result<Option<(PathBuf, Version)>, String> {
         let dir = if let Some(p) = &self.spec.path {
             p.clone()
@@ -296,7 +264,6 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-        // `[replace]` targets one exact version.
         let replace = PatchEntry {
             exact: Some(Version::new(1, 3, 0)),
             ..entry

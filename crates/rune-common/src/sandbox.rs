@@ -1,38 +1,16 @@
-//! Running build-time code confined (`build.sandbox`).
-//!
-//! Build scripts and the compiler (which runs proc-macros) are arbitrary
-//! code from every dependency. In the sandbox they run with **no network**
-//! and a **read-only file system**, except for the directories they must
-//! write: the build's output directory and a temporary directory. A build
-//! script that phones home, or plants something in `~/.bashrc` or another
-//! crate's sources, fails instead.
-//!
-//! The confinement is done by a helper — `rune __sandbox` — that sets it up
-//! in a fresh, single-threaded process and then `exec`s the real program, so
-//! the environment, working directory and inherited file descriptors (the
-//! jobserver) pass through unchanged:
-//!
-//! * Linux: new user, mount and network namespaces (no privileges needed);
-//!   every mount is remounted read-only except the writable directories,
-//!   which are bind-mounted over themselves first; the network namespace has
-//!   no interfaces but a down loopback.
-//! * macOS: `sandbox-exec` with a profile that denies network access and
-//!   every file write outside the writable directories.
+//! `build.sandbox`: build scripts and the compiler run with no network and a read-only file system except
+//! their output and temp directories. `rune __sandbox` sets this up (Linux namespaces / macOS
+//! `sandbox-exec`) and then `exec`s the program.
 
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// The hidden subcommand the helper runs as.
 pub const HELPER_ARG: &str = "__sandbox";
 
-/// How to run confined programs.
 #[derive(Debug, Clone)]
 pub struct Sandbox {
-    /// The `rune` executable (which has the helper built in).
     helper: PathBuf,
-    /// The temporary directory confined programs get (`TMPDIR`): the
-    /// system's is not writable, like everything else outside the build.
     tmp: PathBuf,
 }
 
@@ -41,10 +19,6 @@ impl Sandbox {
         Self { helper, tmp }
     }
 
-    /// A command that runs `program` confined, writing only under
-    /// `writable` (plus its own temporary directory), with network access
-    /// only when `network`. Arguments, environment and working directory are
-    /// added to it as to any command.
     pub fn command(&self, program: &OsStr, writable: &[&Path], network: bool) -> Command {
         let mut cmd = Command::new(&self.helper);
         cmd.arg(HELPER_ARG);
@@ -61,8 +35,6 @@ impl Sandbox {
         cmd
     }
 
-    /// [`Self::command`] for a command already put together: its program,
-    /// arguments, environment and directory carry over.
     pub fn wrap(&self, inner: &Command, writable: &[&Path], network: bool) -> Command {
         let mut cmd = self.command(inner.get_program(), writable, network);
         cmd.args(inner.get_args());
@@ -78,7 +50,6 @@ impl Sandbox {
         cmd
     }
 
-    /// Whether confinement works here: runs `true` through the helper.
     pub fn probe(&self) -> Result<(), String> {
         let out = self
             .command(OsStr::new("true"), &[], false)
@@ -93,10 +64,7 @@ impl Sandbox {
     }
 }
 
-/// The helper: `rune __sandbox [--network] [--rw DIR]... -- PROGRAM ARGS...`.
-/// Sets up the confinement, then replaces itself with `PROGRAM`. Never
-/// returns; exits 125 when the sandbox cannot be set up (the program is then
-/// not run at all).
+/// `rune __sandbox [--network] [--rw DIR]... -- PROGRAM ARGS...`. Exits 125 if setup fails.
 pub fn helper_main(args: &[OsString]) -> ! {
     let mut network = false;
     let mut writable: Vec<PathBuf> = Vec::new();
@@ -120,8 +88,6 @@ pub fn helper_main(args: &[OsString]) -> ! {
     if program.is_empty() {
         fail("no program to run");
     }
-    // Only directories that exist can be kept writable; resolve symlinks so
-    // the mount table's paths match.
     let writable: Vec<PathBuf> = writable
         .into_iter()
         .filter_map(|d| {
@@ -185,7 +151,6 @@ fn confine(writable: &[PathBuf], network: bool) -> Result<(), String> {
             }
             return Err(why);
         }
-        // Keep our own identity inside the namespace.
         let _ = std::fs::write("/proc/self/setgroups", "deny");
         std::fs::write("/proc/self/uid_map", format!("{uid} {uid} 1"))
             .map_err(|e| format!("uid_map: {e}"))?;
@@ -203,8 +168,6 @@ fn confine(writable: &[PathBuf], network: bool) -> Result<(), String> {
         {
             return Err(err("making mounts private"));
         }
-        // The writable directories become mounts of their own, so they can
-        // stay writable while everything else is not.
         for dir in writable {
             let d = CString::new(dir.as_os_str().as_encoded_bytes()).map_err(|e| e.to_string())?;
             if libc::mount(
@@ -230,7 +193,6 @@ fn confine(writable: &[PathBuf], network: bool) -> Result<(), String> {
             if writable.iter().any(|w| path.starts_with(w)) {
                 continue;
             }
-            // Flags a user namespace may not clear must be kept.
             let mut flags = libc::MS_REMOUNT | libc::MS_BIND | libc::MS_RDONLY;
             for o in opts.split(',') {
                 flags |= match o {
@@ -252,26 +214,21 @@ fn confine(writable: &[PathBuf], network: bool) -> Result<(), String> {
                 std::ptr::null(),
             ) != 0
             {
-                // Kernel file systems refuse remounting from a user namespace,
-                // and hold nothing a build could plant anything in.
+                // Kernel file systems refuse remounting from a user namespace.
                 let special = ["/proc", "/sys", "/dev"]
                     .iter()
                     .any(|s| path.starts_with(s));
-                // Something mounted over by the writable directories.
                 let hidden = std::io::Error::last_os_error().raw_os_error() == Some(libc::EINVAL);
                 if !special && !hidden {
                     return Err(err(&format!("making {point} read-only")));
                 }
             }
         }
-        // No privileges can be gained by what runs inside (setuid programs).
         libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
     }
     Ok(())
 }
 
-/// Mount points in `mountinfo` escape space, tab, newline and backslash as
-/// octal (`\040`).
 #[cfg(target_os = "linux")]
 fn unescape_mount_path(s: &str) -> String {
     let b = s.as_bytes();
@@ -294,8 +251,6 @@ fn unescape_mount_path(s: &str) -> String {
 
 #[cfg(target_os = "macos")]
 fn confine(writable: &[PathBuf], network: bool) -> Result<(), String> {
-    // `sandbox-exec` confines what it runs; re-exec through it by making it
-    // the program. The profile language is Scheme: quote paths as strings.
     let quote = |p: &Path| format!("{:?}", p.to_string_lossy());
     let mut profile = String::from("(version 1)\n(allow default)\n");
     if !network {

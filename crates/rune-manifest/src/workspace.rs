@@ -5,72 +5,44 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-/// Workspace package fields that can be inherited by member packages.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct WorkspacePackage {
-    /// Workspace version.
     pub version: Option<semver::Version>,
-    /// Workspace edition.
     pub edition: Option<String>,
-    /// Workspace authors.
     pub authors: Option<Vec<String>>,
-    /// Workspace description.
     pub description: Option<String>,
-    /// Workspace license.
     pub license: Option<String>,
-    /// Workspace repository URL.
     pub repository: Option<String>,
-    /// Workspace rust-version.
     pub rust_version: Option<String>,
-    /// Workspace homepage.
     pub homepage: Option<String>,
-    /// Workspace documentation URL.
     pub documentation: Option<String>,
-    /// Workspace readme path.
     pub readme: Option<String>,
-    /// Workspace license file path.
     pub license_file: Option<String>,
-    /// Everything else that can be inherited (`keywords`, `categories`,
-    /// `publish`, `include`, `exclude`, ...); these don't reach the compiler.
     #[serde(flatten)]
     pub extra: HashMap<String, toml::Value>,
 }
 
-/// Workspace manifest definition.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct WorkspaceManifest {
-    /// Patterns for workspace members.
     #[serde(default)]
     pub members: Vec<String>,
-    /// Patterns for excluded packages.
     #[serde(default)]
     pub exclude: Vec<String>,
-    /// Patterns for default members.
     #[serde(default)]
     pub default_members: Vec<String>,
-    /// The dependency resolver version.
     pub resolver: Option<String>,
-    /// Shared workspace package fields.
     pub package: Option<WorkspacePackage>,
-    /// Shared workspace dependencies.
     #[serde(default)]
     pub dependencies: HashMap<String, DependencySpec>,
-    /// Shared `[workspace.lints]`.
     #[serde(default)]
     pub lints: Option<toml::Value>,
-    /// Free-form `[workspace.metadata]`.
     #[serde(default)]
     pub metadata: Option<toml::Value>,
 }
 
-/// Finds the `[workspace]` a package at `dir` (with manifest `manifest`)
-/// belongs to: an explicit `package.workspace = "../.."`, else the nearest
-/// parent whose `members` include it. Package dependencies that live in some
-/// *other* workspace (a path dependency next door, a git repository with its
-/// own `[workspace]`) inherit their version, edition and dependencies from
-/// that workspace, not from the project being built.
+/// The workspace a package belongs to: an explicit `package.workspace`, else the nearest parent listing it.
 pub fn find_enclosing_workspace(
     dir: &Path,
     manifest: &crate::Manifest,
@@ -84,7 +56,6 @@ pub fn find_enclosing_workspace(
         let root = rune_common::fsutil::canonicalize(dir.join(explicit)).ok()?;
         return load(&root).map(|w| (root, w));
     }
-    // A package that is itself a workspace root is its own workspace.
     if let Some(ws) = &manifest.workspace {
         return Some((dir.to_path_buf(), ws.clone()));
     }
@@ -112,14 +83,10 @@ pub fn find_enclosing_workspace(
 }
 
 impl WorkspaceManifest {
-    /// Resolves the paths of workspace members based on the `members` glob
-    /// patterns, honoring `exclude`. Results are sorted and deduplicated so
-    /// the order never depends on directory iteration order.
     pub fn resolve_members(&self, root: &Path) -> Result<Vec<PathBuf>, ManifestError> {
         self.expand(root, &self.members)
     }
 
-    /// Resolves `default-members` (empty means "no explicit default").
     pub fn resolve_default_members(&self, root: &Path) -> Result<Vec<PathBuf>, ManifestError> {
         self.expand(root, &self.default_members)
     }
@@ -138,10 +105,8 @@ impl WorkspaceManifest {
 
         let mut paths = Vec::new();
         for pattern in patterns {
-            // A plain path (most member lists): `glob` would stat every
-            // directory from the file system root down to it, twice.
+            // A plain path: `glob` would stat every directory from the root down to it.
             if !pattern.contains(['*', '?', '[']) {
-                // (As `glob` gives it: no `.` components or trailing slash.)
                 let path: PathBuf = root.join(pattern).components().collect();
                 if rune_common::manifest_file::has_manifest(&path) && !excluded.contains(&path) {
                     paths.push(path);
@@ -212,7 +177,6 @@ mod tests {
             .collect();
         assert_eq!(names, ["alpha", "zeta"]);
 
-        // Plain paths (no wildcard) give the same, normalized paths.
         let listed = WorkspaceManifest {
             members: vec![
                 "./crates/alpha/".into(),

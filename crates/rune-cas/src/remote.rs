@@ -1,27 +1,6 @@
-//! A shared store behind the local one.
-//!
-//! Point `cas.remote` at something several machines can reach and a build first
-//! looks there before compiling: an entry another machine already built is
-//! copied into the local store and used exactly like a local one. New entries are
-//! published back (unless `cas.remote-write = false`, the usual setting for
-//! developers when only CI writes).
-//!
-//! Two kinds of shared store speak the same protocol — Rune's own layout:
-//!
-//! * a **directory** (a network share, a CI cache volume, a synced folder);
-//! * one or more **Cairn servers** (`http://host:7070`), with a bearer token,
-//!   optional sharding across servers, failover and a circuit breaker so a dead
-//!   server costs one connection attempt, not one per unit.
-//!
-//! Each *slot* of an entry — its compiled artifacts, a stored value, a directory
-//! tree — is copied file by file, and the slot's marker file (`manifest.json`,
-//! `value.json`, `tree.json`) goes last: a reader either sees a complete slot or
-//! none, however many machines write at once. Entries are immutable, so whoever
-//! publishes first wins and everyone else skips.
-//!
-//! **Trust.** Keys identify what went into an artifact, not what came out, and a
-//! pulled entry is checked only against its own manifest. Share a store only
-//! between machines you would run each other's binaries on.
+//! A shared store (directory or Cairn servers) behind the local one. Each slot's marker file is written
+//! last, so readers see complete slots only; first publisher wins. Trust: pulled entries are checked
+//! only against their own manifest — share only between machines you'd run each other's binaries on.
 
 use serde::Deserialize;
 use std::fmt::Debug;
@@ -34,14 +13,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// Which part of an entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Slot {
-    /// Compiled artifacts (`manifest.json` + the files it lists).
     Artifacts,
-    /// One small JSON value (`value.json`).
     Value,
-    /// A directory tree (`tree.json` + `tree/…`).
     Tree,
 }
 
@@ -55,30 +30,19 @@ impl Slot {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Transports
-// ---------------------------------------------------------------------------
-
-/// Where shared entries live.
 trait Transport: Send + Sync + Debug {
-    /// A small file's bytes (markers). `Ok(None)`: it is not there.
     fn fetch(&self, key: &str, rel: &str) -> io::Result<Option<Vec<u8>>>;
-    /// Writes a file atomically (read-only) to `dest`. `Ok(false)`: not there.
     fn fetch_to(&self, key: &str, rel: &str, dest: &Path) -> io::Result<bool>;
     fn exists(&self, key: &str, rel: &str) -> bool;
-    /// Publishes `src` as `key/rel` unless it exists. `blake3` (hex), when
-    /// known, lets a server verify the bytes it receives.
     fn store(&self, key: &str, rel: &str, src: &Path, blake3: Option<&str>) -> io::Result<()>;
     fn describe(&self) -> String;
 }
 
-/// Same sharding as the local store.
 fn object_dir(root: &Path, key: &str) -> PathBuf {
     let prefix = if key.len() >= 2 { &key[0..2] } else { key };
     root.join("objects").join(prefix).join(key)
 }
 
-/// A scratch file next to `dst`, to be written and then [`finish_atomic`]ed.
 fn begin_atomic(dst: &Path) -> io::Result<(PathBuf, fs::File)> {
     if let Some(parent) = dst.parent() {
         fs::create_dir_all(parent)?;
@@ -96,8 +60,6 @@ fn begin_atomic(dst: &Path) -> io::Result<(PathBuf, fs::File)> {
     Ok((tmp, file))
 }
 
-/// Makes a finished scratch file read-only (executable if `exec`) and renames
-/// it into place — readers see the old file or the new one, never half.
 fn finish_atomic(tmp: &Path, dst: &Path, exec: bool) -> io::Result<()> {
     let result = (|| {
         set_read_only(tmp, exec)?;
@@ -109,9 +71,6 @@ fn finish_atomic(tmp: &Path, dst: &Path, exec: bool) -> io::Result<()> {
     result
 }
 
-/// Runs `write` on a scratch file next to `dst`, then publishes it atomically.
-///
-/// `exec`: keep the file executable (a compiled binary must stay runnable).
 fn atomic_write(
     dst: &Path,
     exec: bool,
@@ -129,7 +88,6 @@ fn atomic_write(
     }
 }
 
-/// Read-only, with the execute bits if `exec` (`0555` / `0444`).
 fn set_read_only(path: &Path, exec: bool) -> io::Result<()> {
     #[cfg(unix)]
     {
@@ -148,7 +106,6 @@ fn set_read_only(path: &Path, exec: bool) -> io::Result<()> {
     }
 }
 
-/// Whether a file has any execute bit.
 fn is_executable(path: &Path) -> bool {
     #[cfg(unix)]
     {
@@ -208,11 +165,9 @@ impl Transport for DirTransport {
     }
 }
 
-/// One Cairn server.
 #[derive(Debug)]
 struct Endpoint {
     base: reqwest::Url,
-    /// Unix milliseconds until which this server is skipped after a connection failure.
     down_until: AtomicU64,
 }
 
@@ -222,20 +177,9 @@ fn now_ms() -> u64 {
         .map_or(0, |d| d.as_millis() as u64)
 }
 
-/// How long a server that refused or timed out a connection is left alone.
 const DOWN_FOR_MS: u64 = 30_000;
 
-/// One or more Cairn servers.
-///
-/// With several, each key is placed by rendezvous hashing — every client
-/// computes the same ordering of servers for a key without any coordination —
-/// and lives on the first `replicas` servers that are up. Reads try those in
-/// order; a server that cannot be reached is skipped for half a minute.
-///
-/// Requests run on a small private multi-thread runtime and are driven from
-/// Rune's synchronous, multi-threaded code with `block_on`; unlike
-/// `reqwest::blocking` (one I/O thread for everything) this scales with the
-/// number of restoring threads.
+/// Cairn servers, keys placed by rendezvous hashing on the first `replicas` servers that are up.
 #[derive(Debug)]
 struct HttpTransport {
     endpoints: Vec<Endpoint>,
@@ -246,13 +190,9 @@ struct HttpTransport {
     warned_auth: AtomicBool,
 }
 
-/// What one attempt against one server amounted to.
 enum Attempt<T> {
-    /// The server answered; `Some` settles the request.
     Answered(Option<T>),
-    /// It could not be reached: skip it for a while.
     Down,
-    /// It was reached but the exchange failed.
     Failed,
 }
 
@@ -287,8 +227,6 @@ impl HttpTransport {
             .timeout(Duration::from_secs(300))
             .tcp_nodelay(true)
             .pool_max_idle_per_host(32);
-        // The same CA bundles and proxy as registry traffic (`http.cainfo`,
-        // `http.proxy`), so a Cairn server behind a private CA just works.
         let http = rune_common::net::global();
         for (path, pem) in http.ca_bundles() {
             if let Ok(certs) = pem.map_err(|e| e.to_string()).and_then(|pem| {
@@ -319,7 +257,6 @@ impl HttpTransport {
         })
     }
 
-    /// Server indices in rendezvous order for `key` (highest score first).
     fn order(&self, key: &str) -> Vec<usize> {
         let mut scored: Vec<(u64, usize)> = self
             .endpoints
@@ -383,8 +320,6 @@ impl HttpTransport {
         down
     }
 
-    /// Runs `attempt` against the servers holding `key`, in order, until one
-    /// settles the request or `replicas` servers have answered.
     async fn try_servers<T, F, Fut>(&self, key: &str, mut attempt: F) -> Option<T>
     where
         F: FnMut(usize) -> Fut,
@@ -529,8 +464,7 @@ impl Transport for HttpTransport {
                     Ok(resp) => {
                         let status = resp.status();
                         self.note_status(i, status);
-                        // 409: the server already holds a different file under this
-                        // immutable name — nothing more to do about it.
+                        // 409: the server already holds this immutable file.
                         if status.is_success() || status == reqwest::StatusCode::CONFLICT {
                             stored += 1;
                         } else {
@@ -563,10 +497,6 @@ impl Transport for HttpTransport {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Slots
-// ---------------------------------------------------------------------------
-
 #[derive(Deserialize)]
 struct Listed {
     artifacts: Vec<ListedFile>,
@@ -580,8 +510,6 @@ struct ListedFile {
     hash: String,
 }
 
-/// The files a marker names, relative to the entry, with the size (and BLAKE3
-/// hash) the marker records for them, where it does.
 fn listed(slot: Slot, marker: &[u8]) -> io::Result<Vec<(String, Option<u64>, String)>> {
     let bad = |e: serde_json::Error| io::Error::new(io::ErrorKind::InvalidData, e);
     Ok(match slot {
@@ -600,8 +528,6 @@ fn listed(slot: Slot, marker: &[u8]) -> io::Result<Vec<(String, Option<u64>, Str
     })
 }
 
-/// Copies one slot from the shared store into the local object directory,
-/// marker last. Does nothing if the local store already has the slot.
 fn pull_slot(t: &dyn Transport, key: &str, local: &Path, slot: Slot) -> io::Result<bool> {
     if local.join(slot.marker()).is_file() {
         return Ok(true);
@@ -614,7 +540,6 @@ fn pull_slot(t: &dyn Transport, key: &str, local: &Path, slot: Slot) -> io::Resu
         if !t.fetch_to(key, &rel, &dest)? {
             return Ok(false);
         }
-        // A file that is not what the manifest says is a broken entry: do not keep it.
         if let Some(size) = size
             && fs::metadata(&dest)?.len() != size
         {
@@ -631,8 +556,6 @@ fn pull_slot(t: &dyn Transport, key: &str, local: &Path, slot: Slot) -> io::Resu
     Ok(true)
 }
 
-/// Publishes one local slot to the shared store, marker last. Does nothing if
-/// the shared store already has it.
 fn push_slot(t: &dyn Transport, key: &str, local: &Path, slot: Slot) -> io::Result<()> {
     if t.exists(key, slot.marker()) {
         return Ok(());
@@ -650,11 +573,6 @@ fn push_slot(t: &dyn Transport, key: &str, local: &Path, slot: Slot) -> io::Resu
     t.store(key, slot.marker(), &local.join(slot.marker()), None)
 }
 
-// ---------------------------------------------------------------------------
-// Remote
-// ---------------------------------------------------------------------------
-
-/// Where a store's shared layer is and how to reach it.
 #[derive(Debug, Clone)]
 pub struct Remote {
     transport: Arc<dyn Transport>,
@@ -662,10 +580,7 @@ pub struct Remote {
     root: Option<PathBuf>,
 }
 
-/// Publishes in the background, so copying artifacts to the shared store never
-/// holds up a compiler slot. [`Publisher::flush`] waits for the queue to drain;
-/// anything still queued when a process dies is simply not published (a slot is
-/// only visible once its marker file is in place).
+/// Publishes in the background; a slot is visible only once its marker is in place.
 #[derive(Debug)]
 pub struct Publisher {
     tx: std::sync::Mutex<std::sync::mpsc::Sender<(Remote, String, PathBuf, Slot)>>,
@@ -673,7 +588,6 @@ pub struct Publisher {
 }
 
 impl Publisher {
-    /// Starts `threads` background workers.
     pub fn start(threads: usize) -> Self {
         let (tx, rx) = std::sync::mpsc::channel::<(Remote, String, PathBuf, Slot)>();
         let rx = std::sync::Arc::new(std::sync::Mutex::new(rx));
@@ -713,7 +627,6 @@ impl Publisher {
         }
     }
 
-    /// Waits until everything submitted so far has been published (or failed).
     pub fn flush(&self) {
         let (count, cv) = &*self.outstanding;
         let mut n = count.lock().unwrap();
@@ -724,7 +637,6 @@ impl Publisher {
 }
 
 impl Remote {
-    /// A shared directory.
     pub fn new(root: PathBuf, write: bool) -> Self {
         Self {
             transport: Arc::new(DirTransport { root: root.clone() }),
@@ -733,7 +645,6 @@ impl Remote {
         }
     }
 
-    /// One or more Cairn servers.
     pub fn http(
         urls: &[String],
         token: Option<String>,
@@ -747,8 +658,6 @@ impl Remote {
         })
     }
 
-    /// Parses a `cas.remote` value: a directory, or `http(s)://…` URLs separated
-    /// by commas or spaces.
     pub fn from_spec(
         spec: &str,
         write: bool,
@@ -768,24 +677,18 @@ impl Remote {
         }
     }
 
-    /// The directory, for a directory-backed store.
     pub fn root(&self) -> Option<&Path> {
         self.root.as_deref()
     }
 
-    /// Human-readable location.
     pub fn describe(&self) -> String {
         self.transport.describe()
     }
 
-    /// Whether this store publishes.
     pub fn writes(&self) -> bool {
         self.write
     }
 
-    /// Copies a slot the shared store has into the local object directory.
-    /// Returns whether the local store now has it. Failures are not errors: a
-    /// slow, missing or damaged remote is just a miss.
     pub fn pull(&self, key: &str, local: &Path, slot: Slot) -> bool {
         match pull_slot(&*self.transport, key, local, slot) {
             Ok(found) => found,
@@ -796,7 +699,6 @@ impl Remote {
         }
     }
 
-    /// Publishes a local slot (best effort; only if writing is enabled).
     pub fn push(&self, key: &str, local: &Path, slot: Slot) {
         if !self.write {
             return;
@@ -821,7 +723,6 @@ mod tests {
         b: CasStore,
     }
 
-    /// Two machines (two local stores) sharing one remote directory.
     fn pair(a_writes: bool) -> Pair {
         let (ra, la, lb) = (tempdir().unwrap(), tempdir().unwrap(), tempdir().unwrap());
         let remote = ra.path().to_path_buf();
@@ -853,7 +754,6 @@ mod tests {
         p.a.put("keyfoo", "foo", "1.0.0", &[lib]).unwrap();
         p.a.flush_remote();
 
-        // B has never seen it; it comes from the shared store, verified and usable.
         let out = tempdir().unwrap();
         let linked = p.b.link_to("keyfoo", out.path()).unwrap();
         assert_eq!(linked.len(), 1);
@@ -931,7 +831,7 @@ mod tests {
             .with_remote(dead.path().join("not/mounted"), true);
         assert!(store.get("nokey").is_none());
         let (_d, lib) = artifact("libfoo-abc.rlib", "x");
-        store.put("nokey", "foo", "1.0.0", &[lib]).unwrap(); // still stores locally
+        store.put("nokey", "foo", "1.0.0", &[lib]).unwrap();
         assert!(store.get("nokey").is_some());
     }
 
@@ -941,7 +841,6 @@ mod tests {
         let (_d, lib) = artifact("libfoo-abc.rlib", "bytes");
         p.a.put("keyhalf", "foo", "1.0.0", &[lib]).unwrap();
         p.a.flush_remote();
-        // Simulate a publisher that died before writing its marker.
         let dir = p.remote.join("objects").join("ke").join("keyhalf");
         fs::remove_file(dir.join("manifest.json")).unwrap();
         assert!(p.b.get("keyhalf").is_none());
@@ -976,7 +875,6 @@ mod tests {
         let (_d2, two) = artifact("libfoo-abc.rlib", "second!");
         p.a.put("keyimm", "foo", "1.0.0", &[one]).unwrap();
         p.a.flush_remote();
-        // Another writer for the same key (a racing CI job) does not replace it.
         let l = tempdir().unwrap();
         let other = CasStore::new(l.path().to_path_buf())
             .unwrap()
@@ -997,7 +895,6 @@ mod tests {
         plain
             .put("keyseed", "foo", "1.0.0", std::slice::from_ref(&lib))
             .unwrap();
-        // Same local store, now configured with a remote: storing again publishes.
         let with = CasStore::new(l.path().to_path_buf())
             .unwrap()
             .with_remote(ra.path().to_path_buf(), true);
@@ -1017,7 +914,7 @@ mod tests {
             p.a.put(&format!("keybulk{i:02}"), "bulk", "1.0.0", &[lib])
                 .unwrap();
         }
-        p.a.flush_stats(); // what the executor calls at the end of a build
+        p.a.flush_stats();
         for i in 0..20 {
             assert!(
                 p.b.get(&format!("keybulk{i:02}")).is_some(),
@@ -1043,13 +940,10 @@ mod http_tests {
     type PutLog = Arc<Mutex<Vec<(String, Option<String>)>>>;
     type NameSet = Arc<Mutex<std::collections::HashSet<String>>>;
 
-    /// A tiny in-memory stand-in for a Cairn server (GET/HEAD/PUT of
-    /// `/v1/o/<key>/<file…>`, optional bearer token, immutable files).
     struct Fake {
         url: String,
         files: Files,
         put_headers: PutLog,
-        // Only the (Unix) execute-bit tests look at it.
         #[cfg_attr(not(unix), allow(dead_code))]
         exec: NameSet,
         requests: Arc<AtomicUsize>,
@@ -1194,9 +1088,7 @@ mod http_tests {
             } else {
                 ""
             };
-            // One write: a header and a body sent separately wait out
-            // Nagle's algorithm against the client's delayed ACK, 40 ms a
-            // request.
+            // One write: header and body sent separately wait out Nagle vs. delayed ACK (40 ms a request).
             let mut response =
                 format!("HTTP/1.1 {status}\r\ncontent-length: {claimed}\r\n{exec_line}\r\n")
                     .into_bytes();
@@ -1246,7 +1138,6 @@ mod http_tests {
         let linked = b.link_to("keyfoo", out.path()).unwrap();
         assert_eq!(fs::read_to_string(&linked[0]).unwrap(), "compiled bytes");
         assert_eq!(b.get_value::<Vec<u32>>("keyval"), Some(vec![1, 2, 3]));
-        // Files first, marker last: the manifest is the final PUT for the key.
         assert!(server.requests.load(Ordering::Relaxed) > 0);
         let names: Vec<String> = server
             .put_headers
@@ -1321,13 +1212,11 @@ mod http_tests {
     fn the_bearer_token_is_sent_and_required() {
         let server = fake(Some("s3cret"));
         let (_f, lib) = artifact("libfoo-abc.rlib", "x");
-        // Wrong or missing token: publishing silently fails, nothing is stored.
         let (_d1, nope) = machine(&[&server.url], None, 1, true);
         nope.put("keyauth", "foo", "1.0.0", std::slice::from_ref(&lib))
             .unwrap();
         nope.flush_remote();
         assert!(server.files.lock().unwrap().is_empty());
-        // The right token works, and a reader without it simply misses.
         let (_d2, good) = machine(&[&server.url], Some("s3cret"), 1, true);
         good.put("keyauth", "foo", "1.0.0", &[lib]).unwrap();
         good.flush_remote();
@@ -1370,7 +1259,6 @@ mod http_tests {
             counts.iter().all(|&c| c >= 3),
             "the load is spread: {counts:?}"
         );
-        // A different machine with the same list finds every entry.
         let (_db, b) = machine(&urls, None, 1, false);
         for i in 0..30 {
             assert_eq!(b.get_value::<i32>(&format!("keysh{i:02}")), Some(i));
@@ -1394,7 +1282,7 @@ mod http_tests {
             (10, 10),
             "every entry on both"
         );
-        drop(s1); // one server goes away
+        drop(s1);
         std::thread::sleep(Duration::from_millis(50));
         let (_db, b) = machine(&urls, None, 2, false);
         for i in 0..10 {
@@ -1404,7 +1292,6 @@ mod http_tests {
                 "still served by the other"
             );
         }
-        // Publishing keeps working against the survivor.
         let (_dc, c) = machine(&urls, None, 2, true);
         c.put_value("keynew", &99).unwrap();
         assert!(s2.files.lock().unwrap().contains_key("keynew/value.json"));
@@ -1412,11 +1299,10 @@ mod http_tests {
 
     #[test]
     fn a_dead_server_is_tried_once_and_then_left_alone() {
-        let dead = "http://127.0.0.1:1"; // nothing listens on port 1
+        let dead = "http://127.0.0.1:1";
         let live = fake(None);
         let t = HttpTransport::new(&[dead.to_string(), live.url.clone()], None, 2).unwrap();
         let dead_idx = 0;
-        // Ranking depends on the (random) port, so pick a key the dead server owns.
         let key = (0..1000)
             .map(|i| format!("keydead{i}"))
             .find(|k| t.order(k)[0] == dead_idx)
@@ -1434,7 +1320,6 @@ mod http_tests {
             !t.is_up(dead_idx),
             "the failed connection took it out of rotation"
         );
-        // Later requests do not even try it.
         let before = Instant::now();
         for _ in 0..20 {
             t.fetch(&key, "value.json").unwrap();
@@ -1448,7 +1333,7 @@ mod http_tests {
         let start = Instant::now();
         assert!(store.get("keynone").is_none());
         assert!(store.get_value::<u8>("keynone").is_none());
-        store.put_value("keynone", &1u8).unwrap(); // local write still succeeds
+        store.put_value("keynone", &1u8).unwrap();
         assert_eq!(store.get_value::<u8>("keynone"), Some(1));
         assert!(start.elapsed() < Duration::from_secs(5));
     }
@@ -1465,7 +1350,6 @@ mod http_tests {
             let top = full.order(k)[0];
             assert_eq!(top, full.order(k)[0], "deterministic");
             load[top] += 1;
-            // Rendezvous hashing: only the leaver's keys change owner.
             if top != 3 && without_last.order(k)[0] != top {
                 moved += 1;
             }

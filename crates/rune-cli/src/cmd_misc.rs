@@ -17,10 +17,6 @@ use crate::args::*;
 use crate::ui;
 use crate::workspace::{Workspace, find_project_root};
 
-// ---------------------------------------------------------------------------
-// new / init
-// ---------------------------------------------------------------------------
-
 const RUST_KEYWORDS: &[&str] = &[
     "as", "break", "const", "continue", "crate", "else", "enum", "extern", "false", "fn", "for",
     "if", "impl", "in", "let", "loop", "match", "mod", "move", "mut", "pub", "ref", "return",
@@ -29,7 +25,6 @@ const RUST_KEYWORDS: &[&str] = &[
     "override", "priv", "typeof", "unsized", "virtual", "yield", "try", "gen",
 ];
 
-/// Validates a package name the way Cargo does.
 pub fn validate_package_name(name: &str) -> Result<()> {
     if name.is_empty() {
         bail!("package name cannot be empty");
@@ -85,7 +80,6 @@ fn scaffold(
         "[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"{edition}\"\n\n[dependencies]\n"
     );
     let manifest_path = dir.join(manifest_file);
-    // A `Rune.toml` may already exist as a settings file; keep those settings.
     let content = match fs::read_to_string(&manifest_path) {
         Ok(existing) if !existing.trim().is_empty() => format!("{manifest}\n{existing}"),
         _ => manifest,
@@ -115,7 +109,6 @@ fn scaffold(
         if !path.exists() {
             fs::write(path, "/target\n/.rune\nRune.lock.bin\n")?;
         }
-        // `git init` is a convenience; never a reason to fail.
         if !dir.join(".git").exists() && !inside_git_repo(dir) {
             let _ = std::process::Command::new("git")
                 .arg("init")
@@ -176,7 +169,6 @@ pub fn new(args: NewArgs) -> Result<()> {
     )
 }
 
-/// `--manifest cargo|rune` → the file name.
 fn manifest_file_for(choice: &str) -> &'static str {
     if choice == "rune" {
         rune_common::manifest_file::RUNE_TOML
@@ -196,7 +188,6 @@ pub fn init(args: InitArgs) -> Result<()> {
             .map(str::to_string)
             .context("cannot infer a package name; pass --name")?,
     };
-    // Follow existing sources when initializing a populated directory.
     let lib = args.lib
         || (!args.bin && abs.join("src/lib.rs").exists() && !abs.join("src/main.rs").exists());
     scaffold(
@@ -208,10 +199,6 @@ pub fn init(args: InitArgs) -> Result<()> {
         manifest_file_for(&args.manifest),
     )
 }
-
-// ---------------------------------------------------------------------------
-// clean
-// ---------------------------------------------------------------------------
 
 pub fn clean(args: CleanArgs) -> Result<()> {
     let root = find_project_root(args.manifest.manifest_path.as_deref());
@@ -263,20 +250,8 @@ pub fn clean(args: CleanArgs) -> Result<()> {
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// fmt
-// ---------------------------------------------------------------------------
-
-/// `rune fmt`: formats every selected package's source with `rustfmt`.
-///
-/// Discovers each crate's entry points from its manifest rather than walking
-/// `.rs` files directly — `rustfmt` follows `mod` declarations from a crate
-/// root, so handing it just the entry points formats every file the module
-/// tree reaches, as `cargo fmt` does. Crates are grouped by edition since
-/// `rustfmt` takes a single `--edition` per invocation.
+/// `rune fmt`: rustfmt on each crate's entry points (it follows `mod`s), grouped by edition.
 pub fn fmt(mut args: FmtArgs) -> Result<()> {
-    // `rune fmt -- --check`, as CI writes it for `cargo fmt`: the check flag
-    // after `--` means the same as before it; the rest goes to rustfmt.
     if let Some(i) = args.rustfmt_args.iter().position(|a| a == "--check") {
         args.rustfmt_args.remove(i);
         args.check = true;
@@ -367,10 +342,6 @@ pub fn fmt(mut args: FmtArgs) -> Result<()> {
     });
     Ok(())
 }
-
-// ---------------------------------------------------------------------------
-// config
-// ---------------------------------------------------------------------------
 
 fn config_scope(
     global: bool,
@@ -496,7 +467,6 @@ pub fn config(cmd: ConfigCommands) -> Result<()> {
                     path.display()
                 ),
             );
-            // Say so if something with higher precedence still wins.
             let effective = Settings::load(root.as_deref())?;
             if let Some((v, origin)) = effective.get(&key)
                 && *v != stored
@@ -541,10 +511,6 @@ pub fn config(cmd: ConfigCommands) -> Result<()> {
     }
     Ok(())
 }
-
-// ---------------------------------------------------------------------------
-// cas / lockfile
-// ---------------------------------------------------------------------------
 
 pub fn cas(cmd: CasCommands) -> Result<()> {
     let root = find_project_root(None);
@@ -710,7 +676,6 @@ pub fn cas(cmd: CasCommands) -> Result<()> {
             }
         }
         CasCommands::Gc(args) => {
-            // Started by a build to tidy up: stay out of the way.
             if std::env::var_os("RUNE_BACKGROUND").is_some() {
                 rune_common::sysinfo::lower_priority();
             }
@@ -848,7 +813,6 @@ mod tests {
                 .unwrap()
                 .contains("#[test]")
         );
-        // A second init must not clobber it.
         assert!(scaffold(&p, "demo", true, "2021", false, "Cargo.toml").is_err());
     }
 
@@ -859,7 +823,6 @@ mod tests {
     }
 }
 
-/// "3 min ago", "2 days ago", … for a duration in seconds.
 fn format_idle(secs: u64) -> String {
     match secs {
         0..=59 => "just now".to_string(),
@@ -893,7 +856,6 @@ mod du_format_tests {
     }
 }
 
-/// `rune doctor`.
 pub fn doctor() -> Result<()> {
     use crate::doctor::{Environment, Level, diagnose, fs_type_of};
 
@@ -902,7 +864,6 @@ pub fn doctor() -> Result<()> {
     let config =
         RuneConfig::new(root.clone().unwrap_or_else(|| PathBuf::from("."))).with_settings(settings);
 
-    // rustc -vV
     let vv =
         std::process::Command::new(std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into()))
             .arg("-vV")
@@ -918,7 +879,6 @@ pub fn doctor() -> Result<()> {
     };
     let host = field("host:");
 
-    // Project-level configuration, when we are inside a project.
     let ws = crate::workspace::Workspace::load(None).ok();
     let mut rustflags = crate::session::rustflags_from_env_public();
     let mut configured_linker = None;
@@ -1033,7 +993,6 @@ pub fn doctor() -> Result<()> {
     Ok(())
 }
 
-/// Whether an executable called `tool` is in a `PATH` directory.
 fn which_on_path(tool: &str) -> bool {
     std::env::var_os("PATH").is_some_and(|paths| {
         std::env::split_paths(&paths).any(|dir| {
@@ -1043,7 +1002,6 @@ fn which_on_path(tool: &str) -> bool {
     })
 }
 
-/// `rune affected`.
 pub fn affected(args: crate::args::AffectedArgs) -> Result<()> {
     let ws = crate::workspace::Workspace::load(args.manifest_path.as_deref())?;
     let root = ws.config.project_root.clone();
@@ -1079,8 +1037,6 @@ pub fn affected(args: crate::args::AffectedArgs) -> Result<()> {
             .map(PathBuf::from)
             .collect())
     };
-    // `--relative` makes paths relative to the project root even when the
-    // repository is larger than the workspace.
     let mut changed = git(&["diff", "--name-only", "--relative", &args.since])?;
     changed.extend(git(&["ls-files", "--others", "--exclude-standard"])?);
 
@@ -1120,7 +1076,6 @@ pub fn affected(args: crate::args::AffectedArgs) -> Result<()> {
     Ok(())
 }
 
-/// `rune script`.
 pub fn script(args: crate::args::ScriptArgs) -> Result<()> {
     let file = rune_common::fsutil::canonicalize(&args.file)
         .with_context(|| format!("cannot read script `{}`", args.file.display()))?;
@@ -1131,7 +1086,6 @@ pub fn script(args: crate::args::ScriptArgs) -> Result<()> {
     let manifest = crate::script::manifest(&file, &parsed.manifest)
         .map_err(|e| anyhow::anyhow!("{}: {e}", file.display()))?;
 
-    // One package directory per script, named after it and keyed by its path.
     let mut h = rune_common::hash::HashBuilder::new();
     h.update(file.to_string_lossy().as_bytes());
     let id: String = h.finish_blake3().chars().take(12).collect();
@@ -1139,7 +1093,6 @@ pub fn script(args: crate::args::ScriptArgs) -> Result<()> {
         .join("scripts")
         .join(format!("{}-{id}", crate::script::package_name(&file)));
     std::fs::create_dir_all(dir.join("src"))?;
-    // Rewritten only when different: an untouched script is an untouched package.
     write_if_changed(&dir.join("Cargo.toml"), &manifest)?;
     write_if_changed(&dir.join("src/main.rs"), &parsed.source)?;
 
@@ -1166,7 +1119,6 @@ fn write_if_changed(path: &Path, content: &str) -> Result<()> {
     std::fs::write(path, content).with_context(|| format!("cannot write {}", path.display()))
 }
 
-/// `rune version [-v]`.
 pub fn version(verbose: bool) -> Result<()> {
     println!("rune {}", env!("RUNE_VERSION"));
     if !verbose {
@@ -1192,7 +1144,6 @@ pub fn version(verbose: bool) -> Result<()> {
     Ok(())
 }
 
-/// `rune completions <shell>`.
 pub fn completions(shell: clap_complete::Shell) -> Result<()> {
     use clap::CommandFactory;
     let mut cmd = crate::args::Cli::command();

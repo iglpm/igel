@@ -1,12 +1,5 @@
-//! `rune package`, `rune publish` and the other registry commands (`login`,
-//! `logout`, `yank`, `owner`, `search`, `info`).
-//!
-//! A package is what Cargo would upload: the files version control knows
-//! (respecting `include`/`exclude`), a normalized `Cargo.toml` with workspace
-//! inheritance resolved and path/git dependencies turned into registry ones,
-//! the original manifest as `Cargo.toml.orig`, a `Cargo.lock` and
-//! `.cargo_vcs_info.json`. It is written to `target/package/NAME-VERSION.crate`
-//! and verified by building what it unpacks to.
+//! `package`, `publish`, `login`, `logout`, `yank`, `owner`, `search`, `info`. A package is what Cargo
+//! would upload: VCS files, a normalized `Cargo.toml`, `Cargo.toml.orig`, `Cargo.lock`, `.cargo_vcs_info.json`.
 
 use crate::args::{InfoArgs, LoginArgs, OwnerArgs, PackageArgs, PublishArgs, SearchArgs, YankArgs};
 use crate::session::{Session, drive, ensure_success};
@@ -19,13 +12,8 @@ use serde_json::{Value, json};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-/// Cargo's fixed modification time for packaged files, so that a package's
-/// bytes depend only on its contents.
+/// Cargo's fixed mtime for packaged files.
 const PACKAGE_MTIME: u64 = 1_153_704_088;
-
-// ---------------------------------------------------------------------------
-// package / publish
-// ---------------------------------------------------------------------------
 
 pub fn package(args: PackageArgs) -> Result<()> {
     let ws = Workspace::load(args.manifest.manifest_path.as_deref())?;
@@ -97,8 +85,6 @@ pub fn publish(args: PublishArgs) -> Result<()> {
     Ok(())
 }
 
-/// The packages a command applies to: `-p` names, else `--workspace`, else
-/// the package in the current directory (or the only one).
 fn selected<'a>(ws: &'a Workspace, names: &[String], all: bool) -> Result<Vec<&'a Member>> {
     if all {
         return Ok(ws.members.iter().collect());
@@ -123,15 +109,11 @@ fn selected<'a>(ws: &'a Workspace, names: &[String], all: bool) -> Result<Vec<&'
     }
 }
 
-/// A package ready to be written: its files and generated contents.
 struct Package {
     name: String,
     version: String,
     dir: PathBuf,
-    /// `(path in the package, source file)`.
     files: Vec<(String, PathBuf)>,
-    /// `(path in the package, contents)`: `Cargo.toml`, `Cargo.toml.orig`,
-    /// `.cargo_vcs_info.json`, `Cargo.lock` (added when written).
     generated: Vec<(String, Vec<u8>)>,
     manifest: toml::Table,
 }
@@ -144,7 +126,6 @@ impl Package {
         all.into_iter().collect()
     }
 
-    /// Whether the packaged manifest names `name` as a dependency of any kind.
     fn depends_on(&self, name: &str) -> bool {
         let in_table = |t: Option<&toml::Value>| {
             t.and_then(|t| t.as_table()).is_some_and(|t| {
@@ -173,8 +154,6 @@ impl Package {
         format!("{}-{}", self.name, self.version)
     }
 
-    /// Writes the unpacked package (with its `Cargo.lock`) to
-    /// `target/package/NAME-VERSION/` and the `.crate` beside it.
     fn write(&mut self, ws: &Workspace, manifest: &crate::args::ManifestArgs) -> Result<PathBuf> {
         let out = ws.config.target_dir.join("package");
         let dir = out.join(self.stem());
@@ -188,8 +167,6 @@ impl Package {
         for (rel, content) in &self.generated {
             std::fs::write(dir.join(rel), content)?;
         }
-        // The lockfile of the package on its own, as a user installing it
-        // would resolve it.
         ui::action("locking", format!("{} v{}", self.name, self.version));
         let staged = Workspace::load(Some(&dir.join("Cargo.toml")))?;
         let existing = rune_resolver::LockfileManager::load_fast(ws.root());
@@ -201,8 +178,6 @@ impl Package {
         ) {
             Ok(r) => r,
             Err(e) => {
-                // The usual cause: a path dependency on another workspace
-                // member that is not on the registry yet.
                 let unpublished: Vec<&str> = ws
                     .members
                     .iter()
@@ -270,7 +245,6 @@ impl Package {
         Ok(())
     }
 
-    /// What the registry's publish endpoint wants to know besides the file.
     fn metadata(&self, publishing_to: &str) -> Result<Value> {
         let package = self.manifest.get("package").and_then(|p| p.as_table());
         let field = |k: &str| package.and_then(|p| p.get(k)).cloned();
@@ -316,14 +290,11 @@ impl Package {
                             .index_for_name(Some(name))
                             .ok()
                     })
-                    // Dependencies from the registry being published to
-                    // carry no registry; crates.io ones do elsewhere.
                     .or_else(|| {
                         (publishing_to != rune_common::CRATES_IO_INDEX)
                             .then(|| "https://github.com/rust-lang/crates.io-index".to_string())
                     })
                     .filter(|r| r != publishing_to);
-                // As Cargo sends it: `1.0` becomes `^1.0`.
                 let req = semver::VersionReq::parse(&req)
                     .map(|r| r.to_string())
                     .unwrap_or(req);
@@ -420,7 +391,6 @@ fn mode_of(path: &Path) -> u32 {
     0o644
 }
 
-/// Collects the package's files and generates its manifests.
 fn prepare(ws: &Workspace, member: &Member, allow_dirty: bool) -> Result<Package> {
     let raw_text = std::fs::read_to_string(&member.manifest_path)?;
     let raw: toml::Table = raw_text
@@ -558,7 +528,6 @@ fn prepare(ws: &Workspace, member: &Member, allow_dirty: bool) -> Result<Package
     })
 }
 
-/// Builds the unpacked package on its own, as a user of it would.
 fn verify(pkg: &Package, ws: &Workspace, offline: bool) -> Result<()> {
     ui::action("verifying", format!("{} v{}", pkg.name, pkg.version));
     let common = crate::args::CommonArgs {
@@ -601,9 +570,7 @@ fn check_publish_allowed(pkg: &Package, registry: &str) -> Result<()> {
     }
 }
 
-/// After an upload, the index takes a moment to show the new version; wait
-/// for it (up to a minute) so that publishing the next crate of a workspace
-/// can depend on it.
+/// Wait (up to a minute) for the index to show the new version so dependent crates can publish next.
 fn wait_until_available(index: &str, name: &str, version: &str) {
     let Ok(client) = rune_registry::source::IndexClient::for_registry(index, false) else {
         return;
@@ -625,14 +592,6 @@ fn wait_until_available(index: &str, name: &str, version: &str) {
     ));
 }
 
-// ---------------------------------------------------------------------------
-// Manifest normalization
-// ---------------------------------------------------------------------------
-
-/// The manifest as uploaded: inheritance resolved, path/git dependencies
-/// turned into registry ones, workspace-only tables removed. Also returns
-/// files the package must include because the manifest names them from the
-/// workspace (`readme`, `license-file`).
 fn normalize(
     raw: &toml::Table,
     ws: Option<&toml::Table>,
@@ -663,7 +622,6 @@ fn normalize(
                 .with_context(|| {
                     format!("`package.{key}` inherits from the workspace, which does not define it")
                 })?;
-            // A file named by the workspace is copied into the package.
             let value = match (key.as_str(), &value) {
                 ("readme" | "license-file", toml::Value::String(path)) => {
                     let src = ws_root.join(path);
@@ -747,7 +705,6 @@ fn normalize_deps(
                 toml::Value::Table(t) => t.clone(),
                 _ => toml::Table::new(),
             };
-            // A workspace path is relative to the workspace root.
             if let Some(p) = merged.get("path").and_then(|p| p.as_str()) {
                 merged.insert(
                     "path".into(),
@@ -780,8 +737,7 @@ fn normalize_deps(
         let local = spec.contains_key("path") || spec.contains_key("git");
         if local && !spec.contains_key("version") {
             if dev {
-                // A dev-dependency that exists only locally is dropped, as
-                // with Cargo: the published crate's tests can't use it.
+                // A local-only dev-dependency is dropped, as with Cargo.
                 deps.remove(&name);
                 continue;
             }
@@ -803,16 +759,10 @@ fn normalize_deps(
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// Files
-// ---------------------------------------------------------------------------
-
 struct Vcs {
     sha1: String,
     path_in_vcs: String,
-    /// Paths (relative to the package) git knows or would add.
     files: Vec<PathBuf>,
-    /// `git status` lines for uncommitted changes in the package.
     dirty: Vec<String>,
 }
 
@@ -870,7 +820,6 @@ fn vcs_state(dir: &Path) -> Result<Option<Vcs>> {
     }))
 }
 
-/// Every file under `dir` (relative), for packages outside version control.
 fn walk(dir: &Path) -> Vec<PathBuf> {
     fn go(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) {
         let Ok(entries) = std::fs::read_dir(dir) else {
@@ -894,7 +843,6 @@ fn walk(dir: &Path) -> Vec<PathBuf> {
     out
 }
 
-/// Subdirectories that are packages of their own (never part of this one).
 fn nested_packages(dir: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     for rel in walk(dir) {
@@ -908,8 +856,6 @@ fn nested_packages(dir: &Path) -> Vec<PathBuf> {
     out
 }
 
-/// A gitignore-style `include`/`exclude` pattern as globs over paths
-/// relative to the package root.
 fn gitignore_globs(pattern: &str) -> Vec<String> {
     let p = pattern.trim();
     let dir_only = p.ends_with('/');
@@ -943,11 +889,6 @@ fn human_size(bytes: u64) -> String {
     }
 }
 
-// ---------------------------------------------------------------------------
-// login / logout / yank / owner / search / info
-// ---------------------------------------------------------------------------
-
-/// `rune login`: stores a registry token where Cargo keeps it.
 pub fn login(args: LoginArgs) -> Result<()> {
     configure_registries();
     let token = match args.token {
@@ -994,8 +935,6 @@ pub fn logout(args: LoginArgs) -> Result<()> {
     Ok(())
 }
 
-/// The provider `login`/`logout` use for a registry — the first it would be
-/// asked for a token — and the index URL providers are given.
 fn login_provider(name: &str) -> Result<(rune_registry::credential::Provider, String)> {
     let defs = rune_registry::source::defs();
     let index = defs.index_for_name(Some(name))?;
@@ -1010,8 +949,6 @@ fn login_provider(name: &str) -> Result<(rune_registry::credential::Provider, St
     ))
 }
 
-/// Sets (or with `None`, removes) a token in `$CARGO_HOME/credentials.toml`,
-/// keeping everything else in the file as it was.
 fn edit_credentials(registry: Option<&str>, token: Option<&str>) -> Result<()> {
     let home = rune_registry::source::cargo_home()
         .context("could not determine CARGO_HOME for the credentials file")?;
@@ -1128,7 +1065,6 @@ pub fn search(args: SearchArgs) -> Result<()> {
         return Ok(());
     }
 
-    // Piped: Cargo's lines, ready to paste into a manifest.
     if !ui::stdout_is_term() {
         let width = hits
             .iter()
@@ -1180,7 +1116,6 @@ pub fn search(args: SearchArgs) -> Result<()> {
         };
         let desc = h.description.as_deref().unwrap_or("");
         let lines = ui::wrap(desc, text_width);
-        // A long name gets a line of its own.
         let (first_label, pad) = if label_width > left_width {
             page.line(format!("  {label}"));
             (String::new(), left_width)
@@ -1208,7 +1143,6 @@ pub fn search(args: SearchArgs) -> Result<()> {
     Ok(())
 }
 
-/// `22,412`.
 fn thousands(n: u64) -> String {
     let digits = n.to_string();
     let mut out = String::new();
@@ -1221,7 +1155,6 @@ fn thousands(n: u64) -> String {
     out
 }
 
-/// `12.3M` / `850k` / `42`.
 fn downloads(n: u64) -> String {
     match n {
         0..=999 => format!("{n}"),
@@ -1231,8 +1164,6 @@ fn downloads(n: u64) -> String {
     }
 }
 
-/// `rune info`: a crate's description, links, features and dependencies —
-/// of the version the current project locked, else the newest.
 pub fn info(args: InfoArgs) -> Result<()> {
     configure_registries();
     let (name, wanted) = match args.krate.split_once('@') {
@@ -1281,7 +1212,6 @@ pub fn info(args: InfoArgs) -> Result<()> {
     }
     .with_context(|| format!("no matching version of `{name}`"))?;
 
-    // Descriptions and links come from the web API, when there is one.
     let page = (!args.offline)
         .then(|| RegistryApi::for_index(&index).ok()?.crate_info(&name).ok())
         .flatten();
@@ -1444,8 +1374,6 @@ fn api_for(registry: Option<&str>, token: Option<&str>) -> Result<RegistryApi> {
     })
 }
 
-/// Registries and credentials from the configuration of the working
-/// directory (these commands need no project).
 fn configure_registries() {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let config = rune_common::cargo_config::CargoConfig::load(&cwd);

@@ -7,7 +7,6 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-/// An inheritable string property (either a direct string or `{ workspace = true }`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum InheritableString {
@@ -24,50 +23,32 @@ impl InheritableString {
     }
 }
 
-/// The `[package]` section of a Cargo.toml manifest.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct PackageManifest {
-    /// Package name.
     pub name: String,
-    /// Package version.
     #[serde(default)]
     pub version: Option<InheritableString>,
-    /// Rust edition.
     #[serde(default)]
     pub edition: Option<InheritableString>,
-    /// Build script path or bool.
     #[serde(default)]
     pub build: Option<toml::Value>,
-    /// Links field.
     pub links: Option<String>,
-    /// Auto-discovery of binaries.
     pub autobins: Option<bool>,
-    /// Auto-discovery of the library (`autolib`, Cargo 1.83+).
     pub autolib: Option<bool>,
-    /// Minimum supported Rust version.
     pub rust_version: Option<InheritableString>,
-    /// Path to workspace root.
     pub workspace: Option<String>,
-    /// Feature resolver version (`"1"`, `"2"`, `"3"`); only meaningful on the
-    /// root package of a workspace, exactly as in Cargo.
     pub resolver: Option<String>,
-    /// Binary `cargo run` picks when a package has several.
     pub default_run: Option<String>,
-    /// Description.
     #[serde(default)]
     pub description: Option<InheritableString>,
-    /// License.
     #[serde(default)]
     pub license: Option<InheritableString>,
-    /// Catch-all for extra metadata and arbitrary fields.
     #[serde(flatten)]
     pub extra: HashMap<String, toml::Value>,
 }
 
 impl PackageManifest {
-    /// The package version, following `version.workspace = true` into
-    /// `[workspace.package]`.
     pub fn version_in(&self, ws: Option<&WorkspaceManifest>) -> Option<semver::Version> {
         self.version_str().and_then(|s| s.parse().ok()).or_else(|| {
             ws.and_then(|w| w.package.as_ref())
@@ -75,8 +56,6 @@ impl PackageManifest {
         })
     }
 
-    /// The package edition, following `edition.workspace = true`; defaults to
-    /// 2015 when unspecified, as rustc and Cargo do.
     pub fn edition_in(&self, ws: Option<&WorkspaceManifest>) -> String {
         self.edition_str()
             .map(str::to_string)
@@ -87,10 +66,8 @@ impl PackageManifest {
             .unwrap_or_else(|| "2015".to_string())
     }
 
-    /// Package metadata exposed to the compiler as `CARGO_PKG_*`.
     pub fn meta_in(&self, ws: Option<&WorkspaceManifest>) -> rune_common::PackageMeta {
         let wsp = ws.and_then(|w| w.package.as_ref());
-        // A string field, possibly `{ workspace = true }`.
         let text = |key: &str, from_ws: Option<&String>| -> String {
             match self.extra.get(key) {
                 Some(toml::Value::String(s)) => s.clone(),
@@ -160,31 +137,15 @@ impl PackageManifest {
         }
     }
 
-    /// Returns the version string if directly defined.
     pub fn version_str(&self) -> Option<&str> {
         self.version.as_ref().and_then(|v| v.as_str())
     }
 
-    /// Returns the edition string if directly defined.
     pub fn edition_str(&self) -> Option<&str> {
         self.edition.as_ref().and_then(|e| e.as_str())
     }
 
-    /// Resolves the effective build script path for this package, following
-    /// Cargo's own `package.build` semantics:
-    /// - `build = "path/to/script.rs"` uses that explicit, non-default path
-    ///   (e.g. `rustversion` uses `build = "build/build.rs"`).
-    /// - `build = true` uses the default `build.rs`.
-    /// - `build = false` disables build scripts outright, even if a
-    ///   `build.rs` physically exists at the crate root.
-    /// - Unset (the common case) auto-detects `build.rs` at the crate root,
-    ///   only if the file actually exists.
-    ///
-    /// A caller that instead assumes every build script lives at
-    /// `<manifest_dir>/build.rs` will silently skip build scripts declared
-    /// at a custom path, which produces at-compile-time failures (e.g. a
-    /// crate expecting `OUT_DIR` to be set) that are hard to trace back to
-    /// this root cause.
+    /// The build script path, as Cargo: explicit path, `true` (build.rs), `false` (none), or build.rs if it exists.
     pub fn resolve_build_script(&self, manifest_dir: &Path) -> Option<PathBuf> {
         match &self.build {
             Some(toml::Value::String(s)) => Some(manifest_dir.join(s)),
@@ -198,43 +159,32 @@ impl PackageManifest {
     }
 }
 
-/// Build profile overrides.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct ProfileOverride {
-    /// Optimization level.
     pub opt_level: Option<toml::Value>,
-    /// Debug info.
     pub debug: Option<toml::Value>,
-    /// `[profile.X.package.<name>]` / `[profile.X.package."*"]` overrides.
     #[serde(default)]
     pub package: HashMap<String, ProfileOverride>,
-    /// `[profile.X.build-override]`: applies to build scripts, proc-macros and
-    /// everything only they depend on.
     #[serde(default)]
     pub build_override: Option<Box<ProfileOverride>>,
     #[serde(flatten)]
     pub extra: HashMap<String, toml::Value>,
 }
 
-/// Target-specific dependencies (e.g. `[target.'cfg(unix)'.dependencies]`).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct TargetDeps {
-    /// Normal dependencies.
     #[serde(default)]
     pub dependencies: HashMap<String, toml::Value>,
-    /// Development dependencies.
     #[serde(default)]
     pub dev_dependencies: HashMap<String, toml::Value>,
-    /// Build dependencies.
     #[serde(default)]
     pub build_dependencies: HashMap<String, toml::Value>,
     #[serde(flatten)]
     pub extra: HashMap<String, toml::Value>,
 }
 
-/// The raw layout of a Cargo.toml file before resolving targets and dependencies.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 struct RawManifest {
@@ -271,41 +221,25 @@ struct RawManifest {
     pub extra: HashMap<String, toml::Value>,
 }
 
-/// The fully parsed Cargo.toml manifest.
 #[derive(Debug, Clone)]
 pub struct Manifest {
-    /// The `[package]` section.
     pub package: Option<PackageManifest>,
-    /// Flattened and parsed dependencies.
     pub dependencies: HashMap<String, Dependency>,
-    /// Crate features.
     pub features: HashMap<String, Vec<String>>,
-    /// The `[workspace]` section.
     pub workspace: Option<WorkspaceManifest>,
-    /// Target-specific dependencies.
     pub target: HashMap<String, TargetDeps>,
-    /// Profiles.
     pub profile: HashMap<String, ProfileOverride>,
-    /// Dependency patches (`[patch.<source>]`).
     pub patch: HashMap<String, HashMap<String, DependencySpec>>,
-    /// The deprecated `[replace]` table (`"name:version" = { ... }`).
     pub replace: HashMap<String, DependencySpec>,
-    /// The raw `[lints]` table.
     pub lints: Option<toml::Value>,
-    /// The `[lib]` target.
     pub lib: Option<TargetSpec>,
-    /// The `[[bin]]` targets.
     pub bin: Vec<TargetSpec>,
-    /// The `[[example]]` targets.
     pub example: Vec<TargetSpec>,
-    /// The `[[test]]` targets.
     pub test: Vec<TargetSpec>,
-    /// The `[[bench]]` targets.
     pub bench: Vec<TargetSpec>,
 }
 
 impl Manifest {
-    /// Reads and parses a manifest from the given file path.
     pub fn from_path(path: &Path) -> Result<Self, ManifestError> {
         let content = fs::read_to_string(path).map_err(|source| ManifestError::Io {
             path: path.to_path_buf(),
@@ -319,9 +253,6 @@ impl Manifest {
         Ok(manifest)
     }
 
-    /// The feature resolver version this manifest asks for: the workspace's
-    /// (or root package's) `resolver`, else the one implied by the edition
-    /// (`1` before 2021, `2` for 2021, `3` for 2024), as in Cargo.
     pub fn resolver_version(&self) -> u8 {
         let explicit = self
             .workspace
@@ -345,22 +276,12 @@ impl Manifest {
         }
     }
 
-    /// `rustc` flags for this package's `[lints]`, following
-    /// `lints.workspace = true` into `[workspace.lints]`.
     pub fn lint_args(&self, ws: Option<&WorkspaceManifest>) -> Vec<String> {
         crate::lints::lint_args(self.lints.as_ref(), ws.and_then(|w| w.lints.as_ref()))
     }
 
-    /// Fills in Cargo's automatic target discovery for `dir`, the directory
-    /// holding this manifest.
-    ///
-    /// Mirrors Cargo: `src/lib.rs`, `src/main.rs`, `src/bin/*.rs`,
-    /// `src/bin/*/main.rs`, and `examples/`, `tests/`, `benches/` in the same
-    /// two layouts. Explicit `[[bin]]`-style entries are kept and win over an
-    /// inferred target of the same name; an explicit entry that omits `path`
-    /// gets Cargo's conventional one. Discovery for a kind is skipped when the
-    /// package sets `autobins`/`autoexamples`/`autotests`/`autobenches` to
-    /// `false`.
+    /// Cargo's automatic target discovery (`src/lib.rs`, `src/main.rs`, `src/bin`, `examples`, `tests`,
+    /// `benches`); explicit entries win over inferred ones of the same name.
     pub fn discover_targets(&mut self, dir: &Path) {
         let Some(pkg) = &self.package else { return };
         let pkg_name = pkg.name.clone();
@@ -386,8 +307,6 @@ impl Manifest {
             None => {}
         }
 
-        // Binaries: `src/main.rs` is named after the package; `src/bin/*` after
-        // the file or directory.
         let mut inferred_bins = Vec::new();
         if autobins {
             if dir.join("src/main.rs").exists() {
@@ -441,7 +360,6 @@ impl Manifest {
         );
     }
 
-    /// Parses a manifest from a string, using `path` for error messages.
     pub fn from_str(content: &str, path: &Path) -> Result<Self, ManifestError> {
         let parse_err = |source| ManifestError::TomlParse {
             path: path.to_path_buf(),
@@ -451,11 +369,7 @@ impl Manifest {
             .file_name()
             .is_some_and(|n| n == rune_common::manifest_file::RUNE_TOML)
         {
-            // A `Rune.toml` is both a manifest and Rune's settings file. Its
-            // settings live in tables of their own (`[build]`, `[cas]`, …), which
-            // are just unknown keys here — except `[test]`, which as a *table*
-            // holds the `test.*` settings and as an *array* (`[[test]]`) is the
-            // manifest's list of test targets.
+            // In a `Rune.toml`, `[test]` is a settings table while `[[test]]` is the list of test targets.
             let mut table: toml::Table = content.parse().map_err(parse_err)?;
             if table.get("test").is_some_and(|v| v.is_table()) {
                 table.remove("test");
@@ -467,24 +381,7 @@ impl Manifest {
 
         let mut parsed_deps = HashMap::new();
 
-        // The map key exists only to give every distinct declaration a
-        // unique slot; it is never meant to be read back as the dependency's
-        // name (that's `Dependency::name`, set from `name` below). It must
-        // include `kind`, not just `target`: a crate frequently declares the
-        // same name under both `[dependencies]` and `[dev-dependencies]`
-        // (e.g. a normal optional dependency also pinned as a plain
-        // dev-dependency for its own tests, as `serde_spanned` does with
-        // `serde`) — keying by name alone means the second section parsed
-        // silently overwrites the first's entry in this map, and any caller
-        // that filters by kind afterward sees only whichever kind happened
-        // to be parsed last, which can make a real, active dependency
-        // disappear from resolution entirely.
-        //
-        // A dependency that fails to parse is a hard error, exactly as in
-        // Cargo. Silently skipping it (as this used to) made a typo or an
-        // unsupported spelling turn into "the dependency just isn't there",
-        // which then surfaces much later as an unresolved-import error in
-        // the compiler with no pointer back to the real cause.
+        // The key includes the kind: a name may appear in both `[dependencies]` and `[dev-dependencies]`.
         let mut parse_deps = |deps: &HashMap<String, toml::Value>,
                               kind: DependencyKind,
                               target: Option<&str>,
@@ -580,8 +477,6 @@ impl Manifest {
     }
 }
 
-/// Finds `dir/<sub>/*.rs` (named by file stem) and `dir/<sub>/*/main.rs`
-/// (named by directory), sorted by name so discovery is deterministic.
 fn scan_targets(dir: &Path, sub: &str) -> Vec<(String, PathBuf)> {
     let Ok(entries) = fs::read_dir(dir.join(sub)) else {
         return Vec::new();
@@ -607,8 +502,6 @@ fn scan_targets(dir: &Path, sub: &str) -> Vec<(String, PathBuf)> {
     found
 }
 
-/// Combines explicit targets with inferred ones: an explicit target replaces
-/// an inferred one of the same name and has its missing `name`/`path` filled.
 fn merge_targets(
     explicit: Vec<TargetSpec>,
     inferred: Vec<(String, PathBuf)>,
@@ -631,9 +524,7 @@ fn merge_targets(
         out.push(t);
     }
     for (name, path) in inferred {
-        // An explicit target that points at the same file *is* the inferred
-        // one (e.g. `[[bin]] name = "tool" path = "src/main.rs"`): building it
-        // twice under two names would be wrong.
+        // An explicit target pointing at the inferred one's file *is* that target.
         if out
             .iter()
             .any(|t| t.name.as_deref() == Some(name.as_str()) || t.path.as_ref() == Some(&path))
@@ -666,16 +557,11 @@ mod tests {
 
         let manifest = Manifest::from_str(toml, Path::new("Cargo.toml")).unwrap();
         assert_eq!(manifest.package.unwrap().name, "test-pkg");
-        // The map key is an internal disambiguator (kind + target), not the
-        // dependency name — assert against `Dependency::name` instead.
         assert!(manifest.dependencies.values().any(|d| d.name == "serde"));
     }
 
     #[test]
     fn test_same_name_dependency_and_dev_dependency_both_kept() {
-        // Regression test: a crate name appearing in both `[dependencies]`
-        // and `[dev-dependencies]` must produce two distinct entries, not
-        // have one silently overwrite the other.
         let toml = r#"
         [package]
         name = "test-pkg"
@@ -704,9 +590,6 @@ mod tests {
         assert!(serde_deps.iter().any(|d| d.kind == DependencyKind::Dev));
     }
 
-    /// Cargo 1.94+ accepts TOML 1.1: inline tables may span lines, carry
-    /// comments, and end in a trailing comma. Real crates (and real
-    /// `Cargo.toml` files written by formatters like `taplo`) use all of it.
     #[test]
     fn test_multiline_inline_tables_and_trailing_commas() {
         let toml = r#"
@@ -940,7 +823,6 @@ mod tests {
         assert!(m.replace.contains_key("foo:1.0.0"));
         assert_eq!(m.resolver_version(), 2, "edition 2021 implies resolver 2");
 
-        // `autolib = false` really disables the implicit library.
         write(
             d,
             "Cargo.toml",

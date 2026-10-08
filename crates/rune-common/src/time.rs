@@ -1,7 +1,5 @@
-//! UTC timestamps in RFC 3339, the form registries and SBOMs use, without a
-//! date-time dependency.
+//! RFC 3339 UTC timestamps without a date-time dependency.
 
-/// Seconds since 1970 as `YYYY-MM-DDTHH:MM:SSZ`.
 pub fn format_rfc3339(secs: u64) -> String {
     let days = (secs / 86_400) as i64;
     let rem = secs % 86_400;
@@ -14,8 +12,6 @@ pub fn format_rfc3339(secs: u64) -> String {
     )
 }
 
-/// `2026-03-11T00:20:04Z` (fractional seconds and `+HH:MM` offsets allowed)
-/// → seconds since 1970.
 pub fn parse_rfc3339(s: &str) -> Option<u64> {
     let s = s.trim();
     let (date, rest) = s.split_once(['T', 't', ' '])?;
@@ -31,7 +27,6 @@ pub fn parse_rfc3339(s: &str) -> Option<u64> {
     let hh: i64 = c.next()?.parse().ok()?;
     let mm: i64 = c.next()?.parse().ok()?;
     let ss: i64 = c.next()?.parse().ok()?;
-    // Skip fractional seconds, then read the offset.
     let zone = zone.trim_start_matches(|ch: char| ch == '.' || ch.is_ascii_digit());
     let offset = match zone {
         "Z" | "z" | "" => 0,
@@ -48,7 +43,6 @@ pub fn parse_rfc3339(s: &str) -> Option<u64> {
     u64::try_from(secs).ok()
 }
 
-/// `14d`, `72h`, `30m`, `2w`, `3600` (seconds) → seconds.
 pub fn parse_duration(s: &str) -> Option<u64> {
     let s = s.trim();
     let split = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());

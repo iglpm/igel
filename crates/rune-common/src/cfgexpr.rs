@@ -1,16 +1,7 @@
-//! Evaluation of `cfg(...)` expressions against the exact set of `cfg`s
-//! `rustc --print=cfg` reports for a target.
-//!
-//! Dependencies are gated with `[target.'cfg(unix)'.dependencies]`, and the
-//! set of names that hold depends on the target *and* on `RUSTFLAGS`
-//! (`-C target-feature=+crt-static` changes `target_feature`), so a built-in
-//! table of known triples can't answer it. Asking `rustc` can, for built-in
-//! and custom targets alike.
+//! `cfg(...)` evaluation against the cfg set `rustc --print=cfg` reports (it depends on RUSTFLAGS too).
 
-/// One `cfg` the compiler defines: `unix` or `target_os = "linux"`.
 pub type Cfg = (String, Option<String>);
 
-/// A parsed `cfg` predicate.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CfgExpr {
     Not(Box<CfgExpr>),
@@ -21,7 +12,6 @@ pub enum CfgExpr {
 }
 
 impl CfgExpr {
-    /// Parses the inside of `cfg(...)`, e.g. `all(unix, not(target_os = "macos"))`.
     pub fn parse(input: &str) -> Result<CfgExpr, String> {
         let mut p = Parser {
             chars: input.chars().collect(),
@@ -35,7 +25,6 @@ impl CfgExpr {
         Ok(expr)
     }
 
-    /// Evaluates against the compiler's cfg set.
     pub fn matches(&self, cfgs: &[Cfg]) -> bool {
         match self {
             CfgExpr::Not(e) => !e.matches(cfgs),
@@ -49,10 +38,7 @@ impl CfgExpr {
     }
 }
 
-/// Whether a platform string from a manifest (`cfg(unix)` or a bare target
-/// triple) applies to a target with this `name` and cfg set. A string that
-/// fails to parse is treated as applying, like Cargo would rather include a
-/// dependency than silently drop it.
+/// Unparseable strings apply: better to include a dependency than silently drop it.
 pub fn platform_matches(platform: &str, target_name: &str, cfgs: &[Cfg]) -> bool {
     let platform = platform.trim();
     if platform.is_empty() {

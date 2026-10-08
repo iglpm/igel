@@ -1,7 +1,4 @@
-//! `rune help`: a short, grouped overview of the everyday commands, the
-//! complete list with `--all`, and one command's options with
-//! `rune help <command>` (the same as `rune <command> --help`). Long help
-//! opens in the pager on a terminal.
+//! `rune help`: a grouped overview, `--all`, and `rune help <command>`.
 
 use crate::args::Cli;
 use crate::pager::Page;
@@ -9,7 +6,6 @@ use crate::ui;
 use clap::{CommandFactory, Parser};
 use colored::Colorize;
 
-/// The commands `rune help` shows, by section.
 const EVERYDAY: &[(&str, &[&str])] = &[
     ("Build", &["build", "check", "run", "test", "watch"]),
     (
@@ -24,8 +20,6 @@ const EVERYDAY: &[(&str, &[&str])] = &[
     ("Rune", &["doctor", "cas", "config"]),
 ];
 
-/// Every command, by section (`rune help --all`). A command missing here
-/// still shows, under "Other".
 const ALL: &[(&str, &[&str])] = &[
     (
         "Build and run",
@@ -77,8 +71,6 @@ const ALL: &[(&str, &[&str])] = &[
     ),
 ];
 
-/// One-line descriptions for the overview (a command's own `about` is
-/// often longer than fits).
 fn short(name: &str) -> Option<&'static str> {
     Some(match name {
         "build" => "Compile the package and its dependencies",
@@ -140,16 +132,12 @@ fn short(name: &str) -> Option<&'static str> {
     })
 }
 
-/// Handles the ways of asking for Rune's own help — `rune`, `rune -h`,
-/// `rune --help`, `rune help [--all | COMMAND…]`, `rune --list` — and
-/// returns `true` when it did. Anything else is left to the parser.
 pub fn intercept(args: &[std::ffi::OsString]) -> bool {
     let words: Vec<String> = args
         .iter()
         .skip(1)
         .map(|a| a.to_string_lossy().into_owned())
         .collect();
-    // Global options may come first.
     let mut rest: &[String] = &words;
     loop {
         match rest.first().map(String::as_str) {
@@ -170,7 +158,6 @@ pub fn intercept(args: &[std::ffi::OsString]) -> bool {
     true
 }
 
-/// Shows a command's help, as clap renders it for `rune <command> --help`.
 fn command_help(path: &[&str]) {
     let mut argv = vec!["rune"];
     argv.extend_from_slice(path);
@@ -187,7 +174,6 @@ fn command_help(path: &[&str]) {
     }
 }
 
-/// Shows a help message clap produced (for `--help`), in the pager.
 pub fn show_clap(e: &clap::Error) {
     let text = if ui::colors() {
         e.render().ansi().to_string()
@@ -199,7 +185,6 @@ pub fn show_clap(e: &clap::Error) {
     page.show();
 }
 
-/// `rune help` (`all`: every command).
 fn overview(all: bool) {
     let cmd = Cli::command();
     let about = |name: &str| -> String {
@@ -312,7 +297,6 @@ fn overview(all: bool) {
     page.show();
 }
 
-/// Rune's colours for clap's help and error messages.
 pub fn styles() -> clap::builder::Styles {
     use clap::builder::styling::{Ansi256Color, AnsiColor, Color, Style};
     let violet = Some(Color::Ansi256(Ansi256Color(141)));
@@ -330,7 +314,6 @@ pub fn styles() -> clap::builder::Styles {
         )
 }
 
-/// An "Examples" section for a command's help: `(command line, what it does)`.
 pub fn examples(rows: &[(&str, &str)]) -> String {
     use clap::builder::styling::{Ansi256Color, Color, Style};
     let header = Style::new()
@@ -368,8 +351,6 @@ mod tests {
                 assert!(short(name).is_some(), "{name}");
             }
         }
-        // `--all` lists everything (anything unlisted goes to "Other", but
-        // nothing should need to).
         let listed: Vec<&str> = ALL.iter().flat_map(|(_, n)| n.iter().copied()).collect();
         for c in cmd.get_subcommands().filter(|c| !c.is_hide_set()) {
             assert!(listed.contains(&c.get_name()), "{}", c.get_name());

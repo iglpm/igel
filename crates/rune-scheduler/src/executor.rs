@@ -20,7 +20,6 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use tracing::{debug, error};
 
-/// The result of a build execution.
 #[derive(Debug, Clone)]
 pub struct BuildResult {
     pub success: bool,
@@ -28,20 +27,10 @@ pub struct BuildResult {
     pub cached: usize,
     pub failed: Vec<NodeId>,
     pub total_duration: Duration,
-    /// Every compiled/cache-restored artifact (`.rlib`, `.rmeta`, binaries,
-    /// ...) produced for each node, keyed by node id. Lets a caller that
-    /// needs to link something new against an already-built node (e.g.
-    /// `rune test` linking a test harness binary against a crate's rlib)
-    /// find those paths without re-deriving rustc's own output naming.
     pub artifact_paths: HashMap<NodeId, Vec<PathBuf>>,
-    /// The content-addressable cache key computed for each node.
     pub cache_keys: HashMap<NodeId, String>,
-    /// What each unit's build script reported (run or restored): the `cfg`s,
-    /// environment and native search paths later steps (`rune doc`) need.
     pub build_script_outputs: HashMap<NodeId, BuildScriptOutput>,
-    /// How the build was scheduled, when anything was built.
     pub schedule: Option<ScheduleReport>,
-    /// How long starting more compilers was held back for lack of memory.
     pub memory_held: Duration,
 }
 
@@ -50,19 +39,15 @@ enum WorkerMsg {
     MetadataReady {
         node_id: NodeId,
         rmeta_path: PathBuf,
-        /// What identifies this build of the unit to its dependents.
         content: Option<Content>,
-        /// The store already holds a different build of the unit, compiled
-        /// against the same dependencies: what is compiled against this one
-        /// must not be published (see `BuildExecutor::tainted`).
+        /// The store holds a different build of this unit for the same dependencies: dependents must not be published.
         diverged: bool,
     },
     BuildScriptDone {
         node_id: NodeId,
         output: BuildScriptOutput,
     },
-    /// The unit learned about external inputs (declared by its build script or
-    /// read through `env!`), so its key — and its dependents' — changed.
+    /// External inputs (build script declarations or `env!` reads) changed the unit's key and its dependents'.
     KeyUpdate {
         node_id: NodeId,
         key: String,
@@ -71,34 +56,26 @@ enum WorkerMsg {
         node_id: NodeId,
         artifacts: Vec<PathBuf>,
         duration: Duration,
-        /// The compiler's peak memory, when this process compiled it.
         peak_memory: Option<u64>,
-        /// Taken from the store (another process built it while we waited)
-        /// rather than compiled by this one.
         restored: bool,
-        /// See `MetadataReady` (for a unit that announced no metadata).
         content: Option<Content>,
     },
     Failed {
         node_id: NodeId,
         error: String,
     },
-    /// A unit's build script ran (or its result was restored); the unit's
-    /// compilation is scheduled separately, holding on to the unit's lock.
     ScriptPhaseDone {
         node_id: NodeId,
         duration: Duration,
         lock: Option<rune_common::fsutil::FileLock>,
         lock_waited: bool,
     },
-    /// A waiter thread obtained the lock of a unit another process held.
     LockAcquired {
         node_id: NodeId,
         lock: rune_common::fsutil::FileLock,
     },
 }
 
-/// See [`BuildExecutor::frontend_threads_for`].
 fn frontend_threads(
     setting: rune_common::settings::FrontendThreads,
     cpus: usize,
@@ -114,14 +91,10 @@ fn frontend_threads(
     (n > 1).then_some(n)
 }
 
-/// What a compiled build script was compiled from, kept beside it.
 #[derive(serde::Serialize, serde::Deserialize)]
 struct ScriptStamp {
-    /// The script's base key (configuration and build-dependencies).
     base: String,
-    /// Its source files and their content hashes, from rustc's dep-info.
     sources: Vec<(PathBuf, String)>,
-    /// What the compiler printed.
     warnings: String,
 }
 
@@ -145,7 +118,6 @@ impl ScriptStamp {
     }
 }
 
-/// Shows again what compiling a restored build script printed.
 fn replay_script_warnings(
     events: &Sender<PipelineEvent>,
     node_id: NodeId,
@@ -159,7 +131,6 @@ fn replay_script_warnings(
     }
 }
 
-/// The name a unit has in `--timings` traces.
 fn span_name(unit: &CompilationUnit) -> String {
     format!(
         "{} {} ({})",
@@ -176,8 +147,6 @@ fn step_id(node: NodeId, script: bool) -> StepId {
     }
 }
 
-/// What a step waited for, mirroring the readiness rules in
-/// [`BuildExecutor::execute`].
 fn step_gates(
     graph: &BuildGraph,
     id: NodeId,
@@ -223,8 +192,6 @@ fn step_gates(
     gates
 }
 
-/// The advisory lock file that makes concurrent `rune` processes take turns
-/// on one unit's outputs.
 fn unit_lock_path(
     config: &RuneConfig,
     profile: &Profile,
@@ -237,26 +204,14 @@ fn unit_lock_path(
         .join(script_key(&graph.node(id).unit))
 }
 
-/// Which artifact flavor a compilation needs from its dependencies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExternMode {
-    /// A library being type-checked/compiled: `.rmeta` is enough (and lets
-    /// dependents start before a dependency finishes codegen).
     Pipelined,
-    /// Something that is actually linked (binary, test harness, proc-macro,
-    /// dylib): every dependency's real `.rlib` is required.
     Link,
 }
 
-/// The parallel build executor.
-///
-/// 1. Computes a content-addressable cache key for every unit up front
-///    (registry crates are immutable, so their key never touches the disk).
-/// 2. Restores every cache hit in parallel *before* scheduling anything.
-/// 3. Schedules the remaining units by critical path, weighted by measured
-///    compile times from earlier builds.
-/// 4. Invokes `rustc` with metadata pipelining: dependents start as soon as
-///    a dependency's `.rmeta` exists.
+/// Parallel build executor: keys every unit up front, restores cache hits in parallel, then schedules the
+/// rest by critical path with `.rmeta` pipelining.
 pub struct BuildExecutor {
     config: RuneConfig,
     profile: Profile,
@@ -265,37 +220,25 @@ pub struct BuildExecutor {
     event_rx: Receiver<PipelineEvent>,
     max_jobs: usize,
     force_rebuild: bool,
-    /// `[env]` from configuration, set for every compiler and build script.
     config_env: Vec<(String, String, bool)>,
     color: bool,
-    /// Shared with every `rustc` (and build script) we start, so their
-    /// internal codegen threads and C compilers draw from one pool of
-    /// `max_jobs` tokens instead of each assuming it owns the machine.
+    /// Shared with every `rustc` and build script so all codegen threads draw from one token pool.
     jobserver: Option<jobserver::Client>,
     tokens: Option<crate::tokens::JobTokens>,
-    /// `build.frontend-threads`.
     frontend_threads: rune_common::settings::FrontendThreads,
-    /// Cores on this machine.
     cpus: usize,
-    /// Reads the machine's memory (replaceable in tests).
     memory: fn() -> Option<rune_common::sysinfo::Memory>,
-    /// `build.sandbox`: compilers and build scripts run confined.
     sandbox: Option<std::sync::Arc<SandboxPolicy>>,
-    /// Seconds of work that follow a unit once it is built (a test binary's
-    /// run): scheduling counts them as part of its path.
     extra_costs: HashMap<NodeId, f64>,
 }
 
-/// How build-time code is confined (see `rune_common::sandbox`).
 #[derive(Debug, Clone)]
 pub struct SandboxPolicy {
     pub sandbox: rune_common::sandbox::Sandbox,
-    /// Packages whose build scripts may use the network.
     pub network: HashSet<String>,
 }
 
 impl BuildExecutor {
-    /// Creates a new `BuildExecutor`.
     pub fn new(config: RuneConfig, profile: Profile, max_jobs: usize) -> Self {
         let (event_tx, event_rx) = unbounded();
         let jobserver = jobserver::Client::new(max_jobs.max(1)).ok();
@@ -320,16 +263,11 @@ impl BuildExecutor {
         }
     }
 
-    /// Work that waits on units once they are built, in seconds: `rune test`
-    /// passes how long each test binary ran last time, so the binary a run
-    /// will wait longest on is built first and starts while the rest still
-    /// compile.
     pub fn with_extra_costs(mut self, costs: HashMap<NodeId, f64>) -> Self {
         self.extra_costs = costs;
         self
     }
 
-    /// Replaces how the machine's memory is read (tests).
     pub fn with_memory_probe(
         mut self,
         probe: fn() -> Option<rune_common::sysinfo::Memory>,
@@ -338,9 +276,6 @@ impl BuildExecutor {
         self
     }
 
-    /// Threads for rustc's parallel front end (nightly compilers only; see
-    /// `build.frontend-threads`).
-    /// Runs every compiler and build script confined.
     pub fn with_sandbox(mut self, policy: SandboxPolicy) -> Self {
         self.sandbox = Some(std::sync::Arc::new(policy));
         self
@@ -351,59 +286,44 @@ impl BuildExecutor {
         self
     }
 
-    /// `-Z threads` for a unit started now, with `busy` units running
-    /// (including it) and `waiting` more ready to start: under `auto`, the
-    /// cores nobody else will use, so the long single crates at the end of a
-    /// build type-check on several cores while a busy machine is not
-    /// oversubscribed.
+    /// Under `auto`, `-Z threads` uses the cores nobody else will.
     fn frontend_threads_for(&self, busy: usize, waiting: usize) -> Option<usize> {
         frontend_threads(self.frontend_threads, self.cpus, busy, waiting)
             .filter(|_| toolchain::global().accepts_unstable_flags())
     }
 
-    /// Sets the CAS store for artifact caching.
     pub fn with_cas(mut self, cas: CasStore) -> Self {
         self.cas = Some(cas);
         self
     }
 
-    /// Never restore from the CAS: compile every unit (and re-run every build
-    /// script) even if an identical artifact is cached. Results are still
-    /// *stored*, so a later ordinary build can reuse them.
-    ///
-    /// This is what `build.release-rebuild-all` turns on for release builds.
+    /// Never restore from the CAS (results are still stored). `build.release-rebuild-all`.
     pub fn with_force_rebuild(mut self, force: bool) -> Self {
         self.force_rebuild = force;
         self
     }
 
-    /// Environment from the `[env]` configuration table: `(name, value, force)`.
     pub fn with_config_env(mut self, env: Vec<(String, String, bool)>) -> Self {
         self.config_env = env;
         self
     }
 
-    /// Ask the compiler for ANSI-colored diagnostics.
     pub fn with_color(mut self, color: bool) -> Self {
         self.color = color;
         self
     }
 
-    /// Returns a receiver for pipeline events to drive progress bars or logs.
     pub fn event_receiver(&self) -> Receiver<PipelineEvent> {
         self.event_rx.clone()
     }
 
-    /// Directory a unit's primary artifacts are written to.
     fn out_dir_for(&self, unit: &CompilationUnit) -> PathBuf {
         out_dir_for(&self.config, &self.profile, unit)
     }
 
-    /// Executes the build graph.
     pub fn execute(&self, graph: &BuildGraph) -> RuneResult<BuildResult> {
         let result = self.execute_graph(graph);
         if result.is_err() {
-            // Whoever follows the events must learn that nothing more comes.
             let _ = self.event_tx.send(PipelineEvent::AllComplete {
                 total_duration: Duration::ZERO,
                 cached: 0,
@@ -429,28 +349,18 @@ impl BuildExecutor {
         let timings_path = self.config.fingerprint_dir.join("timings.json");
         let global_timings_path = self.config.cas_dir.join("timings.json");
         let mut timings = Timings::load(&timings_path, &global_timings_path);
-        // The schedule as it happened (see `schedule`): when each step became
-        // ready, started, wrote metadata and finished.
         let mut steps: HashMap<StepId, Step> = HashMap::new();
         let mut started: HashMap<StepId, f64> = HashMap::new();
         let mut first_ready: HashMap<StepId, f64> = HashMap::new();
         let mut metadata_at: HashMap<NodeId, f64> = HashMap::new();
         let now = || start_time.elapsed().as_secs_f64();
 
-        // 1. Cache keys for every node, dependencies first. A unit's *base*
-        // key covers its source, configuration and dependencies; the key it is
-        // stored under also covers the current value of whatever external
-        // inputs a previous build of it declared (see `inputs`).
+        // 1. Cache keys, dependencies first. The stored key also covers the current values of declared inputs.
         let keys_timer = rune_common::timing::phase("cache keys");
         let mut unit_base_keys: HashMap<NodeId, String> = HashMap::with_capacity(topo.len());
         let mut unit_cas_keys: HashMap<NodeId, String> = HashMap::with_capacity(topo.len());
-        // `rune check` after `rune build` reuses the build: a checked unit
-        // takes the stored result of the same unit fully compiled (its
-        // `.rmeta` is what dependents type-check against). rustc gives the
-        // two `.rmeta` flavours different crate hashes, so they must never
-        // mix in one dependency chain: a unit is substituted only if its whole
-        // dependency closure is, and then carries the full unit's key so that
-        // every dependent's key says which flavour it was compiled against.
+        // `rune check` reuses a build's stored result only if the unit's whole dependency closure is substituted:
+        // rustc gives the two `.rmeta` flavours different crate hashes, so they must never mix in one chain.
         let substitute = self.cas.is_some() && !self.force_rebuild;
         let mut full_keys: HashMap<NodeId, String> = HashMap::new();
         let mut substituted: HashSet<NodeId> = HashSet::new();
@@ -472,8 +382,6 @@ impl BuildExecutor {
                 }
                 full_keys.insert(id, full_key);
             } else if substitute {
-                // Not a check unit (a build script's or proc-macro's
-                // dependency): the same unit in both modes.
                 full_keys.insert(id, key.clone());
             }
             unit_base_keys.insert(id, base);
@@ -490,28 +398,19 @@ impl BuildExecutor {
         let mut artifact_paths: HashMap<NodeId, Vec<PathBuf>> = HashMap::new();
         let mut metadata_paths: HashMap<NodeId, PathBuf> = HashMap::new();
         let mut build_script_outputs: HashMap<NodeId, BuildScriptOutput> = HashMap::new();
-        // What identifies the build of each unit that is in place (restored or
-        // compiled) to the units compiled against it.
         let mut contents: HashMap<NodeId, Content> = HashMap::new();
-        // Units whose result must not be published: compiled against a build
-        // of a dependency that differs from the one the store holds under its
-        // key (a non-reproducible compiler output), so the store's entries
-        // would not fit together.
+        // Compiled against a dependency build the store doesn't hold under its key: never published.
         let mut tainted: HashSet<NodeId> = HashSet::new();
         let mut compiled = 0;
         let mut cached = 0;
         let mut failed: Vec<NodeId> = Vec::new();
 
-        // 2. Restore every cache hit in parallel. A unit's key already covers
-        // its dependencies' keys, so whether it is cached doesn't depend on
-        // whether those dependencies were restored or will be rebuilt.
+        // 2. Restore every cache hit in parallel.
         if let Some(cas) = self.cas.as_ref().filter(|_| !self.force_rebuild) {
             let _timer = rune_common::timing::phase("cas restore");
             let restore = |&id: &NodeId| -> Option<(NodeId, rune_cas::store::Linked)> {
                 let unit = &graph.node(id).unit;
                 let key = &unit_cas_keys[&id];
-                // Without its script's result (or with one stored for another
-                // project) a unit is no use to its dependents: it is built.
                 if unit.build_script.is_some()
                     && unit.ext.script_owner.is_none()
                     && stored_script_output(
@@ -527,13 +426,7 @@ impl BuildExecutor {
                 {
                     return None;
                 }
-                // Another `rune` sharing this target directory may be
-                // compiling a unit with the same output files right now
-                // (the same crate built with other flags, as `rune
-                // coverage` does): putting the store's read-only copy in
-                // place under its compiler fails that build. Such a unit
-                // is left to the scheduler, which waits its turn and
-                // then restores it.
+                // Another `rune` may be compiling a unit with the same outputs right now; leave it to the scheduler.
                 let path = unit_lock_path(&self.config, &self.profile, graph, id);
                 let rune_common::fsutil::TryLock::Locked(_lock) =
                     rune_common::fsutil::FileLock::try_exclusive(&path)
@@ -553,21 +446,13 @@ impl BuildExecutor {
                     .ok()?;
                 (!linked.files.is_empty()).then_some((id, linked))
             };
-            // In parallel only where it pays: a small graph's restores are
-            // quicker than starting (and spinning down) a thread pool.
             let mut restored: HashMap<NodeId, rune_cas::store::Linked> = if topo.len() < 48 {
                 topo.iter().filter_map(restore).collect()
             } else {
                 topo.par_iter().filter_map(restore).collect()
             };
 
-            // A restored unit is usable only next to the very builds of its
-            // dependencies it was compiled against: rustc refuses to load a
-            // crate whose dependency is a different build ("can't find crate
-            // for `tracing`"), and the same key does not always mean the same
-            // bytes. Dependencies first, so a unit whose dependency is not
-            // restored, or was compiled against something else, is compiled
-            // again — and so is everything compiled against it.
+            // A restored unit is only usable next to the exact dependency builds it was compiled against.
             for &id in &topo {
                 let Some(linked) = restored.get(&id) else {
                     continue;
@@ -604,18 +489,13 @@ impl BuildExecutor {
                 completed.insert(id);
                 metadata_ready.insert(id);
 
-                // A cache hit skips the worker entirely, so it never runs the
-                // build script — whose output dependents (`DEP_<LINKS>_<KEY>`)
-                // and the package's other units (cfgs, link libraries,
-                // `OUT_DIR`) still need. Restore it from the store.
+                // A cache hit never runs the build script, but dependents and sibling units need its output.
                 if unit.build_script.is_some() {
                     let script_key_name = format!("{}-script-output", unit_cas_keys[&id]);
                     let script_out_dir = self.config.build_script_out_dir_by_key(
                         self.profile.output_dir_name(),
                         &script_key(unit),
                     );
-                    // The generated files too: the package's other units
-                    // `include!` them from the shared `OUT_DIR`.
                     if let Some(output) = restore_script_output(
                         cas,
                         &script_key_name,
@@ -637,7 +517,6 @@ impl BuildExecutor {
                     metadata_paths.insert(id, rmeta.clone());
                 }
                 uplift_artifacts(&self.config, &self.profile, unit, &linked);
-                // Cargo replays a cached crate's warnings; so do we.
                 let warnings = if unit.crate_id.source == CrateSource::Local {
                     cas.get_value::<String>(&format!("{}-warnings", unit_cas_keys[&id]))
                         .unwrap_or_default()
@@ -660,11 +539,7 @@ impl BuildExecutor {
             }
         }
 
-        // 3. Critical-path priorities over the *remaining* work only: for each
-        // unit, the longest chain of work still to happen after it starts. Costs
-        // are measured compile times where we have them, size-based estimates
-        // where we do not. A dependent that only needs a library's `.rmeta`
-        // waits for part of the library's time, not all of it.
+        // 3. Critical-path priorities over the remaining work (measured times, else size estimates).
         let weights = {
             let _timer = rune_common::timing::phase("critical path");
             timings.measure_sources(
@@ -698,15 +573,7 @@ impl BuildExecutor {
         let (worker_tx, worker_rx) = unbounded::<WorkerMsg>();
         let total_nodes = graph.node_count();
 
-        // Full transitive dependency closure per node, needed for anything
-        // that performs a real link step (binaries, cdylibs, proc-macros,
-        // build scripts). Pipelining lets a *library* finish compiling using
-        // only its dependencies' `.rmeta`, so "direct dependency completed"
-        // does NOT imply "that dependency's own dependencies finished
-        // linking". A binary link needs every transitively linked crate's
-        // actual `.rlib` on disk, so gating readiness on direct dependencies
-        // alone raced the final link against the slowest transitive
-        // dependency ("crate `X` required to be available in rlib format").
+        // Transitive closure: anything that links needs every transitive `.rlib`, not just direct deps' `.rmeta`.
         let transitive_deps: HashMap<NodeId, HashSet<NodeId>> = {
             let mut map: HashMap<NodeId, HashSet<NodeId>> = HashMap::new();
             for &id in &topo {
@@ -722,14 +589,8 @@ impl BuildExecutor {
             map
         };
 
-        // A package's build script is its own step, as in Cargo: it needs its
-        // build-dependencies fully built (it links them) and the scripts of
-        // the `links` crates it depends on (their `DEP_*` metadata), but not
-        // the package's ordinary dependencies. So it compiles and runs while
-        // those are still compiling, and the library itself then starts as
-        // soon as their `.rmeta` exists. (Running the script first and only
-        // then the library, both after *every* dependency was fully linked,
-        // put each such crate's whole script on the critical path.)
+        // A build script is its own step: it needs its build-dependencies and `links` scripts, not the package's
+        // ordinary dependencies, so it runs while those still compile.
         let own_script = |id: NodeId| {
             let u = &graph.node(id).unit;
             u.build_script.is_some() && u.ext.script_owner.is_none()
@@ -755,24 +616,15 @@ impl BuildExecutor {
             })
             .collect();
         let mut script_done: HashSet<NodeId> = HashSet::new();
-        // Units whose script step is running (their key may still change as
-        // their dependencies learn about outside inputs).
         let mut in_script_phase: HashSet<NodeId> = HashSet::new();
-        // A unit's lock is held from its script step through its compilation,
-        // so another process never re-runs the script (and rewrites `OUT_DIR`)
-        // under a compiler reading it. `bool`: whether we had to wait for it.
+        // Held from the script step through compilation so no other process reruns the script under a compiler.
         let mut held_locks: HashMap<NodeId, (rune_common::fsutil::FileLock, bool)> = HashMap::new();
-        // Units another process holds the lock of; a waiter thread (not a job
-        // slot) blocks on it and hands it over.
         let mut lock_waiting: HashSet<NodeId> = HashSet::new();
         let mut job_threads: Vec<std::thread::JoinHandle<()>> = Vec::new();
-        // How long new work was held back because memory was short.
         let mut memory_held = Duration::ZERO;
-        // What each running compilation is expected to peak at.
         let mut predicted_running: HashMap<NodeId, u64> = HashMap::new();
         let mut memory_held_since: Option<Instant> = None;
 
-        // Nodes still to schedule, in stable graph order.
         let mut unscheduled: Vec<NodeId> = graph
             .nodes()
             .iter()
@@ -785,8 +637,6 @@ impl BuildExecutor {
                 break; // Nothing more can start once something failed.
             }
 
-            // Readiness is checked even while every slot is taken, so that the
-            // schedule report knows how long a unit waited for one.
             if failed.is_empty() {
                 let mut ready: Vec<(NodeId, bool)> = unscheduled
                     .iter()
@@ -823,7 +673,6 @@ impl BuildExecutor {
                         .entry(step_id(*id, *script_only))
                         .or_insert_with(now);
                 }
-                // Longest remaining chain first.
                 ready.sort_by(|(a, _), (b, _)| {
                     let wa = weights.get(a).copied().unwrap_or(0.0);
                     let wb = weights.get(b).copied().unwrap_or(0.0);
@@ -835,12 +684,7 @@ impl BuildExecutor {
                     if in_flight.len() >= self.max_jobs {
                         break;
                     }
-                    // Short of memory: let what runs finish (it frees memory)
-                    // before starting more — a slower build instead of a
-                    // swapping machine or a compiler killed for lack of it.
-                    // "Short" counts what this compiler is expected to need
-                    // (its peak the last time) and room for the running ones
-                    // to grow toward theirs, not only what is free right now.
+                    // Short of memory: let running compilers finish before starting more.
                     let need = if script_only {
                         0
                     } else {
@@ -865,12 +709,7 @@ impl BuildExecutor {
                     if let Some(since) = memory_held_since.take() {
                         memory_held += since.elapsed();
                     }
-                    // Another `rune` process may be building this very unit into
-                    // the same target directory (an editor's background check
-                    // next to a terminal build). Whoever holds the unit's lock
-                    // owns its output files; everyone else waits — without
-                    // tying up a job slot — and then usually finds the finished
-                    // result in the store instead of compiling it again.
+                    // Another process holding this unit's lock owns its outputs; wait without a job slot, then likely restore.
                     let (lock, lock_waited) = match held_locks.remove(&node_id) {
                         Some(held) => held,
                         None => {
@@ -918,8 +757,6 @@ impl BuildExecutor {
                     );
                     job.script_only = script_only;
                     if !script_only {
-                        // Every dependency's build is known by now: the unit
-                        // only starts once their metadata exists.
                         job.compiled_against = compiled_against(graph, node_id, &contents);
                         let fits = job.compiled_against.is_some()
                             && extern_dependencies(graph, node_id).all(|d| !tainted.contains(&d));
@@ -945,8 +782,6 @@ impl BuildExecutor {
                     if !script_only {
                         job.frontend_threads =
                             self.frontend_threads_for(in_flight.len(), ready_count - index - 1);
-                        // (After its script step: the script's record is the
-                        // one its result was stored under.)
                         job.read_script = self.read_mode(
                             graph,
                             node_id,
@@ -970,7 +805,6 @@ impl BuildExecutor {
 
             let Ok(msg) = worker_rx.recv() else { break };
             let mut next = Some(msg);
-            // Drain everything already queued before rescanning readiness.
             while let Some(msg) = next.take().or_else(|| worker_rx.try_recv().ok()) {
                 match msg {
                     WorkerMsg::MetadataReady {
@@ -1046,16 +880,8 @@ impl BuildExecutor {
                         );
                     }
                     WorkerMsg::KeyUpdate { node_id, key } => {
-                        // The unit's key changed; so do those of everything
-                        // above it whose compilation has not started yet
-                        // (nothing above it can have, apart from pipelined
-                        // dependents, which wait for the metadata that follows
-                        // this message — and units running only their build
-                        // script, which are keyed again here too).
+                        // The key changed; recompute the keys of everything above it that hasn't started.
                         unit_cas_keys.insert(node_id, key);
-                        // Only what transitively depends on this unit can have
-                        // changed: one pass in dependency order, recomputing a
-                        // key only when one of its dependencies' just did.
                         let mut changed: HashSet<NodeId> = HashSet::from([node_id]);
                         for &id in &topo {
                             if id == node_id
@@ -1142,9 +968,6 @@ impl BuildExecutor {
                         }
                     }
                     WorkerMsg::Failed { node_id, error } => {
-                        // The rendered diagnostic already went out on
-                        // `PipelineEvent::BuildFailed`; callers print it
-                        // themselves, so this is just a trace breadcrumb.
                         debug!("Failed to compile node {:?}: {}", node_id, error);
                         in_flight.remove(&node_id);
                         in_script_phase.remove(&node_id);
@@ -1157,8 +980,7 @@ impl BuildExecutor {
         if let Some(since) = memory_held_since.take() {
             memory_held += since.elapsed();
         }
-        // Units report `Finished` before they are stored (so their dependents
-        // start sooner); the build is over once every store has landed.
+        // Units report `Finished` before they are stored; the build ends once every store has landed.
         drop(held_locks);
         for t in job_threads {
             let _ = t.join();
@@ -1220,7 +1042,6 @@ impl BuildExecutor {
         })
     }
 
-    /// `(base key, effective key)` of a node, given its dependencies' final keys.
     fn compute_keys(
         &self,
         graph: &BuildGraph,
@@ -1230,7 +1051,6 @@ impl BuildExecutor {
         as_full_build: bool,
     ) -> (String, String) {
         let node = graph.node(id);
-        // The key the unit would have outside `rune check` (see `execute`).
         let full_unit;
         let unit = if as_full_build && node.unit.check_only {
             full_unit = CompilationUnit {
@@ -1258,13 +1078,8 @@ impl BuildExecutor {
         (base, key)
     }
 
-    /// Whether a unit can be keyed by the files it read (see
-    /// [`inputs::ReadRecord`]), and with which build script result:
-    /// `Some(None)` for a local crate without a build script, `Some(Some(key))`
-    /// for one compiled with its package's script's result `key`. `None`: it
-    /// is keyed by every file of its package — not a local crate, or its
-    /// script receives `DEP_*` values (known only once its dependencies'
-    /// scripts ran).
+    /// Whether a unit can be keyed by the files it read: `Some(None)` local crate without a build script,
+    /// `Some(Some(key))` with script result `key`, `None` keyed by every file of its package.
     fn read_mode(
         &self,
         graph: &BuildGraph,
@@ -1295,8 +1110,6 @@ impl BuildExecutor {
         {
             return None;
         }
-        // `rune check` looking for a build's result keys it as the build did:
-        // with the script result of the full build's unit.
         let full;
         let owner_unit = if as_full_build && owner_node.unit.check_only {
             full = CompilationUnit {
@@ -1311,8 +1124,6 @@ impl BuildExecutor {
         Some(Some(key))
     }
 
-    /// The files a local crate read when it was last compiled, if recorded,
-    /// with its build script result (see [`Self::read_mode`]).
     fn read_record(
         &self,
         graph: &BuildGraph,
@@ -1328,8 +1139,6 @@ impl BuildExecutor {
         Some((record, script))
     }
 
-    /// What a unit's key is made of now (see [`UnitIdentity`]), given its
-    /// dependencies' keys.
     fn unit_identity(
         &self,
         graph: &BuildGraph,
@@ -1366,8 +1175,6 @@ impl BuildExecutor {
         identity
     }
 
-    /// Every unit's current identity, dependencies first, with its label —
-    /// what `rune explain` compares with the last build.
     pub fn current_identities(
         &self,
         graph: &BuildGraph,
@@ -1390,25 +1197,18 @@ impl BuildExecutor {
         Ok(out)
     }
 
-    /// Every store slot a build of `graph` reads, as it stands now: each
-    /// unit's artifacts, its build script's result, replayed warnings and
-    /// diagnostics, and the outside inputs recorded for it — what
-    /// `rune cas export` puts in a bundle.
     pub fn store_keys(&self, graph: &BuildGraph) -> RuneResult<Vec<String>> {
         let topo = graph.topological_sort()?;
         let cache_path = self.config.fingerprint_dir.join("source-cache.json");
         let mut source_cache =
             rune_fingerprint::FingerprintCache::load(&cache_path).unwrap_or_default();
         let mut keys: HashMap<NodeId, String> = HashMap::new();
-        // Build script results found so far, by script (for `DEP_*` values).
         let mut script_outputs: HashMap<String, BuildScriptOutput> = HashMap::new();
         let mut out = Vec::new();
         for id in topo {
             let (base, key) = self.compute_keys(graph, id, &keys, &mut source_cache, false);
             out.extend([
                 key.clone(),
-                // The script output a cache hit of the unit restores (for its
-                // dependents' `DEP_*`, link paths and `OUT_DIR`).
                 format!("{key}-script-output"),
                 format!("{key}-warnings"),
                 format!("{key}-diagnostics"),
@@ -1451,10 +1251,6 @@ impl BuildExecutor {
         Ok(out)
     }
 
-    /// The keys of a unit's build script result: `(base, package hash, key
-    /// it is looked up under)` (see [`compute_script_base`] and
-    /// [`inputs::script_result_key`]), given its build-dependencies' final
-    /// keys and the `DEP_*` values the script receives.
     fn script_keys(
         &self,
         graph: &BuildGraph,
@@ -1467,8 +1263,6 @@ impl BuildExecutor {
         self.script_keys_of(graph, id, unit, keys, dep_metadata, source_cache)
     }
 
-    /// [`Self::script_keys`] for `unit` in the place of node `id`'s (the full
-    /// build's unit where the graph has a `check` one).
     fn script_keys_of(
         &self,
         graph: &BuildGraph,
@@ -1519,12 +1313,10 @@ impl BuildExecutor {
         (base, package_hash, key)
     }
 
-    /// Whether the store has a result for `key`.
     pub fn is_cached(&self, key: &str) -> bool {
         self.cas.as_ref().is_some_and(|c| c.contains(key))
     }
 
-    /// Records what each unit built now was built from, for `rune explain`.
     fn save_identities(
         &self,
         graph: &BuildGraph,
@@ -1539,8 +1331,6 @@ impl BuildExecutor {
             if !built(id) {
                 continue;
             }
-            // The same key is the same identity: nothing to work out again
-            // (every unit of a build where nothing changed).
             let label = unit_label(&graph.node(id).unit, &self.profile);
             if keys
                 .get(&id)
@@ -1563,10 +1353,7 @@ impl BuildExecutor {
     }
 }
 
-/// A unit's dependencies' keys, named by *how* it depends on them: under
-/// which name it links a dependency (`package = "..."` renames), and whether
-/// it is a normal or a build dependency. The manifest that says so is not
-/// hashed, so the key has to.
+/// Dependency keys named by how they are depended on (rename, normal/build): the manifest isn't hashed.
 fn dep_keys_of(
     graph: &BuildGraph,
     id: NodeId,
@@ -1600,7 +1387,6 @@ fn dep_keys_of(
 }
 
 impl BuildExecutor {
-    /// Gathers everything a worker thread needs, by value.
     #[allow(clippy::too_many_arguments)]
     fn prepare_job(
         &self,
@@ -1623,8 +1409,6 @@ impl BuildExecutor {
         };
         let extern_deps = extern_deps_for(graph, node_id, artifact_paths, metadata_paths, mode);
 
-        // Build scripts run natively and link against real artifacts — of
-        // their *build-dependencies* only, which are host units.
         let build_script_extern_deps: Vec<(String, PathBuf)> = node
             .dependencies
             .iter()
@@ -1654,16 +1438,11 @@ impl BuildExecutor {
                             .find(|p| !matches!(ext(p).as_deref(), Some("d") | Some("rmeta")))
                     })
                     .map(|p| (name, p.clone()))
-                    .filter(|_| {
-                        // Only dependencies that are libraries can be linked.
-                        dep_node.unit.crate_type != CrateType::Bin
-                    })
+                    .filter(|_| dep_node.unit.crate_type != CrateType::Bin)
             })
             .collect();
 
-        // `DEP_<LINKS>_<KEY>`: a `links`-declaring crate's build script
-        // reports metadata via `cargo:KEY=VALUE`, which Cargo exposes to a
-        // *dependent's* build script.
+        // `DEP_<LINKS>_<KEY>` from `links` crates' build scripts.
         let mut dep_metadata = Vec::new();
         for &dep_id in &node.dependencies {
             let dep_unit = &graph.node(dep_id).unit;
@@ -1676,9 +1455,7 @@ impl BuildExecutor {
             }
         }
 
-        // Integration tests, benches and examples of a package can run its
-        // binaries: Cargo exposes each as `CARGO_BIN_EXE_<name>` at compile
-        // time, so every binary this unit depends on gets one.
+        // `CARGO_BIN_EXE_<name>` for every binary this unit depends on.
         let mut extra_env = Vec::new();
         if matches!(
             unit.kind,
@@ -1697,12 +1474,7 @@ impl BuildExecutor {
             }
         }
 
-        // `cargo::rustc-link-search` from the build scripts of everything this
-        // unit links against. A library records which native libraries it
-        // needs, not where they are; the directory only matters where the
-        // final link happens (a `-lpython3.9` from `pyo3-ffi`, found under a
-        // path only its build script knows). Cargo passes them to every
-        // dependent; build-dependencies and proc-macros are not linked in.
+        // Link search paths from the build scripts of everything this unit links against, as Cargo passes them.
         let mut dep_link_search: Vec<(Option<String>, PathBuf)> = Vec::new();
         let mut seen: HashSet<NodeId> = HashSet::new();
         let mut stack: Vec<NodeId> = node
@@ -1743,8 +1515,6 @@ impl BuildExecutor {
             cas_key: cas_key.to_string(),
             dep_keys,
             build_output: match &unit_owner_key {
-                // A unit that shares its package's build script takes the
-                // output of the unit that ran it.
                 Some(owner) => node
                     .dependencies
                     .iter()
@@ -1780,23 +1550,16 @@ impl BuildExecutor {
     }
 }
 
-/// Everything one worker thread needs to build a single unit.
 struct UnitJob {
     node_id: NodeId,
     unit: CompilationUnit,
     extern_deps: Vec<(String, PathBuf)>,
     build_script_extern_deps: Vec<(String, PathBuf)>,
     dep_metadata: Vec<(String, String, String)>,
-    /// The unit's key before external inputs; where its declared inputs are
-    /// recorded.
     base_key: String,
-    /// The key the unit was scheduled under (may be updated as it learns
-    /// about external inputs).
     cas_key: String,
-    /// Its dependencies' keys, to key it again by the files it read.
     dep_keys: Vec<(String, String)>,
     build_output: Option<BuildScriptOutput>,
-    /// Link search paths from the build scripts of the unit's dependencies.
     dep_link_search: Vec<(Option<String>, PathBuf)>,
     config: RuneConfig,
     profile: Profile,
@@ -1807,42 +1570,24 @@ struct UnitJob {
     force_rebuild: bool,
     max_jobs: usize,
     config_env: Vec<(String, String, bool)>,
-    /// Extra compile-time environment, e.g. `CARGO_BIN_EXE_<name>` for
-    /// integration tests.
     extra_env: Vec<(String, String)>,
     color: bool,
     jobserver: Option<jobserver::Client>,
     tokens: Option<crate::tokens::JobTokens>,
     sandbox: Option<std::sync::Arc<SandboxPolicy>>,
-    /// Only run (or restore) the unit's build script; its compilation is a
-    /// separate job, started once its dependencies' metadata exists.
     script_only: bool,
-    /// The unit's lock, taken by the scheduler (see `execute`).
     lock: Option<rune_common::fsutil::FileLock>,
-    /// Another process held the lock first: it may have built the unit.
     lock_waited: bool,
-    /// `-Z threads` for this unit's compilation.
     frontend_threads: Option<usize>,
-    /// For a script step: the script result's base key (see
-    /// [`compute_script_base`]) and the key it is looked up under now.
     script_base: Option<String>,
     script_cache_key: Option<String>,
-    /// The package's source hash (for a script that watches no files).
     package_hash: String,
-    /// Whether the unit is keyed by the files it read, and with which build
-    /// script result (see [`BuildExecutor::read_mode`]).
     read_script: Option<Option<String>>,
-    /// The builds of its dependencies the unit is compiled against (see
-    /// `ArtifactManifest::compiled_against`); `None` if one is not known.
     compiled_against: Option<std::collections::BTreeMap<String, String>>,
-    /// Whether its result may be stored: it is compiled against the builds
-    /// of its dependencies the store holds (see `tainted` in `execute`).
     publish: bool,
 }
 
 impl UnitJob {
-    /// The compiler command, confined when `build.sandbox` is on: it writes
-    /// only into the build directory, and proc-macros get no network.
     fn compiler_command(&self, member: bool) -> std::process::Command {
         let cmd = self.toolchain.rustc_command(member);
         match &self.sandbox {
@@ -1867,16 +1612,10 @@ impl UnitJob {
         });
     }
 
-    /// After waiting for another process's lock: if that process stored this
-    /// unit, restore it exactly as the up-front cache pass would and report
-    /// the unit finished. Returns whether it did.
     fn restore_finished_elsewhere(&self, start: Instant) -> bool {
         let Some(cas) = &self.cas else { return false };
         let unit = &self.unit;
         let has_script = unit.build_script.is_some();
-        // The other process may have learned which files the unit reads and
-        // what it depends on outside itself (which change the key the unit
-        // is stored under), which we did not know about.
         let mut base = self.base_key.clone();
         let mut files = rune_fingerprint::FingerprintCache::new();
         if let Some(script) = &self.read_script
@@ -1893,8 +1632,6 @@ impl UnitJob {
         }
         let recorded: Option<DeclaredInputs> = cas.get_value(&format!("{base}-inputs"));
         let key = effective_key(&base, recorded.as_ref(), has_script);
-        // Only a result compiled against the builds of its dependencies that
-        // this build uses fits next to them (see `execute`).
         let fits = |m: &rune_cas::store::ArtifactManifest| {
             self.compiled_against
                 .as_ref()
@@ -1904,7 +1641,6 @@ impl UnitJob {
             .config
             .build_script_out_dir_by_key(self.profile.output_dir_name(), &script_key(unit));
         let script_key_name = format!("{key}-script-output");
-        // (Without its script's result, see `execute`.)
         if !cas.get(&key).is_some_and(|e| fits(&e.manifest))
             || (has_script
                 && unit.ext.script_owner.is_none()
@@ -1921,7 +1657,6 @@ impl UnitJob {
         else {
             return false;
         };
-        // (It may have been replaced in between.)
         if linked.is_empty() || !fits(&manifest) {
             return false;
         }
@@ -1985,13 +1720,9 @@ impl UnitJob {
     }
 
     fn run(mut self) {
-        // Claim a core for as long as this unit runs, without waiting behind
-        // other compilers' codegen threads (see `tokens`); the compiler may
-        // borrow more for its own codegen while cores are idle.
+        // Claim a core without waiting behind other compilers' codegen threads (see `tokens`).
         let token = self.tokens.as_ref().map(|t| t.start());
         let start = Instant::now();
-        // Held until the unit is stored (or, for a script step, handed back to
-        // the scheduler for the compilation that follows).
         let mut unit_lock = self.lock.take();
         let node_id = self.node_id;
         let unit = &self.unit;
@@ -2004,9 +1735,6 @@ impl UnitJob {
             });
         }
 
-        // The process we waited for may have built this unit. (Not checked by
-        // a script step: its dependencies may not have their final keys yet,
-        // so neither has the unit.)
         if self.lock_waited
             && !self.script_only
             && !self.force_rebuild
@@ -2015,25 +1743,13 @@ impl UnitJob {
             return;
         }
 
-        // A distinct CAS slot from the compiled-artifact entry, keyed off the
-        // same (build-script-aware) fingerprint: whenever the crate needs
-        // recompiling for any reason, a build script whose own inputs didn't
-        // change can skip being recompiled and re-executed — the most
-        // expensive part of crates like `openssl-sys` or `ring`.
-        // A script step looks its result up by the script's own key (see
-        // `compute_script_base`): editing the package's other files does not
-        // run a script that declared which files it reads.
+        // The build script result has its own slot, so a recompiled crate needn't rerun an unchanged script.
         let build_script_cache_key = match &self.script_cache_key {
             Some(k) => format!("{k}-script-output"),
             None => format!("{}-script-output", self.cas_key),
         };
-        // The files the script's own compilation read (for its record).
         let mut script_sources: Vec<PathBuf> = Vec::new();
 
-        // 1. Compile & execute the build script, unless a cached run already
-        //    told us its output. Its output is two things that must be
-        //    restored together: the parsed `cargo:` directives and whatever
-        //    files it wrote to `OUT_DIR` (which the crate may `include!()`).
         let script_out_dir = config.build_script_out_dir_by_key(
             profile.output_dir_name(),
             unit.ext
@@ -2044,18 +1760,11 @@ impl UnitJob {
         );
         let mut effective_build_output = self.build_output.clone();
         let shares_script = unit.ext.script_owner.is_some();
-        // External inputs this unit is observed to depend on, and the key it
-        // is finally stored under (which follows them).
         let mut declared = DeclaredInputs::default();
         let mut store_key = self.cas_key.clone();
         let mut script_ran: Option<BuildScriptOutput> = None;
         let has_script = unit.build_script.is_some();
-        // A script step does not announce keys: its dependencies may still
-        // change theirs, and the compilation that follows keys the unit again
-        // (with the same script output) once they are settled.
         let script_only = self.script_only;
-        // The unit's key before external inputs: what it was scheduled under,
-        // until the compiler says which files it read.
         let mut base_key = self.base_key.clone();
         let read_key = self
             .read_script
@@ -2093,20 +1802,14 @@ impl UnitJob {
                 node_id,
                 crate_name: unit.crate_id.name.clone(),
             });
-            // Start from an empty directory. Files restored from the store are
-            // hard links to shared objects; a script that rewrote one *in
-            // place* would change the object for everyone. Unlinking first
-            // means every file the script writes is its own.
+            // Start from an empty directory: restored files are hard links to shared objects.
             let _ = std::fs::remove_dir_all(&script_out_dir);
             let _ = std::fs::create_dir_all(&script_out_dir);
 
             let deps_dir = config.deps_dir(profile.output_dir_name());
             let tc = self.toolchain;
             let eff = unit.effective_profile(profile);
-            // `TARGET` must always be a real triple: build scripts like
-            // openssl-sys parse it. `HOST` is always the build machine's.
-            // `CARGO_CFG_*` describes the *target* (asked of the compiler,
-            // with the unit's own flags), never the machine Rune runs on.
+            // `TARGET` must be a real triple; `CARGO_CFG_*` describes the target, never this machine.
             let target_info = TargetInfo::query(
                 tc,
                 unit.target.as_ref().map(|t| t.0.as_str()),
@@ -2146,20 +1849,16 @@ impl UnitJob {
                 rustflags: unit.ext.script_rustflags.clone(),
                 config_env: self.config_env.clone(),
             };
-            // The script itself is compiled with the host's flags.
             let compile_env = BuildScriptEnv {
                 linker: unit.ext.script_linker.as_ref().map(PathBuf::from),
                 ..env.clone()
             };
 
-            // `[profile.*.build-override]` decides how the script itself is
-            // compiled (by default unoptimized: it runs once).
             let script_flags = unit
                 .ext
                 .script_profile
                 .as_ref()
                 .map(|p| {
-                    // Build scripts ignore `panic`, as in Cargo.
                     let p = Profile {
                         panic: rune_common::PanicStrategy::Unwind,
                         ..p.clone()
@@ -2179,8 +1878,6 @@ impl UnitJob {
                 if color {
                     cmd.arg("--color=always");
                 }
-                // A dependency's build script is not the user's code: its
-                // warnings are noise, exactly as for the crate itself.
                 if unit.crate_id.source != CrateSource::Local {
                     cmd.arg("--cap-lints").arg("allow");
                 }
@@ -2190,9 +1887,7 @@ impl UnitJob {
             };
             let script_bin_dir =
                 config.build_script_bin_dir_by_key(profile.output_dir_name(), &script_key(unit));
-            // The compiled script is kept beside `OUT_DIR` with a stamp of
-            // what it was compiled from; a script that must run again because
-            // a file it watches changed is not compiled again for that.
+            // A stamp beside the compiled script: rerunning a script doesn't recompile it.
             let stamp_path = script_bin_dir.join(".rune-stamp");
             let reusable = self
                 .script_base
@@ -2238,8 +1933,6 @@ impl UnitJob {
             };
             match compiled {
                 Ok((bin_path, printed)) => {
-                    // Warnings about a dependency's `build.rs` are capped, as
-                    // for the crate itself; the workspace's own are kept.
                     let compile_warnings = if unit.crate_id.source == CrateSource::Local {
                         printed
                     } else {
@@ -2250,14 +1943,10 @@ impl UnitJob {
                             js.configure(cmd);
                         }
                     };
-                    // A registry or git package is immutable, and shared by
-                    // every project: its build script may write to `OUT_DIR`
-                    // and nowhere near its own source.
+                    // Registry/git packages are immutable and shared: their scripts may only write to `OUT_DIR`.
                     let immutable_before = (unit.crate_id.source != CrateSource::Local)
                         .then(|| tree_stamp(&unit.manifest_dir));
                     let script_cmd = match &self.sandbox {
-                        // Writes go to `OUT_DIR` only; the network is off
-                        // unless the package is allowed it.
                         Some(p) => p.sandbox.command(
                             bin_path.as_os_str(),
                             &[&env.out_dir],
@@ -2292,8 +1981,6 @@ impl UnitJob {
                                 duration: start.elapsed(),
                             });
                             out.compile_warnings = compile_warnings;
-                            // Shown when the script runs (as Cargo does), for
-                            // the workspace's own packages.
                             if unit.crate_id.source == CrateSource::Local {
                                 let mut text = out.compile_warnings.clone();
                                 for w in &out.warnings {
@@ -2331,9 +2018,6 @@ impl UnitJob {
             }
         }
 
-        // What the script told us about its outside reads. If that changes the
-        // unit's key, say so before anything above it can start; then cache the
-        // script's result under the final key.
         if let (Some(out), false) = (&effective_build_output, shares_script) {
             declared.merge(inputs::from_script_output(
                 out,
@@ -2344,7 +2028,6 @@ impl UnitJob {
         }
         if let (Some(out), Some(cas_store)) = (&script_ran, &self.cas) {
             let key = match &self.script_base {
-                // What the run showed it depends on keys its next lookup.
                 Some(base) => {
                     let record = inputs::script_record(
                         out,
@@ -2383,10 +2066,7 @@ impl UnitJob {
             return;
         }
 
-        // 2. Build the rustc command. Any leftover output from an earlier
-        // build is unlinked first: outputs are hard links into the CAS, and a
-        // compiler that rewrites an existing file in place would silently
-        // change the cached object every other project shares.
+        // Unlink leftover outputs first: they are hard links into the CAS.
         let out_dir = out_dir_for(config, profile, unit);
         remove_stale_outputs(&out_dir, unit);
 
@@ -2412,8 +2092,6 @@ impl UnitJob {
         for (k, v) in &self.extra_env {
             cmd_builder = cmd_builder.env(k, v);
         }
-        // How the compiler divides its work, not what it produces: not part
-        // of the key (like `-j`).
         if let Some(n) = self.frontend_threads {
             cmd_builder = cmd_builder.extra_flags(vec![format!("-Zthreads={n}")]);
         }
@@ -2428,9 +2106,7 @@ impl UnitJob {
         }
         debug!("Running {:?}", cmd);
 
-        // 3. Pipelined invocation: report `.rmeta` as soon as it exists. rustc
-        // announces its dep-info first; it lists the environment variables the
-        // crate read through `env!`/`option_env!`, which belong in the key.
+        // Pipelined: report `.rmeta` as soon as it exists. Dep-info comes first and lists `env!` reads.
         let invoker = RustcInvoker::new();
         let worker_tx = self.worker_tx.clone();
         let event_tx = self.event_tx.clone();
@@ -2450,8 +2126,6 @@ impl UnitJob {
         let result = invoker.invoke_streaming(cmd, &mut |artifact| match artifact.emit.as_str() {
             "dep-info" => {
                 let mut moved = false;
-                // Keyed by exactly the files it read from now on (and found
-                // again by them next time; see `ReadRecord`).
                 if read_key.is_some() {
                     let record = inputs::ReadRecord::from_dep_info(
                         &artifact.artifact,
@@ -2498,11 +2172,7 @@ impl UnitJob {
             }
             "metadata" if !sent_metadata => {
                 sent_metadata = true;
-                // Before anything is compiled against it: is this the build
-                // the store holds for these inputs? A compiler that produced
-                // other bytes than last time (its output is not always
-                // reproducible) makes a crate other crates were not compiled
-                // against, so nothing compiled against it may be stored.
+                // A non-reproducible compiler output: nothing compiled against it may be stored.
                 own_content =
                     rune_cas::store::content_of_files(std::slice::from_ref(&artifact.artifact));
                 let diverged = match (&self.cas, &own_content, &self.compiled_against) {
@@ -2530,8 +2200,6 @@ impl UnitJob {
         match result {
             Ok(comp_res) if comp_res.success => {
                 let duration = start.elapsed();
-                // Dependencies are compiled with `--cap-lints allow`; only
-                // the user's own crates have warnings worth showing.
                 let warnings: String = if unit.crate_id.source == CrateSource::Local {
                     comp_res
                         .diagnostics
@@ -2550,14 +2218,10 @@ impl UnitJob {
                 let artifacts: Vec<PathBuf> =
                     comp_res.artifacts.into_iter().map(|a| a.artifact).collect();
                 uplift_artifacts(config, profile, unit, &artifacts);
-                // (A unit that announced no metadata: a binary, or a compiler
-                // that does not say.)
                 if own_content.is_none() {
                     own_content = rune_cas::store::content_of_files(&artifacts);
                 }
 
-                // Dependents can start now; storing the result is not their
-                // concern (the files they use are the ones just written).
                 let _ = self.event_tx.send(PipelineEvent::BuildFinished {
                     node_id,
                     artifacts: artifacts.clone(),
@@ -2573,15 +2237,10 @@ impl UnitJob {
                     restored: false,
                     content: own_content,
                 });
-                // Storing is disk work, not compiler work: give the job slot's
-                // token back so another compiler can use the core meanwhile.
+                // Storing is disk work: give the job token back meanwhile.
                 drop(token);
 
                 if let Some(cas_store) = &self.cas {
-                    // Only a unit compiled against the stored builds of its
-                    // dependencies is stored: the record says which, and an
-                    // entry compiled against others (no longer stored) is
-                    // replaced.
                     if let (true, Some(deps)) = (self.publish, &self.compiled_against) {
                         let _ = cas_store.put_unit(
                             &store_key,
@@ -2602,20 +2261,12 @@ impl UnitJob {
                         let _ =
                             cas_store.put_value(&format!("{store_key}-diagnostics"), &diagnostics);
                     }
-                    // Remember what this unit depends on outside itself, so
-                    // the next lookup keys on the current values of those.
                     if !declared.is_empty() {
                         let _ = cas_store.put_value(&format!("{base_key}-inputs"), &declared);
                     }
-                    // And which of its files it read, which the next lookup
-                    // keys on instead of every file of the package.
                     if let (Some(key), Some(record)) = (&read_key, &read_record) {
                         let _ = cas_store.put_value(&format!("{key}-read"), record);
                     }
-                    // The script's result under the key the unit is finally
-                    // stored under, which is what a later cache hit restores
-                    // it by (the script step stored it under the key the unit
-                    // had then, which its dependencies may have changed since).
                     if let (Some(out), false) = (&effective_build_output, shares_script) {
                         let key = format!("{store_key}-script-output");
                         if stored_script_output(
@@ -2648,8 +2299,6 @@ impl UnitJob {
     }
 }
 
-/// Appends advice to a build-script failure when it is one of the usual
-/// "a system tool or library is missing" ones.
 fn with_hint(message: String) -> String {
     match crate::hints::hint_for_failure(&message, crate::hints::Family::current()) {
         Some(hint) => format!("{message}\n\n{hint}"),
@@ -2657,17 +2306,8 @@ fn with_hint(message: String) -> String {
     }
 }
 
-/// A cheap fingerprint of every file below `dir` (path, size, modification
-/// time), to notice that something wrote there.
-///
-/// Directories only contribute their path, not their own size/mtime: tools
-/// invoked by a build script (e.g. `rustc --emit=metadata -o -`, which stages
-/// the `.rmeta` in a temp dir under the process's CWD before streaming it to
-/// stdout) routinely create-then-remove a scratch directory inside the
-/// package root. That leaves no file behind, but it does bump the mtime of
-/// whichever directory held it — which would otherwise register as a false
-/// "modified its own source" violation even though the tree's actual
-/// contents are unchanged.
+/// Fingerprint of files below `dir` (path, size, mtime). Directory mtimes are ignored: tools create and
+/// remove scratch directories in the package root.
 fn tree_stamp(dir: &Path) -> u64 {
     let mut hb = rune_common::hash::HashBuilder::new();
     for entry in walkdir::WalkDir::new(dir)
@@ -2692,14 +2332,10 @@ fn tree_stamp(dir: &Path) -> u64 {
     rune_common::hash::xxhash3(hb.finish_blake3().as_bytes())
 }
 
-/// The `crate-name-hash` directory a unit's build script output lives in.
 pub fn script_key(unit: &CompilationUnit) -> String {
     format!("{}-{}", unit.rustc_crate_name(), unit.metadata_hash())
 }
 
-/// Where a build script's result that only fits one project is stored: the
-/// script's key, qualified by the directories it names (its `OUT_DIR`, which
-/// is inside the project's target directory, and its package).
 fn pinned_script_key(key: &str, out_dir: &Path, manifest_dir: &Path) -> String {
     let at = format!(
         "{}\0{}",
@@ -2709,11 +2345,7 @@ fn pinned_script_key(key: &str, out_dir: &Path, manifest_dir: &Path) -> String {
     format!("{key}-at-{}", rune_common::hash::xxhash3_hex(at.as_bytes()))
 }
 
-/// Whether a script's result names this project's directories in a way that
-/// cannot be relocated: a directive pointing into another package's
-/// `OUT_DIR`, say, or a generated Rust file with an absolute path in it
-/// (`include_bytes!("C:\\proj\\assets\\logo.png")`) that the package will
-/// `include!`.
+/// Whether a script's result names this project's directories in a way that cannot be relocated.
 fn names_project(output: &BuildScriptOutput, out_dir: &Path, manifest_dir: &Path) -> bool {
     let build_dir = out_dir.parent().and_then(Path::parent).unwrap_or(out_dir);
     let dirs = [
@@ -2745,11 +2377,8 @@ fn names_project(output: &BuildScriptOutput, out_dir: &Path, manifest_dir: &Path
     })
 }
 
-/// Stores a build script's result: the files it wrote to `out_dir` and its
-/// directives. The store is shared by every project and its keys do not say
-/// where a project lives, so paths into `out_dir` and the package are stored
-/// as placeholders (see [`BuildScriptOutput::normalize`]); a result that still
-/// names the project is stored for this project alone.
+/// Stores a build script's result with portable placeholders; one that still names the project is
+/// stored for this project alone.
 fn store_script_output(
     cas: &CasStore,
     key: &str,
@@ -2771,11 +2400,6 @@ fn store_script_output(
     let _ = cas.put_value(&key, &portable);
 }
 
-/// A build script's stored result that fits this project, and the key it is
-/// stored under (which its `OUT_DIR` files are restored from), with paths
-/// pointed at this project's `out_dir` and package. An entry stored before
-/// paths were made portable names another project's directories (which may
-/// be gone), so it counts as absent.
 fn stored_script_output(
     cas: &CasStore,
     key: &str,
@@ -2800,8 +2424,6 @@ fn stored_script_output(
     })
 }
 
-/// Restores a build script's stored result for this project: its directives
-/// and the files it wrote to `out_dir`.
 fn restore_script_output(
     cas: &CasStore,
     key: &str,
@@ -2814,11 +2436,7 @@ fn restore_script_output(
         .then_some(output)
 }
 
-/// Where a unit is compiled to (and restored from the store to): `deps/`, or
-/// `examples/` for examples, as in Cargo. Binaries get their friendly names
-/// in [`bin_dir_for`]; keeping the hash-named file and whatever else the
-/// compiler leaves beside it (object files under `split-debuginfo=unpacked`)
-/// in `deps/` keeps the profile directory clean.
+/// `deps/`, or `examples/` for examples, as in Cargo.
 pub fn out_dir_for(config: &RuneConfig, profile: &Profile, unit: &CompilationUnit) -> PathBuf {
     match (unit.crate_type, unit.kind) {
         (CrateType::Bin, TargetKind::Example) if !unit.check_only && !unit.harness => {
@@ -2828,9 +2446,6 @@ pub fn out_dir_for(config: &RuneConfig, profile: &Profile, unit: &CompilationUni
     }
 }
 
-/// Where a binary's friendly names (`target/debug/my-app`) live: the profile
-/// directory — `target/<triple>/debug/` with `--target`, as Cargo lays it
-/// out — or its `examples/`.
 pub fn bin_dir_for(config: &RuneConfig, profile: &Profile, unit: &CompilationUnit) -> PathBuf {
     let dir = profile.output_dir_name();
     let base = match &unit.target {
@@ -2847,8 +2462,6 @@ pub fn bin_dir_for(config: &RuneConfig, profile: &Profile, unit: &CompilationUni
     }
 }
 
-/// The directory name for a target: the triple, or a custom specification's
-/// file stem (`--target specs/my-os.json` → `my-os`).
 pub fn target_dir_name(target: &str) -> String {
     match target.strip_suffix(".json") {
         Some(stem) => Path::new(stem)
@@ -2859,7 +2472,6 @@ pub fn target_dir_name(target: &str) -> String {
     }
 }
 
-/// The `--extern` name a dependent uses for one of its dependencies.
 fn extern_name(graph: &BuildGraph, node_id: NodeId, dep_id: NodeId) -> String {
     graph
         .node(node_id)
@@ -2869,8 +2481,6 @@ fn extern_name(graph: &BuildGraph, node_id: NodeId, dep_id: NodeId) -> String {
         .unwrap_or_else(|| graph.node(dep_id).unit.rustc_crate_name())
 }
 
-/// The dependencies a unit's compiler is handed with `--extern` (see
-/// [`extern_deps_for`]): normal edges to libraries and proc-macros.
 fn extern_dependencies(graph: &BuildGraph, node_id: NodeId) -> impl Iterator<Item = NodeId> + '_ {
     graph
         .node(node_id)
@@ -2882,13 +2492,7 @@ fn extern_dependencies(graph: &BuildGraph, node_id: NodeId) -> impl Iterator<Ite
         })
 }
 
-/// What a unit is compiled against when its dependencies are the builds
-/// `contents` describes (see `ArtifactManifest::compiled_against`). `None`
-/// while a dependency's build is not known.
-///
-/// By file name, not by unit: `rune check` puts a fully built dependency's
-/// `.rmeta` where its own would go (see `execute`), and what was compiled
-/// against that is what it is.
+/// By file name: `rune check` puts a full build's `.rmeta` where its own would go.
 fn compiled_against(
     graph: &BuildGraph,
     node_id: NodeId,
@@ -2902,11 +2506,6 @@ fn compiled_against(
         .collect()
 }
 
-/// Builds the `--extern name=path` list for a graph node.
-///
-/// Proc-macros are always passed as their shared library; everything else
-/// prefers `.rmeta` in [`ExternMode::Pipelined`] and `.rlib` in
-/// [`ExternMode::Link`].
 pub fn extern_deps_for(
     graph: &BuildGraph,
     node_id: NodeId,
@@ -2917,20 +2516,14 @@ pub fn extern_deps_for(
     let ext_of = |p: &&PathBuf| p.extension().and_then(|e| e.to_str()).map(str::to_owned);
     let mut deps = Vec::new();
     for &dep_id in &graph.node(node_id).dependencies {
-        // A build-dependency links into the build script, not the crate.
         if !graph.is_normal_edge(node_id, dep_id) {
             continue;
         }
         let dep_node = graph.node(dep_id);
-        // A binary can be a *build-order* dependency (integration tests need
-        // the package's executables to exist) but is never `--extern`ed.
         if dep_node.unit.crate_type == CrateType::Bin {
             continue;
         }
         let name = extern_name(graph, node_id, dep_id);
-        // A dependency that is still compiling has no entry in
-        // `artifact_paths` yet, but may already have published its `.rmeta`
-        // (that is the whole point of pipelining), so an empty list is fine.
         let no_artifacts = Vec::new();
         let artifacts = artifact_paths.get(&dep_id).unwrap_or(&no_artifacts);
         let is_real = |p: &&PathBuf| !matches!(ext_of(p).as_deref(), Some("d") | Some("rmeta"));
@@ -2977,9 +2570,6 @@ pub fn extern_deps_for(
     deps
 }
 
-/// Removes files from a previous build of this exact unit (same crate and
-/// metadata hash) so the compiler creates fresh files instead of rewriting
-/// hard-linked ones. See the note at the call site.
 fn remove_stale_outputs(out_dir: &Path, unit: &CompilationUnit) {
     let needle = format!("{}-{}", unit.rustc_crate_name(), unit.metadata_hash());
     let Ok(entries) = std::fs::read_dir(out_dir) else {
@@ -2994,17 +2584,7 @@ fn remove_stale_outputs(out_dir: &Path, unit: &CompilationUnit) {
     }
 }
 
-/// Gives a freshly built or restored artifact the names Cargo gives it in the
-/// profile directory, next to the hash-suffixed real file in `deps/`:
-///
-/// * a binary: `name` (and the underscore-normalized `name`), `name.exe` on
-///   Windows;
-/// * a workspace member's library: `libname.rlib`, `libname.a`,
-///   `libname.so`/`.dylib`, `name.dll`/`name.lib` — what C build systems,
-///   Python packaging and plugin loaders look for.
-///
-/// Hard links, not copies: a debug binary can be tens of megabytes, and copying
-/// it on every no-op build was a large part of a "nothing changed" build's cost.
+/// Cargo's friendly names in the profile directory, as hard links to the real files in `deps/`.
 fn uplift_artifacts(
     config: &RuneConfig,
     profile: &Profile,
@@ -3046,8 +2626,6 @@ fn uplift_artifacts(
     }
 }
 
-/// Makes `dest` a hard link to (or, failing that, a copy of) `src`, doing
-/// nothing if it already is one.
 fn link_or_copy_replace(src: &Path, dest: &Path) {
     #[cfg(unix)]
     {
@@ -3062,28 +2640,18 @@ fn link_or_copy_replace(src: &Path, dest: &Path) {
     let _ = rune_common::fsutil::replace_with_link(src, dest);
 }
 
-/// Fraction of a library's compile time after which its `.rmeta` exists, i.e.
-/// how long a pipelined dependent waits for it.
 const METADATA_FRACTION: f64 = 0.4;
 
-/// What a compiler never measured before is assumed to need at its peak.
 const DEFAULT_COMPILER_MEMORY: u64 = 256 << 20;
 
-/// Part of every unit's key: how Rune runs the compiler, where that changes
-/// what the compiler produces from the same inputs (see `identity_with`).
+/// Part of every unit's key: how Rune runs the compiler (2: non-project crates compile in their package root).
 const INVOCATION: &str = "\0invocation=2";
 
-/// Compile times, used to weight the critical path.
-///
-/// Measured seconds from earlier builds win (this project's, then those of any
-/// project on the machine, kept next to the CAS so a fresh checkout does not
-/// start blind). For a unit nobody has timed yet the estimate comes from the
-/// size of its sources, which on a cold build is the difference between
-/// starting `syn` first and starting it last.
+/// Compile times for critical-path weighting: measured (this project, then machine-wide), else estimated
+/// from source size.
 #[derive(Default)]
 struct Timings {
     secs: HashMap<String, f64>,
-    /// Sizes of package sources in bytes, by manifest directory.
     source_bytes: HashMap<PathBuf, u64>,
     dirty: bool,
 }
@@ -3100,7 +2668,6 @@ impl Timings {
         )
     }
 
-    /// Loads the machine-wide timings, then this project's on top of them.
     fn load(project: &Path, global: &Path) -> Self {
         let read = |p: &Path| -> HashMap<String, f64> {
             std::fs::read_to_string(p)
@@ -3116,8 +2683,6 @@ impl Timings {
         }
     }
 
-    /// Measures the source size of every distinct package directory in
-    /// `dirs`, in parallel.
     fn measure_sources(&mut self, dirs: impl IntoIterator<Item = PathBuf>) {
         let todo: Vec<PathBuf> = dirs
             .into_iter()
@@ -3137,11 +2702,7 @@ impl Timings {
         self.source_bytes.extend(sizes);
     }
 
-    /// Seconds this unit is expected to take: measured if we have seen it
-    /// before, otherwise guessed from the size of its package's sources.
     fn estimate(&self, unit: &CompilationUnit, profile: &Profile) -> f64 {
-        // A unit that runs its own build script also waits for that (measured
-        // separately, since it can overlap the unit's dependencies).
         let script = if unit.build_script.is_some() && unit.ext.script_owner.is_none() {
             self.secs
                 .get(&Self::script_key(unit, profile))
@@ -3163,7 +2724,6 @@ impl Timings {
         self.dirty = true;
     }
 
-    /// Seconds the unit's own compilation is expected to take.
     fn estimate_compile(&self, unit: &CompilationUnit, profile: &Profile) -> f64 {
         if let Some(&secs) = self.secs.get(&Self::key(unit, profile)) {
             return secs;
@@ -3173,9 +2733,7 @@ impl Timings {
             .get(&unit.manifest_dir)
             .copied()
             .unwrap_or(0) as f64;
-        // Roughly: 100 KB of Rust ≈ 1 s, 1 MB ≈ 4 s, 4 MB ≈ 8 s of debug
-        // compile time (fitted to a 182-crate build; only the *ordering*
-        // matters to the scheduler, not the absolute value).
+        // Fitted to a 182-crate build; only the ordering matters.
         let mb = bytes / (1024.0 * 1024.0);
         let mut secs = 0.3 + 3.0 * mb.powf(0.6);
         if unit.harness {
@@ -3190,14 +2748,12 @@ impl Timings {
         secs
     }
 
-    /// Records a compiler's peak memory for this unit.
     fn record_memory(&mut self, unit: &CompilationUnit, profile: &Profile, bytes: u64) {
         self.secs
             .insert(format!("{} rss", Self::key(unit, profile)), bytes as f64);
         self.dirty = true;
     }
 
-    /// The unit's peak memory the last time it was compiled.
     fn memory(&self, unit: &CompilationUnit, profile: &Profile) -> Option<u64> {
         self.secs
             .get(&format!("{} rss", Self::key(unit, profile)))
@@ -3210,9 +2766,6 @@ impl Timings {
         self.dirty = true;
     }
 
-    /// Writes this project's timings, and merges them into the machine-wide
-    /// file (atomically; concurrent builds may lose each other's newest
-    /// numbers, which only costs some scheduling accuracy).
     fn save(&self, project: &Path, global: &Path) {
         if !self.dirty {
             return;
@@ -3225,7 +2778,6 @@ impl Timings {
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_default();
         merged.extend(self.secs.iter().map(|(k, v)| (k.clone(), *v)));
-        // Bound the file: keep it a few thousand entries at most.
         if merged.len() > 20_000 {
             merged.retain(|k, _| self.secs.contains_key(k));
         }
@@ -3238,8 +2790,6 @@ impl Timings {
     }
 }
 
-/// Total size of the `.rs` files below a package directory (build output,
-/// VCS metadata and vendored trees excluded); a cheap proxy for compile time.
 fn rust_source_bytes(dir: &Path) -> u64 {
     const MAX_FILES: usize = 20_000;
     let mut total = 0u64;
@@ -3272,7 +2822,6 @@ fn rust_source_bytes(dir: &Path) -> u64 {
     total
 }
 
-/// `RUSTFLAGS` (or `CARGO_ENCODED_RUSTFLAGS`) as individual arguments.
 pub fn rustflags_from_env() -> Vec<String> {
     if let Ok(encoded) = std::env::var("CARGO_ENCODED_RUSTFLAGS") {
         return encoded
@@ -3286,11 +2835,6 @@ pub fn rustflags_from_env() -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// Turns a failed `rustc` invocation into a human-readable message.
-///
-/// Prefers each diagnostic's pre-rendered, ANSI-colored text (the same text
-/// `rustc` would print directly to a terminal) over dumping the raw
-/// `--json=diagnostic-rendered-ansi` event stream.
 pub fn render_compile_error(result: &CompilationResult) -> String {
     let rendered: String = result
         .diagnostics
@@ -3308,8 +2852,6 @@ pub fn render_compile_error(result: &CompilationResult) -> String {
     }
 }
 
-/// Sets the `CARGO_PKG_*` / `CARGO_CRATE_NAME` / `CARGO_MANIFEST_*`
-/// environment that `env!()` reads at compile time.
 pub fn with_cargo_env(
     mut builder: RustcCommandBuilder,
     unit: &CompilationUnit,
@@ -3355,9 +2897,7 @@ pub fn with_cargo_env(
         builder = builder.env("CARGO_BIN_NAME", &unit.crate_id.name);
     }
 
-    // Cargo always sets all four version components, MAJOR/MINOR/PATCH/PRE,
-    // even when a component is absent (as an empty string) — crates
-    // routinely read all four unconditionally via `env!(...)`.
+    // Cargo always sets all four version components, even empty.
     let core_version = pkg_version.split(['-', '+']).next().unwrap_or(&pkg_version);
     let mut version_parts = core_version.split('.');
     builder
@@ -3382,20 +2922,13 @@ pub fn with_cargo_env(
         )
 }
 
-/// Adds the codegen flags a [`Profile`] implies (`-C opt-level`, `debuginfo`,
-/// `debug-assertions`, `overflow-checks`, `lto`, `panic`, `codegen-units`,
-/// `strip`, `rpath`).
 pub fn with_profile_flags(
     mut builder: RustcCommandBuilder,
     profile: &Profile,
     target: &str,
     links_final_artifact: bool,
 ) -> RustcCommandBuilder {
-    // Only spell out settings that differ from what rustc does on its own for
-    // this opt-level (`opt-level=0` implies debug assertions and overflow
-    // checks; higher levels imply neither). Passing the defaults explicitly
-    // is harmless but makes every command line — and thus every diagnostic
-    // and debug session — noisier than Cargo's.
+    // Only spell out settings that differ from rustc's defaults for this opt-level.
     let opt0 = profile.opt_level == rune_common::OptLevel::O0;
     if !opt0 {
         builder = builder.opt_level(profile.opt_level.as_str());
@@ -3413,17 +2946,11 @@ pub fn with_profile_flags(
             on_off(profile.overflow_checks)
         ));
     }
-    // LTO happens when the final artifact is linked, over the bitcode embedded
-    // in every library it pulls in. So `-C lto` goes only to units that link
-    // (binaries and C-style libraries), never to ordinary libraries or
-    // proc-macros (rustc rejects LTO for proc-macro crates outright); and
-    // bitcode is embedded in libraries exactly when some LTO is in play.
+    // `-C lto` only for units that link; bitcode is embedded exactly when some LTO is in play.
     match (profile.lto.as_flag(), links_final_artifact) {
         (Some(lto), true) => builder = builder.lto(lto),
         (Some(_), false) => {}
         (None, _) => {
-            // Nothing will LTO this crate, so don't spend time and disk
-            // embedding bitcode in it (Cargo does the same).
             builder = builder.codegen_flag("embed-bitcode=no");
         }
     }
@@ -3433,8 +2960,7 @@ pub fn with_profile_flags(
     if let Some(cgu) = profile.codegen_units {
         builder = builder.codegen_units(cgu);
     }
-    // Stripping applies to what gets linked; a stripped proc-macro dylib could
-    // no longer be loaded by the compiler.
+    // A stripped proc-macro could no longer be loaded.
     if let (Some(strip), true) = (&profile.strip, links_final_artifact) {
         builder = builder.codegen_flag(&format!("strip={strip}"));
     }
@@ -3451,17 +2977,11 @@ fn on_off(b: bool) -> &'static str {
     if b { "on" } else { "off" }
 }
 
-/// The triple a unit is compiled for: its `--target`, or the host for host
-/// units (build-script dependencies, proc-macros) and native builds.
 fn compiled_for(unit: &CompilationUnit) -> &str {
     unit.compiled_for()
 }
 
-/// `--remap-path-prefix` flags for `trim-paths`: a registry or git package's
-/// sources become `name-version/src/…` (or the checkout's own relative path),
-/// the workspace's become relative to its root — what Cargo's `trim-paths`
-/// does. The standard library is remapped by rustc itself. The flags are not
-/// part of the key (they name this machine's paths; the result does not).
+/// `--remap-path-prefix` for `trim-paths`. Not part of the key.
 fn trim_path_flags(unit: &CompilationUnit, config: &RuneConfig) -> Vec<String> {
     let with_slash = |p: &Path| {
         let mut s = p.to_string_lossy().into_owned();
@@ -3483,7 +3003,6 @@ fn trim_path_flags(unit: &CompilationUnit, config: &RuneConfig) -> Vec<String> {
     flags
 }
 
-/// Helper to build a complete `rustc` command for a compilation unit.
 pub fn build_rustc_command(
     unit: &CompilationUnit,
     profile: &Profile,
@@ -3492,18 +3011,9 @@ pub fn build_rustc_command(
     build_output: Option<&BuildScriptOutput>,
     color: bool,
 ) -> RustcCommandBuilder {
-    // The unit's own profile (`[profile.*.package.*]`, `build-override`);
-    // the request's profile still names the output directory.
     let eff = unit.effective_profile(profile);
-    // A crate of the project is compiled from the project root with a
-    // relative path, as Cargo does: diagnostics and panic locations read
-    // `src/main.rs`, not an absolute path. Everything else (registry and git
-    // crates, path dependencies outside the project) is compiled from its own
-    // package root, also as Cargo does — never from wherever `rune` happened
-    // to be started. rustc hashes its working directory into the crate's
-    // identity (its SVH): the same crate compiled from two directories is two
-    // different crates to every dependent, and the store shares one result
-    // for both between all projects on the machine.
+    // Project crates compile from the project root with relative paths; others from their own package root.
+    // rustc hashes its working directory into the crate's identity, so this must be stable.
     let unit_source_root = rune_common::fsutil::simplified(&unit.source_root);
     let config_project_root = rune_common::fsutil::simplified(&config.project_root);
     let (source, cwd) = match unit_source_root.strip_prefix(config_project_root) {
@@ -3515,27 +3025,19 @@ pub fn build_rustc_command(
             rune_common::fsutil::simplified(&unit.manifest_dir).to_path_buf(),
         ),
     };
-    // With the platform's separators throughout, as Cargo passes it: rustc
-    // names the file in diagnostics and panics as it was given, and a
-    // manifest's `src/main.rs` below a Windows directory is `app\src/main.rs`.
+    // Platform separators, as Cargo passes it.
     let source: PathBuf = source.components().collect();
     let mut builder = RustcCommandBuilder::new(source)
         .current_dir(cwd)
         .crate_name(&unit.rustc_crate_name())
         .edition(unit.edition.as_str())
         .metadata_hash(&unit.metadata_hash());
-    // A test harness replaces `--crate-type`: rustc generates a `main()` that
-    // discovers and runs every `#[test]` item, and defines `cfg(test)`.
     builder = if unit.harness {
         builder.test_harness()
     } else {
-        // `[lib] crate-type = ["cdylib", "rlib"]` is one compilation with
-        // several outputs, not several compilations.
         unit.all_crate_types()
             .fold(builder, |b, t| b.crate_type(t.rustc_crate_type()))
     };
-    // A test harness is a program too: `[profile.test] lto = "fat"` applies
-    // to it (some crates' tests depend on it, e.g. `no-panic` checks).
     let links_final_artifact = if unit.harness {
         !unit.check_only && unit.crate_type != CrateType::ProcMacro
     } else {
@@ -3546,8 +3048,7 @@ pub fn build_rustc_command(
             )
         })
     };
-    // The test harness needs unwinding, and a panicking proc-macro must not
-    // take the compiler down: both ignore `panic = "abort"`, as in Cargo.
+    // Test harnesses and proc-macros need unwinding: they ignore `panic = "abort"`, as in Cargo.
     let unwinding;
     let eff = if eff.panic != rune_common::PanicStrategy::Unwind
         && (unit.harness || unit.crate_type == CrateType::ProcMacro)
@@ -3566,8 +3067,6 @@ pub fn build_rustc_command(
         builder = builder.extra_flags(trim_path_flags(unit, config));
     }
 
-    // Host units (proc-macros, build-script dependencies) are built for the
-    // machine running the compiler, whatever `--target` says.
     if let (Some(target), false, false) = (
         &unit.target,
         unit.ext.for_host,
@@ -3580,7 +3079,6 @@ pub fn build_rustc_command(
         builder = builder.extra_flags(unit.ext.rustflags.clone());
     }
     if let (Some(linker), true) = (&unit.ext.linker, links_final_artifact) {
-        // `rune:hyprlnk@...` becomes this executable, in linker mode.
         let (exe, env) = rune_common::linker::for_rustc(linker);
         builder = builder.linker(&exe.to_string_lossy());
         if let Some((k, v)) = env {
@@ -3596,10 +3094,7 @@ pub fn build_rustc_command(
         builder = builder.cap_lints("allow");
     }
 
-    // Declare the cfgs Cargo declares for every package it lints: `docsrs`
-    // and `test`, and which `feature = "..."` values exist (none is a list
-    // too), so `unexpected_cfgs` catches typos but not `#[cfg(test)]` — a
-    // crate that denies warnings fails otherwise.
+    // Declare the cfgs Cargo declares (`docsrs`, `test`, feature values) for `unexpected_cfgs`.
     if unit.crate_id.source == CrateSource::Local {
         let values = unit
             .ext
@@ -3618,13 +3113,9 @@ pub fn build_rustc_command(
     }
 
     let profile_dir_name = profile.output_dir_name();
-    // `rune check` never links a binary, so there's nothing to place in the
-    // top-level profile dir — everything lands in `deps/`, like `cargo check`.
     builder = builder.out_dir(&out_dir_for(config, profile, unit));
 
-    // Emits. `rune check` skips codegen and linking for everything except a
-    // proc-macro, which must be a real, loadable dylib even to typecheck code
-    // that invokes it (see `CompilationUnit::produces_real_artifact`).
+    // `rune check` skips codegen except for proc-macros, which must be loadable.
     if unit.check_only && unit.crate_type != CrateType::ProcMacro {
         builder = builder.emit(&["dep-info", "metadata"]);
     } else if unit.crate_type == CrateType::Bin || unit.harness {
@@ -3633,10 +3124,6 @@ pub fn build_rustc_command(
         builder = builder.emit(&["dep-info", "metadata", "link"]);
     }
 
-    // Incremental compilation for the crates being edited (path dependencies
-    // and workspace members) in profiles that ask for it, exactly like Cargo.
-    // Registry crates never change, so incremental state would only cost disk.
-    // It lives in the project's build directory, never in the shared CAS.
     if eff.incremental && unit.crate_id.source == CrateSource::Local {
         let dir = config
             .profile_target_dir(profile_dir_name)
@@ -3649,7 +3136,6 @@ pub fn build_rustc_command(
         builder = builder.incremental(&dir);
     }
 
-    // Dependencies
     builder = builder.search_path("dependency", &config.deps_dir(profile_dir_name));
     for (crate_name, path) in extern_deps {
         builder = builder.extern_crate(crate_name, path);
@@ -3659,7 +3145,6 @@ pub fn build_rustc_command(
         builder = builder.feature(feat);
     }
 
-    // Build script outputs (native libs, search paths, cfgs, envs)
     if unit.build_script.is_some() {
         let key = unit
             .ext
@@ -3693,11 +3178,9 @@ pub fn build_rustc_command(
         }
     }
 
-    // JSON output for diagnostics & artifact tracking
     builder.json_output(color)
 }
 
-/// Whether a `cargo::rustc-link-arg*` directive applies to this unit.
 fn link_arg_applies(scope: &LinkArgScope, unit: &CompilationUnit) -> bool {
     let links = !unit.check_only
         && (unit.harness
@@ -3725,25 +3208,8 @@ fn link_arg_applies(scope: &LinkArgScope, unit: &CompilationUnit) -> bool {
     }
 }
 
-/// Computes the content-addressable cache key for a compilation unit.
-///
-/// The key is the unit's *complete* identity, not merely its source:
-///
-/// * the unit itself (`metadata_hash`: package, version, **source identity**,
-///   crate types, features, target, edition, mode, role),
-/// * every codegen-relevant setting of its *effective* profile,
-/// * the compiler — executable, version, driver, and the `RUSTC_WRAPPER` /
-///   `RUSTC_WORKSPACE_WRAPPER` in front of it,
-/// * the effective `rustflags`, linker, lint flags and package metadata baked
-///   in via `env!`,
-/// * for local packages, every input file, and
-/// * every dependency's own key (so a change deep in the graph invalidates
-///   everything above it).
-///
-/// *Registry* and *Git* crates are immutable — a checksum or a commit pins
-/// their content — so their inputs are not read from disk at all. Only local
-/// (path) packages are hashed, package-wide and mtime-gated (see
-/// [`rune_fingerprint::hasher::compute_package_hash`]).
+/// A unit's complete identity: the unit, its effective profile, the compiler and wrappers, flags, linker,
+/// metadata, local input files and every dependency's key. Registry/git crates are never read from disk.
 pub fn compute_unit_cas_key(
     unit: &CompilationUnit,
     profile: &Profile,
@@ -3761,20 +3227,14 @@ pub fn compute_unit_cas_key(
     .key
 }
 
-/// What a unit's key is made of, part by part: what `rune explain` compares
-/// to say why a unit is (or would be) compiled again.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct UnitIdentity {
     pub key: String,
-    /// Part (`sources`, `toolchain`, `dependency serde`, …) → digest.
     pub parts: std::collections::BTreeMap<String, String>,
-    /// Local packages: each file (relative to the package) → content hash.
     #[serde(default)]
     pub files: std::collections::BTreeMap<String, String>,
 }
 
-/// Feeds the key hasher exactly as before, and — when the parts are wanted
-/// (`rune explain`'s records) — a hasher per named part.
 struct KeyRecorder {
     key: rune_common::hash::HashBuilder,
     parts: Option<std::collections::BTreeMap<String, rune_common::hash::HashBuilder>>,
@@ -3795,7 +3255,6 @@ impl KeyRecorder {
     }
 }
 
-/// [`compute_unit_cas_key`], with the key's parts.
 pub fn compute_unit_identity(
     unit: &CompilationUnit,
     profile: &Profile,
@@ -3812,9 +3271,6 @@ pub fn compute_unit_identity(
     )
 }
 
-/// [`compute_unit_identity`] keyed by the files a local crate read when it
-/// was last compiled, when they are known (see [`inputs::ReadRecord`]), and
-/// by the key of its build script's result if it has one.
 pub fn compute_unit_identity_from(
     unit: &CompilationUnit,
     profile: &Profile,
@@ -3829,8 +3285,6 @@ pub fn compute_unit_identity_from(
     identity_with(unit, profile, dep_keys, source_cache, sources, true)
 }
 
-/// The key alone of [`compute_unit_identity_from`] (without the parts it
-/// is made of, which only `rune explain`'s records need).
 pub fn compute_unit_key_from(
     unit: &CompilationUnit,
     profile: &Profile,
@@ -3845,11 +3299,7 @@ pub fn compute_unit_key_from(
     identity_with(unit, profile, dep_keys, source_cache, sources, false).key
 }
 
-/// Where the files a local crate read are recorded (`<this>-read`). Keyed
-/// by the crate's configuration and its root file's contents, so each
-/// version of the root keeps its record. A record that does not fit only
-/// costs a miss: a stored result's key names the files it read and their
-/// contents.
+/// Keyed by configuration and root file contents; a stale record only costs a miss.
 pub fn read_record_key(
     unit: &CompilationUnit,
     source_cache: &mut rune_fingerprint::FingerprintCache,
@@ -3873,22 +3323,12 @@ pub fn read_record_key(
     Some(hb.finish_blake3())
 }
 
-/// Which of a local package's files a unit's key covers.
 enum Sources<'a> {
-    /// None (a build script result's base: the script says what it read).
     None,
-    /// Every file of the package (nothing is known about what it reads).
     Package,
-    /// The files it read when it was last compiled, and the key of the build
-    /// script result it compiles with (whose output — generated code in
-    /// `OUT_DIR`, cfgs, environment — the files do not cover).
     Read(&'a inputs::ReadRecord, Option<&'a str>),
 }
 
-/// The base key of a unit's *build script result*: the unit's configuration
-/// without its package's sources (which [`inputs::script_result_key`] adds
-/// back as the script declared them), with the script's build-dependencies
-/// and the `DEP_*` values it receives in place of the unit's dependencies.
 pub fn compute_script_base(
     unit: &CompilationUnit,
     profile: &Profile,
@@ -3907,9 +3347,7 @@ pub fn compute_script_base(
     if let Some(script) = &unit.build_script {
         let rel = script.strip_prefix(&unit.manifest_dir).unwrap_or(script);
         hb.update(rel.to_string_lossy().as_bytes());
-        // The script itself: two packages that agree on everything else (the
-        // same name and version in two projects) must not share a record of
-        // what the other's script read.
+        // Two packages agreeing on everything else must not share a record of what the other's script read.
         hb.update(b"\0script=");
         hb.update(inputs::hash_path(script).as_bytes());
     }
@@ -3932,8 +3370,6 @@ fn identity_with(
     hb.update(UNIT, unit.metadata_hash().as_bytes());
     let eff = unit.effective_profile(profile);
     hb.update("profile", eff.codegen_fingerprint().as_bytes());
-    // A platform default (not in the profile itself) that changes what rustc
-    // emits. Only added when it applies, so other platforms' keys are unchanged.
     if eff.split_debuginfo.is_none()
         && let Some(split) = eff.split_debuginfo_for(compiled_for(unit))
     {
@@ -3945,9 +3381,6 @@ fn identity_with(
         "toolchain",
         toolchain::global().identity_for(unit.ext.member).as_bytes(),
     );
-    // How Rune runs the compiler, where that changes what it produces for the
-    // same inputs. 2: crates outside the project compile in their package
-    // root (rustc hashes its working directory into a crate's identity).
     hb.update("toolchain", INVOCATION.as_bytes());
     for flag in &unit.ext.rustflags {
         hb.update("rustflags", b"\0rustflag=");
@@ -3971,8 +3404,6 @@ fn identity_with(
             hb.update("environment", v.as_bytes());
         }
     }
-    // How the build script is compiled and what it links against is part of
-    // what the package produces.
     if let Some(p) = &unit.ext.script_profile
         && unit.build_script.is_some()
     {
@@ -4009,8 +3440,6 @@ fn identity_with(
         hb.update("lints", b"\0lint=");
         hb.update("lints", arg.as_bytes());
     }
-    // The cfgs declared for `unexpected_cfgs` (see `build_rustc_command`)
-    // decide which warnings a local crate's result replays.
     if unit.crate_id.source == CrateSource::Local {
         hb.update("lints", b"\0check-cfg=docsrs,test,features");
     }
@@ -4021,21 +3450,16 @@ fn identity_with(
 
     let mut files = std::collections::BTreeMap::new();
     if unit.crate_id.source == CrateSource::Local && !matches!(sources, Sources::None) {
-        // Where the crate root lives is an input too (`[lib] path = ...`).
         let rel_root = unit
             .source_root
             .strip_prefix(&unit.manifest_dir)
             .unwrap_or(&unit.source_root);
         hb.update("crate root", rel_root.to_string_lossy().as_bytes());
         if let Sources::Read(record, script) = sources {
-            // The result of its build script: what it generated, set and
-            // linked follows from that.
             if let Some(script) = script {
                 hb.update("build script result", b"script=");
                 hb.update("build script result", script.as_bytes());
             }
-            // Exactly the files it read, by name and contents ("missing" for
-            // one that is gone).
             hb.update("sources", b"read\0");
             for (name, path) in record.paths(&unit.manifest_dir) {
                 let hash = rune_fingerprint::hasher::file_hash(&path, source_cache)
@@ -4057,9 +3481,6 @@ fn identity_with(
                 files.extend(source_cache.package_file_hashes(&unit.manifest_dir));
             }
         }
-        // A build script (or crate root) can live outside the package
-        // directory (`build = "../shared/build.rs"`), where the walk above
-        // doesn't see it.
         for outside in [
             unit.build_script.as_deref(),
             Some(unit.source_root.as_path()),
@@ -4074,14 +3495,10 @@ fn identity_with(
         }
     }
 
-    // `dep_keys` arrives in dependency order, which traces back to iterating
-    // a `HashMap` during graph construction — Rust randomizes iteration order
-    // per process, so hashing it unsorted made the key change from run to run
-    // for any unit with more than one dependency.
+    // Sorted: `dep_keys` order comes from a `HashMap`.
     let mut sorted_dep_keys: Vec<&(String, String)> = dep_keys.iter().collect();
     sorted_dep_keys.sort();
     for (dep_name, dep_key) in sorted_dep_keys {
-        // `dep:alias:crate` / `build-dep:alias:crate`.
         let mut it = dep_name.splitn(3, ':');
         let part = match (it.next(), it.nth(1)) {
             (Some("build-dep"), Some(krate)) => format!("build dependency {krate}"),
@@ -4104,8 +3521,6 @@ fn identity_with(
     }
 }
 
-/// A stable name for a unit across builds (its key and hash change with
-/// what it is built from; this does not): package, target, role, profile.
 pub fn unit_label(unit: &CompilationUnit, profile: &Profile) -> String {
     let mut label = format!(
         "{} v{} ({} `{}`",
@@ -4130,7 +3545,6 @@ pub fn unit_label(unit: &CompilationUnit, profile: &Profile) -> String {
     label
 }
 
-/// The identities of the last build, by [`unit_label`].
 pub fn load_identities(fingerprint_dir: &Path) -> HashMap<String, UnitIdentity> {
     std::fs::read_to_string(fingerprint_dir.join("identities.json"))
         .ok()
@@ -4179,7 +3593,6 @@ mod tests {
 
     #[test]
     fn registry_keys_never_touch_the_filesystem() {
-        // The directory doesn't exist: a registry key must not care.
         let u = unit("serde", registry(), Path::new("/nonexistent/x"));
         assert_eq!(key(&u, &Profile::dev()), key(&u, &Profile::dev()));
     }
@@ -4248,7 +3661,6 @@ mod tests {
             u.target_name = name.into();
             graph.add_node(u);
         }
-        // 3 GiB free of 8: room for several ordinary compilers.
         fn roomy() -> Option<rune_common::sysinfo::Memory> {
             Some(rune_common::sysinfo::Memory {
                 total: 8 << 30,
@@ -4261,12 +3673,9 @@ mod tests {
             .execute(&graph)
             .unwrap();
         assert!(first.success);
-        // Each compiler's peak was measured and kept.
         let path = config.fingerprint_dir.join("timings.json");
         let mut timings: HashMap<String, f64> =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        // (The timings file also holds the machine-wide ones, of real builds
-        // and other tests: packages named `two` among them.)
         let our_keys: HashSet<String> = graph
             .nodes()
             .iter()
@@ -4281,7 +3690,6 @@ mod tests {
                 .filter(|(k, _)| ours(k))
                 .all(|(_, v)| *v > 0.0)
         );
-        // Pretend each needed 2 GiB: two at once would not fit in 3.
         for (k, v) in timings.iter_mut() {
             if ours(k) {
                 *v = (2u64 << 30) as f64;
@@ -4306,10 +3714,8 @@ mod tests {
     #[test]
     fn auto_frontend_threads_use_only_idle_cores() {
         use rune_common::settings::FrontendThreads::*;
-        // A busy machine: one thread, i.e. no flag.
         assert_eq!(frontend_threads(Auto, 10, 10, 0), None);
         assert_eq!(frontend_threads(Auto, 10, 4, 6), None);
-        // The last crate of a build on an otherwise idle machine.
         assert_eq!(frontend_threads(Auto, 10, 1, 0), Some(8));
         assert_eq!(frontend_threads(Auto, 4, 2, 0), Some(3));
         assert_eq!(frontend_threads(Off, 16, 1, 0), None);
@@ -4373,14 +3779,11 @@ mod tests {
                 "missing {expected}: {args:?}"
             );
         }
-        // Release defaults (`debug-assertions` off) match rustc's own for
-        // opt-level 3, so they are not spelled out.
         assert!(
             !args.iter().any(|a| a.starts_with("debug-assertions")),
             "{args:?}"
         );
 
-        // A non-default combination *is* spelled out.
         let mut odd = Profile::release();
         odd.debug_assertions = true;
         odd.overflow_checks = true;
@@ -4398,7 +3801,6 @@ mod tests {
         assert!(args.iter().any(|a| a == "debug-assertions=on"), "{args:?}");
         assert!(args.iter().any(|a| a == "overflow-checks=on"), "{args:?}");
 
-        // LTO is a link-time flag: libraries and proc-macros never get it.
         let cmd = with_profile_flags(
             RustcCommandBuilder::new("x.rs".into()),
             &p,
@@ -4422,8 +3824,6 @@ mod tests {
 
     #[test]
     fn rustflags_are_split_on_whitespace() {
-        // Only exercises the parser; env vars are process-global, so use the
-        // pure splitting logic through a scoped set.
         let parsed: Vec<String> = "-C target-cpu=native  -D warnings"
             .split_whitespace()
             .map(str::to_string)

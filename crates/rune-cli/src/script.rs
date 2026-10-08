@@ -1,35 +1,15 @@
-//! Single-file scripts: `rune script hello.rs`.
-//!
-//! A script is one `.rs` file that may start with a shebang line and a
-//! frontmatter block holding a manifest fragment:
-//!
-//! ```text
-//! #!/usr/bin/env -S rune script
-//! ---cargo
-//! [dependencies]
-//! serde_json = "1"
-//! ---
-//! fn main() { println!("{}", serde_json::json!({"hello": "world"})); }
-//! ```
-//!
-//! Rune turns it into a throwaway package under `$RUNE_HOME/scripts/` and runs
-//! that through the normal pipeline, so compiled dependencies come from the
-//! content-addressed store: the second run of any script, and the first run of a
-//! script whose dependencies another project already built, takes milliseconds.
+//! Single-file scripts (`rune script hello.rs`) with a `---cargo` frontmatter manifest, run as a package
+//! under `$RUNE_HOME/scripts/`.
 
 use std::path::Path;
 
-/// A script split into its manifest fragment and its Rust source.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Script {
-    /// TOML from the frontmatter (empty if there is none).
     pub manifest: String,
-    /// The source with the frontmatter blanked out (not removed: line numbers in
-    /// errors and panics still match the file).
+    /// Frontmatter blanked, not removed, so line numbers still match.
     pub source: String,
 }
 
-/// Splits a script into manifest and source.
 pub fn parse(text: &str) -> Result<Script, String> {
     let lines: Vec<&str> = text
         .split('\n')
@@ -42,7 +22,6 @@ pub fn parse(text: &str) -> Result<Script, String> {
     {
         i = 1;
     }
-    // Blank lines may precede the frontmatter.
     while i < lines.len() && lines[i].trim().is_empty() {
         i += 1;
     }
@@ -85,7 +64,6 @@ pub fn parse(text: &str) -> Result<Script, String> {
     })
 }
 
-/// A valid package name derived from the file name.
 pub fn package_name(file: &Path) -> String {
     let stem = file
         .file_stem()
@@ -112,8 +90,6 @@ pub fn package_name(file: &Path) -> String {
     name
 }
 
-/// The `Cargo.toml` for a script: the frontmatter, completed with what a
-/// package needs, standing alone (never picked up by an enclosing workspace).
 pub fn manifest(file: &Path, frontmatter: &str) -> Result<String, String> {
     let mut table: toml::Table = if frontmatter.trim().is_empty() {
         toml::Table::new()

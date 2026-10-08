@@ -1,23 +1,17 @@
 use std::collections::{BTreeSet, HashMap};
 
-/// Resolves and unifies features across the dependency graph.
-/// When multiple crates depend on the same crate with different features,
-/// the features are unified (merged).
 #[derive(Debug, Default)]
 pub struct FeatureResolver {
-    /// Map from crate name to its resolved (unified) feature set.
     resolved: HashMap<String, BTreeSet<String>>,
 }
 
 impl FeatureResolver {
-    /// Creates a new `FeatureResolver`.
     pub fn new() -> Self {
         Self {
             resolved: HashMap::new(),
         }
     }
 
-    /// Add a feature request: crate `name` should have feature `feature` enabled.
     pub fn request_feature(&mut self, name: &str, feature: &str) {
         self.resolved
             .entry(name.to_string())
@@ -25,7 +19,6 @@ impl FeatureResolver {
             .insert(feature.to_string());
     }
 
-    /// Add multiple feature requests at once.
     pub fn request_features(&mut self, name: &str, features: &[String]) {
         let entry = self.resolved.entry(name.to_string()).or_default();
         for feature in features {
@@ -33,7 +26,6 @@ impl FeatureResolver {
         }
     }
 
-    /// Get the unified feature set for a crate.
     pub fn resolved_features(&self, name: &str) -> Vec<String> {
         self.resolved
             .get(name)
@@ -41,8 +33,6 @@ impl FeatureResolver {
             .unwrap_or_default()
     }
 
-    /// Resolve default features: if a dependency has `default-features = true` (the default),
-    /// add all features listed in `default = [...]` from the dependency's own manifest.
     pub fn apply_defaults(&mut self, name: &str, default_features: &[String]) {
         self.request_features(name, default_features);
     }
@@ -56,13 +46,10 @@ mod tests {
     fn test_feature_unification() {
         let mut resolver = FeatureResolver::new();
 
-        // Crate A requests "serde" and "json" for Crate C
         resolver.request_features("crate_c", &["serde".to_string(), "json".to_string()]);
 
-        // Crate B requests "serde" and "xml" for Crate C
         resolver.request_features("crate_c", &["serde".to_string(), "xml".to_string()]);
 
-        // Crate D requests "async" for Crate E
         resolver.request_feature("crate_e", "async");
 
         let mut resolved_c = resolver.resolved_features("crate_c");

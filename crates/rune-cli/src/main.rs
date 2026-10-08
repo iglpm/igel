@@ -1,5 +1,3 @@
-//! The Rune command-line interface.
-
 mod affected;
 mod args;
 mod cmd_audit;
@@ -36,9 +34,7 @@ mod workspace;
 
 use clap::Parser;
 
-/// Most of what Rune does between compilers is small allocations (index
-/// records, keys, paths) on many threads, where glibc's allocator spent
-/// about 40 % of an offline resolution.
+/// Mostly small allocations on many threads, where glibc's allocator was ~40% of a resolution.
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 use std::ffi::OsString;
@@ -47,33 +43,26 @@ use args::{Cli, Commands};
 use graph::Mode;
 
 fn main() {
-    // The built-in linker (`build.linker = "hyprlnk"`): Rune passes its own
-    // executable to rustc as the linker and marks the compiler's environment,
-    // so this process is rustc running "the linker".
+    // `build.linker = "hyprlnk"`: this process is rustc running "the linker".
     if std::env::var_os(rune_common::linker::EMBEDDED_ENV).is_some() {
         std::process::exit(hyprlnk::main_with_args(std::env::args_os()));
     }
-    // `rune __hyprlnk <link.exe-style arguments>`: the same, by hand.
     if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("__hyprlnk")) {
         let args = std::iter::once(OsString::from("hyprlnk")).chain(std::env::args_os().skip(2));
         std::process::exit(hyprlnk::main_with_args(args));
     }
-    // `rune tree | head`: when the reader goes away, stop quietly, as Cargo
-    // and every Unix tool do, instead of panicking on the next write.
+    // `rune tree | head`: stop quietly when the reader goes away, as Unix tools do.
     #[cfg(unix)]
     // SAFETY: called first thing, before any other thread exists.
     unsafe {
         libc::signal(libc::SIGPIPE, libc::SIG_DFL);
     }
-    // The sandbox helper (`build.sandbox`): confine, then run the program.
     if std::env::args_os().nth(1).as_deref()
         == Some(std::ffi::OsStr::new(rune_common::sandbox::HELPER_ARG))
     {
         let rest: Vec<OsString> = std::env::args_os().skip(2).collect();
         rune_common::sandbox::helper_main(&rest);
     }
-    // llvm-cov's demangler (`rune coverage --html`): mangled names in, one
-    // per line; readable names out.
     if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("__demangle")) {
         cmd_coverage::demangle_stdin();
         return;
@@ -93,7 +82,6 @@ fn main() {
             return;
         }
         Err(e) if e.kind() == clap::error::ErrorKind::InvalidSubcommand => unknown_command(&e),
-        // Usage errors in Rune's own style (`✗ …`), clap's text otherwise.
         Err(e)
             if e.use_stderr()
                 && e.kind() != clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand =>
@@ -177,10 +165,6 @@ fn main() {
     }
 }
 
-/// An error and its causes, each once: errors that already include their
-/// cause in their own message (a TOML error naming the file and the parse
-/// error) would otherwise print it twice. A cause spanning several lines
-/// (a compiler's or parser's report) starts on a line of its own.
 fn render_error(err: &anyhow::Error) -> String {
     let mut parts: Vec<String> = Vec::new();
     for cause in err.chain() {
@@ -201,8 +185,6 @@ fn render_error(err: &anyhow::Error) -> String {
     out
 }
 
-/// `rune buidl`: Rune's own error line and the nearest commands (not the
-/// one-letter aliases clap would also offer).
 fn unknown_command(e: &clap::Error) -> ! {
     use clap::error::{ContextKind, ContextValue};
     let Some(ContextValue::String(name)) = e.get(ContextKind::InvalidSubcommand) else {
@@ -227,7 +209,6 @@ fn unknown_command(e: &clap::Error) -> ! {
     std::process::exit(e.exit_code())
 }
 
-/// What to do about an error the machine caused, not the project.
 fn hint_for(err: &anyhow::Error) -> Option<String> {
     for cause in err.chain() {
         if let Some(io) = cause.downcast_ref::<std::io::Error>() {
@@ -279,8 +260,6 @@ fn disk_full_hint() -> String {
         .to_string()
 }
 
-/// A panic is a bug in Rune: say so plainly, with what to report, instead of
-/// a bare panic message under a half-drawn progress line.
 fn install_panic_hook() {
     use colored::Colorize;
     static REPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -289,7 +268,6 @@ fn install_panic_hook() {
         if std::env::var_os("RUST_BACKTRACE").is_some() {
             default(info);
         }
-        // A worker's panic resurfaces where its scope ends: report it once.
         if REPORTED.swap(true, std::sync::atomic::Ordering::SeqCst) {
             return;
         }
@@ -317,7 +295,6 @@ fn install_panic_hook() {
     }));
 }
 
-/// `--color` takes effect before anything is printed, help included.
 fn apply_color_flag(args: &[OsString]) {
     let mut words = args.iter().filter_map(|a| a.to_str());
     let mut choice = None;

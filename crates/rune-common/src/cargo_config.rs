@@ -1,40 +1,22 @@
-//! Hierarchical `.cargo/config.toml` support.
-//!
-//! A project's build can be steered from configuration files as well as the
-//! manifest: `build.rustc`, `build.rustc-wrapper`, `build.rustflags`,
-//! `[target.<triple>] linker/runner/rustflags`, `[env]`, `[source.*]`,
-//! `[registries.*]`, `[patch]`, credentials. Rune reads the same files Cargo
-//! does, with Cargo's rules:
-//!
-//! * `.cargo/config.toml` (or the legacy `.cargo/config`) in the working
-//!   directory and every parent, then `$CARGO_HOME/config.toml`;
-//! * closer files win for scalars, tables merge, and arrays are joined with the
-//!   lower-precedence entries first;
-//! * `CARGO_*` environment variables override the files;
-//! * relative paths in path-like keys are relative to the directory *containing*
-//!   `.cargo/`, unless they are bare program names.
+//! `.cargo/config.toml`, read with Cargo's rules: closer files win for scalars, tables merge, arrays join
+//! lower-precedence first, `CARGO_*` env vars override, and path-like keys are relative to the directory
+//! containing `.cargo/`.
 
 use std::path::{Path, PathBuf};
 use toml::{Table, Value};
 
-/// The merged view of every config file that applies.
 #[derive(Debug, Clone, Default)]
 pub struct CargoConfig {
     table: Table,
-    /// The files that contributed, closest first.
     pub files: Vec<PathBuf>,
-    /// Files that exist but could not be read or parsed, with why. A command
-    /// that builds refuses to go on (a mirror, rustflags or linker silently
-    /// not applying is worse than an error), as Cargo does.
+    /// Unreadable files: a build refuses to go on, as Cargo does.
     pub errors: Vec<(PathBuf, String)>,
 }
 
-/// One `[env]` entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EnvEntry {
     pub name: String,
     pub value: String,
-    /// Overwrite a variable that is already set.
     pub force: bool,
 }
 
@@ -43,8 +25,6 @@ impl CargoConfig {
         Self::default()
     }
 
-    /// Loads every config file that applies to a build started in `start`,
-    /// under whatever `--config` gave on the command line.
     pub fn load(start: &Path) -> Self {
         let mut cfg = Self::default();
         for entry in cli_overrides() {
@@ -83,8 +63,6 @@ impl CargoConfig {
         cfg
     }
 
-    /// Parses config text as if it lived in `<base>/.cargo/config.toml`.
-    /// Later calls are lower precedence than earlier ones.
     pub fn add_str(&mut self, text: &str, base: &Path) -> Result<(), toml::de::Error> {
         let mut table: Table = toml::from_str(text)?;
         absolutize(&mut table, base);
@@ -96,9 +74,6 @@ impl CargoConfig {
         self.add_file_depth(path, base, 0);
     }
 
-    /// Adds a file and then what its `include` names (`"a.toml"`, a list of
-    /// paths, or `{ path, optional }` tables, relative to the including
-    /// file): the including file wins over what it includes.
     fn add_file_depth(&mut self, path: &Path, base: &Path, depth: usize) {
         if depth > 8 || (depth > 0 && self.files.iter().any(|f| f == path)) {
             return;
@@ -164,7 +139,6 @@ impl CargoConfig {
         }
     }
 
-    /// The first problem with a configuration file, as an error message.
     pub fn error(&self) -> Option<String> {
         self.errors.first().map(|(path, e)| {
             if path.as_os_str() == "--config" {
@@ -178,7 +152,6 @@ impl CargoConfig {
         })
     }
 
-    /// Looks up a value by path, e.g. `["build", "rustc"]`, ignoring the environment.
     pub fn file_value(&self, path: &[&str]) -> Option<&Value> {
         let mut cur: &Table = &self.table;
         for (i, seg) in path.iter().enumerate() {
@@ -191,7 +164,6 @@ impl CargoConfig {
         None
     }
 
-    /// The `CARGO_*` variable that overrides `path`.
     pub fn env_name(path: &[&str]) -> String {
         let mut s = String::from("CARGO");
         for seg in path {
@@ -207,7 +179,6 @@ impl CargoConfig {
         s
     }
 
-    /// A string setting, environment first.
     pub fn string(&self, path: &[&str]) -> Option<String> {
         if let Ok(v) = std::env::var(Self::env_name(path)) {
             return Some(v);
@@ -217,7 +188,6 @@ impl CargoConfig {
             .map(str::to_string)
     }
 
-    /// A boolean setting, environment first.
     pub fn bool(&self, path: &[&str]) -> Option<bool> {
         if let Ok(v) = std::env::var(Self::env_name(path)) {
             return match v.as_str() {
@@ -229,8 +199,6 @@ impl CargoConfig {
         self.file_value(path).and_then(Value::as_bool)
     }
 
-    /// A list of strings (`["a", "b"]`, or one string split on whitespace),
-    /// environment first (whitespace-separated).
     pub fn string_list(&self, path: &[&str]) -> Option<Vec<String>> {
         if let Ok(v) = std::env::var(Self::env_name(path)) {
             return Some(v.split_whitespace().map(str::to_string).collect());
@@ -246,19 +214,15 @@ impl CargoConfig {
         }
     }
 
-    /// A sub-table (`[registries]`, `[source]`, ...).
     pub fn table(&self, path: &[&str]) -> Option<&Table> {
         self.file_value(path).and_then(Value::as_table)
     }
 
-    /// The whole merged document.
     pub fn root(&self) -> &Table {
         &self.table
     }
 
-    /// `[target.<triple>]` and `[target.'cfg(..)']` tables that apply to a
-    /// target: the exact-triple table first, then every matching `cfg` table
-    /// in key order (Cargo rejects conflicting `linker` values among them).
+    /// Exact-triple table first, then every matching `cfg` table in key order.
     pub fn target_tables<'a>(
         &'a self,
         triple: &str,
@@ -287,7 +251,6 @@ impl CargoConfig {
         out
     }
 
-    /// The `[env]` table.
     pub fn env_entries(&self) -> Vec<EnvEntry> {
         let Some(env) = self.table(&["env"]) else {
             return Vec::new();
@@ -317,8 +280,6 @@ impl CargoConfig {
     }
 }
 
-/// Merges `lower` (lower precedence) into `higher`: scalars keep the higher
-/// value, tables merge recursively, arrays are joined lower-first.
 fn merge(higher: &mut Table, lower: Table) {
     for (key, low) in lower {
         match higher.get_mut(&key) {
@@ -365,10 +326,7 @@ fn abs(p: &str, base: &Path) -> String {
     }
 }
 
-/// Rewrites config-relative paths (see the module docs) to absolute ones, so a
-/// merged table no longer needs to remember which file a value came from.
 fn absolutize(root: &mut Table, base: &Path) {
-    // build.<key>
     if let Some(Value::Table(build)) = root.get_mut("build") {
         for key in [
             "rustc",
@@ -381,7 +339,6 @@ fn absolutize(root: &mut Table, base: &Path) {
             }
         }
     }
-    // target.<x>.linker / runner
     if let Some(Value::Table(targets)) = root.get_mut("target") {
         for (_, t) in targets.iter_mut() {
             let Value::Table(t) = t else { continue };
@@ -406,13 +363,11 @@ fn absolutize(root: &mut Table, base: &Path) {
             }
         }
     }
-    // source.<x>.directory / local-registry
     if let Some(Value::Table(sources)) = root.get_mut("source") {
         for (_, t) in sources.iter_mut() {
             let Value::Table(t) = t else { continue };
             for key in ["directory", "local-registry"] {
                 if let Some(Value::String(s)) = t.get_mut(key) {
-                    // Always config-relative, slash or not.
                     if !Path::new(s.as_str()).is_absolute() {
                         *s = join_path(base, s);
                     }
@@ -420,7 +375,6 @@ fn absolutize(root: &mut Table, base: &Path) {
             }
         }
     }
-    // patch.<source>.<name>.path
     if let Some(Value::Table(patches)) = root.get_mut("patch") {
         for (_, srcs) in patches.iter_mut() {
             let Value::Table(srcs) = srcs else { continue };
@@ -434,7 +388,6 @@ fn absolutize(root: &mut Table, base: &Path) {
             }
         }
     }
-    // paths = [..]
     if let Some(Value::Array(paths)) = root.get_mut("paths") {
         for p in paths.iter_mut() {
             if let Value::String(s) = p
@@ -444,7 +397,6 @@ fn absolutize(root: &mut Table, base: &Path) {
             }
         }
     }
-    // [env] entries with `relative = true`
     if let Some(Value::Table(env)) = root.get_mut("env") {
         for (_, v) in env.iter_mut() {
             if let Value::Table(t) = v
@@ -459,8 +411,6 @@ fn absolutize(root: &mut Table, base: &Path) {
 
 static CLI_OVERRIDES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
 
-/// `--config KEY=VALUE` (TOML) or `--config path/to/file.toml` from the
-/// command line: the highest-precedence configuration, as with Cargo.
 pub fn set_cli_overrides(entries: Vec<String>) {
     let _ = CLI_OVERRIDES.set(entries);
 }
@@ -507,7 +457,6 @@ mod tests {
     }
 
     fn cfg(files: &[(&str, &str)]) -> CargoConfig {
-        // Closest first, like `load`.
         let mut c = CargoConfig::empty();
         for (base, text) in files {
             c.add_str(text, Path::new(base)).unwrap();

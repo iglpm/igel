@@ -1,8 +1,4 @@
-//! # rune-resolver
-//!
-//! High-speed SemVer dependency resolver, dynamic feature unifier,
-//! dual binary (`Rune.lock.bin`) & standard (`Cargo.lock`) lockfile manager,
-//! dependency tree visualizer, and reverse-dependency tracer for Rune.
+//! Dependency resolution, feature unification, lockfiles, `rune tree`/`rune why`.
 
 pub mod features;
 pub mod lockfile;

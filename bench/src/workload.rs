@@ -1,13 +1,4 @@
-//! What gets built: generated workspaces of known shape, or a copy of a real
-//! project.
-//!
-//! Generated workspaces are layered: every crate of a layer depends on two
-//! crates of the layer below, every crate of layer 1 on the `core` crate,
-//! and an `app` package (library, binary, integration test) on the whole top
-//! layer. Editing `core` therefore rebuilds everything; editing `app` only
-//! `app`. The code is plain functions and small generic types, so compile
-//! times grow with size the way real crates' do. Generation is deterministic:
-//! the same name always gives the same sources.
+//! Generated layered workspaces of known shape, or a copy of a real project.
 
 use anyhow::{Context, Result, bail};
 use std::fmt::Write as _;
@@ -18,11 +9,8 @@ pub struct Workload {
     pub name: String,
     pub description: String,
     pub source: Source,
-    /// A file whose change rebuilds one crate at the top of the graph.
     pub leaf_edit: Option<PathBuf>,
-    /// A file whose change rebuilds (nearly) everything.
     pub core_edit: Option<PathBuf>,
-    /// An integration test: its change rebuilds that test alone.
     pub test_edit: Option<PathBuf>,
 }
 
@@ -36,9 +24,7 @@ pub enum Source {
 pub struct Spec {
     pub layers: usize,
     pub width: usize,
-    /// Functions per crate.
     pub fns: usize,
-    /// Unit tests per crate.
     pub tests: usize,
 }
 
@@ -48,7 +34,6 @@ impl Spec {
     }
 }
 
-/// The built-in workloads, smallest first.
 pub fn builtin() -> Vec<Workload> {
     let generated = |name: &str, spec: Spec, what: &str| Workload {
         name: name.to_string(),
@@ -92,7 +77,6 @@ pub fn builtin() -> Vec<Workload> {
     ]
 }
 
-/// A real project at `path`, copied before every use so it is never touched.
 pub fn project(
     path: &Path,
     leaf: Option<PathBuf>,
@@ -109,15 +93,12 @@ pub fn project(
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "project".into());
-    // Without a file to edit, the top package's own sources stand in for the
-    // leaf: a change there is what an edit-compile loop looks like.
     let leaf = leaf.or_else(|| {
         ["src/main.rs", "src/lib.rs"]
             .into_iter()
             .map(PathBuf::from)
             .find(|f| path.join(f).is_file())
     });
-    // Without one named, the first of the top package's integration tests.
     let test = test.or_else(|| {
         let mut tests: Vec<PathBuf> = std::fs::read_dir(path.join("tests"))
             .into_iter()
@@ -141,7 +122,6 @@ pub fn project(
 }
 
 impl Workload {
-    /// Writes the workload's sources into `dest` (which must not exist yet).
     pub fn materialize(&self, dest: &Path) -> Result<()> {
         std::fs::create_dir_all(dest)?;
         match &self.source {
@@ -151,14 +131,7 @@ impl Workload {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Edits
-// ---------------------------------------------------------------------------
-
-/// Puts `file` (relative to `dir`) into edit state `n`: generated files hold
-/// `pub const EDIT: u64 = <n>;`, other files get a trailing comment. The
-/// same `n` always gives the same content, so a state can be returned to
-/// (a branch switched back).
+/// Edit state `n` always gives the same content, so a state can be returned to.
 pub fn apply_edit(dir: &Path, file: &Path, n: u64) -> Result<()> {
     let path = dir.join(file);
     let pristine = pristine_path(&path);
@@ -179,8 +152,6 @@ pub fn apply_edit(dir: &Path, file: &Path, n: u64) -> Result<()> {
     Ok(())
 }
 
-/// Where the untouched content of an edited file is kept: beside the
-/// project, not in it (a file in the package would be a source).
 fn pristine_path(path: &Path) -> PathBuf {
     let key: String = path
         .to_string_lossy()
@@ -190,7 +161,6 @@ fn pristine_path(path: &Path) -> PathBuf {
     std::env::temp_dir().join(format!("rune-bench-pristine-{}-{key}", std::process::id()))
 }
 
-/// Deletes the pristine copies this process kept of edited files.
 pub fn forget_pristine() {
     let prefix = format!("rune-bench-pristine-{}-", std::process::id());
     if let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) {
@@ -201,10 +171,6 @@ pub fn forget_pristine() {
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// Generation
-// ---------------------------------------------------------------------------
 
 fn crate_name(layer: usize, i: usize) -> String {
     format!("c{layer}_{i}")
@@ -291,8 +257,7 @@ fn write_lib(dest: &Path, name: &str, deps: &[String], spec: &Spec, seed: usize)
             "    let mut i{t} = Item{t}::<u32>::default();\n    n += i{t}.bump({t}) as usize + Item{t}::<String>::default().describe().len();"
         );
     }
-    // (`mut` only where something is folded in: generated code compiles
-    // without warnings, which both tools would replay on every run.)
+    // `mut` only where needed: generated code compiles without warnings.
     let binding = if deps.is_empty() { "let" } else { "let mut" };
     let _ = write!(
         src,
@@ -323,7 +288,6 @@ fn write_app(dest: &Path, top: &[String], spec: &Spec) -> Result<()> {
         dir.join("src/edit.rs"),
         "/// Changed by the benchmarks to make an edit.\npub const EDIT: u64 = 0;\n",
     )?;
-    // What many applications have: a build script stamping the build.
     std::fs::write(
         dir.join("build.rs"),
         "fn main() {\n    println!(\"cargo::rerun-if-changed=build.rs\");\n    println!(\"cargo::rustc-env=APP_PROFILE={}\", std::env::var(\"PROFILE\").unwrap_or_default());\n}\n",
@@ -354,11 +318,6 @@ fn write_app(dest: &Path, top: &[String], spec: &Spec) -> Result<()> {
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// Copying a real project
-// ---------------------------------------------------------------------------
-
-/// Directories never copied: build output, VCS data, editors' and tools' own.
 const SKIP: &[&str] = &[
     "target",
     ".rune",
@@ -409,12 +368,10 @@ mod tests {
         };
         let root = std::fs::read_to_string(dir.join("Cargo.toml")).unwrap();
         assert_eq!(root.matches("\",\n").count(), spec.crates());
-        // Layer 1 depends on the core crate, so a core edit reaches everything.
         let l1 = std::fs::read_to_string(dir.join("c1_3/Cargo.toml")).unwrap();
         assert!(l1.contains("c0_0 = "), "{l1}");
         let app = std::fs::read_to_string(dir.join("app/Cargo.toml")).unwrap();
         assert!(app.contains(&format!("c{}_0", spec.layers - 1)));
-        // Deterministic.
         let again = scratch("gen2");
         w.materialize(&again).unwrap();
         assert_eq!(

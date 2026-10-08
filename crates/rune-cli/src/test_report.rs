@@ -1,13 +1,7 @@
-//! Per-test results from libtest's output, and reports for CI (JUnit XML).
-//!
-//! libtest prints one line per test (`test path::name ... ok`) and, for
-//! failures, the captured output under `---- path::name stdout ----`. That is
-//! stable across Rust versions (it is what humans read), unlike its JSON
-//! format, which still needs `-Z unstable-options`.
+//! Per-test results parsed from libtest's human output (stable, unlike its JSON), and JUnit XML.
 
 use std::fmt::Write as _;
 
-/// How one test ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Status {
@@ -16,20 +10,16 @@ pub enum Status {
     Ignored,
 }
 
-/// One test of a test binary.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct Case {
     pub name: String,
     pub status: Status,
-    /// What the test printed, for a failure.
     #[serde(skip_serializing_if = "String::is_empty")]
     pub output: String,
-    /// Failed at first and passed when run again.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub flaky: bool,
 }
 
-/// The tests in one run of a libtest binary.
 pub fn parse_cases(output: &str) -> Vec<Case> {
     let mut cases: Vec<Case> = Vec::new();
     for line in output.lines() {
@@ -43,7 +33,6 @@ pub fn parse_cases(output: &str) -> Vec<Case> {
             "ok" => Status::Passed,
             "FAILED" => Status::Failed,
             r if r.starts_with("ignored") => Status::Ignored,
-            // `bench:` lines and anything else libtest may add.
             _ => continue,
         };
         cases.push(Case {
@@ -53,8 +42,6 @@ pub fn parse_cases(output: &str) -> Vec<Case> {
             flaky: false,
         });
     }
-    // Captured output of failures: `---- name stdout ----` up to the next
-    // such header or the `failures:` summary list.
     let mut current: Option<(String, String)> = None;
     let mut sections: Vec<(String, String)> = Vec::new();
     for line in output.lines() {
@@ -86,13 +73,10 @@ pub fn parse_cases(output: &str) -> Vec<Case> {
     cases
 }
 
-/// The results of one test binary (or doc-test run), for reports.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct Suite {
     pub name: String,
     pub seconds: f64,
-    /// The binary itself failed without a test failing (a crash, a
-    /// `process::exit`): recorded as an error of the suite.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     pub cases: Vec<Case>,
@@ -107,7 +91,6 @@ fn xml_escape(s: &str) -> String {
             '>' => out.push_str("&gt;"),
             '"' => out.push_str("&quot;"),
             '\'' => out.push_str("&apos;"),
-            // Characters XML 1.0 cannot hold at all (ANSI escapes, NUL…).
             c if (c as u32) < 0x20 && !matches!(c, '\n' | '\r' | '\t') => {}
             c => out.push(c),
         }
@@ -115,9 +98,6 @@ fn xml_escape(s: &str) -> String {
     out
 }
 
-/// A JUnit XML document (the shape Jenkins, GitLab, GitHub reporters and
-/// most CI systems read): one `<testsuite>` per binary, `<testcase>` per test
-/// with its module path as `classname`.
 pub fn junit(suites: &[Suite]) -> String {
     let count = |s: &Suite, st: Status| s.cases.iter().filter(|c| c.status == st).count();
     let total_tests: usize = suites.iter().map(|s| s.cases.len()).sum();

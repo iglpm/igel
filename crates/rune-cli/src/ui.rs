@@ -1,15 +1,4 @@
-//! Shared output styling for the Rune CLI.
-//!
-//! Deliberately does not mirror Cargo's layout (a right-aligned, bold-green,
-//! Capitalized verb column). Rune has its own identity: a violet brand
-//! accent, a left-aligned glyph marker instead of column padding, and
-//! lowercase verbs. No emoji — every marker below is a plain text symbol
-//! that renders as a single monochrome glyph in any terminal font.
-//!
-//! Every line goes through [`emit`]: it suspends the live progress display
-//! while it writes, so status lines printed from any thread (test results
-//! arriving while crates still compile, warnings, log lines) land above the
-//! progress line instead of tearing it.
+//! Output styling. Every line goes through [`emit`], which suspends the progress display while writing.
 
 use colored::*;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
@@ -19,7 +8,6 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tracing_subscriber::{EnvFilter, fmt};
 
-/// `--quiet`: no action or summary lines at all.
 static QUIET: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 pub fn set_quiet(on: bool) {
@@ -30,27 +18,20 @@ fn quiet() -> bool {
     QUIET.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// The `MultiProgress` shared between the active progress display and every
-/// line printed, so output never tears the progress line.
 static MULTI_PROGRESS: OnceLock<MultiProgress> = OnceLock::new();
 
-/// Returns the process-wide `MultiProgress`, creating it on first use.
 pub fn multi_progress() -> MultiProgress {
     MULTI_PROGRESS.get_or_init(MultiProgress::new).clone()
 }
 
-/// Serializes whole lines between threads, so two lines never interleave.
 static OUTPUT: Mutex<()> = Mutex::new(());
 
-/// Which stream a line goes to.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Stream {
     Out,
     Err,
 }
 
-/// Writes `text` (one or more complete lines, each ending in `\n`) with the
-/// progress display suspended.
 /// Whether the last text printed ended with a blank line (see `blank_line`).
 static ENDS_BLANK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -76,25 +57,20 @@ pub fn emit(stream: Stream, text: &str) {
     });
 }
 
-/// A line on stdout (what a command produces), above any progress display.
 pub fn out(line: impl Display) {
     emit(Stream::Out, &format!("{line}\n"));
 }
 
-/// An empty line on stderr to set what follows apart, unless the output
-/// already ends with one.
 pub fn blank_line() {
     if !ENDS_BLANK.load(std::sync::atomic::Ordering::Relaxed) {
         err("");
     }
 }
 
-/// A line on stderr (status), above any progress display.
 pub fn err(line: impl Display) {
     emit(Stream::Err, &format!("{line}\n"));
 }
 
-/// Prints text to stderr above any active progress display without tearing it.
 pub fn print_above_progress(text: &str) {
     if text.ends_with('\n') {
         emit(Stream::Err, text);
@@ -103,8 +79,6 @@ pub fn print_above_progress(text: &str) {
     }
 }
 
-/// A `tracing` writer that goes through [`emit`], so log lines are printed
-/// cleanly above the progress display instead of corrupting its redraw.
 #[derive(Clone)]
 struct ProgressAwareWriter;
 
@@ -127,17 +101,13 @@ impl<'a> fmt::MakeWriter<'a> for ProgressAwareWriter {
     }
 }
 
-/// Installs the global tracing subscriber (`RUST_LOG` controls verbosity)
-/// and the network progress display.
 pub fn setup_logging() {
     match EnvFilter::try_from_default_env() {
-        // Debugging: the full log format.
         Ok(filter) => fmt()
             .with_env_filter(filter)
             .with_target(false)
             .with_writer(ProgressAwareWriter)
             .init(),
-        // Otherwise only warnings, which read like every other warning.
         Err(_) => fmt()
             .with_env_filter(EnvFilter::new("warn"))
             .with_writer(ProgressAwareWriter)
@@ -147,7 +117,6 @@ pub fn setup_logging() {
     rune_common::progress::set_sink(Box::new(NetProgress::default()));
 }
 
-/// Formats log events the way [`warn`] and [`error`] print.
 struct PlainWarnings;
 
 impl<S, N> tracing_subscriber::fmt::FormatEvent<S, N> for PlainWarnings
@@ -181,13 +150,7 @@ where
     }
 }
 
-// ---------------------------------------------------------------------------
-// Colour
-// ---------------------------------------------------------------------------
-
-/// Whether the terminal renders 24-bit colour (`COLORTERM`). Without it the
-/// brand violet is sent as its 256-colour neighbour rather than let
-/// `colored` round it to the nearest of the 16 basic colours (blue).
+/// Without 24-bit colour, violet is sent as its 256-colour neighbour rather than rounded to blue.
 fn truecolor() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
@@ -195,12 +158,10 @@ fn truecolor() -> bool {
     })
 }
 
-/// Whether styled output is on (`--color`, `NO_COLOR`, a terminal).
 pub fn colors() -> bool {
     colored::control::SHOULD_COLORIZE.should_colorize()
 }
 
-/// `s` in Rune's brand accent (a soft violet), bold.
 pub fn brand(s: impl Display) -> String {
     paint(s, true)
 }
@@ -217,17 +178,14 @@ fn paint(s: impl Display, bold: bool) -> String {
     }
 }
 
-/// The marker printed at the start of every action line.
 fn marker() -> String {
     brand("▸")
 }
 
-/// The display width of `s`, ignoring colour codes.
 pub fn width_of(s: &str) -> usize {
     console::measure_text_width(s)
 }
 
-/// The width of the terminal on stderr (80 when it is not a terminal).
 pub fn term_width() -> usize {
     console::Term::stderr()
         .size_checked()
@@ -241,7 +199,6 @@ pub fn term_width() -> usize {
         .max(20)
 }
 
-/// `text` wrapped to `width` columns (at spaces), as lines.
 pub fn wrap(text: &str, width: usize) -> Vec<String> {
     let width = width.max(10);
     let mut lines = Vec::new();
@@ -261,15 +218,6 @@ pub fn wrap(text: &str, width: usize) -> Vec<String> {
     lines
 }
 
-// ---------------------------------------------------------------------------
-// Status lines
-// ---------------------------------------------------------------------------
-
-/// A notable action, in progress or completed (e.g. `resolving`, `finished`,
-/// `added`). Lowercase by convention — set the verb lowercase at the call
-/// site. Status goes to stderr, as Cargo's does: stdout is for what a command
-/// produces (`metadata`, `vendor`'s configuration, the program `run` runs),
-/// so that it can be piped and redirected.
 pub fn action(verb: &str, message: impl Display) {
     if quiet() {
         return;
@@ -277,7 +225,6 @@ pub fn action(verb: &str, message: impl Display) {
     err(format!("{} {} {}", marker(), brand(verb), message));
 }
 
-/// The final summary line for a completed command (on stderr, see [`action`]).
 pub fn summary(message: impl Display) {
     if quiet() {
         return;
@@ -285,19 +232,14 @@ pub fn summary(message: impl Display) {
     err(format!("{} {}", "✓".green().bold(), message));
 }
 
-/// A summary that is the command's result (a test run's verdict): printed
-/// under `--quiet` too, which only silences the steps that led to it.
 pub fn result(message: impl Display) {
     err(format!("{} {}", "✓".green().bold(), message));
 }
 
-/// Advice after a summary: something the user may want to know or change,
-/// not a problem (on stderr, like every status line).
 pub fn hint(message: impl Display) {
     if quiet() {
         return;
     }
-    // Wrapped at word boundaries, continuation lines under the text.
     let text = message.to_string();
     let lines = if io::stderr().is_terminal() {
         wrap(&text, term_width().saturating_sub(9).max(30))
@@ -313,7 +255,6 @@ pub fn hint(message: impl Display) {
     }
 }
 
-/// An indented, dimmed line under a status line (on stderr).
 pub fn hint_line(message: impl Display) {
     if quiet() {
         return;
@@ -321,7 +262,6 @@ pub fn hint_line(message: impl Display) {
     err(format!("    {}", message.to_string().dimmed()));
 }
 
-/// A non-fatal warning.
 pub fn warn(message: impl Display) {
     err(format!(
         "{} {}",
@@ -330,23 +270,18 @@ pub fn warn(message: impl Display) {
     ));
 }
 
-/// A fatal error, printed the way the process is about to exit.
 pub fn error(message: impl Display) {
     err(format!("{} {}", "✗".red().bold(), message));
 }
 
-/// A dimmed, secondary detail printed under an action or summary line.
 pub fn detail(message: impl Display) {
     out(format!("  {}", message.to_string().dimmed()));
 }
 
-/// A section heading for multi-line output (e.g. CAS stats).
 pub fn heading(title: &str) {
     out(brand(title));
 }
 
-/// `key  value` rows with the keys aligned, for a card of facts about one
-/// thing (`rune info`, `rune cas stats`). Keys are dimmed.
 pub fn kv_lines(rows: &[(&str, String)], indent: usize) -> Vec<String> {
     let key_width = rows.iter().map(|(k, _)| k.len()).max().unwrap_or(0);
     rows.iter()
@@ -355,10 +290,6 @@ pub fn kv_lines(rows: &[(&str, String)], indent: usize) -> Vec<String> {
         .collect()
 }
 
-// ---------------------------------------------------------------------------
-// Activity: one live status line for a phase
-// ---------------------------------------------------------------------------
-
 fn spinner_style() -> ProgressStyle {
     ProgressStyle::default_spinner()
         .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏ ")
@@ -366,21 +297,15 @@ fn spinner_style() -> ProgressStyle {
         .expect("valid template")
 }
 
-/// A phase in progress (resolving, fetching an index), shown as one spinner
-/// line on a terminal and nothing otherwise. Network progress reported while
-/// it is active is shown on its line.
 pub struct Activity {
     bar: Option<ProgressBar>,
     started: Instant,
 }
 
-/// The activity whose line index fetches are reported on.
 static CURRENT: Mutex<Option<ProgressBar>> = Mutex::new(None);
-/// Index fetches since the current activity started.
 static FETCHED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 impl Activity {
-    /// Starts showing `verb message` with a spinner.
     pub fn start(verb: &str, message: impl Display) -> Self {
         FETCHED.store(0, std::sync::atomic::Ordering::Relaxed);
         let bar = (!quiet()).then(|| {
@@ -400,22 +325,18 @@ impl Activity {
         }
     }
 
-    /// How long the activity has run.
     pub fn elapsed(&self) -> Duration {
         self.started.elapsed()
     }
 
-    /// Index files fetched over the network while the activity ran.
     pub fn fetched(&self) -> usize {
         FETCHED.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// Removes the line, leaving nothing behind.
     pub fn clear(mut self) {
         self.stop();
     }
 
-    /// Removes the line and prints `verb message` as an action line.
     pub fn finish(mut self, verb: &str, message: impl Display) {
         self.stop();
         action(verb, message);
@@ -442,8 +363,6 @@ impl Drop for Activity {
     }
 }
 
-/// `path` relative to the working directory when it is below it
-/// (`.rune/target/debug/app`), as it was given otherwise.
 pub fn rel(path: &std::path::Path) -> String {
     std::env::current_dir()
         .ok()
@@ -452,7 +371,6 @@ pub fn rel(path: &std::path::Path) -> String {
         .unwrap_or_else(|| path.display().to_string())
 }
 
-/// `1.24s` / `380ms`.
 pub fn secs(d: Duration) -> String {
     if d < Duration::from_secs(1) {
         format!("{}ms", d.as_millis())
@@ -461,7 +379,6 @@ pub fn secs(d: Duration) -> String {
     }
 }
 
-/// `4.2 MiB`.
 pub fn bytes(n: u64) -> String {
     const UNITS: [&str; 4] = ["B", "KiB", "MiB", "GiB"];
     let mut v = n as f64;
@@ -477,13 +394,6 @@ pub fn bytes(n: u64) -> String {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Network progress (index fetches, downloads)
-// ---------------------------------------------------------------------------
-
-/// Draws [`rune_common::progress`] events: index fetches on the current
-/// [`Activity`]'s line, downloads on a bar of their own that turns into a
-/// summary line when the batch is done.
 #[derive(Default)]
 struct NetProgress {
     downloads: Mutex<Downloads>,
@@ -496,9 +406,7 @@ struct Downloads {
     done: usize,
     bytes: u64,
     started: Option<Instant>,
-    /// In flight, in start order (shown while they download).
     active: Vec<String>,
-    /// Downloads that failed (the error is reported by whoever asked).
     failed: usize,
 }
 
@@ -606,7 +514,6 @@ impl Downloads {
     }
 }
 
-/// `1 crate` / `3 crates`.
 pub fn plural(n: usize, what: &str) -> String {
     if n == 1 {
         format!("1 {what}")
@@ -619,7 +526,6 @@ pub fn plural(n: usize, what: &str) -> String {
     }
 }
 
-/// Whether stdout is a terminal.
 pub fn stdout_is_term() -> bool {
     io::stdout().is_terminal()
 }

@@ -1,21 +1,10 @@
-//! What `rune <name>` means when `<name>` is not one of Rune's commands:
-//!
-//! 1. an `[alias]` from `.cargo/config.toml` (`xtask = "run --package xtask --"`,
-//!    or a list), expanded before parsing, as Cargo does;
-//! 2. an external subcommand: a `rune-<name>` or `cargo-<name>` executable on
-//!    `PATH` (or in `$CARGO_HOME/bin`), run as `<exe> <name> <args…>` — how
-//!    `cargo nextest`, `cargo expand` or `cargo machete` plug in.
-//!
-//! Plugins find the build tool through `CARGO`: the real `cargo` when there is
-//! one (they are written against its exact behaviour), or Rune itself with
-//! `RUNE_PLUGIN_CARGO=rune`.
+//! Unknown `rune <name>`: an `[alias]` from `.cargo/config.toml`, or a `rune-<name>`/`cargo-<name>`
+//! executable on `PATH`.
 
 use clap::CommandFactory;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
-/// The command line with aliases expanded. Does not return when the command
-/// is an external subcommand: that program runs instead.
 pub fn expand(mut args: Vec<OsString>) -> Vec<OsString> {
     for _ in 0..16 {
         let Some(pos) = subcommand_position(&args) else {
@@ -34,14 +23,12 @@ pub fn expand(mut args: Vec<OsString>) -> Vec<OsString> {
         if let Some(exe) = find_external(&name) {
             run_external(&exe, &name, &args[pos + 1..]);
         }
-        // Not ours to handle: clap reports the unknown command.
         return args;
     }
     crate::ui::error("aliases expand into each other endlessly");
     std::process::exit(101);
 }
 
-/// Where the subcommand is: the first argument that is not a global option.
 fn subcommand_position(args: &[OsString]) -> Option<usize> {
     let mut i = 1;
     while i < args.len() {
@@ -51,7 +38,6 @@ fn subcommand_position(args: &[OsString]) -> Option<usize> {
             continue;
         }
         if a.starts_with('-') {
-            // `--color=never`, `-V`, `--help`, …: clap's business.
             if a.starts_with("--color=") {
                 i += 1;
                 continue;
@@ -67,7 +53,6 @@ fn is_builtin(name: &str) -> bool {
     name == "help" || crate::args::Cli::command().find_subcommand(name).is_some()
 }
 
-/// `[alias]` in configuration: a string (split on whitespace) or a list.
 fn alias(name: &str) -> Option<Vec<String>> {
     let cwd = std::env::current_dir().ok()?;
     let config = rune_common::cargo_config::CargoConfig::load(&cwd);

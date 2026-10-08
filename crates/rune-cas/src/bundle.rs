@@ -1,33 +1,19 @@
-//! Moving store entries between machines as one file: `rune cas export`
-//! writes the entries a build needs into a tar archive (gzip-compressed when
-//! the name ends in `.gz`), `rune cas import` adds an archive's entries to the
-//! local store — what a CI cache step saves and restores.
-//!
-//! An archive holds object directories exactly as the store lays them out
-//! (`objects/<xx>/<key>/…`). Importing treats it as untrusted: only paths of
-//! that shape are accepted, every artifact is checked against the hash its
-//! entry records, and an entry the store already has is left as it is (the
-//! first result stored for a key stands, as everywhere in the store).
+//! `rune cas export`/`import`: store entries as a tar archive. Imports are untrusted: only
+//! `objects/<xx>/<key>/…` paths, every artifact checked against its hash, existing entries kept.
 
 use crate::store::{CasStore, hash_file};
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 
-/// What an export or import did.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct BundleStats {
-    /// Object directories written or added.
     pub entries: usize,
-    /// Object directories skipped (absent when exporting; present already, or
-    /// damaged, when importing).
     pub skipped: usize,
     pub bytes: u64,
 }
 
 impl CasStore {
-    /// Writes the object directories of `keys` that this store has into a
-    /// tar archive (gzip-compressed when `path` ends in `.gz`).
     pub fn export_bundle(&self, keys: &[String], path: &Path) -> std::io::Result<BundleStats> {
         let file = fs::File::create(path)?;
         let gz = path.extension().is_some_and(|e| e == "gz" || e == "tgz");
@@ -47,7 +33,6 @@ impl CasStore {
             if !seen.insert(key.as_str()) {
                 continue;
             }
-            // A compressed entry travels decompressed, as it is used.
             let _ = self.get(key);
             let dir = self.object_dir(key);
             if !dir.is_dir() {
@@ -58,7 +43,6 @@ impl CasStore {
             for entry in walkdir::WalkDir::new(&dir).sort_by_file_name() {
                 let entry = entry.map_err(std::io::Error::other)?;
                 let name = entry.file_name().to_string_lossy();
-                // Half-written files of a concurrent store.
                 if name.starts_with('.') && name.ends_with(".tmp") {
                     continue;
                 }
@@ -75,7 +59,6 @@ impl CasStore {
         Ok(stats)
     }
 
-    /// Adds the entries of an archive written by [`Self::export_bundle`].
     pub fn import_bundle(&self, path: &Path) -> std::io::Result<BundleStats> {
         let file = fs::File::open(path)?;
         let mut magic = [0u8; 2];
@@ -98,14 +81,11 @@ impl CasStore {
         let mut dirs: Vec<PathBuf> = Vec::new();
         for entry in archive.entries()? {
             let mut entry = entry?;
-            // Linker output often has holes, which archives keep as GNU
-            // sparse entries; reading them gives the whole file.
             let kind = entry.header().entry_type();
             if !(kind.is_file() || kind.is_gnu_sparse()) {
                 continue;
             }
             let rel = entry.path()?.into_owned();
-            // `objects/<xx>/<key>/<file…>`, nothing else, nowhere else.
             let parts: Vec<&str> = rel
                 .components()
                 .map(|c| match c {
@@ -132,8 +112,7 @@ impl CasStore {
             let mut out = fs::File::create(&dest)?;
             std::io::copy(&mut entry, &mut out)?;
             drop(out);
-            // Stored objects are read-only; a binary or proc-macro keeps its
-            // execute bit, or a restored program could not run.
+            // Objects are read-only; binaries keep their execute bit.
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
@@ -164,8 +143,6 @@ impl CasStore {
             if let Some(parent) = target.parent() {
                 fs::create_dir_all(parent)?;
             }
-            // A concurrent import or build may have stored it meanwhile: the
-            // rename fails and theirs stands.
             if fs::rename(&staged, &target).is_ok() {
                 stats.entries += 1;
                 stats.bytes += bytes;
@@ -176,9 +153,6 @@ impl CasStore {
         Ok(stats)
     }
 
-    /// Whatever slots an object directory has must be whole: artifacts of the
-    /// size and hash the manifest records, every file a tree lists, values
-    /// that parse.
     fn staged_entry_is_sound(dir: &Path) -> bool {
         if let Ok(text) = fs::read_to_string(dir.join("manifest.json")) {
             let Ok(manifest) = serde_json::from_str::<crate::store::ArtifactManifest>(&text) else {
@@ -262,7 +236,6 @@ mod tests {
             assert_eq!(fs::read_to_string(&linked[0]).unwrap(), "compiled bytes");
             assert_eq!(b.get_value::<String>("k1-warnings").unwrap(), "a warning");
             assert!(b.restore_dir_tree("k1-buildscript", target.path()).unwrap());
-            // Importing again adds nothing.
             assert_eq!(b.import_bundle(&path).unwrap().skipped, 3);
         }
     }
@@ -275,7 +248,6 @@ mod tests {
         let src = tempdir().unwrap();
         let bin = src.path().join("app-abc");
         {
-            // A hole in the middle, as linkers leave them.
             use std::io::{Seek, SeekFrom};
             let mut f = fs::File::create(&bin).unwrap();
             f.write_all(b"head").unwrap();
@@ -325,7 +297,6 @@ mod tests {
         let bundle = tempdir().unwrap();
         let path = bundle.path().join("b.tar");
         a.export_bundle(&["k1".into()], &path).unwrap();
-        // Flip the artifact's bytes inside the archive (same length).
         let mut bytes = fs::read(&path).unwrap();
         let at = bytes
             .windows(14)

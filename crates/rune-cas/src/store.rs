@@ -20,35 +20,13 @@ pub enum CasError {
 
 pub type Result<T> = std::result::Result<T, CasError>;
 
-/// Content-Addressable Store for Rune build artifacts.
-///
-/// Stores compiled artifacts (`.rlib`, `.rmeta`, `.d`, binaries) keyed by
-/// a content hash of all inputs. Enables artifact reuse across projects
-/// and machines.
 #[derive(Debug, Clone)]
 pub struct CasStore {
     root: PathBuf,
-    /// Guards read-modify-write access to `stats.json` against the build
-    /// executor's concurrent worker threads within this process. Cross-process
-    /// races (e.g. two `rune build` invocations at once) can still interleave;
-    /// stats are diagnostic counters, not correctness-critical state, so that
-    /// residual race is an accepted tradeoff rather than a bug to chase.
     stats_lock: Arc<Mutex<()>>,
-    /// Counters accumulated in memory during a build and merged into
-    /// `stats.json` once by [`CasStore::flush_stats`]. Rewriting the stats
-    /// file after every single cache hit made a fully cached build of a few
-    /// hundred crates do a few hundred read-modify-write round trips on one
-    /// file for no benefit.
     pending: Arc<PendingStats>,
-    /// Re-hash every artifact on every hit (`cas.verify`). Off by default: an
-    /// entry is always verified against its key and the sizes in its manifest;
-    /// this additionally catches bit rot and tampering, at the cost of reading
-    /// every restored file.
     verify: bool,
-    /// A store shared with other machines, consulted on a local miss and
-    /// published to after a store (`cas.remote`).
     remote: Option<crate::remote::Remote>,
-    /// Copies new entries to `remote` off the compilers' critical path.
     publisher: Option<Arc<crate::remote::Publisher>>,
 }
 
@@ -60,46 +38,25 @@ struct PendingStats {
     bytes: AtomicU64,
 }
 
-/// Metadata about a cached artifact set.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ArtifactManifest {
-    /// The fingerprint/cache key that produced these artifacts.
     pub cache_key: String,
-    /// Crate name.
     pub crate_name: String,
-    /// Crate version.
     pub crate_version: String,
-    /// List of artifact files in this entry.
     pub artifacts: Vec<ArtifactEntry>,
-    /// When this entry was stored.
     pub stored_at: u64,
-    /// Size in bytes of all artifacts combined.
     pub total_size: u64,
-    /// The artifacts are stored zstd-compressed, as `<filename>.zst`: the
-    /// entry went unused for a while (see [`CasStore::compress`]). The next
-    /// use decompresses them again.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub compressed: bool,
-    /// Bytes on disk while compressed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stored_size: Option<u64>,
-    /// What the artifacts were compiled against: for each crate the compiler
-    /// was handed (`--extern`), its [content](Self::content) — the name of
-    /// the file that identifies its build (`libserde-1a2b….rmeta`) and that
-    /// file's hash.
-    ///
-    /// A key names a unit's inputs, not the bytes the compiler produced from
-    /// them, and rustc does not always produce the same bytes (a crate
-    /// compiled in another directory, a proc-macro iterating a `HashMap`).
-    /// rustc only loads a crate next to the exact build of each dependency it
-    /// was compiled against, so an entry is only usable next to the entries
-    /// it records here. See [`Self::matches_dependencies`].
+    /// Content of every crate it was compiled against (`--extern`). rustc output isn't always reproducible
+    /// and rustc only loads a crate next to the exact builds it was compiled against.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub compiled_against: BTreeMap<String, String>,
 }
 
 impl ArtifactManifest {
-    /// Bytes the entry's artifacts take on disk.
     pub fn disk_size(&self) -> u64 {
         match self.stored_size {
             Some(n) if self.compressed => n,
@@ -107,8 +64,6 @@ impl ArtifactManifest {
         }
     }
 
-    /// What identifies this build of the unit to the crates compiled against
-    /// it (see [`Content`]).
     pub fn content(&self) -> Option<Content> {
         let chosen = content_file(self.artifacts.iter().map(|a| Path::new(&a.filename)))?;
         self.artifacts
@@ -120,16 +75,11 @@ impl ArtifactManifest {
             })
     }
 
-    /// Whether the entry was compiled against exactly `deps` (file → content
-    /// id, see [`Self::compiled_against`]): every dependency it records, and
-    /// nothing else.
     pub fn matches_dependencies(&self, deps: &BTreeMap<String, String>) -> bool {
         self.compiled_against == *deps
     }
 }
 
-/// The file among a unit's outputs whose hash is its
-/// [content id](ArtifactManifest::content_id).
 pub fn content_file<'a>(files: impl IntoIterator<Item = &'a Path>) -> Option<&'a Path> {
     let rank = |p: &Path| match p.extension().and_then(|e| e.to_str()) {
         Some("rmeta") => Some(0),
@@ -144,19 +94,13 @@ pub fn content_file<'a>(files: impl IntoIterator<Item = &'a Path>) -> Option<&'a
         .map(|(_, p)| p)
 }
 
-/// What identifies one build of a unit to the crates compiled against it:
-/// its metadata (`.rmeta`), or its library when it has none, by file name
-/// and hash. Two builds with the same content are interchangeable for every
-/// dependent; two with different content are different crates to rustc.
+/// One build of a unit as dependents see it: its `.rmeta` (or library) by name and hash.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Content {
-    /// The file's name (`libserde-1a2b….rmeta`).
     pub file: String,
-    /// Its blake3 hash.
     pub id: String,
 }
 
-/// The content of a unit's freshly written outputs, read from disk.
 pub fn content_of_files(files: &[PathBuf]) -> Option<Content> {
     let chosen = content_file(files.iter().map(PathBuf::as_path))?;
     Some(Content {
@@ -165,44 +109,27 @@ pub fn content_of_files(files: &[PathBuf]) -> Option<Content> {
     })
 }
 
-/// How [`CasStore::put_unit`] stores a compiled unit.
 #[derive(Debug, Default, Clone)]
 pub struct PutOptions {
-    /// Take the files themselves (see [`CasStore::put_adopted`]).
     pub adopt: bool,
-    /// What the unit was compiled against (see
-    /// [`ArtifactManifest::compiled_against`]).
     pub compiled_against: BTreeMap<String, String>,
-    /// An entry already stored under the key that records other
-    /// dependencies than these was compiled against builds of them that are
-    /// no longer the stored ones: replace it instead of keeping it.
     pub replace_stale: bool,
 }
 
-/// What [`CasStore::put_unit`] did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PutOutcome {
-    /// The files are now the entry.
     Stored,
-    /// An entry compiled against the same dependencies was already there;
-    /// it stands (objects are immutable).
     Kept,
-    /// An entry compiled against other dependencies was there, and was left
-    /// alone because `replace_stale` was off.
     KeptStale,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ArtifactEntry {
-    /// Filename (e.g., "libfoo-abc123.rlib")
     pub filename: String,
-    /// Size in bytes.
     pub size: u64,
-    /// Blake3 hash of the artifact file.
     pub hash: String,
 }
 
-/// Statistics about CAS usage.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CasStats {
     pub total_entries: u64,
@@ -217,17 +144,13 @@ pub struct CasEntry {
     pub object_dir: PathBuf,
 }
 
-/// An entry restored by [`CasStore::link_entry`].
 #[derive(Debug, Clone)]
 pub struct Linked {
-    /// The restored files, in the target directory.
     pub files: Vec<PathBuf>,
     pub manifest: ArtifactManifest,
 }
 
-/// Stored objects are never modified: taking away write permission makes a
-/// stray in-place write (through a hard link from a project directory) fail
-/// loudly instead of silently changing an object every project shares.
+/// Objects are read-only so a stray write through a hard link fails instead of corrupting the store.
 #[cfg_attr(unix, allow(dead_code))]
 pub(crate) fn make_read_only_pub(path: &Path) {
     make_read_only(path);
@@ -241,15 +164,11 @@ fn make_read_only(path: &Path) {
     }
 }
 
-/// True if `dest` is already a hardlink to `src` (same inode on the same
-/// device), meaning there is nothing left to do to "link" it. (Elsewhere the
-/// link is simply made again, which is correct, only slower.)
 fn already_linked(src: &Path, dest: &Path) -> bool {
     same_file::is_same_file(src, dest).unwrap_or(false)
 }
 
 impl CasStore {
-    /// Create a new CAS store, initializing directories if needed.
     pub fn new(root: PathBuf) -> Result<Self> {
         fs::create_dir_all(root.join("objects"))?;
 
@@ -270,13 +189,10 @@ impl CasStore {
         })
     }
 
-    /// Consults (and, if `write`, publishes to) a store shared with other
-    /// machines. See [`crate::remote`].
     pub fn with_remote(self, root: PathBuf, write: bool) -> Self {
         self.with_remote_store(crate::remote::Remote::new(root, write))
     }
 
-    /// Like [`Self::with_remote`], for any kind of shared store.
     pub fn with_remote_store(mut self, remote: crate::remote::Remote) -> Self {
         if remote.writes() {
             self.publisher = Some(Arc::new(crate::remote::Publisher::start(2)));
@@ -285,16 +201,12 @@ impl CasStore {
         self
     }
 
-    /// Makes `slot` of `cache_key` local if only the shared store has it.
     fn pull(&self, cache_key: &str, slot: crate::remote::Slot) -> bool {
         self.remote
             .as_ref()
             .is_some_and(|r| r.pull(cache_key, &self.object_dir(cache_key), slot))
     }
 
-    /// Publishes `slot` of `cache_key` to the shared store: in the background
-    /// for the big slots, at once for a small value (so a process that ends
-    /// right after storing one does not lose it).
     fn publish(&self, cache_key: &str, slot: crate::remote::Slot) {
         let Some(r) = &self.remote else { return };
         if !r.writes() {
@@ -309,22 +221,17 @@ impl CasStore {
         }
     }
 
-    /// Waits for background publishing to the shared store to finish.
     pub fn flush_remote(&self) {
         if let Some(p) = &self.publisher {
             p.flush();
         }
     }
 
-    /// Verifies the content hash of every artifact on every hit.
     pub fn with_verify(mut self, verify: bool) -> Self {
         self.verify = verify;
         self
     }
 
-    /// An entry is usable only if it is the one asked for and everything its
-    /// manifest lists is present at the recorded size. Anything else — a
-    /// half-collected entry, damage on disk — is a miss, never a hit.
     fn is_intact(entry: &CasEntry, cache_key: &str) -> bool {
         entry.manifest.cache_key == cache_key
             && entry.manifest.artifacts.iter().all(|a| {
@@ -334,12 +241,10 @@ impl CasStore {
             })
     }
 
-    /// Return the root path.
     pub fn root(&self) -> &Path {
         &self.root
     }
 
-    /// Compute the object directory for a given cache key (sharded by first 2 chars).
     pub fn object_dir(&self, cache_key: &str) -> PathBuf {
         let prefix = if cache_key.len() >= 2 {
             &cache_key[0..2]
@@ -349,19 +254,13 @@ impl CasStore {
         self.root.join("objects").join(prefix).join(cache_key)
     }
 
-    /// The manifest of the entry this store holds for `cache_key`, if any —
-    /// without asking a shared store or decompressing anything: what was
-    /// stored, not something to restore.
     pub fn manifest(&self, cache_key: &str) -> Option<ArtifactManifest> {
         let text = fs::read_to_string(self.object_dir(cache_key).join("manifest.json")).ok()?;
         serde_json::from_str(&text).ok()
     }
 
-    /// Check if artifacts exist for this key and return the entry.
     pub fn get(&self, cache_key: &str) -> Option<CasEntry> {
         let dir = self.object_dir(cache_key);
-        // One read instead of `exists()` + read: a miss (the common case on a
-        // cold build) costs a single failed `open`.
         let content = match fs::read_to_string(dir.join("manifest.json")) {
             Ok(c) => c,
             Err(_) if self.pull(cache_key, crate::remote::Slot::Artifacts) => {
@@ -379,14 +278,9 @@ impl CasStore {
         })
     }
 
-    /// Decompresses an entry [`Self::compress`] compressed, so it can be
-    /// hard-linked again. Each file is checked against its recorded hash and
-    /// renamed into place; the manifest is rewritten last. `None` if the
-    /// entry is damaged (a miss, like any damaged entry).
     fn inflate(&self, dir: &Path, mut manifest: ArtifactManifest) -> Option<ArtifactManifest> {
         for a in &manifest.artifacts {
             let dest = dir.join(&a.filename);
-            // Another process may have decompressed it already.
             if fs::metadata(&dest).is_ok_and(|m| m.len() == a.size) {
                 continue;
             }
@@ -425,10 +319,6 @@ impl CasStore {
         Some(manifest)
     }
 
-    /// Compresses the artifacts of the entry in `dir` with zstd, keeping them
-    /// only when that saves at least a tenth. Returns the bytes saved. The
-    /// entry stays valid throughout: the compressed files and the manifest
-    /// that names them are written before the originals are removed.
     pub fn compress(&self, dir: &Path) -> Result<u64> {
         let content = fs::read_to_string(dir.join("manifest.json"))?;
         let mut manifest: ArtifactManifest = serde_json::from_str(&content)?;
@@ -465,7 +355,6 @@ impl CasStore {
         manifest.stored_size = Some(packed_total);
         let tmp = dir.join(format!(".manifest.{}.{}.tmp", std::process::id(), unique()));
         fs::write(&tmp, serde_json::to_string(&manifest)?)?;
-        // Keep the entry's last-use time: compressing is not a use.
         let used = fs::metadata(dir.join("manifest.json"))?.modified()?;
         fs::rename(&tmp, dir.join("manifest.json"))?;
         let _ = filetime::set_file_mtime(
@@ -478,26 +367,17 @@ impl CasStore {
         Ok(manifest.total_size - packed_total)
     }
 
-    /// Whether an entry exists for `cache_key`.
     pub fn contains(&self, cache_key: &str) -> bool {
         self.object_dir(cache_key).join("manifest.json").is_file()
     }
 
-    /// Whether this store (not a remote one) has both a directory tree and a
-    /// value under `cache_key` — a build script's complete result.
     pub fn contains_tree(&self, cache_key: &str) -> bool {
         let dir = self.object_dir(cache_key);
         dir.join("tree.json").is_file() && dir.join("value.json").is_file()
     }
 
-    /// Copy compiled artifacts into the CAS store.
-    ///
-    /// Every file is written to a temporary name and renamed into place, and
-    /// the manifest is written last. This matters because objects are
-    /// hard-linked into project target directories: overwriting one *in
-    /// place* would silently change every build directory linked to it, while
-    /// a rename leaves those links pointing at the old, intact inode. It also
-    /// means a concurrent reader never sees a half-written entry.
+    /// Temp names + rename, manifest last: objects are hard-linked into target dirs and must never change
+    /// in place, and readers never see a half-written entry.
     pub fn put(
         &self,
         cache_key: &str,
@@ -515,12 +395,7 @@ impl CasStore {
         .map(drop)
     }
 
-    /// Like [`Self::put`], but the store takes the files themselves (hard
-    /// links; a copy only across file systems) instead of copies of them, and
-    /// makes them read-only. For outputs the caller will never write again in
-    /// place — a compiler's fresh outputs, which a later compilation unlinks
-    /// before writing new ones, exactly as it does for restored outputs — this
-    /// saves writing every artifact twice (a debug binary can be 100+ MB).
+    /// Like [`Self::put`], but takes the files themselves (hard links) instead of copies.
     pub fn put_adopted(
         &self,
         cache_key: &str,
@@ -536,7 +411,6 @@ impl CasStore {
             .map(drop)
     }
 
-    /// Stores a compiled unit (see [`Self::put`] and [`PutOptions`]).
     pub fn put_unit(
         &self,
         cache_key: &str,
@@ -546,12 +420,8 @@ impl CasStore {
         options: &PutOptions,
     ) -> Result<PutOutcome> {
         let dir = self.object_dir(cache_key);
-        // Objects are immutable: the first published result for a key stands,
-        // and a later build of the same key (a forced rebuild, a racing
-        // process) never changes it. A *damaged* entry is not an entry, though:
-        // it is removed so it can be published again. Nor is one compiled
-        // against builds of its dependencies that the store no longer holds,
-        // when the caller knows that (`replace_stale`): nothing can use it.
+        // Objects are immutable: the first result for a key stands, unless it is damaged or (with
+        // `replace_stale`) compiled against dependency builds the store no longer holds.
         if let Some(existing) = self.get(cache_key) {
             if Self::is_intact(&existing, cache_key) {
                 let current = existing
@@ -569,8 +439,6 @@ impl CasStore {
                     "replacing {cache_key} ({} {}): it was compiled against other builds of its dependencies",
                     existing.manifest.crate_name, existing.manifest.crate_version
                 );
-                // Readers find no entry from here on until the new manifest
-                // lands, never a manifest naming files of the other build.
                 let _ = fs::remove_file(dir.join("manifest.json"));
             }
             let _ = fs::remove_dir_all(&dir);
@@ -641,20 +509,8 @@ impl CasStore {
         Ok(PutOutcome::Stored)
     }
 
-    /// Caches an entire directory tree (recursively) under `cache_key` —
-    /// used for a build script's `OUT_DIR`, which can contain arbitrary
-    /// generated files (not just the flat set of `.rlib`/`.rmeta`/`.d`
-    /// outputs [`Self::put`] handles) that later `include!()`-based
-    /// compilation depends on. Skipping a build script's re-execution
-    /// without restoring these is only safe as long as the local
-    /// `.rune/target` directory happens to still hold them from whenever it
-    /// last actually ran; caching the tree here makes that safe even after
-    /// `rune clean`, on a fresh checkout, or when the CAS is shared across
-    /// machines.
     pub fn put_dir_tree(&self, cache_key: &str, source_dir: &Path) -> Result<()> {
         let object_dir = self.object_dir(cache_key);
-        // Immutable, like artifact entries: a complete tree already stored
-        // under this key stands.
         if let Ok(text) = fs::read_to_string(object_dir.join("tree.json"))
             && let Ok(rels) = serde_json::from_str::<Vec<String>>(&text)
             && rels
@@ -666,9 +522,7 @@ impl CasStore {
         }
         fs::create_dir_all(&object_dir)?;
         let tree_root = object_dir.join("tree");
-        // Build the new tree beside the old one and swap by rename, so a
-        // reader restoring concurrently sees either the old tree or the new
-        // one, never a directory that is half deleted.
+        // Build beside and swap by rename so concurrent readers never see a half-deleted tree.
         let staging = object_dir.join(format!(".tree.{}.tmp", std::process::id()));
         if staging.exists() {
             fs::remove_dir_all(&staging)?;
@@ -708,11 +562,6 @@ impl CasStore {
         Ok(())
     }
 
-    /// Restores a directory tree cached by [`Self::put_dir_tree`] into
-    /// `dest_dir`. Returns `false` (rather than erroring) when there's
-    /// simply no cached entry, so callers can fall through to regenerating
-    /// it; returns an error only for an I/O failure while restoring one that
-    /// does exist.
     pub fn restore_dir_tree(&self, cache_key: &str, dest_dir: &Path) -> Result<bool> {
         let object_dir = self.object_dir(cache_key);
         let manifest_path = object_dir.join("tree.json");
@@ -727,8 +576,6 @@ impl CasStore {
         for rel in relative_paths {
             let src = tree_root.join(&rel);
             if !src.exists() {
-                // Corrupted or partially-GC'd entry: don't restore a
-                // partial tree and claim it as a hit.
                 return Ok(false);
             }
             let dest = dest_dir.join(&rel);
@@ -743,20 +590,10 @@ impl CasStore {
         Ok(true)
     }
 
-    /// Hardlink (or copy) artifacts from CAS into target build directory.
-    ///
-    /// On a repeat build where the destination is already hardlinked to the
-    /// same CAS object (the common "nothing changed" case), this does no
-    /// filesystem work at all beyond a single `stat` per artifact: relinking
-    /// and re-hashing multi-megabyte `.rlib`s on every invocation, as the
-    /// naive version of this function did, is what made even a fully cached
-    /// build noticeably slower than Cargo's near-instant no-op rebuild.
     pub fn link_to(&self, cache_key: &str, target_dir: &Path) -> Result<Vec<PathBuf>> {
         self.link_entry(cache_key, target_dir).map(|l| l.files)
     }
 
-    /// [`Self::link_to`], also returning the entry's manifest (what it was
-    /// compiled against, its content id).
     pub fn link_entry(&self, cache_key: &str, target_dir: &Path) -> Result<Linked> {
         let entry = self
             .get(cache_key)
@@ -786,12 +623,6 @@ impl CasStore {
                 continue;
             }
 
-            // Replace atomically: another process may be reading `dest` right
-            // now. Try hardlink, fallback to copy. A hardlink shares the
-            // source's inode, so its content is the source's content by
-            // construction and does not need re-verifying; only the copy
-            // fallback (e.g. across filesystems) can actually diverge and is
-            // worth the cost of hashing.
             rune_common::fsutil::replace_with_link(&src, &dest)?;
             let hard_linked = already_linked(&src, &dest);
             if hard_linked {
@@ -820,7 +651,6 @@ impl CasStore {
         })
     }
 
-    /// Read stats from store.
     pub fn stats(&self) -> Result<CasStats> {
         let stats_path = self.root.join("stats.json");
         if stats_path.exists() {
@@ -832,13 +662,6 @@ impl CasStore {
         }
     }
 
-    /// Save stats to store.
-    ///
-    /// Deliberately skips `fsync`: these are diagnostic hit/miss counters,
-    /// not build-correctness state, and `record_hit`/`record_miss` are
-    /// called once per compilation unit, so forcing a durability barrier on
-    /// every single one of them would trade real per-build latency for
-    /// durability nobody needs on a counter that can simply be rebuilt.
     pub(crate) fn save_stats(&self, stats: &CasStats) -> Result<()> {
         let json = serde_json::to_string_pretty(stats)?;
         let temp_path = self.root.join("stats.json.tmp");
@@ -847,14 +670,6 @@ impl CasStore {
         Ok(())
     }
 
-    /// Reads a cached, arbitrary-value entry (currently used for build
-    /// script output) previously stored with [`Self::put_value`].
-    ///
-    /// This is a separate, lightweight slot from the compiled-artifact entry
-    /// at the same object directory: it stores exactly one small JSON blob
-    /// rather than a manifest plus copied artifact files, since a build
-    /// script's output (link flags, cfgs, env vars) is data, not a file to
-    /// hardlink into a build directory.
     pub fn get_value<T: serde::de::DeserializeOwned>(&self, cache_key: &str) -> Option<T> {
         let path = self.object_dir(cache_key).join("value.json");
         let content = match fs::read_to_string(&path) {
@@ -867,14 +682,10 @@ impl CasStore {
         serde_json::from_str(&content).ok()
     }
 
-    /// Stores an arbitrary, JSON-serializable value under `cache_key`. See
-    /// [`Self::get_value`].
     pub fn put_value<T: Serialize>(&self, cache_key: &str, value: &T) -> Result<()> {
         let dir = self.object_dir(cache_key);
         fs::create_dir_all(&dir)?;
         let json = serde_json::to_string(value)?;
-        // Written beside and renamed: a crash mid-write must never leave a
-        // truncated value that a later build could mistake for a valid one.
         let tmp = dir.join(format!(".value.{}.tmp", std::process::id()));
         fs::write(&tmp, json)?;
         fs::rename(&tmp, dir.join("value.json"))?;
@@ -882,18 +693,14 @@ impl CasStore {
         Ok(())
     }
 
-    /// Record a cache hit (in memory; see [`Self::flush_stats`]).
     pub fn record_hit(&self) {
         self.pending.hits.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Record a cache miss (in memory; see [`Self::flush_stats`]).
     pub fn record_miss(&self) {
         self.pending.misses.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Merges the counters accumulated since the last flush into
-    /// `stats.json` in one write. Call once at the end of a build.
     pub fn flush_stats(&self) {
         self.flush_remote();
         let hits = self.pending.hits.swap(0, Ordering::Relaxed);
@@ -913,11 +720,7 @@ impl CasStore {
     }
 }
 
-/// Marks an entry as recently used by bumping its manifest's mtime — but only
-/// if that is more than a few hours stale, so a fully cached build doesn't
-/// turn into hundreds of metadata writes. Garbage collection evicts by this
-/// timestamp, which is what makes it least-recently-*used* rather than
-/// least-recently-*stored*.
+/// Bumps the manifest's mtime (GC's last-use time), only when hours stale.
 fn touch_if_stale(manifest: &Path) {
     const FRESH_FOR: std::time::Duration = std::time::Duration::from_secs(6 * 3600);
     let stale = fs::metadata(manifest)
@@ -930,13 +733,11 @@ fn touch_if_stale(manifest: &Path) {
     }
 }
 
-/// A number no other call in this process gets, for temporary file names.
 fn unique() -> u64 {
     static NEXT: AtomicU64 = AtomicU64::new(0);
     NEXT.fetch_add(1, Ordering::Relaxed)
 }
 
-/// Blake3 of a file's contents, hex encoded.
 pub(crate) fn hash_file(path: &Path) -> Result<String> {
     let mut hasher = blake3::Hasher::new();
     hasher.update_reader(File::open(path)?)?;
@@ -986,12 +787,9 @@ mod tests {
             .put("keyv", "foo", "1.0.0", std::slice::from_ref(&file))
             .unwrap();
 
-        // A build directory hardlinks the object...
         let build = tempdir().unwrap();
         let linked = store.link_to("keyv", build.path()).unwrap();
 
-        // ...then the same key is published again with different content (a
-        // forced or racing rebuild). The first result stands.
         fs::write(&file, "v2").unwrap();
         store.put("keyv", "foo", "1.0.0", &[file]).unwrap();
 
@@ -1000,9 +798,6 @@ mod tests {
         let relinked = store.link_to("keyv", other_build.path()).unwrap();
         assert_eq!(fs::read_to_string(&relinked[0]).unwrap(), "v1");
 
-        // And a stray in-place write through a link fails instead of
-        // corrupting the shared object. (A superuser may write read-only
-        // files anyway; then only the permission bits can be checked.)
         assert!(
             fs::metadata(&linked[0]).unwrap().permissions().readonly(),
             "stored objects must be read-only"
@@ -1031,8 +826,6 @@ mod tests {
         let obj = store.object_dir("k").join("libfoo-abc.rlib");
         assert!(already_linked(&out, &obj), "the output itself is stored");
         assert!(fs::metadata(&out).unwrap().permissions().readonly());
-        // It restores like any entry, and a restore into the same directory
-        // finds it already in place.
         let linked = store.link_to("k", build.path()).unwrap();
         assert_eq!(fs::read_to_string(&linked[0]).unwrap(), "compiled");
     }
@@ -1048,12 +841,10 @@ mod tests {
             .put("k", "bar", "1.0.0", std::slice::from_ref(&file))
             .unwrap();
 
-        // Damage: the artifact disappears (a half-collected entry).
         let obj = store.object_dir("k").join("libbar.rlib");
         fs::remove_file(&obj).unwrap();
         assert!(store.link_to("k", tempdir().unwrap().path()).is_err());
 
-        // Publishing again repairs it instead of trusting the broken entry.
         store.put("k", "bar", "1.0.0", &[file]).unwrap();
         let target = tempdir().unwrap();
         let ok = store.link_to("k", target.path()).unwrap();
@@ -1096,8 +887,6 @@ mod tests {
                 .matches_dependencies(&deps(&[("libdep-1.rmeta", "bbbb")]))
         );
         assert!(!linked.manifest.matches_dependencies(&BTreeMap::new()));
-        // The metadata identifies the build, not the library; the same as
-        // the outputs it was stored from say.
         let content = linked.manifest.content().unwrap();
         assert_eq!(content.file, "libmid-1.rmeta");
         assert_eq!(content.id, hash_file(&rmeta).unwrap());
@@ -1127,14 +916,11 @@ mod tests {
                 .unwrap()
         };
         assert_eq!(put(&[("dep-1", "old")], true), PutOutcome::Stored);
-        // A restore into a build directory, before anything changes.
         let earlier_dir = tempdir().unwrap();
         let earlier = store.link_to("k", earlier_dir.path()).unwrap();
 
-        // The same dependencies: the first result stands.
         fs::write(&file, "rebuilt").unwrap();
         assert_eq!(put(&[("dep-1", "old")], true), PutOutcome::Kept);
-        // Other ones, but the caller cannot vouch for them: kept as well.
         assert_eq!(put(&[("dep-1", "new")], false), PutOutcome::KeptStale);
         let read = |s: &CasStore| {
             let target = tempdir().unwrap();
@@ -1143,8 +929,6 @@ mod tests {
         };
         assert_eq!(read(&store), "against old");
 
-        // Compiled against the dependencies the store holds now: replaced,
-        // read-only files and all, while what was linked before is untouched.
         fs::write(&file, "against new").unwrap();
         assert_eq!(put(&[("dep-1", "new")], true), PutOutcome::Stored);
         assert_eq!(read(&store), "against new");
@@ -1214,7 +998,6 @@ mod tests {
         store.put("kv", "baz", "1.0.0", &[file]).unwrap();
         assert!(store.link_to("kv", tempdir().unwrap().path()).is_ok());
 
-        // Bit rot: same size, different bytes.
         let obj = store.object_dir("kv").join("libbaz.rlib");
         #[allow(clippy::permissions_set_readonly_false)]
         {
@@ -1224,7 +1007,6 @@ mod tests {
         }
         fs::write(&obj, "bbbb").unwrap();
         assert!(store.link_to("kv", tempdir().unwrap().path()).is_err());
-        // Without verification only the size is checked.
         let lax = CasStore::new(dir.path().to_path_buf()).unwrap();
         assert!(lax.link_to("kv", tempdir().unwrap().path()).is_ok());
     }
@@ -1248,7 +1030,7 @@ mod tests {
         store.flush_stats();
         let stats = store.stats().unwrap();
         assert_eq!((stats.hits, stats.misses, stats.total_entries), (1, 1, 1));
-        store.flush_stats(); // idempotent: counters were drained
+        store.flush_stats();
         assert_eq!(store.stats().unwrap().hits, 1);
     }
 }

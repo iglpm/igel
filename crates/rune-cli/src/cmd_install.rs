@@ -1,14 +1,4 @@
-//! `rune install` and `rune uninstall`.
-//!
-//! Binaries come from the registry (`rune install ripgrep`), a git repository
-//! (`--git`) or a local package (`--path`). Every install is recorded in
-//! Cargo's own tracking files (`.crates.toml`, `.crates2.json`) in the
-//! installation root, so `cargo install --list` and `cargo uninstall` see what
-//! Rune installed, and the other way round.
-//!
-//! Registry and git sources are immutable, so a package from either is built
-//! in a scratch copy under `RUNE_HOME/install`, removed afterwards: compiled
-//! results live on in the store, which makes reinstalling or upgrading cheap.
+//! `rune install`/`uninstall`, recorded in Cargo's tracking files so `cargo install --list` sees them.
 
 use crate::args::{InstallArgs, UninstallArgs};
 use crate::cmd_build::plan_for;
@@ -21,7 +11,6 @@ use rune_scheduler::executor::bin_dir_for;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-/// Cargo's name for crates.io in tracking keys and lockfiles.
 const CRATES_IO_SOURCE: &str = "registry+https://github.com/rust-lang/crates.io-index";
 
 pub fn install(args: InstallArgs) -> Result<()> {
@@ -51,10 +40,6 @@ pub fn install(args: InstallArgs) -> Result<()> {
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// Sources
-// ---------------------------------------------------------------------------
 
 fn install_from_registry(args: &InstallArgs, spec: &str, root: &Path) -> Result<()> {
     configure_registries();
@@ -99,8 +84,7 @@ fn install_from_registry(args: &InstallArgs, spec: &str, root: &Path) -> Result<
     let downloader = rune_registry::CrateDownloader::for_registry(&index)?.offline(offline);
     let src = downloader.download_and_extract(name, &version, Some(&record.cksum))?;
     let scratch = scratch_copy(&src, &format!("{name}-{version}"))?;
-    // A published package's `Cargo.lock` is only honoured with `--locked`,
-    // as with Cargo; otherwise the newest compatible dependencies are used.
+    // A published `Cargo.lock` is only honoured with `--locked`, as with Cargo.
     if !args.common.locked {
         let _ = std::fs::remove_file(scratch.join("Cargo.lock"));
     }
@@ -127,7 +111,6 @@ fn install_from_git(args: &InstallArgs, url: &str, root: &Path) -> Result<()> {
         .strip_prefix(&checkout.dir)
         .unwrap_or(Path::new(""))
         .to_path_buf();
-    // The whole repository: a member may inherit from its workspace.
     let scratch = scratch_copy(&checkout.dir, &format!("git-{}", &checkout.commit[..12]))?;
     let manifest = rune_common::manifest_file::manifest_in(&scratch.join(&rel));
     let name = package_name(&manifest)?;
@@ -137,8 +120,6 @@ fn install_from_git(args: &InstallArgs, url: &str, root: &Path) -> Result<()> {
     result
 }
 
-/// Builds the package at `manifest` in release mode and copies its binaries
-/// into `<root>/bin`, recording them.
 fn build_and_install(
     args: &InstallArgs,
     manifest: &Path,
@@ -148,10 +129,8 @@ fn build_and_install(
     root: &Path,
 ) -> Result<()> {
     let mut common = args.common.clone();
-    // Installed binaries are release builds unless a profile is named.
     common.release = common.profile.is_none();
     common.manifest_path = Some(manifest.to_path_buf());
-    // Build the package itself, not the workspace it may sit in.
     if common.package.is_empty() {
         common.package = vec![name.to_string()];
     }
@@ -185,7 +164,6 @@ fn build_and_install(
     let bin_dir = root.join("bin");
     let mut tracking = Tracking::load(root);
     let exe = |n: &str| format!("{n}{}", std::env::consts::EXE_SUFFIX);
-    // Binaries another package installed are not silently replaced.
     if !args.force {
         for r in &bins {
             let dest = bin_dir.join(exe(&r.target));
@@ -220,16 +198,12 @@ fn build_and_install(
         let unit = &plan.graph.node(r.node).unit;
         let src = bin_dir_for(sess.config(), &sess.profile, unit).join(exe(&r.target));
         let dest = bin_dir.join(exe(&r.target));
-        // Copy to a temporary name and rename: a running copy of the old
-        // binary keeps working, and the new one appears whole.
+        // Temp name + rename: a running old binary keeps working.
         let tmp = bin_dir.join(format!(".{}.rune-install", exe(&r.target)));
         let _ = remove_read_only(&tmp);
         std::fs::copy(&src, &tmp)
             .with_context(|| format!("failed to install {}", dest.display()))?;
-        // The build's copy is read-only (it is the store's); an installed
-        // program is the user's, and the next install replaces it.
         make_writable(&tmp).with_context(|| format!("failed to install {}", dest.display()))?;
-        // (One installed by an earlier Rune may still be read-only.)
         rune_common::fsutil::rename_over(&tmp, &dest)
             .with_context(|| format!("failed to install {}", dest.display()))?;
         ui::action("installed", dest.display());
@@ -241,10 +215,6 @@ fn build_and_install(
     warn_if_not_on_path(&bin_dir);
     Ok(())
 }
-
-// ---------------------------------------------------------------------------
-// Uninstall and list
-// ---------------------------------------------------------------------------
 
 pub fn uninstall(args: UninstallArgs) -> Result<()> {
     if args.packages.is_empty() {
@@ -296,8 +266,6 @@ pub fn uninstall(args: UninstallArgs) -> Result<()> {
 fn list(root: &Path) -> Result<()> {
     let tracking = Tracking::load(root);
     for (key, bins) in &tracking.v1 {
-        // Cargo prints `name version:` (with the `v`), the source omitted
-        // for registry packages.
         let mut parts = key.splitn(3, ' ');
         let (name, version, source) = (
             parts.next().unwrap_or(""),
@@ -316,13 +284,6 @@ fn list(root: &Path) -> Result<()> {
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// Tracking files
-// ---------------------------------------------------------------------------
-
-/// Cargo's install tracking: `.crates.toml` (`"name version (source)" =
-/// [bins]`) and `.crates2.json` (the same keys with the build's details).
-/// Both are kept in step; entries Rune does not understand are preserved.
 struct Tracking {
     v1: BTreeMap<String, Vec<String>>,
     v2: serde_json::Map<String, serde_json::Value>,
@@ -358,7 +319,6 @@ impl Tracking {
         Self { v1, v2 }
     }
 
-    /// The tracking key owning binary `bin`, if any.
     fn owner_of(&self, bin: &str) -> Option<String> {
         self.v1
             .iter()
@@ -366,7 +326,6 @@ impl Tracking {
             .map(|(k, _)| k.clone())
     }
 
-    /// Replaces whatever was recorded for package `name` with this install.
     fn record(
         &mut self,
         name: &str,
@@ -375,7 +334,6 @@ impl Tracking {
         bins: Vec<String>,
         sess: &Session,
     ) {
-        // A binary belongs to one package: drop it from any other entry.
         let old: Vec<String> = self
             .v1
             .keys()
@@ -445,7 +403,6 @@ fn installed_version(root: &Path, name: &str, source: &str) -> Option<String> {
     Tracking::load(root).version_of(name, source)
 }
 
-/// The package name of a tracking key (`"name version (source)"`).
 fn package_of(key: &str) -> &str {
     key.split(' ').next().unwrap_or(key)
 }
@@ -457,11 +414,6 @@ fn write_atomic(path: &Path, content: &str) -> Result<()> {
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-/// `--root`, else `$CARGO_INSTALL_ROOT`, else `$CARGO_HOME`, else `~/.cargo`.
 pub fn install_root(root: Option<&Path>) -> Result<PathBuf> {
     if let Some(root) = root {
         return Ok(root.to_path_buf());
@@ -475,8 +427,6 @@ pub fn install_root(root: Option<&Path>) -> Result<PathBuf> {
         .context("could not determine the install directory; pass --root")
 }
 
-/// Registries, mirrors and credentials from the configuration that applies
-/// in the working directory (there is no project yet).
 fn configure_registries() {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let config = rune_common::cargo_config::CargoConfig::load(&cwd);
@@ -488,8 +438,6 @@ fn configure_registries() {
     ));
 }
 
-/// `1.2.3` means exactly that version (as with Cargo); anything else is a
-/// requirement; nothing means the newest.
 fn version_req(spec: Option<&str>) -> Result<semver::VersionReq> {
     let Some(spec) = spec.map(str::trim) else {
         return Ok(semver::VersionReq::STAR);
@@ -500,9 +448,6 @@ fn version_req(spec: Option<&str>) -> Result<semver::VersionReq> {
     semver::VersionReq::parse(spec).with_context(|| format!("invalid version requirement `{spec}`"))
 }
 
-/// The newest non-yanked version matching `req` — preferring one this
-/// compiler can build (`rust-version`) — and no pre-release unless the
-/// requirement names one.
 fn pick_version<'a>(
     entries: &'a rune_registry::CrateIndex,
     req: &semver::VersionReq,
@@ -539,8 +484,6 @@ fn pick_version<'a>(
     }
 }
 
-/// Copies `src` (immutable registry or git source) to a fresh directory the
-/// build may write into (its `Cargo.lock`, `.rune/`).
 fn scratch_copy(src: &Path, label: &str) -> Result<PathBuf> {
     let base = rune_common::settings::rune_home().join("install");
     let dir = base.join(format!("{label}-{}", std::process::id()));
@@ -570,15 +513,12 @@ fn copy_tree(src: &Path, dest: &Path) -> std::io::Result<()> {
             std::fs::copy(from.parent().unwrap_or(src).join(target), &to).map(|_| ())?;
         } else {
             std::fs::copy(&from, &to)?;
-            // Sources are read-only in the store; the copy must be writable
-            // for the build (and removable afterwards).
             make_writable(&to)?;
         }
     }
     Ok(())
 }
 
-/// Clears a file's read-only flag (a copy of a stored file keeps it).
 fn make_writable(path: &Path) -> std::io::Result<()> {
     let mut perms = std::fs::metadata(path)?.permissions();
     if perms.readonly() {
@@ -589,7 +529,6 @@ fn make_writable(path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Removes a file, read-only or not (`fs::copy` cannot write over one).
 fn remove_read_only(path: &Path) -> std::io::Result<()> {
     make_writable(path)?;
     std::fs::remove_file(path)

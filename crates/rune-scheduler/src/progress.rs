@@ -3,33 +3,18 @@ use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use rune_graph::NodeId;
 use std::time::Duration;
 
-/// Live progress display for builds: a single line,
-///
-/// ```text
-/// ⠹ building ━━━━━━━━━━━╾──────────── 45/183 · serde_derive, syn, tokio +2
-/// ```
-///
-/// with the crates being compiled in the order they started (the oldest
-/// first: those are what the build is waiting on). One line that is cut to
-/// the terminal's width can never wrap or outgrow the screen, which a stack
-/// of one spinner per crate did on narrow or short terminals.
+/// Single-line build progress, cut to the terminal width, with active crates oldest first.
 pub struct BuildProgress {
     multi: MultiProgress,
     bar: ProgressBar,
-    /// Units compiling or running a build script, oldest first.
     active: Vec<(NodeId, String)>,
 }
 
 impl BuildProgress {
-    /// Create a new progress display on top of an existing `MultiProgress`.
-    ///
-    /// The `MultiProgress` is shared with every line the CLI prints, which
-    /// suspends it while writing, so output never tears the progress line.
     pub fn new(multi: MultiProgress, total_units: u64) -> Self {
         Self::with_verb(multi, total_units, "building")
     }
 
-    /// Like [`Self::new`], with another verb (`checking`, `testing`).
     pub fn with_verb(multi: MultiProgress, total_units: u64, verb: &str) -> Self {
         let bar = multi.add(ProgressBar::new(total_units));
         bar.set_style(bar_style(bar_width()));
@@ -54,7 +39,6 @@ impl BuildProgress {
     }
 
     fn redraw(&self) {
-        // What is left of the line after the spinner, verb, bar and count.
         let used = 2
             + self.bar.prefix().chars().count()
             + 1
@@ -67,7 +51,6 @@ impl BuildProgress {
         self.bar.set_message(fit_list(&names, room));
     }
 
-    /// Process a pipeline event.
     pub fn on_event(&mut self, event: &PipelineEvent) {
         match event {
             PipelineEvent::BuildStarted { node_id, unit } => {
@@ -86,8 +69,6 @@ impl BuildProgress {
                 self.bar.inc(1);
             }
             PipelineEvent::BuildFailed { node_id, .. } => {
-                // The full rendered diagnostic is printed separately by the
-                // caller once the progress display has finished.
                 self.stop(*node_id);
             }
             PipelineEvent::AllComplete { .. } => self.finish(),
@@ -95,7 +76,6 @@ impl BuildProgress {
         }
     }
 
-    /// Finish the progress display.
     pub fn finish(&self) {
         self.bar.finish_and_clear();
         self.multi.remove(&self.bar);
@@ -110,7 +90,6 @@ impl Drop for BuildProgress {
     }
 }
 
-/// The width of the terminal the progress line is drawn on.
 fn term_width() -> usize {
     console::Term::stderr()
         .size_checked()
@@ -118,13 +97,10 @@ fn term_width() -> usize {
         .unwrap_or(80)
 }
 
-/// A bar that leaves room for the count and some names: 24 cells on an
-/// ordinary terminal, fewer on a narrow one.
 pub fn bar_width() -> usize {
     (term_width().saturating_sub(40) / 2).clamp(8, 24)
 }
 
-/// The style of Rune's progress bars, `width` cells wide.
 pub fn bar_style(width: usize) -> ProgressStyle {
     ProgressStyle::default_bar()
         .template(&format!(
@@ -135,8 +111,6 @@ pub fn bar_style(width: usize) -> ProgressStyle {
         .progress_chars("━╾─")
 }
 
-/// As many of `names` as fit in `room` columns, joined with commas, and
-/// `+N` for the rest: `serde_derive, syn, tokio +3`. Never cuts a name.
 pub fn fit_list(names: &[&str], room: usize) -> String {
     let mut out = String::new();
     for (i, name) in names.iter().enumerate() {

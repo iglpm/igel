@@ -1,8 +1,5 @@
-//! `rune self update`, against a local download server.
-//!
-//! (Not named `self_update`: Windows takes a program whose name holds
-//! "update", "setup" or "install" for an installer and refuses to start the
-//! test binary without elevation.)
+//! `rune self update` against a local download server. (Not named `self_update`: Windows treats
+//! programs named "update"/"setup"/"install" as installers needing elevation.)
 
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -26,8 +23,16 @@ fn serve_dir(dir: &Path) -> (String, std::sync::mpsc::Sender<()>) {
                 break;
             }
             if let Ok((mut stream, _)) = listener.accept() {
-                let mut req = [0u8; 1024];
-                let _ = stream.read(&mut req);
+                // On Windows an accepted socket inherits the listener's non-blocking mode.
+                stream.set_nonblocking(false).unwrap();
+                let mut req = Vec::new();
+                let mut buf = [0u8; 1024];
+                while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match stream.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => req.extend_from_slice(&buf[..n]),
+                    }
+                }
                 let req_str = String::from_utf8_lossy(&req);
                 let first_line = req_str.lines().next().unwrap_or("");
                 let path = first_line
@@ -73,14 +78,12 @@ fn test_self_update_lifecycle() {
         format!("{arch}-{os}")
     };
 
-    // Create a mock updated binary inside a folder structure
     let package_dir = tempfile::tempdir().unwrap();
     let inner_dir = package_dir.path().join(format!("rune-{target}"));
     std::fs::create_dir_all(&inner_dir).unwrap();
 
     let bin_name = if cfg!(windows) { "rune.exe" } else { "rune" };
     let mock_bin = inner_dir.join(bin_name);
-    // Write a small executable shell script or file
     let mock_content = b"#!/bin/sh\necho \"rune 9999.9.9 (test)\"\n";
     std::fs::write(&mock_bin, mock_content).unwrap();
     #[cfg(unix)]
@@ -89,7 +92,6 @@ fn test_self_update_lifecycle() {
         std::fs::set_permissions(&mock_bin, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 
-    // Package into tar.gz
     let archive_name = format!("rune-{target}.tar.gz");
     let archive_path = server_dir.path().join(&archive_name);
     let tar_gz = std::fs::File::create(&archive_path).unwrap();
@@ -100,20 +102,16 @@ fn test_self_update_lifecycle() {
     let enc = tar.into_inner().unwrap();
     enc.finish().unwrap();
 
-    // Compute SHA-256 and write .sha256 file
     let hash = rune_registry::download::sha256_file(&archive_path).unwrap();
     let sha_path = server_dir.path().join(format!("{archive_name}.sha256"));
     std::fs::write(sha_path, format!("{hash}  {archive_name}\n")).unwrap();
 
-    // Start mock HTTP server
     let (base_url, shutdown_tx) = serve_dir(server_dir.path());
 
-    // Prepare a destination directory with an old dummy binary
     let client_dir = tempfile::tempdir().unwrap();
     let target_dest = client_dir.path().join(bin_name);
     std::fs::write(&target_dest, b"old binary").unwrap();
 
-    // Run `rune self update --to <target_dest> -v v9999.9.9` with RUNE_DOWNLOAD_BASE set
     let output = Command::new(rune_bin())
         .args([
             "self",
@@ -140,7 +138,6 @@ fn test_self_update_lifecycle() {
     assert!(stderr.contains("checksum matches"), "stderr: {stderr}");
     assert!(stderr.contains("updated"), "stderr: {stderr}");
 
-    // Verify the file was replaced with the mock binary content
     let installed_bytes = std::fs::read(&target_dest).unwrap();
     assert_eq!(installed_bytes, mock_content);
 }

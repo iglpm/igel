@@ -1,30 +1,23 @@
-//! Rendering of the resolved dependency graph: `rune tree` and `rune why`.
+//! `rune tree` and `rune why`.
 
 use crate::resolver::{ResolvedDependencyRef, ResolvedGraph, ResolvedPackage};
 use colored::*;
 use rune_manifest::dependency::DependencyKind;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
-/// How each line of a tree starts (`--prefix`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Prefix {
-    /// Tree lines (`├── `).
     #[default]
     Indent,
-    /// The depth as a number (`2serde v1.0.0`), for tools.
     Depth,
-    /// Nothing: one package per line.
     None,
 }
 
-/// Which dependency edges a tree follows (`-e/--edges`), as in Cargo.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Edges {
     pub normal: bool,
     pub build: bool,
-    /// Development dependencies (of the workspace's own packages only).
     pub dev: bool,
-    /// Features as nodes: which package turns on which feature of which.
     pub features: bool,
 }
 
@@ -40,9 +33,6 @@ impl Default for Edges {
 }
 
 impl Edges {
-    /// Cargo's `-e` values: `all`, `normal`, `build`, `dev`, `features`,
-    /// `no-normal`, `no-build`, `no-dev` (comma-separated or repeated).
-    /// Naming a kind shows only the kinds named; `no-` removes one.
     pub fn parse(values: &[String]) -> Result<Self, String> {
         let words: Vec<&str> = values
             .iter()
@@ -91,26 +81,16 @@ impl Edges {
     }
 }
 
-/// Options for [`render_tree`].
 #[derive(Debug, Clone, Default)]
 pub struct TreeOptions {
-    /// Stop descending below this depth (roots are depth 0).
     pub max_depth: Option<usize>,
-    /// Show each package's active features.
     pub features: bool,
-    /// Show only packages that appear in more than one version, as inverted
-    /// trees (who pulls in each duplicate).
     pub duplicates: bool,
-    /// Show the reverse tree of this package name: what depends on it.
     pub invert: Option<String>,
-    /// Include dev-dependencies even if `edges` leaves them out.
     pub dev: bool,
     pub edges: Edges,
     pub prefix: Prefix,
-    /// Only dependencies that apply to this target triple (`None`: all).
     pub target: Option<String>,
-    /// The workspace's packages (ids): only their development dependencies
-    /// are shown. Empty: the roots.
     pub members: Vec<String>,
 }
 
@@ -118,8 +98,6 @@ fn id_of(pkg: &ResolvedPackage) -> String {
     format!("{} {}", pkg.name, pkg.version)
 }
 
-/// The resolved children of `pkg` as package ids, in a stable order, without
-/// duplicates.
 fn children(graph: &ResolvedGraph, pkg: &ResolvedPackage, dev: bool) -> Vec<String> {
     let mut out: BTreeSet<(String, String)> = BTreeSet::new();
     for dep in &pkg.dependencies {
@@ -134,14 +112,12 @@ fn children(graph: &ResolvedGraph, pkg: &ResolvedPackage, dev: bool) -> Vec<Stri
     out.into_iter().map(|(_, id)| id).collect()
 }
 
-/// A node of the tree: a package, or (with `-e features`) one feature of one.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 enum Node {
     Pkg(String),
     Feat(String, String),
 }
 
-/// The graph as a tree shows it: which edges apply under the options.
 struct View<'a> {
     graph: &'a ResolvedGraph,
     opts: &'a TreeOptions,
@@ -170,9 +146,6 @@ impl<'a> View<'a> {
         self.graph.packages.get(id)
     }
 
-    /// Whether `p` turns its optional dependency `dep` on. A package whose
-    /// feature table is unknown (a local one) is taken to, when the
-    /// dependency is in the graph at all.
     fn activated(&self, p: &ResolvedPackage, dep: &ResolvedDependencyRef) -> bool {
         if !dep.optional || p.declared_features.is_empty() {
             return true;
@@ -190,7 +163,6 @@ impl<'a> View<'a> {
         })
     }
 
-    /// The dependency edges of `p` that apply, with the package each leads to.
     fn dep_edges(
         &self,
         p: &'a ResolvedPackage,
@@ -219,14 +191,11 @@ impl<'a> View<'a> {
         out
     }
 
-    /// Whether feature `f` of `p` is on (always, when that is unknown).
     fn enabled(&self, p: &ResolvedPackage, f: &str) -> bool {
         p.features.iter().any(|x| x == f)
             || (p.declared_features.is_empty() && p.features.is_empty())
     }
 
-    /// A node's children, each with the kind of the dependency edge it comes
-    /// from (for the `[build-dependencies]` / `[dev-dependencies]` sections).
     fn children(&self, node: &Node) -> Vec<(DependencyKind, Node)> {
         let mut out: Vec<(DependencyKind, Node)> = Vec::new();
         let mut push = |kind: DependencyKind, n: Node| {
@@ -243,8 +212,6 @@ impl<'a> View<'a> {
                         push(dep.kind, Node::Pkg(cid));
                         continue;
                     }
-                    // An optional dependency is reached through the feature
-                    // that turns it on (when the feature table is known).
                     if dep.optional && !p.declared_features.is_empty() {
                         continue;
                     }
@@ -301,7 +268,6 @@ impl<'a> View<'a> {
         out
     }
 
-    /// Sort key: package name, then version (numerically), then feature.
     fn order<'n>(&self, node: &'n Node) -> (&'a str, Option<&'a semver::Version>, &'n str, u8) {
         let (id, feature, rank) = match node {
             Node::Pkg(id) => (id, "", 0),
@@ -318,7 +284,6 @@ impl<'a> View<'a> {
             Node::Pkg(id) => match self.pkg(id) {
                 Some(p) => {
                     let mut s = format!("{} v{}", p.name.bold(), p.version);
-                    // Where it comes from, when not a registry (as Cargo shows).
                     match &p.source {
                         crate::resolver::PackageSource::Path(dir) => {
                             s.push_str(&format!(" ({})", dir.display()));
@@ -342,9 +307,6 @@ impl<'a> View<'a> {
         }
     }
 
-    /// Every edge between nodes reachable from `roots` (and from the enabled
-    /// features of the workspace's packages, which the command line turns on),
-    /// reversed: node → the nodes that lead to it.
     fn reverse(&self, roots: &[String]) -> BTreeMap<Node, Vec<(DependencyKind, Node)>> {
         let mut starts: Vec<Node> = roots.iter().cloned().map(Node::Pkg).collect();
         if roots.is_empty() {
@@ -381,7 +343,6 @@ impl<'a> View<'a> {
     }
 }
 
-/// Resolves a user-typed root (`name` or `name version`) to package ids.
 fn ids_for_name(graph: &ResolvedGraph, name: &str) -> Vec<String> {
     let mut ids: Vec<String> = graph
         .packages
@@ -399,8 +360,6 @@ fn ids_for_name(graph: &ResolvedGraph, name: &str) -> Vec<String> {
     ids
 }
 
-/// Writes the lines below one node: its children (from `next`), grouped as
-/// Cargo groups them, recursively.
 struct Printer<'v, 'a, F: Fn(&Node) -> Vec<(DependencyKind, Node)>> {
     view: &'v View<'a>,
     next: F,
@@ -432,8 +391,6 @@ impl<F: Fn(&Node) -> Vec<(DependencyKind, Node)>> Printer<'_, '_, F> {
             return;
         }
         let kids = (self.next)(node);
-        // Normal edges first, then `[build-dependencies]`, then
-        // `[dev-dependencies]`, each under its heading.
         for kind in [
             DependencyKind::Normal,
             DependencyKind::Build,
@@ -475,7 +432,6 @@ impl<F: Fn(&Node) -> Vec<(DependencyKind, Node)>> Printer<'_, '_, F> {
     }
 }
 
-/// Renders a tree rooted at each id in `roots`.
 pub fn render_tree(graph: &ResolvedGraph, roots: &[String], opts: &TreeOptions) -> String {
     let view = View::new(graph, roots, opts);
 
@@ -513,8 +469,6 @@ pub fn render_tree(graph: &ResolvedGraph, roots: &[String], opts: &TreeOptions) 
         let target = opts.invert.as_deref().unwrap_or_default();
         for id in ids_for_name(graph, target) {
             printer.expanded.clear();
-            // With features, a package's features lead to it: start there,
-            // so each enabled feature shows who turned it on.
             printer.root(&Node::Pkg(id), false);
         }
         if printer.out.is_empty() {
@@ -539,7 +493,6 @@ pub fn render_tree(graph: &ResolvedGraph, roots: &[String], opts: &TreeOptions) 
     printer.out
 }
 
-/// Compatibility wrapper: renders a tree from `graph.root_packages`.
 pub fn render_dependency_tree(graph: &ResolvedGraph, max_depth: Option<usize>) -> String {
     let roots: Vec<String> = graph
         .root_packages
@@ -556,12 +509,6 @@ pub fn render_dependency_tree(graph: &ResolvedGraph, max_depth: Option<usize>) -
     )
 }
 
-/// Shortest dependency chains from any of `roots` (package ids) to every
-/// package named `target` (a bare name or `name version`).
-///
-/// Returns each chain as a list of `name version` strings, root first. Chains
-/// are found breadth-first, so the shortest come out first, and one chain is
-/// reported per distinct final version.
 pub fn trace_why(graph: &ResolvedGraph, roots: &[String], target: &str) -> Vec<Vec<String>> {
     let targets: HashSet<String> = ids_for_name(graph, target).into_iter().collect();
     let mut results: Vec<Vec<String>> = Vec::new();
@@ -579,8 +526,6 @@ pub fn trace_why(graph: &ResolvedGraph, roots: &[String], target: &str) -> Vec<V
             }
             continue;
         }
-        // Allow revisiting a package only via an equally short path, so all
-        // shortest chains are kept but the search stays linear-ish.
         match best.get(&cur) {
             Some(&len) if len < path.len() => continue,
             _ => {
@@ -655,7 +600,6 @@ mod tests {
     }
 
     fn plain(s: String) -> String {
-        // Strip ANSI so assertions don't depend on the terminal.
         let mut out = String::new();
         let mut chars = s.chars().peekable();
         while let Some(c) = chars.next() {
@@ -689,7 +633,6 @@ mod tests {
             out.contains("shared v1.2.0 (*)"),
             "second occurrence of shared 1.2.0 is collapsed: {out}"
         );
-        // A leaf has nothing to hide: repeated without the marker, as in Cargo.
         assert!(!out.contains("leaf v1.0.0 (*)"), "{out}");
     }
 
@@ -776,9 +719,6 @@ mod tests {
         }
     }
 
-    /// app → serde (with `derive`), build → cc, dev → tmp; serde's `derive`
-    /// turns on its optional `serde_derive`; `cc` has a dev-dependency (not
-    /// a workspace package, so never shown) and a Windows-only one.
     fn featured() -> ResolvedGraph {
         let mk = |name: &str,
                   deps: Vec<ResolvedDependencyRef>,
@@ -863,8 +803,6 @@ mod tests {
             .unwrap();
         assert!(lines[1].contains("serde v1.0.0") && build < dev, "{out}");
         assert!(lines[build + 1].contains("cc v1.0.0"), "{out}");
-        // `cc`'s own dev-dependency and its Windows-only dependency are not
-        // shown; `serde`'s optional dependency is, since `derive` is on.
         assert_eq!(out.matches("tmp v1.0.0").count(), 1, "{out}");
         assert!(!out.contains("winapi"), "{out}");
         assert!(out.contains("serde_derive v1.0.0"), "{out}");
@@ -901,7 +839,6 @@ mod tests {
         assert!(out.contains("serde feature \"derive\""), "{out}");
         assert!(out.contains("serde feature \"std\""), "{out}");
 
-        // Inverted: why is serde's `std` on? Its `default`, which app asked for.
         let why = TreeOptions {
             invert: Some("serde_derive".into()),
             ..opts

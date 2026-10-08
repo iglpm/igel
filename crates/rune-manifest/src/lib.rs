@@ -1,6 +1,4 @@
-//! # rune-manifest
-//!
-//! Cargo.toml and Rune.toml manifest parser for the Rune build system.
+//! Cargo.toml and Rune.toml manifest parsing.
 
 pub mod cargo_toml;
 pub mod dependency;

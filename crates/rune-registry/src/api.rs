@@ -1,8 +1,4 @@
-//! The registry web API (crates.io's, and every registry that implements
-//! it): search, crate information, publishing, yanking and owners.
-//!
-//! crates.io's API lives at `https://crates.io`; an alternative registry
-//! names its API in the `config.json` at the root of its index (`"api"`).
+//! The registry web API: search, crate info, publishing, yanking and owners.
 
 use crate::source::{CRATES_IO, defs};
 use serde_json::Value;
@@ -22,13 +18,11 @@ pub enum ApiError {
 
 pub type Result<T> = std::result::Result<T, ApiError>;
 
-/// A search hit: `name = "max_version"    # description`.
 #[derive(Debug, Clone)]
 pub struct SearchHit {
     pub name: String,
     pub version: String,
     pub description: Option<String>,
-    /// All-time downloads (0 when the registry does not say).
     pub downloads: u64,
 }
 
@@ -36,12 +30,10 @@ pub struct RegistryApi {
     base: String,
     token: Option<String>,
     client: reqwest::blocking::Client,
-    /// How configuration names the registry, for messages.
     pub name: String,
 }
 
 impl RegistryApi {
-    /// The API of the registry with this index.
     pub fn for_index(index: &str) -> Result<Self> {
         let defs = defs();
         let client = crate::http::client(
@@ -84,13 +76,11 @@ impl RegistryApi {
         })
     }
 
-    /// Uses this token instead of the configured one (`--token`).
     pub fn with_token(mut self, token: &str) -> Self {
         self.token = Some(token.to_string());
         self
     }
 
-    /// The API root, e.g. `https://crates.io`.
     pub fn base(&self) -> &str {
         &self.base
     }
@@ -117,8 +107,6 @@ impl RegistryApi {
         })
     }
 
-    /// Sends a request and returns its JSON body, turning the API's
-    /// `{"errors": [{"detail": ...}]}` into an error.
     fn call(&self, req: reqwest::blocking::RequestBuilder) -> Result<Value> {
         let resp = req.send()?;
         let status = resp.status();
@@ -144,7 +132,6 @@ impl RegistryApi {
         Ok(body)
     }
 
-    /// `GET /api/v1/crates?q=…`: the hits and the total number of matches.
     pub fn search(&self, query: &str, limit: u32) -> Result<(Vec<SearchHit>, u64)> {
         let body = self.call(
             self.client
@@ -173,7 +160,6 @@ impl RegistryApi {
         Ok((hits, body["meta"]["total"].as_u64().unwrap_or(0)))
     }
 
-    /// `GET /api/v1/crates/{name}`: the crate's page data.
     pub fn crate_info(&self, name: &str) -> Result<Value> {
         self.call(
             self.client
@@ -181,8 +167,6 @@ impl RegistryApi {
         )
     }
 
-    /// `PUT /api/v1/crates/new`: uploads a package. Returns the registry's
-    /// warnings (unknown categories, badges, …).
     pub fn publish(&self, metadata: &Value, tarball: &[u8]) -> Result<Vec<String>> {
         let json = serde_json::to_vec(metadata).expect("metadata is JSON");
         let mut body = Vec::with_capacity(8 + json.len() + tarball.len());
@@ -215,7 +199,6 @@ impl RegistryApi {
         Ok(warnings)
     }
 
-    /// Yanks (or with `undo`, un-yanks) a published version.
     pub fn yank(&self, name: &str, version: &str, undo: bool) -> Result<()> {
         let url = format!(
             "{}/api/v1/crates/{name}/{version}/{}",
@@ -231,7 +214,6 @@ impl RegistryApi {
         Ok(())
     }
 
-    /// The crate's owners, as `login (name)`.
     pub fn owners(&self, name: &str) -> Result<Vec<String>> {
         let body = self.call(
             self.client
@@ -252,7 +234,6 @@ impl RegistryApi {
             .collect())
     }
 
-    /// Adds (or with `remove`, removes) owners by login.
     pub fn change_owners(&self, name: &str, logins: &[String], remove: bool) -> Result<String> {
         let url = format!("{}/api/v1/crates/{name}/owners", self.base);
         let req = if remove {

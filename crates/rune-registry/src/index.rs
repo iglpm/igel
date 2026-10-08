@@ -26,7 +26,6 @@ pub enum IndexError {
 
 pub type Result<T> = std::result::Result<T, IndexError>;
 
-/// A single version entry in the crates.io sparse index.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct IndexRecord {
     pub name: String,
@@ -42,14 +41,11 @@ pub struct IndexRecord {
     pub yanked: bool,
     #[serde(default)]
     pub rust_version: Option<String>,
-    /// When the release was published (`2026-03-11T00:20:04Z`), where the
-    /// registry says.
     #[serde(default)]
     pub pubtime: Option<String>,
 }
 
 impl IndexRecord {
-    /// Combines features and features2 into a single unified map.
     pub fn all_features(&self) -> HashMap<String, Vec<String>> {
         let mut feats = self.features.clone();
         if let Some(f2) = &self.features2 {
@@ -61,7 +57,6 @@ impl IndexRecord {
     }
 }
 
-/// A dependency specification inside an index record.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct IndexDependency {
     pub name: String,
@@ -78,8 +73,6 @@ pub struct IndexDependency {
     pub kind: Option<String>, // "normal", "dev", "build"
     #[serde(default)]
     pub package: Option<String>,
-    /// The index of the registry this dependency comes from, when it is not
-    /// the registry of the depending package (`None` means the same one).
     #[serde(default)]
     pub registry: Option<String>,
 }
@@ -88,7 +81,6 @@ fn default_true() -> bool {
     true
 }
 
-/// In-memory representation of all published versions of a crate.
 #[derive(Debug, Clone, Default)]
 pub struct CrateIndex {
     pub name: String,
@@ -96,37 +88,27 @@ pub struct CrateIndex {
 }
 
 impl CrateIndex {
-    /// Returns all un-yanked versions sorted in index order.
     pub fn available_versions(&self) -> Vec<&IndexRecord> {
         self.versions.iter().filter(|v| !v.yanked).collect()
     }
 
-    /// Finds a specific version record.
     pub fn get_version(&self, version: &str) -> Option<&IndexRecord> {
         self.versions.iter().find(|v| v.vers == version)
     }
 }
 
-/// Client for the crates.io Sparse Index (`https://index.crates.io/`).
 pub struct SparseIndexClient {
     base_url: String,
     cache_dir: PathBuf,
     client: crate::http::LazyClient,
-    /// Never touch the network: serve only what is already cached.
     offline: bool,
-    /// Sent as the `Authorization` header (private registries).
     token: Option<String>,
-    /// For messages: the registry's identity.
     label: String,
 }
 
-/// How many index requests to keep in flight at once. Index files are tiny
-/// and the cost is almost entirely round-trip latency, so far more than the
-/// CPU count pays off.
 const PREFETCH_CONCURRENCY: usize = 48;
 
 impl SparseIndexClient {
-    /// Creates a new `SparseIndexClient`.
     pub fn new(cache_dir: PathBuf) -> Self {
         Self {
             base_url: "https://index.crates.io".to_string(),
@@ -143,8 +125,6 @@ impl SparseIndexClient {
         }
     }
 
-    /// A client for an alternative sparse registry. Its cache lives in its own
-    /// directory, so registries never see each other's index files.
     pub fn for_registry(index: &str, token: Option<String>) -> Self {
         if index == crate::source::CRATES_IO && token.is_none() {
             return Self::default_client();
@@ -166,8 +146,6 @@ impl SparseIndexClient {
         client
     }
 
-    /// Default client targeting `~/.rune/registry/index/crates.io-index`
-    /// (or `$RUNE_HOME/registry/...`).
     pub fn default_client() -> Self {
         let cache_dir = rune_common::settings::rune_home()
             .join("registry")
@@ -176,22 +154,15 @@ impl SparseIndexClient {
         Self::new(cache_dir)
     }
 
-    /// Makes this client serve only from the local cache.
     pub fn offline(mut self, offline: bool) -> Self {
         self.offline = offline;
         self
     }
 
-    /// Fetches many crates' indexes concurrently, in the same order as
-    /// `names`. Cached entries return immediately; the rest overlap their
-    /// network round trips instead of paying them one after another, which is
-    /// what dominated cold resolution time.
     pub fn fetch_many(&self, names: &[String]) -> Vec<Result<CrateIndex>> {
         self.fetch_many_with(names, false)
     }
 
-    /// Like [`Self::fetch_many`]; with `refresh`, every crate is re-queried
-    /// over the network (conditionally, see [`Self::refresh_crate`]).
     pub fn fetch_many_with(&self, names: &[String], refresh: bool) -> Vec<Result<CrateIndex>> {
         use rayon::prelude::*;
         let one = |n: &String| {
@@ -213,11 +184,6 @@ impl SparseIndexClient {
         }
     }
 
-    /// Computes the sparse index sharding path for a crate name according to the RFC.
-    /// - 1 char: `1/{name}`
-    /// - 2 chars: `2/{name}`
-    /// - 3 chars: `3/{first_char}/{name}`
-    /// - 4+ chars: `{first_2}/{next_2}/{name}`
     pub fn crate_index_path(name: &str) -> String {
         let lower = name.to_lowercase();
         match lower.len() {
@@ -235,21 +201,11 @@ impl SparseIndexClient {
         }
     }
 
-    /// The cached index entry of `name`, as stored.
     pub fn cached_text(&self, name: &str) -> Option<String> {
         fs::read_to_string(self.cache_dir.join(Self::crate_index_path(name))).ok()
     }
 
-    /// Fetches the crate index, preferring the local cache.
-    ///
-    /// Mirrors Cargo's own behavior: the registry index is only queried over
-    /// the network when no local copy exists yet. A crate's published
-    /// versions never change in place on crates.io, so once an index entry
-    /// has been fetched it remains valid for resolution purposes; only
-    /// `refresh_crate` (used by `rune update`/`rune add`) re-queries the
-    /// network to discover newly published versions. This is what removes
-    /// per-build network round-trips from the common "nothing changed"
-    /// rebuild path.
+    /// Prefers the local cache: published versions never change, so only `refresh_crate` hits the network.
     pub fn fetch_crate(&self, name: &str) -> Result<CrateIndex> {
         let cached_file = self.cache_dir.join(Self::crate_index_path(name));
 
@@ -263,14 +219,7 @@ impl SparseIndexClient {
         self.refresh_crate(name)
     }
 
-    /// Forces a network refresh of the sparse index entry for `name`,
-    /// updating the local cache. Falls back to the local cache if the
-    /// network is unreachable.
-    ///
-    /// Uses a conditional request (`If-None-Match`) when the cached copy has a
-    /// stored ETag, so refreshing an unchanged crate — the common case for
-    /// `rune update` — costs a tiny `304 Not Modified` instead of the full
-    /// file.
+    /// Re-queries the index (with `If-None-Match`), falling back to the cache when offline.
     pub fn refresh_crate(&self, name: &str) -> Result<CrateIndex> {
         let rel_path = Self::crate_index_path(name);
         let cached_file = self.cache_dir.join(&rel_path);
@@ -306,9 +255,7 @@ impl SparseIndexClient {
             request
         });
 
-        // What went wrong, if the answer is not usable; the cached copy (if
-        // any) is used instead, so a flaky network never breaks a build that
-        // has what it needs.
+        // The cached copy is used instead, so a flaky network never breaks a build.
         let failure = match sent {
             Ok(resp) => {
                 let status = resp.status();
@@ -328,8 +275,6 @@ impl SparseIndexClient {
                             if let Some(parent) = cached_file.parent() {
                                 let _ = fs::create_dir_all(parent);
                             }
-                            // Write to a temp name and rename: parallel fetches and
-                            // concurrent `rune` processes share this cache.
                             let tmp =
                                 cached_file.with_extension(format!("{}.tmp", std::process::id()));
                             if fs::write(&tmp, &text).is_ok() {
@@ -370,7 +315,6 @@ impl SparseIndexClient {
             Err(e) => IndexError::Network(e),
         };
 
-        // Fall back to the local cache if the network failed.
         if let Some(index) = read_cached(name, &cached_file) {
             debug!("using the cached index entry of `{name}`: {failure}");
             return Ok(index);
@@ -378,7 +322,6 @@ impl SparseIndexClient {
         Err(failure)
     }
 
-    /// Parses a line-delimited JSON sparse index file.
     pub fn parse_index_text(name: &str, text: &str) -> Result<CrateIndex> {
         let mut versions = Vec::new();
         for line in text.lines() {
@@ -405,10 +348,7 @@ impl SparseIndexClient {
     }
 }
 
-/// The cached index entry at `json`, parsed. A binary copy of the parsed
-/// records sits beside it (`<file>.rbin`), valid while the JSON file keeps
-/// its size and modification time: decoding it is several times faster than
-/// parsing the JSON again, which was most of an offline resolution.
+/// A binary copy (`.rbin`) beside the JSON is valid while size and mtime match; much faster to decode.
 fn read_cached(name: &str, json: &Path) -> Option<CrateIndex> {
     const MAGIC: &[u8; 8] = b"RUNEIDX1";
     let meta = fs::metadata(json).ok()?;
@@ -446,8 +386,6 @@ fn read_cached(name: &str, json: &Path) -> Option<CrateIndex> {
     Some(index)
 }
 
-/// A directory name for a registry's caches: readable host plus a hash of the
-/// full identity, so two registries never collide.
 pub fn registry_dir_key(index: &str) -> String {
     if index == crate::source::CRATES_IO {
         return "crates.io-index".to_string();
@@ -481,8 +419,6 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let client = SparseIndexClient::new(dir.path().to_path_buf()).offline(true);
 
-        // Not cached: a clear offline error, not a network attempt or a
-        // misleading "crate not found".
         assert!(matches!(
             client.fetch_crate("serde"),
             Err(IndexError::Offline(_))

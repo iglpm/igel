@@ -1,39 +1,18 @@
-//! Global Rune configuration.
-//!
-//! Handles discovery of `.rune/` directories, CAS store paths,
-//! and other global settings.
-
 use crate::settings::Settings;
 use std::path::{Path, PathBuf};
 
-/// Global Rune configuration.
 #[derive(Debug, Clone)]
 pub struct RuneConfig {
-    /// The project root directory (where the manifest lives).
     pub project_root: PathBuf,
-    /// The Rune output directory (`.rune/` within project root).
     pub rune_dir: PathBuf,
-    /// The target output directory (`.rune/target/`).
     pub target_dir: PathBuf,
-    /// The fingerprint cache directory (`.rune/fingerprints/`).
     pub fingerprint_dir: PathBuf,
-    /// The global CAS store directory (`~/.rune/cas/`).
     pub cas_dir: PathBuf,
-    /// Number of parallel jobs (default: num_cpus).
     pub jobs: usize,
-    /// Layered user settings (`rune config`): global file, `Rune.toml`, env.
     pub settings: Settings,
 }
 
-/// Default number of parallel jobs: a third more than the CPU count.
-///
-/// A compiler process spends part of its life waiting (on a build script, on
-/// the linker, on disk) and the scheduler can only start a unit once its
-/// dependencies' metadata exists; with exactly one job per core the machine
-/// idles during those gaps. The jobserver shared with every `rustc` keeps the
-/// *total* thread count in check, so a few extra processes only fill the
-/// gaps. Measured on a 12-core machine building 197 crates: 12 jobs took 32.8s,
-/// 16 jobs took 29.2s (Cargo, one job per core: 28.7s).
+/// A third more jobs than CPUs fills the gaps where compilers wait; the jobserver bounds total threads.
 pub fn default_jobs() -> usize {
     let cpus = std::thread::available_parallelism()
         .map(|n| n.get())
@@ -41,7 +20,6 @@ pub fn default_jobs() -> usize {
     cpus + cpus / 3
 }
 
-/// `path` as an absolute path: itself if it is one, else below `base`.
 fn absolute_in(base: &Path, path: &Path) -> PathBuf {
     let path = if path.is_absolute() {
         path.to_path_buf()
@@ -52,12 +30,6 @@ fn absolute_in(base: &Path, path: &Path) -> PathBuf {
 }
 
 impl RuneConfig {
-    /// Create a new `RuneConfig` for the given project root.
-    ///
-    /// Creates the standard directory structure:
-    /// - `.rune/target/{debug,release}/deps/`
-    /// - `.rune/fingerprints/`
-    /// - `~/.rune/cas/objects/`
     pub fn new(project_root: impl Into<PathBuf>) -> Self {
         let project_root = crate::fsutil::simplified(&project_root.into()).to_path_buf();
         let rune_dir = project_root.join(".rune");
@@ -85,13 +57,8 @@ impl RuneConfig {
         }
     }
 
-    /// Applies user settings: `build.target-dir`, `cas.dir`, and `build.jobs`
-    /// take effect on the paths and job count carried by this config.
     pub fn with_settings(mut self, settings: Settings) -> Self {
-        // The compiler runs in other directories (a registry crate's package
-        // root), so every path it is handed must be absolute. (`Rune.toml`'s
-        // relative paths arrive resolved against the project; one from the
-        // environment or the command line is the current directory's.)
+        // The compiler runs in other directories, so every path must be absolute.
         let cwd = std::env::current_dir().unwrap_or_default();
         if let Some(dir) = settings.target_dir() {
             self.target_dir = absolute_in(&cwd, &dir);
@@ -106,11 +73,6 @@ impl RuneConfig {
         self
     }
 
-    /// Returns the output directory for the given profile.
-    /// e.g., `.rune/target/debug/` or `.rune/target/release/`
-    ///
-    /// `profile_name` is the profile's *output directory name*
-    /// (`Profile::output_dir_name`): `debug`, `release`, or a custom profile.
     pub fn profile_target_dir(&self, profile_name: &str) -> PathBuf {
         let dir_name = match profile_name {
             "dev" | "test" => "debug",
@@ -120,12 +82,10 @@ impl RuneConfig {
         self.target_dir.join(dir_name)
     }
 
-    /// Returns the deps directory for compiled dependencies.
     pub fn deps_dir(&self, profile_name: &str) -> PathBuf {
         self.profile_target_dir(profile_name).join("deps")
     }
 
-    /// Returns the build script output directory for a crate.
     pub fn build_script_out_dir(
         &self,
         profile_name: &str,
@@ -138,7 +98,6 @@ impl RuneConfig {
             .join("out")
     }
 
-    /// Like [`Self::build_script_out_dir`], for a `crate-name-hash` directory key.
     pub fn build_script_out_dir_by_key(&self, profile_name: &str, key: &str) -> PathBuf {
         self.profile_target_dir(profile_name)
             .join("build")
@@ -146,9 +105,6 @@ impl RuneConfig {
             .join("out")
     }
 
-    /// Where a package's build script is compiled: beside its `OUT_DIR`, not
-    /// in it, so that the directory the script fills (and the store keeps)
-    /// holds only what the script generated.
     pub fn build_script_bin_dir_by_key(&self, profile_name: &str, key: &str) -> PathBuf {
         self.profile_target_dir(profile_name)
             .join("build")
@@ -156,7 +112,6 @@ impl RuneConfig {
             .join("script")
     }
 
-    /// Ensure all necessary directories exist.
     pub fn ensure_dirs(&self, profile_name: &str) -> std::io::Result<()> {
         std::fs::create_dir_all(&self.fingerprint_dir)?;
         std::fs::create_dir_all(self.deps_dir(profile_name))?;
@@ -167,8 +122,6 @@ impl RuneConfig {
         Ok(())
     }
 
-    /// Discover the project root by searching upward from the given
-    /// path for a manifest (`Cargo.toml`, or a `Rune.toml` that is one).
     pub fn discover(start: &Path) -> Option<Self> {
         let mut current = start.to_path_buf();
         loop {

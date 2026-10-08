@@ -1,20 +1,5 @@
-//! Turns a workspace plus a build request into a [`BuildGraph`].
-//!
-//! The pipeline:
-//!
-//! 1. **Resolve** versions for the whole workspace — every platform, every
-//!    feature, like `Cargo.lock` — so the lockfile is complete and stable no
-//!    matter what a command selects. Reused while no manifest changed.
-//! 2. **Resolve features** for *this* request: only the selected packages'
-//!    requested features count, host artifacts (build scripts, proc-macros,
-//!    and what only they use) get a feature set of their own, and target-gated
-//!    dependencies apply to the platform they are built for
-//!    (`rune_resolver::unit_features`). That fixes what must be compiled, so
-//!    only those registry crates are downloaded.
-//! 3. **Build units**: one per (package, role) library, per requested target
-//!    (binary, example, test harness, ...), wired with normal edges and
-//!    build-script edges.
-//! 4. Drop everything not reachable from the requested targets.
+//! Turns a workspace plus a build request into a [`BuildGraph`]: resolve versions for the whole workspace
+//! (like `Cargo.lock`), resolve features for this request, download what's needed, then plan units.
 
 use anyhow::{Context, Result, bail};
 use colored::Colorize;
@@ -40,11 +25,6 @@ use std::path::{Path, PathBuf};
 use crate::ui;
 use crate::workspace::{Member, Workspace};
 
-// ---------------------------------------------------------------------------
-// Request types
-// ---------------------------------------------------------------------------
-
-/// What kind of command is asking for a graph.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     Build,
@@ -53,7 +33,6 @@ pub enum Mode {
     Bench,
 }
 
-/// `--features`, `--all-features`, `--no-default-features`.
 #[derive(Debug, Clone, Default)]
 pub struct FeatureArgs {
     pub features: Vec<String>,
@@ -62,7 +41,6 @@ pub struct FeatureArgs {
 }
 
 impl FeatureArgs {
-    /// Splits `a,b c` style values (Cargo accepts commas and spaces).
     pub fn parse(raw: &[String], all: bool, no_default: bool) -> Self {
         Self {
             features: raw
@@ -77,7 +55,6 @@ impl FeatureArgs {
     }
 }
 
-/// `--lib`, `--bin`, `--example`, `--test`, `--bench`, `--all-targets`, ...
 #[derive(Debug, Clone, Default)]
 pub struct TargetSelection {
     pub lib: bool,
@@ -90,7 +67,6 @@ pub struct TargetSelection {
     pub benches: bool,
     pub bench: Vec<String>,
     pub all_targets: bool,
-    /// Run only documentation tests (`rune test --doc`).
     pub doc_only: bool,
 }
 
@@ -110,7 +86,6 @@ impl TargetSelection {
     }
 }
 
-/// Everything a graph is planned for.
 pub struct Request<'a> {
     pub profile: &'a Profile,
     pub target: Option<&'a str>,
@@ -120,65 +95,45 @@ pub struct Request<'a> {
     pub targets: &'a TargetSelection,
     pub offline: bool,
     pub locked: bool,
-    /// Run doctests (only meaningful for [`Mode::Test`]).
     pub doctests: bool,
-    /// Skip the `rust-version` check (`--ignore-rust-version`).
     pub ignore_rust_version: bool,
 }
 
-/// One requested output of the build.
 #[derive(Debug, Clone)]
 pub struct Requested {
     pub node: NodeId,
     pub member: usize,
     pub kind: TargetKind,
     pub harness: bool,
-    /// Cargo target name (`my-bin`, `integration`, ...).
     pub target: String,
 }
 
-/// A library whose documentation examples should be tested.
 #[derive(Debug, Clone)]
 pub struct DocTest {
     pub member: usize,
     pub lib_source: PathBuf,
     pub crate_name: String,
-    /// `--extern name=<artifact of node>` for the library itself and every
-    /// dependency (normal, build and dev).
     pub externs: Vec<(String, NodeId)>,
     pub features: Vec<String>,
     pub edition: Edition,
-    /// The library is a proc-macro crate (its examples use it through its
-    /// compiled plugin, as Cargo's doc tests do).
     pub proc_macro: bool,
 }
 
-/// The planned build.
 pub struct Plan {
     pub graph: BuildGraph,
     pub requested: Vec<Requested>,
     pub doc_tests: Vec<DocTest>,
 }
 
-// ---------------------------------------------------------------------------
-// Local packages (workspace members and path dependencies)
-// ---------------------------------------------------------------------------
-
 struct Locals {
     list: Vec<Member>,
-    /// `list[i]` is `ws.members[member_of[i]]`, when it is a workspace member.
     member_of: Vec<Option<usize>>,
     by_dir: HashMap<PathBuf, usize>,
-    /// For a package that belongs to some *other* workspace (a path dependency
-    /// next door, a git repository with its own `[workspace]`): that
-    /// workspace, which its `workspace = true` fields inherit from.
     foreign_ws: Vec<Option<(PathBuf, rune_manifest::WorkspaceManifest)>>,
-    /// Set for packages checked out from a git repository.
     git_of: Vec<Option<rune_registry::git::GitCheckout>>,
 }
 
 impl Locals {
-    /// The workspace `list[li]` inherits from.
     fn member_ws<'a>(
         &'a self,
         ws: &'a Workspace,
@@ -197,8 +152,6 @@ impl Locals {
         }
     }
 
-    /// A dependency of `list[li]` with paths made absolute and workspace
-    /// inheritance applied.
     fn spec_for(
         &self,
         ws: &Workspace,
@@ -213,9 +166,6 @@ impl Locals {
         )
     }
 
-    /// Loads the workspace members plus every package reachable through a
-    /// `path = "..."` or `git = "..."` dependency (which may live outside the
-    /// workspace).
     fn load(ws: &Workspace) -> Result<Self> {
         let n = ws.members.len();
         let mut this = Locals {
@@ -254,10 +204,6 @@ impl Locals {
                     }
                     this.add(dir, None)?;
                 } else if let (Some(url), true) = (&spec.git, is_member || !spec.optional) {
-                    // A member's optional git dependencies are part of its
-                    // lockfile (which covers every feature); those of a
-                    // dependency are only fetched if something activates them,
-                    // which the resolver decides.
                     let real = spec.package.clone().unwrap_or(name);
                     let req = spec.version.clone().unwrap_or(semver::VersionReq::STAR);
                     if let Some(dir) = ws
@@ -281,8 +227,6 @@ impl Locals {
                     let dir = rune_common::fsutil::canonicalize(&dir).unwrap_or(dir);
                     this.add(dir, Some(co))?;
                 } else {
-                    // A registry-style dependency that a `[patch]` replaces:
-                    // load the patch's package (only if its version fits).
                     let real = spec.package.clone().unwrap_or(name);
                     let req = spec.version.clone().unwrap_or(semver::VersionReq::STAR);
                     let source = match spec.registry.as_deref() {
@@ -306,7 +250,6 @@ impl Locals {
         Ok(this)
     }
 
-    /// Loads the package in `dir` if it is not loaded yet.
     fn add(&mut self, dir: PathBuf, git: Option<rune_registry::git::GitCheckout>) -> Result<usize> {
         if let Some(&li) = self.by_dir.get(&dir) {
             return Ok(li);
@@ -324,12 +267,7 @@ impl Locals {
         Ok(li)
     }
 
-    /// Loads packages the lockfile names but no manifest of ours reaches
-    /// directly — a git dependency of a registry crate, or of another git
-    /// package's optional feature.
     fn extend_from_lock(&mut self, ws: &Workspace, lock: &Lockfile) -> Result<()> {
-        // Local packages of the lockfile that nothing loaded directly: a
-        // patched crate that only a registry dependency reaches.
         for p in lock.packages.iter().filter(|p| p.source.is_none()) {
             if self
                 .list
@@ -378,9 +316,6 @@ impl Locals {
     }
 }
 
-/// Tells the git layer which commits the lockfile pinned, so that a build
-/// resolves a branch to the commit it was locked to instead of wherever it has
-/// moved. `update` (`rune update`) ignores the pins.
 fn configure_git(ws: &Workspace, offline: bool, update: bool, lock: Option<&Lockfile>) {
     let disk;
     let lock = match lock {
@@ -409,14 +344,6 @@ fn configure_git(ws: &Workspace, offline: bool, update: bool, lock: Option<&Lock
     });
 }
 
-// ---------------------------------------------------------------------------
-// Resolution
-// ---------------------------------------------------------------------------
-
-/// Which of a package's `features` a `--features` list turns on.
-///
-/// Accepts `feat`, `pkg/feat`, and `pkg?/feat`. A bare `feat` applies to every
-/// selected package that declares it; it is an error if none do.
 fn features_for_member(
     member: &Member,
     selected: bool,
@@ -429,7 +356,6 @@ fn features_for_member(
     let default_features = !args.no_default_features;
     if args.all_features {
         let mut all: Vec<String> = member.manifest.features.keys().cloned().collect();
-        // Optional dependencies are implicit features.
         all.extend(
             member
                 .manifest
@@ -449,8 +375,6 @@ fn features_for_member(
             Some((pkg, feat)) if pkg.trim_end_matches('?') == member.name => {
                 out.push(feat.to_string());
             }
-            // `dep/feature`: a feature of one of this package's dependencies,
-            // handed to the feature resolver in `[features]` syntax.
             Some((pkg, _))
                 if member
                     .manifest
@@ -488,10 +412,7 @@ fn resolution_roots(
     _req: &Request,
 ) -> Result<Vec<(String, DependencySpec)>> {
     let mut roots = Vec::new();
-    // The resolution behind the lockfile covers *every* feature of every
-    // member — like `Cargo.lock` — so that it does not change with the
-    // command line. Which features a build really enables is decided later,
-    // per selection, by the feature resolver.
+    // Covers every feature of every member, like `Cargo.lock`, so it doesn't change with the command line.
     for m in &ws.members {
         let mut all: Vec<String> = m.manifest.features.keys().cloned().collect();
         all.extend(
@@ -513,10 +434,7 @@ fn resolution_roots(
             },
         ));
     }
-    // Development dependencies are not followed by the resolver's package
-    // walk (they don't propagate to dependents), so add them as roots. Always
-    // included, even for `build`: one resolution then serves every command and
-    // the lockfile doesn't flip-flop between `build` and `test`.
+    // Dev-dependencies are always roots, so one resolution serves every command.
     for (li, m) in locals.list.iter().enumerate() {
         for dep in m.manifest.dependencies.values() {
             if dep.kind != DependencyKind::Dev {
@@ -530,9 +448,6 @@ fn resolution_roots(
     Ok(roots)
 }
 
-/// With resolver 3 (edition 2024's default), resolution prefers dependency
-/// versions the project's own `rust-version` (else the active compiler) can
-/// build. Earlier resolvers take the newest release regardless.
 fn msrv_for_resolution(ws: &Workspace) -> Option<semver::Version> {
     if ws.root_manifest.resolver_version() < 3 {
         return None;
@@ -545,20 +460,12 @@ fn msrv_for_resolution(ws: &Workspace) -> Option<semver::Version> {
     lowest.or_else(|| Some(toolchain::global().version.clone()))
 }
 
-/// Hash of everything that determines a resolution's result: the manifests.
-/// The command line does not — version resolution is independent of the
-/// selected packages and features.
 fn resolution_fingerprint(ws: &Workspace, locals: &Locals, _req: &Request) -> String {
     with_cargo_lock(&resolution_inputs(ws, locals), ws.root())
 }
 
-/// A hash of everything a resolution is made from except `Cargo.lock`: the
-/// manifests (read now — take it *before* resolving, so a manifest saved
-/// while the resolution runs makes the next build resolve again instead of
-/// trusting a lockfile made from the old one), the configuration files
-/// (`[patch]`, source replacement, registries) and settings, and the exact
-/// `rune` binary (a newer one may resolve differently; the version number
-/// alone does not change between development builds).
+/// Everything a resolution is made from except `Cargo.lock`: manifests (read before resolving), config,
+/// settings and the exact `rune` binary.
 fn resolution_inputs(ws: &Workspace, locals: &Locals) -> String {
     let mut hasher = rune_common::hash::HashBuilder::new();
     hasher.update(env!("CARGO_PKG_VERSION").as_bytes());
@@ -589,9 +496,6 @@ fn resolution_inputs(ws: &Workspace, locals: &Locals) -> String {
     hasher.finish_blake3()
 }
 
-/// `inputs` plus the current `Cargo.lock`, which seeds the versions chosen:
-/// a `cargo update` or a teammate's change is picked up rather than shadowed
-/// by the binary lockfile.
 fn with_cargo_lock(inputs: &str, root: &Path) -> String {
     let mut hasher = rune_common::hash::HashBuilder::new();
     hasher.update(inputs.as_bytes());
@@ -602,8 +506,6 @@ fn with_cargo_lock(inputs: &str, root: &Path) -> String {
     hasher.finish_blake3()
 }
 
-/// Restricts a resolution (with its dependency edges and kinds, which
-/// `rune tree` and `rune why` display) to what a refined lockfile kept.
 fn prune_resolved(mut resolved: ResolvedGraph, refined: &Lockfile) -> ResolvedGraph {
     let kept: HashMap<String, &rune_resolver::LockPackage> = refined
         .packages
@@ -625,11 +527,7 @@ fn prune_resolved(mut resolved: ResolvedGraph, refined: &Lockfile) -> ResolvedGr
     resolved
 }
 
-/// The resolved graph as a build of every workspace member (default
-/// features, development dependencies included) sees it on `target`
-/// (`None`: every platform) — what `rune tree` shows, as `cargo tree` does:
-/// only the packages and edges the feature resolver reaches, each package
-/// with the features it is built with (both roles' together).
+/// The resolved graph as a build of every member sees it on `target` — what `rune tree` shows.
 pub fn tree_view(ws: &Workspace, offline: bool, target: Option<&str>) -> Result<ResolvedGraph> {
     let existing = LockfileManager::load_fast(ws.root());
     let (resolved, lock) = resolve_fresh(ws, offline, existing.as_ref(), false)?;
@@ -672,7 +570,6 @@ pub fn tree_view(ws: &Workspace, offline: bool, target: Option<&str>) -> Result<
             .or_default()
             .extend(feats.iter().cloned());
     }
-    // (package id, dependency alias, kind) of every edge a build follows.
     let mut edges: HashSet<(String, String, rune_manifest::dependency::DependencyKind)> =
         HashSet::new();
     for e in &res.edges {
@@ -689,15 +586,8 @@ pub fn tree_view(ws: &Workspace, offline: bool, target: Option<&str>) -> Result<
     Ok(view)
 }
 
-/// Tightens a freshly resolved lockfile to exactly what Cargo would lock.
-///
-/// The version resolver over-approximates which optional dependencies are
-/// active (it unifies features by package *name*, so a feature enabled for one
-/// version counts for all). Cargo's lockfile covers every platform and every
-/// feature of the workspace members, but only what those features really
-/// activate — so run the precise feature resolver over the result with those
-/// same semantics and keep only the packages and edges it reaches. Also
-/// records each package's resolved feature set.
+/// Tightens a fresh lockfile to exactly what Cargo would lock: the version resolver over-approximates
+/// optional dependencies, so rerun the precise feature resolver and keep what it reaches.
 fn refine_lock(ws: &Workspace, locals: &Locals, lock: &Lockfile) -> Lockfile {
     let uni = Universe::build(ws, locals, lock);
     let mut roots = Vec::new();
@@ -724,7 +614,6 @@ fn refine_lock(ws: &Workspace, locals: &Locals, lock: &Lockfile) -> Lockfile {
         &uni.views,
         &roots,
         &FeatureOptions {
-            // One universe, every platform: what a lockfile records.
             resolver: 1,
             platform_matches: &|_, _| true,
             weak_activates: true,
@@ -764,14 +653,8 @@ fn refine_lock(ws: &Workspace, locals: &Locals, lock: &Lockfile) -> Lockfile {
     out
 }
 
-/// Keeps `Cargo.lock` in step with the resolution, the way Cargo does: it is
-/// created if missing and rewritten when the *set of locked packages* changes
-/// (a dependency added or removed, `rune update`), and left alone when it
-/// already describes the same packages — so a project that already builds with
-/// Cargo never sees churn. `resolve.write-cargo-lock = false` turns this off.
-///
-/// Returns whether the file was written. With `locked`, a needed change is an
-/// error instead.
+/// Keeps `Cargo.lock` in step like Cargo: created if missing, rewritten only when the set of locked
+/// packages changes. With `locked`, a needed change is an error.
 pub fn sync_cargo_lock(ws: &Workspace, lock: &Lockfile, locked: bool) -> Result<bool> {
     if !ws.config.settings.write_cargo_lock() {
         return Ok(false);
@@ -814,11 +697,7 @@ pub fn sync_cargo_lock(ws: &Workspace, lock: &Lockfile, locked: bool) -> Result<
         );
     }
     let mut out = lock.clone();
-    // An existing file keeps its format version. A new one gets the newest
-    // format the active toolchain reads (4 since Rust 1.83) — unless the
-    // workspace promises to build with an older Rust (`rust-version`), whose
-    // Cargo must be able to read it: then 3, as Cargo does. (Cargo would go
-    // down to 2 for a `rust-version` before 1.53; Rune writes 3 at least.)
+    // A new file gets format 4, or 3 if `rust-version` predates Rust 1.83.
     let newest = if toolchain::global().satisfies_msrv("1.83") {
         4
     } else {
@@ -848,19 +727,15 @@ pub fn sync_cargo_lock(ws: &Workspace, lock: &Lockfile, locked: bool) -> Result<
     Ok(true)
 }
 
-/// Whether a lockfile `source` names a registry (any protocol).
 fn is_registry_source(source: Option<&str>) -> bool {
     source.is_some_and(|s| s.starts_with("registry+") || s.starts_with("sparse+"))
 }
 
-/// The canonical index URL for a lockfile `source`.
 pub fn index_of_lock_source(source: Option<&str>) -> String {
     match source {
         Some("registry+https://github.com/rust-lang/crates.io-index") | None => {
             rune_common::CRATES_IO_INDEX.to_string()
         }
-        // `sparse+…`, or `registry+…` for a git-based index: the identity
-        // configuration uses.
         Some(s) => s.to_string(),
     }
 }
@@ -895,10 +770,7 @@ fn resolved_from_lock(lock: &Lockfile) -> ResolvedGraph {
     }
 }
 
-/// The resolution recorded in `Rune.lock.bin`, when it was made from the
-/// current manifests, configuration and `Cargo.lock` (its fingerprint says
-/// so) and covers every dependency they declare: the whole graph, edges and
-/// feature tables included, rebuilt from the lockfile and the manifests.
+/// The resolution in `Rune.lock.bin`, when its fingerprint matches and it covers every declared dependency.
 fn cached_resolution(ws: &Workspace) -> Option<(ResolvedGraph, Lockfile)> {
     let _timer = phase("resolve (cached)");
     let (lock, Some(stored)) =
@@ -939,7 +811,6 @@ fn cached_resolution(ws: &Workspace) -> Option<(ResolvedGraph, Lockfile)> {
                 });
                 let source = match &locals.git_of[li] {
                     Some(co) => {
-                        // `git+URL?branch=x#commit`, as locked.
                         let reference = lp
                             .and_then(|p| p.source.as_deref())
                             .and_then(|s| s.split_once('?'))
@@ -960,8 +831,6 @@ fn cached_resolution(ws: &Workspace) -> Option<(ResolvedGraph, Lockfile)> {
                 )
             }
         };
-        // Only the edges the lockfile records: an optional dependency nothing
-        // turns on resolves to a package another one pulls in, but is no edge.
         let recorded: Option<HashSet<&String>> = match uni.origin[idx] {
             Origin::Registry => Some(
                 lock.packages[uni.lock_pkg[idx]?]
@@ -1028,8 +897,6 @@ fn cached_resolution(ws: &Workspace) -> Option<(ResolvedGraph, Lockfile)> {
     ))
 }
 
-/// A request with no feature flags that selects every member — what
-/// commands like `update`, `fetch` and `tree` resolve against.
 pub fn whole_workspace_request<'a>(
     profile: &'a Profile,
     offline: bool,
@@ -1051,9 +918,6 @@ pub fn whole_workspace_request<'a>(
     }
 }
 
-/// Fully resolves the whole workspace from scratch (no fast path) and returns
-/// the result without touching any file. `existing` seeds version choices;
-/// `refresh` re-queries the registry index for newer releases.
 pub fn resolve_fresh(
     ws: &Workspace,
     offline: bool,
@@ -1063,8 +927,6 @@ pub fn resolve_fresh(
     resolve_fresh_with(ws, offline, existing, refresh, &[])
 }
 
-/// [`resolve_fresh`], preferring the given `(registry index, name, version)`s
-/// wherever a requirement allows them.
 pub fn resolve_fresh_with(
     ws: &Workspace,
     offline: bool,
@@ -1072,12 +934,7 @@ pub fn resolve_fresh_with(
     refresh: bool,
     preferred: &[(String, String, semver::Version)],
 ) -> Result<(ResolvedGraph, Lockfile)> {
-    // Nothing to refresh or prefer, and the lockfile on disk was made from
-    // exactly these manifests: it *is* the resolution (`tree`, `why`,
-    // `metadata`, `features` … need no resolver run).
-    // Only when seeded by exactly the lockfile on disk: a trimmed seed
-    // (`update -p foo`) or none (`generate-lockfile`) asks for a real
-    // resolution.
+    // The lockfile on disk was made from these manifests: it is the resolution.
     let from_disk = !refresh
         && preferred.is_empty()
         && LockfileManager::load_fast(ws.root()).as_ref() == existing;
@@ -1085,9 +942,6 @@ pub fn resolve_fresh_with(
         return Ok(cached);
     }
     let (resolved, lock) = resolve_uncached(ws, offline, existing, refresh, preferred)?;
-    // Keep what was resolved from the lockfile on disk (as `cargo tree`
-    // updates `Cargo.lock`), so the next `tree`, `metadata` or build starts
-    // from it instead of resolving again.
     if from_disk {
         let _ = store_resolution(ws, &lock);
     }
@@ -1102,8 +956,6 @@ fn resolve_uncached(
     preferred: &[(String, String, semver::Version)],
 ) -> Result<(ResolvedGraph, Lockfile)> {
     let _timer = phase("resolve (fresh)");
-    // Callers report the outcome (a lockfile written, a tree printed); the
-    // line only shows what is going on meanwhile.
     let _activity = ui::Activity::start(
         "resolving",
         if refresh {
@@ -1125,8 +977,6 @@ fn resolve_uncached(
     let req = whole_workspace_request(&profile, offline, &features, &targets, &selected);
     let roots = resolution_roots(ws, &locals, &req)?;
 
-    // Even when not seeded by it (`rune update`), the current lockfile says
-    // which index entries the resolution will need.
     let on_disk = existing
         .is_none()
         .then(|| LockfileManager::load_fast(ws.root()))
@@ -1157,8 +1007,6 @@ fn resolve_uncached(
     Ok((resolved, lock))
 }
 
-/// A `[patch]` that matched nothing is almost always a mistake (a version
-/// the graph does not ask for, a misspelt name); Cargo says so, and so do we.
 fn warn_unused_patches(ws: &Workspace, resolved: &ResolvedGraph) {
     for entry in ws.patches.entries() {
         let name = entry.spec.package.as_deref().unwrap_or(&entry.name);
@@ -1182,8 +1030,6 @@ fn warn_unused_patches(ws: &Workspace, resolved: &ResolvedGraph) {
     }
 }
 
-/// Writes `lock` as the project's lockfile and records the resolution as
-/// current, so the next build takes the fast path.
 pub fn store_resolution(ws: &Workspace, lock: &Lockfile) -> Result<()> {
     let locals = Locals::load(ws)?;
     let profile = Profile::dev();
@@ -1198,8 +1044,6 @@ pub fn store_resolution(ws: &Workspace, lock: &Lockfile) -> Result<()> {
     Ok(())
 }
 
-/// Downloads every registry crate in `resolved` (in parallel). Returns how
-/// many were fetched or already present.
 pub fn download_all(resolved: &ResolvedGraph, offline: bool) -> Result<usize> {
     let pkgs: Vec<(String, String, Option<String>, String)> = resolved
         .packages
@@ -1219,11 +1063,6 @@ pub fn download_all(resolved: &ResolvedGraph, offline: bool) -> Result<usize> {
     Ok(pkgs.len())
 }
 
-/// Resolves the workspace, or (with `trust_cache`) reuses the previous
-/// resolution when nothing that feeds it changed. Returns the graph and the
-/// lockfile it corresponds to. Without `trust_cache`, the binary lockfile is
-/// not reused even when its fingerprint matches (it was found not to cover
-/// the manifests).
 fn resolve_with(
     ws: &Workspace,
     locals: &Locals,
@@ -1234,17 +1073,13 @@ fn resolve_with(
     let inputs = resolution_inputs(ws, locals);
     let fingerprint = with_cargo_lock(&inputs, root);
 
-    // Fast path: nothing changed since the last resolution, and we have the
-    // binary lockfile that carries its feature sets — with the fingerprint
-    // it was made from in the same file, so the two always belong together.
+    // Fast path: nothing changed since the last resolution.
     if trust_cache
         && let Ok((lock, Some(stored))) =
             LockfileManager::read_binary_with_fingerprint(&root.join("Rune.lock.bin"))
         && stored == fingerprint
         && !lock.packages.is_empty()
     {
-        // The lockfile can be missing (deleted, or a fresh checkout with only
-        // our cache present): write it, and record the new fingerprint.
         if !root.join("Cargo.lock").is_file() && sync_cargo_lock(ws, &lock, req.locked)? {
             let _ = LockfileManager::sync_all_with_fingerprint(
                 root,
@@ -1255,8 +1090,7 @@ fn resolve_with(
         return Ok((resolved_from_lock(&lock), lock));
     }
 
-    // Cargo.lock (if present) seeds version choices so that adopting Rune on
-    // an existing project doesn't move any dependency.
+    // `Cargo.lock` seeds version choices so adopting Rune doesn't move any dependency.
     let existing_lock = LockfileManager::load_fast(root);
     let roots = resolution_roots(ws, locals, req)?;
 
@@ -1308,9 +1142,7 @@ fn resolve_with(
         );
     }
     sync_cargo_lock(ws, &lockfile, req.locked)?;
-    // The fingerprint is taken *after* `Cargo.lock` was (re)written — it
-    // covers its content, and our own write must not look like an outside
-    // change — but from the manifests as they were before resolving.
+    // Fingerprint after `Cargo.lock` was written, but from the manifests as they were before resolving.
     let fingerprint = with_cargo_lock(&inputs, root);
     LockfileManager::sync_all_with_fingerprint(root, &lockfile, Some(&fingerprint))
         .context("Failed to write lockfiles")?;
@@ -1318,7 +1150,6 @@ fn resolve_with(
     Ok((resolved, lockfile))
 }
 
-/// The registry part of a lockfile: what `--locked` compares.
 fn locked_registry_packages(lock: &Lockfile) -> BTreeMap<(String, String), Option<String>> {
     lock.packages
         .iter()
@@ -1326,10 +1157,6 @@ fn locked_registry_packages(lock: &Lockfile) -> BTreeMap<(String, String), Optio
         .map(|p| ((p.name.clone(), p.version.clone()), p.checksum.clone()))
         .collect()
 }
-
-// ---------------------------------------------------------------------------
-// Target picking
-// ---------------------------------------------------------------------------
 
 struct Pick {
     kind: TargetKind,
@@ -1347,7 +1174,6 @@ fn required_features_ok(spec: &Option<TargetSpec>, active: &[String]) -> bool {
     })
 }
 
-/// Which targets of `member` the request asks for.
 fn pick_targets(member: &Member, req: &Request, active: &[String]) -> Result<Vec<Pick>> {
     let sel = req.targets;
     let m = &member.manifest;
@@ -1359,7 +1185,6 @@ fn pick_targets(member: &Member, req: &Request, active: &[String]) -> Result<Vec
 
     let named = |wanted: &[String], have: &str| wanted.iter().any(|w| w == have);
 
-    // Library.
     if let Some(lib) = &m.lib {
         let want_lib = if explicit {
             sel.lib || all
@@ -1375,8 +1200,6 @@ fn pick_targets(member: &Member, req: &Request, active: &[String]) -> Result<Vec
             .clone()
             .unwrap_or_else(|| member.name.replace('-', "_"));
         if want_lib && !sel.doc_only {
-            // Plain build of the library (a dependency of everything else in
-            // build/check; in test mode it is a dependency only, added lazily).
             if !test_mode || all {
                 out.push(Pick {
                     kind: TargetKind::Lib,
@@ -1399,14 +1222,11 @@ fn pick_targets(member: &Member, req: &Request, active: &[String]) -> Result<Vec
             });
         }
     } else if !sel.bin.is_empty() || sel.lib {
-        // Asked for a lib that doesn't exist: only an error when explicit and
-        // nothing else was asked for.
         if sel.lib && !explicit_other_than_lib(sel) {
             bail!("no library targets found in package `{}`", member.name);
         }
     }
 
-    // Binaries.
     let want_all_bins = if explicit {
         sel.bins || all
     } else {
@@ -1456,15 +1276,10 @@ fn pick_targets(member: &Member, req: &Request, active: &[String]) -> Result<Vec
             .bin
             .iter()
             .any(|b| b.name.as_deref() == Some(wanted.as_str()))
-        {
-            // Only an error if no selected package has it; the caller checks
-            // that across all packages.
-        }
+        {}
     }
 
-    // Examples. `test` without a selection builds them all, as Cargo does
-    // (to check they compile; a test may also run one), and runs those that
-    // ask for it (`test = true`) as tests.
+    // `test` without a selection builds every example, as Cargo does, and runs those with `test = true`.
     let want_all_examples = if explicit {
         sel.examples || all
     } else {
@@ -1504,7 +1319,6 @@ fn pick_targets(member: &Member, req: &Request, active: &[String]) -> Result<Vec
         }
     }
 
-    // Integration tests.
     let want_all_tests = if explicit {
         sel.tests || all
     } else {
@@ -1537,7 +1351,6 @@ fn pick_targets(member: &Member, req: &Request, active: &[String]) -> Result<Vec
         });
     }
 
-    // Benchmarks.
     let want_all_benches = if explicit {
         sel.benches || all
     } else {
@@ -1564,9 +1377,6 @@ fn pick_targets(member: &Member, req: &Request, active: &[String]) -> Result<Vec
     Ok(out)
 }
 
-/// Cargo's error for a declared target whose source file is missing (a
-/// published crate whose examples were left out of the package, say),
-/// rather than rustc's "couldn't read" halfway through the build.
 fn ensure_target_exists(member: &Member, picks: &[Pick]) -> Result<()> {
     for p in picks {
         let path = member.dir.join(&p.path);
@@ -1605,17 +1415,11 @@ trait LibHarness {
     fn proc_macro_or_no_harness(&self) -> bool;
 }
 impl LibHarness for TargetSpec {
-    /// A `harness = false` library has no `#[test]` harness to run.
     fn proc_macro_or_no_harness(&self) -> bool {
         !self.harness
     }
 }
 
-// ---------------------------------------------------------------------------
-// Roles: what is built for the target, and what for the host
-// ---------------------------------------------------------------------------
-
-/// The configuration one role (target or host) is compiled with.
 #[derive(Clone)]
 struct RoleCfg {
     info: TargetInfo,
@@ -1623,9 +1427,7 @@ struct RoleCfg {
     linker: Option<String>,
 }
 
-/// Build scripts, proc-macros and everything only they use run on the *host*;
-/// the rest of the graph is built for the *target*. Without `--target` they are
-/// the same machine, but the roles can still differ in features and profile.
+/// Build scripts, proc-macros and what only they use run on the host; the rest is built for the target.
 struct Roles {
     target: RoleCfg,
     host: RoleCfg,
@@ -1645,9 +1447,7 @@ impl Roles {
             }
         };
         let build = |arg: Option<&str>, role: Role| {
-            // The flags that apply can depend on the target's cfgs, and the
-            // cfgs on the flags (`-C target-feature`): ask once bare, pick
-            // the flags, then ask again with them.
+            // Flags can depend on cfgs and cfgs on flags (`-C target-feature`): ask bare, pick flags, ask again.
             let probe = TargetInfo::query(tc, arg, &[]);
             let flags = toolchain::rustflags(cfg, &probe, role, cross);
             let info = if flags.is_empty() {
@@ -1655,7 +1455,6 @@ impl Roles {
             } else {
                 TargetInfo::query(tc, arg, &flags)
             };
-            // The built-in linker, where it can link for the target.
             let linker = if hyprlnk && hyprlnk::supports_target(&info.name) {
                 Some(rune_common::linker::embedded(hyprlnk::VERSION))
             } else {
@@ -1685,26 +1484,18 @@ impl Roles {
     }
 }
 
-// ---------------------------------------------------------------------------
-// The package universe: everything the feature resolver reasons about
-// ---------------------------------------------------------------------------
-
 #[derive(Clone, Copy)]
 enum Origin {
-    /// `locals.list[i]`: a workspace member, path or patched package.
     Local(usize),
-    /// A registry package, described by the lockfile until it is downloaded.
     Registry,
 }
 
 struct Universe {
     views: Vec<PackageView>,
     origin: Vec<Origin>,
-    /// `name version`.
     id: Vec<String>,
     name: Vec<String>,
     version: Vec<semver::Version>,
-    /// Index into `lock.packages`, for registry packages.
     lock_pkg: Vec<Option<usize>>,
 }
 
@@ -1720,8 +1511,6 @@ impl Universe {
         };
         let mut by_id: HashMap<String, usize> = HashMap::new();
 
-        // Non-member local packages (a patched crate, a git package) can
-        // satisfy a registry-style dependency on their name.
         let mut registry_by_name: HashMap<String, Vec<usize>> = HashMap::new();
         for (li, m) in locals.list.iter().enumerate() {
             by_id.insert(m.id(), li);
@@ -1735,8 +1524,6 @@ impl Universe {
             uni.version.push(m.version.clone());
             uni.lock_pkg.push(None);
         }
-        // Registry packages from the lockfile. A package that is also a local
-        // one (a patch of the same version) is the local one.
         for (i, lp) in lock.packages.iter().enumerate() {
             if !is_registry_source(lp.source.as_deref()) {
                 continue;
@@ -1762,7 +1549,6 @@ impl Universe {
             uni.lock_pkg.push(Some(i));
         }
 
-        // Views (they refer to other packages by index, so come last).
         for idx in 0..uni.views.len() {
             uni.views[idx] = match uni.origin[idx] {
                 Origin::Local(li) => local_view(ws, locals, li, &uni, &registry_by_name, lock),
@@ -1776,10 +1562,6 @@ impl Universe {
     }
 }
 
-/// Declared dependencies a build for these platforms needs that the
-/// lockfile does not resolve (`app → serde`): a local package's non-optional
-/// dependency matching no locked package, or a locked package's edge to a
-/// package the lockfile does not contain.
 fn incomplete(
     uni: &Universe,
     locals: &Locals,
@@ -1791,7 +1573,6 @@ fn incomplete(
         let Origin::Local(li) = uni.origin[idx] else {
             continue;
         };
-        // Development dependencies matter for the workspace's own packages.
         let member = locals.member_of[li].is_some();
         for d in &view.deps {
             if d.resolved.is_none()
@@ -1810,10 +1591,7 @@ fn incomplete(
         .collect();
     for p in &lock.packages {
         for d in &p.decls {
-            // An optional dependency nothing switches on is left out of the
-            // lockfile on purpose (as Cargo does): `combine`'s `bytes 0.5`.
-            // Whether a build switches it on is the feature resolver's to
-            // say (see `unresolved_deps`).
+            // Optional dependencies nothing switches on are left out of the lockfile on purpose, as Cargo does.
             if let Some(id) = &d.resolved
                 && d.kind != 1
                 && !d.optional
@@ -1829,8 +1607,6 @@ fn incomplete(
     out
 }
 
-/// Dependencies a feature resolution follows (needed, or switched on by a
-/// feature) that the lockfile has no package for.
 fn unresolved_deps(uni: &Universe, res: &FeatureResolution) -> Vec<String> {
     let mut out: Vec<String> = res
         .unresolved
@@ -1857,7 +1633,6 @@ fn registry_view(lp: &rune_resolver::LockPackage, by_id: &HashMap<String, usize>
         deps: lp
             .decls
             .iter()
-            // A registry package's own dev-dependencies never matter.
             .filter(|d| d.kind != 1)
             .map(|d| DepDecl {
                 alias: d.alias.clone(),
@@ -1870,13 +1645,10 @@ fn registry_view(lp: &rune_resolver::LockPackage, by_id: &HashMap<String, usize>
                 resolved: d.resolved.as_ref().and_then(|id| by_id.get(id).copied()),
             })
             .collect(),
-        // Learned from the manifest once downloaded.
         proc_macro: false,
     }
 }
 
-/// The registry package a declared dependency resolves to: what the lockfile
-/// says the depending package uses, else the newest locked version that fits.
 fn pick_registry(
     candidates: &[usize],
     uni: &Universe,
@@ -1936,11 +1708,9 @@ fn local_view(
                     spec.version.as_ref().unwrap_or(&semver::VersionReq::STAR),
                 )
             {
-                // `[patch."<url>"]` replaces the repository.
                 let dir = rune_common::fsutil::canonicalize(&dir).unwrap_or(dir);
                 locals.by_dir.get(&dir).copied()
             } else if let Some(url) = &spec.git {
-                // Already checked out when the locals were loaded.
                 let real = spec.package.as_deref().unwrap_or(&dep.name);
                 let reference = rune_registry::git::GitRef::from_spec(
                     spec.branch.as_deref(),
@@ -1978,11 +1748,6 @@ fn local_view(
     }
 }
 
-// ---------------------------------------------------------------------------
-// Planning
-// ---------------------------------------------------------------------------
-
-/// A package built for one role: `(package index, for_host)`.
 type UnitRef = unit_features::UnitRef;
 
 struct Planner<'a> {
@@ -1992,21 +1757,15 @@ struct Planner<'a> {
     uni: Universe,
     lock: &'a Lockfile,
     roles: Roles,
-    /// Downloaded registry packages: directory and manifest.
     reg: HashMap<usize, (PathBuf, Manifest)>,
     res: FeatureResolution,
-    /// Packages whose host build is *not* the same unit as their target build
-    /// (different features or profile, or cross-compiling).
     distinct_host: HashSet<usize>,
     edges_from: HashMap<UnitRef, Vec<usize>>,
     graph: BuildGraph,
-    /// (package, role) → library node.
     lib_node: HashMap<UnitRef, NodeId>,
 }
 
 impl Planner<'_> {
-    /// A host build collapses onto the target build of the same package
-    /// unless the two would differ.
     fn canon(&self, u: UnitRef) -> UnitRef {
         if u.1 && !self.distinct_host.contains(&u.0) {
             (u.0, false)
@@ -2016,7 +1775,6 @@ impl Planner<'_> {
     }
 
     fn features_of(&self, u: UnitRef) -> Vec<String> {
-        // A collapsed unit's features are the same in both roles.
         self.res
             .features
             .get(&u)
@@ -2040,7 +1798,6 @@ impl Planner<'_> {
         }
     }
 
-    /// The profile a package compiles with in a role (`None` = the request's).
     fn profile_for(&self, pkg: usize, host: bool) -> Option<Profile> {
         let tables = &self.ws.root_manifest.profile;
         let role = UnitRole {
@@ -2052,8 +1809,7 @@ impl Planner<'_> {
                 && !self.ws.config.settings.dependency_debuginfo(),
         };
         let mut p = resolve_unit_profile(&self.req.profile.name, tables, role).ok()?;
-        // Everything a test or benchmark links unwinds, whatever the profile
-        // says: the harness needs it (Cargo does the same).
+        // Everything a test or benchmark links unwinds, as in Cargo.
         if matches!(self.req.mode, Mode::Test | Mode::Bench) {
             p.panic = rune_common::PanicStrategy::Unwind;
         }
@@ -2118,7 +1874,6 @@ impl Planner<'_> {
         }
     }
 
-    /// A unit for one target of a local package.
     #[allow(clippy::too_many_arguments)]
     fn local_unit(
         &self,
@@ -2143,8 +1898,6 @@ impl Planner<'_> {
             .and_then(|p| p.resolve_build_script(&m.dir));
         let mut ext = self.extras(li, host);
         ext.extra_crate_types = extra_crate_types;
-        // A git package is immutable, identified by its commit; anything else
-        // local is hashed by content.
         let crate_source = match &self.locals.git_of[li] {
             Some(co) => CrateSource::Git {
                 url: co.url.clone(),
@@ -2189,7 +1942,6 @@ impl Planner<'_> {
         }
     }
 
-    /// The library unit of a registry package.
     fn registry_unit(&self, idx: usize, host: bool) -> Option<CompilationUnit> {
         let (dir, manifest) = self.reg.get(&idx)?;
         let lp = &self.lock.packages[self.uni.lock_pkg[idx]?];
@@ -2244,9 +1996,6 @@ impl Planner<'_> {
         })
     }
 
-    /// Adds `node`'s dependency edges for package role `role`, returning the
-    /// `--extern` names it links. With `add`, edges are actually created;
-    /// without, this only reports what they would be (for doctests).
     fn wire(
         &mut self,
         node: Option<NodeId>,
@@ -2288,11 +2037,7 @@ impl Planner<'_> {
     }
 }
 
-/// The set of `links` values in a graph must be unique per package: two
-/// packages linking the same native library would collide at link time.
 fn check_links_conflicts(graph: &BuildGraph) -> Result<()> {
-    // A package is its directory: its test, example and binary units carry
-    // their target's name, not the package's (`ring`'s `aead_tests`).
     let mut seen: HashMap<String, (PathBuf, String, semver::Version)> = HashMap::new();
     for node in graph.nodes() {
         let Some(links) = &node.unit.links else {
@@ -2324,8 +2069,6 @@ fn check_links_conflicts(graph: &BuildGraph) -> Result<()> {
     Ok(())
 }
 
-/// Every package selected or built must be compilable by the active
-/// compiler, unless the user says otherwise.
 fn check_rust_versions(
     uni: &Universe,
     locals: &Locals,
@@ -2363,17 +2106,12 @@ fn check_rust_versions(
     Ok(())
 }
 
-/// Which packages' feature requests a build honors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Unification {
-    /// Only the selected packages' (Cargo's default).
     Selected,
-    /// Every workspace member's.
     Workspace,
 }
 
-/// `build.feature-unification` in Rune's settings, else Cargo's
-/// `resolver.feature-unification` config, else `selected`.
 fn feature_unification(ws: &Workspace) -> Result<Unification> {
     let value = ws
         .config
@@ -2389,8 +2127,6 @@ fn feature_unification(ws: &Workspace) -> Result<Unification> {
     }
 }
 
-/// Keeps the part of a feature resolution the selected roots reach: with
-/// workspace unification the other members only contribute features.
 fn reachable(mut res: FeatureResolution, roots: &[UnitRef]) -> FeatureResolution {
     let mut from: HashMap<UnitRef, Vec<UnitRef>> = HashMap::new();
     for e in &res.edges {
@@ -2414,15 +2150,11 @@ fn reachable(mut res: FeatureResolution, roots: &[UnitRef]) -> FeatureResolution
     res
 }
 
-/// The feature resolver's roots for `req`: the selected members' requests,
-/// those plus every other member's with workspace feature unification, and
-/// the selected members' units.
 fn feature_roots(
     ws: &Workspace,
     locals: &Locals,
     req: &Request,
 ) -> Result<(Vec<RootRequest>, Vec<RootRequest>, Vec<UnitRef>)> {
-    // -- What is requested, and does it involve development dependencies?
     let include_dev = matches!(req.mode, Mode::Test | Mode::Bench)
         || req.targets.all_targets
         || req.targets.examples
@@ -2448,9 +2180,6 @@ fn feature_roots(
         });
     }
 
-    // With workspace feature unification, every other member's requests
-    // count too (their default features), but only what the selected
-    // packages reach is built.
     let unify = feature_unification(ws)?;
     let mut all_roots = roots.clone();
     if unify == Unification::Workspace {
@@ -2469,7 +2198,6 @@ fn feature_roots(
     Ok((roots, all_roots, selected_units))
 }
 
-/// Plans the build for `req`.
 pub fn plan(ws: &Workspace, req: &Request) -> Result<Plan> {
     let total = phase("plan");
     configure_git(ws, req.offline, false, None);
@@ -2482,9 +2210,7 @@ pub fn plan(ws: &Workspace, req: &Request) -> Result<Plan> {
     let either_role =
         |t: &str, _host: bool| roles.target.info.matches(t) || roles.host.info.matches(t);
 
-    // Never build from a lockfile that leaves out a dependency this build
-    // needs: rustc would only say "undeclared crate". Resolve again from
-    // scratch, and if even that cannot place it, say which one.
+    // Never build from a lockfile missing a needed dependency: resolve again from scratch.
     let mut fresh = false;
     let (locals, lock, uni, all_roots, selected_units, pass1) = loop {
         let mut locals = Locals::load(ws)?;
@@ -2494,10 +2220,7 @@ pub fn plan(ws: &Workspace, req: &Request) -> Result<Plan> {
         let mut missing = incomplete(&uni, &locals, &lock, &applies);
         let (_roots, all_roots, selected_units) = feature_roots(ws, &locals, req)?;
 
-        // -- Feature resolution, pass 1: which packages does this build reach
-        // in either role? (Proc-macro-ness of registry crates isn't known
-        // before their manifests are, so this may over-approximate roles,
-        // never packages.)
+        // Feature resolution pass 1: which packages are reached in either role (may over-approximate roles).
         let pass1 = reachable(
             unit_features::resolve(
                 &uni.views,
@@ -2528,7 +2251,7 @@ pub fn plan(ws: &Workspace, req: &Request) -> Result<Plan> {
     };
     let mut uni = uni;
 
-    // -- Download and read the manifests of the registry crates we need.
+    // Download and read the manifests of the needed registry crates.
     let mut needed: Vec<usize> = pass1
         .features
         .keys()
@@ -2570,7 +2293,7 @@ pub fn plan(ws: &Workspace, req: &Request) -> Result<Plan> {
         }
     }
 
-    // -- Feature resolution, pass 2: exact roles and platforms.
+    // Feature resolution pass 2: exact roles and platforms.
     let exact = |t: &str, host: bool| roles.of(host).info.matches(t);
     let res = reachable(
         unit_features::resolve(
@@ -2585,13 +2308,7 @@ pub fn plan(ws: &Workspace, req: &Request) -> Result<Plan> {
         &selected_units,
     );
     check_rust_versions(&uni, &locals, &reg, &res, req)?;
-    // A local package asking a local dependency for a feature it lacks
-    // (registry packages were checked when they were published) — on any
-    // platform, as Cargo checks: a manifest that builds on Windows must not
-    // be refused on Linux CI over a `[target.'cfg(unix)']` dependency. This
-    // build's resolution already follows every edge between local packages
-    // unless a platform-gated dependency (or, through `[patch]`, a registry
-    // package) leads to one; only then is it worth resolving again.
+    // Check feature requests between local packages on any platform, as Cargo does.
     let is_local = |p: usize| matches!(uni.origin[p], Origin::Local(_));
     let gated_way_to_a_local = uni.views.iter().enumerate().any(|(from, view)| {
         view.deps.iter().any(|d| {
@@ -2642,7 +2359,6 @@ pub fn plan(ws: &Workspace, req: &Request) -> Result<Plan> {
         lib_node: HashMap::new(),
     };
 
-    // -- Which packages need a separate host build?
     {
         let pkgs: HashSet<usize> = planner.res.features.keys().map(|(p, _)| *p).collect();
         for pkg in pkgs {
@@ -2666,7 +2382,6 @@ pub fn plan(ws: &Workspace, req: &Request) -> Result<Plan> {
         }
     }
 
-    // -- Library nodes: one per (package, role).
     let unit_keys: Vec<UnitRef> = planner.res.features.keys().copied().collect();
     for (pkg, host) in unit_keys {
         let key = planner.canon((pkg, host));
@@ -2703,8 +2418,6 @@ pub fn plan(ws: &Workspace, req: &Request) -> Result<Plan> {
             planner.lib_node.insert(key, id);
         }
     }
-    // Wire the libraries' dependencies (no dev-dependencies: they belong to
-    // a package's own tests, examples and benches).
     let lib_nodes: Vec<(UnitRef, NodeId)> = {
         let mut v: Vec<_> = planner.lib_node.iter().map(|(k, v)| (*k, *v)).collect();
         v.sort_by_key(|(_, n)| n.0);
@@ -2714,7 +2427,6 @@ pub fn plan(ws: &Workspace, req: &Request) -> Result<Plan> {
         planner.wire(Some(node), key, false, true);
     }
 
-    // -- Requested targets.
     let mut requested: Vec<Requested> = Vec::new();
     let mut doc_tests: Vec<DocTest> = Vec::new();
     let mut extra_roots: Vec<NodeId> = Vec::new();
@@ -2727,11 +2439,9 @@ pub fn plan(ws: &Workspace, req: &Request) -> Result<Plan> {
         let active = planner.features_of((li, false));
         let picks = pick_targets(member, req, &active)?;
 
-        // Package binaries are build-order dependencies of tests and benches.
         let mut bin_nodes: HashMap<String, NodeId> = HashMap::new();
         let mut nodes_for_picks: Vec<(usize, NodeId)> = Vec::new();
 
-        // First pass: binaries (plain) so tests can depend on them.
         for (pi, pick) in picks.iter().enumerate() {
             let proc_macro = pick.kind == TargetKind::Lib
                 && member.manifest.lib.as_ref().is_some_and(|l| l.proc_macro);
@@ -2746,7 +2456,6 @@ pub fn plan(ws: &Workspace, req: &Request) -> Result<Plan> {
             };
             let is_plain_lib = pick.kind == TargetKind::Lib && !pick.harness;
             if is_plain_lib {
-                // Already created above; just request it.
                 if let Some(&n) = planner.lib_node.get(&(li, false)) {
                     requested.push(Requested {
                         node: n,
@@ -2758,8 +2467,6 @@ pub fn plan(ws: &Workspace, req: &Request) -> Result<Plan> {
                 }
                 continue;
             }
-            // A harness compiles the library's own source with `--test`; it
-            // has no library crate types of its own.
             let extras = if pick.harness { Vec::new() } else { extras };
             let unit = planner.local_unit(
                 li,
@@ -2778,7 +2485,6 @@ pub fn plan(ws: &Workspace, req: &Request) -> Result<Plan> {
             }
             nodes_for_picks.push((pi, node));
         }
-        // Test/bench units need every package binary built first.
         let needs_bins = picks
             .iter()
             .any(|p| matches!(p.kind, TargetKind::Test | TargetKind::Bench));
@@ -2807,7 +2513,6 @@ pub fn plan(ws: &Workspace, req: &Request) -> Result<Plan> {
                 );
                 let node = planner.graph.add_node(unit);
                 bin_nodes.insert(name, node);
-                // Wire the binary itself.
                 planner.wire(Some(node), (li, false), false, true);
                 if let Some(&lib) = planner.lib_node.get(&(li, false)) {
                     planner.graph.add_edge(node, lib);
@@ -2848,8 +2553,6 @@ pub fn plan(ws: &Workspace, req: &Request) -> Result<Plan> {
             });
         }
 
-        // Doctests: need the library and every dependency, dev-dependencies
-        // included, as real artifacts.
         if req.mode == Mode::Test
             && req.doctests
             && (req.targets.doc_only || !req.targets.any_explicit() || req.targets.all_targets)
@@ -2859,8 +2562,6 @@ pub fn plan(ws: &Workspace, req: &Request) -> Result<Plan> {
         {
             let mut externs = match harness_lib_externs.take() {
                 Some(e) => e,
-                // No lib harness node (e.g. `--doc`): work out the
-                // dependency list without adding a compile unit.
                 None => planner.wire(None, (li, false), true, false),
             };
             externs.push((
@@ -2885,10 +2586,8 @@ pub fn plan(ws: &Workspace, req: &Request) -> Result<Plan> {
         }
     }
 
-    // Explicitly requested names must exist in at least one selected package.
     check_named_targets(req, &locals, ws)?;
 
-    // -- Prune to what was asked for.
     let mut roots: Vec<NodeId> = requested.iter().map(|r| r.node).collect();
     roots.extend(extra_roots.iter().copied());
     let (mut graph, map) = planner.graph.subgraph(&roots);
@@ -2915,9 +2614,6 @@ pub fn plan(ws: &Workspace, req: &Request) -> Result<Plan> {
     })
 }
 
-/// `[lib] crate-type`: the primary crate type and any additional ones. A
-/// library that produces an `rlib` is primarily that, since it is what
-/// dependents link.
 fn crate_types_of(lib: &TargetSpec) -> (CrateType, Vec<CrateType>) {
     let parse = |s: &str| match s {
         "lib" | "rlib" => Some(CrateType::Lib),
@@ -2951,8 +2647,7 @@ fn crate_types_of(lib: &TargetSpec) -> (CrateType, Vec<CrateType>) {
     (primary, extras)
 }
 
-/// A package's build script runs once; every other unit of the package (its
-/// binaries, tests, examples) shares the library's run and `OUT_DIR`.
+/// A package's build script runs once; all its units share the library's run and `OUT_DIR`.
 fn assign_script_owners(graph: &mut BuildGraph) {
     let mut assignments: Vec<(NodeId, String)> = Vec::new();
     for node in graph.nodes() {
@@ -3017,23 +2712,10 @@ fn check_named_targets(req: &Request, locals: &Locals, _ws: &Workspace) -> Resul
     check("bench", &sel.bench, &have_bench)
 }
 
-/// `rune check` marks nearly every unit `check_only` so `build_rustc_command`
-/// emits metadata only, skipping codegen and linking. That's unsound for two
-/// kinds of node regardless of check mode: a build script is a real executable
-/// compiled and run before its owning crate compiles, and a proc-macro is
-/// loaded into the compiler process — both need actual linked `.rlib`s (or a
-/// dylib) from their dependencies, not just `.rmeta`.
-///
-/// This walks the graph once, seeded from every proc-macro's dependencies and
-/// every build script's build-dependencies, and lifts `check_only` back to
-/// `false` across them and everything below them (never the seed itself: a
-/// crate that merely *has* a build script still only needs its own code
-/// type-checked, and so do its ordinary dependencies).
+/// Build scripts and proc-macros need real linked dependencies, so lift `check_only` across their
+/// dependency closure (proc-macro deps and build-dependencies).
 fn exempt_real_link_requirements_from_check(graph: &mut BuildGraph) {
     let mut must_be_real: HashSet<NodeId> = HashSet::new();
-    // What is linked into something that runs: a proc-macro's dependencies,
-    // and a build script's *build*-dependencies (its package's ordinary
-    // dependencies are only type-checked, like any other library's).
     let mut stack: Vec<NodeId> = Vec::new();
     for n in graph.nodes() {
         if n.unit.crate_type == CrateType::ProcMacro {
@@ -3062,11 +2744,6 @@ fn exempt_real_link_requirements_from_check(graph: &mut BuildGraph) {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Inventory: every package of the resolved graph, for reports (`rune sbom`)
-// ---------------------------------------------------------------------------
-
-/// How a package depends on another.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum EdgeKind {
     Normal,
@@ -3074,28 +2751,19 @@ pub enum EdgeKind {
     Dev,
 }
 
-/// A package of the resolved graph, with what its manifest says about it.
 #[derive(Debug, Clone)]
 pub struct InventoryPackage {
     pub name: String,
     pub version: semver::Version,
-    /// As `Cargo.lock` spells it; `None` for a path package.
     pub source: Option<String>,
     pub checksum: Option<String>,
     pub meta: rune_common::PackageMeta,
-    /// A member of this workspace.
     pub member: bool,
-    /// `(repository URL, commit)` of a git package.
     pub git: Option<(String, String)>,
-    /// The registry's index URL, for a registry package.
     pub registry: Option<String>,
-    /// Packages this one depends on as locked (only what is used, with
-    /// optional dependencies nothing enables left out), and how.
     pub deps: Vec<(usize, EdgeKind)>,
 }
 
-/// Every package the lockfile holds, with metadata from its manifest and the
-/// locked dependency edges. Resolves (and downloads) first, like `build`.
 pub fn inventory(ws: &Workspace, offline: bool) -> Result<Vec<InventoryPackage>> {
     let existing = LockfileManager::load_fast(ws.root());
     let (resolved, lock) = resolve_fresh(ws, offline, existing.as_ref(), false)?;
@@ -3151,7 +2819,6 @@ pub fn inventory(ws: &Workspace, offline: bool) -> Result<Vec<InventoryPackage>>
         });
     }
 
-    // Edges as locked: `name`, `name version` or `name version (source)`.
     let find = |spec: &str| -> Option<usize> {
         let mut parts = spec.split_whitespace();
         let name = parts.next()?;
@@ -3174,8 +2841,6 @@ pub fn inventory(ws: &Workspace, offline: bool) -> Result<Vec<InventoryPackage>>
         };
         for spec in &locked.dependencies {
             let Some(j) = find(spec) else { continue };
-            // The strongest way the manifest declares it: a dependency that
-            // is also a build- or dev-dependency is an ordinary one.
             let kinds: Vec<DependencyKind> = p
                 .dependencies
                 .iter()

@@ -1,16 +1,12 @@
-//! The HTTP client every registry request goes through, configured like
-//! Cargo's (`http.cainfo`, `http.proxy`, `http.timeout`, `http.user-agent`,
-//! `net.retry`; see [`rune_common::net`]).
+//! The HTTP client every registry request goes through, configured like Cargo's.
 
 use reqwest::blocking::{Client, ClientBuilder, RequestBuilder, Response};
 use rune_common::net::{self, HttpConfig};
 use std::time::Duration;
 use tracing::{debug, warn};
 
-/// The default `User-Agent`.
 pub const USER_AGENT: &str = concat!("rune/", env!("CARGO_PKG_VERSION"));
 
-/// Applies the process's network settings to a client builder.
 pub fn configure(mut builder: ClientBuilder, http: &HttpConfig) -> ClientBuilder {
     builder = builder.user_agent(http.user_agent.as_deref().unwrap_or(USER_AGENT));
     for (path, pem) in http.ca_bundles() {
@@ -36,7 +32,6 @@ pub fn configure(mut builder: ClientBuilder, http: &HttpConfig) -> ClientBuilder
     builder
 }
 
-/// A blocking client with the process's network settings on top of `builder`.
 pub fn client(builder: ClientBuilder) -> Client {
     configure(builder, net::global())
         .build()
@@ -46,23 +41,13 @@ pub fn client(builder: ClientBuilder) -> Client {
         })
 }
 
-/// A client created on first use: building one loads trust stores and starts
-/// an I/O thread, which a build that never touches the network should not pay
-/// for.
-///
-/// Clients are shared by everything in the process with the same `setup`
-/// and never dropped: every index client or downloader created during one
-/// command reuses the same connections (no new TLS handshakes), and exiting
-/// does not wait for a blocking client's I/O thread to shut its HTTP/2
-/// connections down — which took a second at the end of some resolutions.
+/// Created on first use and never dropped: shared connections, and exit doesn't wait for HTTP/2 shutdown.
 pub struct LazyClient {
     cell: std::sync::OnceLock<&'static Client>,
     setup: fn(ClientBuilder) -> ClientBuilder,
 }
 
 impl LazyClient {
-    /// `setup` adds the caller's own settings (pool size, timeouts) on top of
-    /// the process-wide ones.
     pub const fn new(setup: fn(ClientBuilder) -> ClientBuilder) -> Self {
         Self {
             cell: std::sync::OnceLock::new(),
@@ -75,7 +60,6 @@ impl LazyClient {
     }
 }
 
-/// The process-wide client for `setup`.
 fn shared(setup: fn(ClientBuilder) -> ClientBuilder) -> &'static Client {
     static CLIENTS: std::sync::Mutex<Vec<(usize, &'static Client)>> =
         std::sync::Mutex::new(Vec::new());
@@ -109,7 +93,6 @@ impl Clone for LazyClient {
     }
 }
 
-/// Why a request failed: worth another attempt, or final.
 fn transient(result: &reqwest::Result<Response>) -> bool {
     match result {
         Ok(resp) => net::is_retryable_status(resp.status().as_u16()),
@@ -117,9 +100,7 @@ fn transient(result: &reqwest::Result<Response>) -> bool {
     }
 }
 
-/// Sends an idempotent request (a GET), retrying transient failures —
-/// connection errors, timeouts, `429` and `5xx` — up to `net.retry` times with
-/// a growing delay. `make` builds a fresh request for every attempt.
+/// GET with retries on connection errors, timeouts, `429` and `5xx`.
 pub fn send_with_retry(make: impl Fn() -> RequestBuilder) -> reqwest::Result<Response> {
     send_with_retry_n(make, net::global().retries, net::retry_delay)
 }
@@ -148,14 +129,11 @@ fn send_with_retry_n(
     }
 }
 
-/// A downloaded file and its validator.
 pub struct Fetched {
     pub body: Vec<u8>,
     pub etag: Option<String>,
 }
 
-/// Downloads `url` unless it still matches `etag` (`None` then: not
-/// modified). With the process's network settings and retries.
 pub fn fetch_if_changed(url: &str, etag: Option<&str>) -> Result<Option<Fetched>, String> {
     static CLIENT: LazyClient = LazyClient::new(|b| b.timeout(Duration::from_secs(120)));
     let resp = send_with_retry(|| {
@@ -182,9 +160,6 @@ pub fn fetch_if_changed(url: &str, etag: Option<&str>) -> Result<Option<Fetched>
     Ok(Some(Fetched { body, etag }))
 }
 
-/// A one-line explanation of a failed request for users: the innermost cause
-/// (e.g. "invalid peer certificate: UnknownIssuer") plus, for certificate
-/// problems, how to trust a custom CA.
 pub fn describe(e: &reqwest::Error) -> String {
     let mut msg = e.to_string();
     let mut source = std::error::Error::source(e);
@@ -216,7 +191,6 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    /// A server that answers the first `fail` requests with `503`, then `200`.
     fn flaky_server(fail: usize) -> (String, Arc<AtomicUsize>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}/x", listener.local_addr().unwrap());
@@ -259,7 +233,6 @@ mod tests {
 
     #[test]
     fn a_refused_connection_is_reported_with_its_cause() {
-        // Bind and drop: nothing listens on the port any more.
         let port = TcpListener::bind("127.0.0.1:0")
             .unwrap()
             .local_addr()

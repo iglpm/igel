@@ -1,30 +1,19 @@
-//! `rune test --cached`: skip test binaries whose result cannot have changed.
-//!
-//! A passing run is remembered under a key made of everything Rune can *see*
-//! that decides the outcome — the test binary's bytes (which cover the code, its
-//! dependencies and the compiler), every file in the package directory (where
-//! tests find their fixtures), the arguments, the working directory and the
-//! `RUST_*`/`CARGO_*`/`RUNE_*` environment. A test that also depends on something
-//! Rune cannot see (the network, the clock, files outside the package, other
-//! environment variables) must not be cached, which is why this is opt-in.
-//! A failing run is never remembered.
+//! `rune test --cached`: remember passing runs keyed by the binary, package files, arguments, cwd and
+//! `RUST_*`/`CARGO_*`/`RUNE_*` env. Opt-in: tests depending on anything else must not be cached.
 
 use rune_common::hash::HashBuilder;
 use serde::{Deserialize, Serialize};
 use std::io::Read;
 use std::path::Path;
 
-/// What is stored for a passing run.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Record {
     pub passed: u64,
     pub ignored: u64,
     pub filtered: u64,
-    /// The run's output, so `--show-output` style runs can still show it.
     pub output: String,
 }
 
-/// Output beyond this is not kept.
 const MAX_OUTPUT: usize = 256 * 1024;
 
 impl Record {
@@ -46,7 +35,6 @@ impl Record {
     }
 }
 
-/// Feeds a file's bytes to the hash without loading it whole.
 fn hash_file(h: &mut HashBuilder, path: &Path) -> std::io::Result<()> {
     let mut file = std::fs::File::open(path)?;
     let mut buf = vec![0u8; 1 << 20];
@@ -59,12 +47,10 @@ fn hash_file(h: &mut HashBuilder, path: &Path) -> std::io::Result<()> {
     }
 }
 
-/// The variables that configure how tests and the harness behave.
 fn relevant_env(vars: impl Iterator<Item = (String, String)>) -> Vec<(String, String)> {
     let mut v: Vec<_> = vars
         .filter(|(k, _)| {
             (k.starts_with("RUST_") || k.starts_with("CARGO_") || k.starts_with("RUNE_"))
-                // Where scratch output goes is not an input, and moves with the checkout.
                 && k != "CARGO_TARGET_TMPDIR"
         })
         .collect();
@@ -72,10 +58,6 @@ fn relevant_env(vars: impl Iterator<Item = (String, String)>) -> Vec<(String, St
     v
 }
 
-/// The key a test run is remembered under.
-///
-/// `package_hash` is the hash of the package directory's contents (the same one
-/// that keys local crates), computed by the caller so its file cache is shared.
 pub fn key(
     exe: &Path,
     package_hash: &str,

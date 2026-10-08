@@ -1,8 +1,4 @@
 //! `rune self update` and `rune self uninstall`.
-//!
-//! Downloads the latest (or a requested) release archive from GitHub (or a mirror),
-//! checks the SHA-256 against the published checksum, extracts the binary,
-//! and atomically replaces the currently running executable.
 
 use crate::args::{SelfUninstallArgs, SelfUpdateArgs};
 use crate::ui;
@@ -10,7 +6,6 @@ use anyhow::{Context, Result, bail};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
-/// Updates the Rune binary to the latest or specified release.
 pub fn update(args: SelfUpdateArgs) -> Result<()> {
     let target = current_target()?;
     let current_version = env!("CARGO_PKG_VERSION");
@@ -28,8 +23,6 @@ pub fn update(args: SelfUpdateArgs) -> Result<()> {
         .or(option_env!("RUNE_REPOSITORY"))
         .unwrap_or("runepm/rune");
 
-    // Rune's own network settings (CA bundles, proxy, `http.*`); a whole
-    // release must fit in the timeout on a slow connection.
     let client = rune_registry::http::client(
         reqwest::blocking::Client::builder()
             .user_agent(format!("rune/{current_version}"))
@@ -39,7 +32,6 @@ pub fn update(args: SelfUpdateArgs) -> Result<()> {
 
     let download_base_env = std::env::var("RUNE_DOWNLOAD_BASE").ok();
 
-    // Determine target release tag and download base
     let (target_tag, base_url) = if let Some(base) = download_base_env {
         let tag = args.version.unwrap_or_else(|| "latest".to_string());
         (tag, base.trim_end_matches('/').to_string())
@@ -52,13 +44,11 @@ pub fn update(args: SelfUpdateArgs) -> Result<()> {
         };
         (tag, base)
     } else {
-        // Query GitHub for the latest release
         ui::action("checking", format!("latest release from {repo}"));
         let (tag, base) = resolve_latest_release(&client, repo)?;
         (tag, base)
     };
 
-    // Check version if target tag has a semver format
     let clean_tag = target_tag.trim_start_matches('v');
     if let Ok(target_semver) = semver::Version::parse(clean_tag)
         && let Ok(curr_semver) = semver::Version::parse(current_version)
@@ -85,14 +75,12 @@ pub fn update(args: SelfUpdateArgs) -> Result<()> {
         return Ok(());
     }
 
-    // Prepare archive names
     let archive_name = format!("rune-{target}.tar.gz");
     let archive_url = format!("{base_url}/{archive_name}");
     let sha256_url = format!("{base_url}/{archive_name}.sha256");
 
     ui::action("downloading", format!("Rune {target_tag} ({target})"));
 
-    // Download checksum file
     let sha256_resp = client
         .get(&sha256_url)
         .send()
@@ -113,7 +101,6 @@ pub fn update(args: SelfUpdateArgs) -> Result<()> {
         .context("invalid checksum file format")?
         .to_lowercase();
 
-    // Download archive to a temp file
     let mut archive_temp = tempfile::Builder::new()
         .prefix("rune-archive-")
         .suffix(".tar.gz")
@@ -148,7 +135,6 @@ pub fn update(args: SelfUpdateArgs) -> Result<()> {
         .flush()
         .context("failed to flush archive data")?;
 
-    // Verify SHA-256
     let actual_hash = rune_registry::download::sha256_file(archive_temp.path())
         .context("failed to compute archive checksum")?
         .to_lowercase();
@@ -158,7 +144,6 @@ pub fn update(args: SelfUpdateArgs) -> Result<()> {
     }
     ui::action("verifying", "checksum matches");
 
-    // Extract archive
     let extract_dir = tempfile::Builder::new()
         .prefix("rune-extract-")
         .tempdir()
@@ -172,7 +157,6 @@ pub fn update(args: SelfUpdateArgs) -> Result<()> {
         .unpack(extract_dir.path())
         .context("failed to unpack release archive")?;
 
-    // Locate binary inside extracted archive
     let bin_name = if cfg!(windows) { "rune.exe" } else { "rune" };
     let expected_bin = extract_dir
         .path()
@@ -182,12 +166,10 @@ pub fn update(args: SelfUpdateArgs) -> Result<()> {
     let new_bin = if expected_bin.exists() {
         expected_bin
     } else {
-        // Fallback: search recursively for the binary
         find_file_recursively(extract_dir.path(), bin_name)
             .with_context(|| format!("could not find `{bin_name}` in extracted archive"))?
     };
 
-    // Ensure executable permissions on Unix
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -195,7 +177,6 @@ pub fn update(args: SelfUpdateArgs) -> Result<()> {
             .context("failed to set executable permissions on unpacked binary")?;
     }
 
-    // Replace current executable
     replace_executable(&new_bin, &current_exe)?;
 
     ui::action(
@@ -209,7 +190,6 @@ pub fn update(args: SelfUpdateArgs) -> Result<()> {
     Ok(())
 }
 
-/// Uninstalls the Rune binary from the system.
 pub fn uninstall(args: SelfUninstallArgs) -> Result<()> {
     let current_exe = std::env::current_exe()
         .ok()
@@ -231,14 +211,12 @@ pub fn uninstall(args: SelfUninstallArgs) -> Result<()> {
         }
     }
 
-    // Remove the binary
     if current_exe.exists() {
         std::fs::remove_file(&current_exe)
             .with_context(|| format!("failed to remove binary `{}`", current_exe.display()))?;
         ui::action("removed", current_exe.display());
     }
 
-    // Purge configuration and cache if requested
     let rune_home = rune_common::settings::rune_home();
     if args.purge {
         if rune_home.exists() && !looks_like_rune_home(&rune_home) {
@@ -274,9 +252,7 @@ pub fn uninstall(args: SelfUninstallArgs) -> Result<()> {
     Ok(())
 }
 
-/// Whether `dir` is a directory `--purge` may delete: one Rune made (it
-/// holds Rune's store, caches or settings), and never the home directory or
-/// a file system root, whatever `RUNE_HOME` says.
+/// Only a directory Rune made, never home or a file system root, whatever `RUNE_HOME` says.
 fn looks_like_rune_home(dir: &Path) -> bool {
     let canonical = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
     if canonical.parent().is_none() {
@@ -300,7 +276,6 @@ fn looks_like_rune_home(dir: &Path) -> bool {
     .any(|entry| canonical.join(entry).exists())
 }
 
-/// Resolves the latest release tag and download base URL.
 fn resolve_latest_release(
     client: &reqwest::blocking::Client,
     repo: &str,
@@ -318,7 +293,6 @@ fn resolve_latest_release(
         return Ok((tag.to_string(), base));
     }
 
-    // Fallback: check redirect location of releases/latest
     let redirect_url = format!("https://github.com/{repo}/releases/latest");
     if let Ok(resp) = client.get(&redirect_url).send() {
         let final_url = resp.url().as_str();
@@ -332,13 +306,10 @@ fn resolve_latest_release(
         }
     }
 
-    // Ultimate fallback to releases/latest/download
     let base = format!("https://github.com/{repo}/releases/latest/download");
     Ok(("latest".to_string(), base))
 }
 
-/// The release tag for what a user typed: `2027.1` and `2027.1.0` are both
-/// `v2027.1.0`; `latest` and full tags stay as they are.
 fn release_tag(version: &str) -> String {
     if version == "latest" {
         return version.to_string();
@@ -353,7 +324,6 @@ fn release_tag(version: &str) -> String {
     format!("v{full}")
 }
 
-/// Detects the target triple for the current machine.
 fn current_target() -> Result<String> {
     let build_target = env!("RUNE_BUILD_TARGET");
     if !build_target.is_empty() {
@@ -376,7 +346,6 @@ fn current_target() -> Result<String> {
     Ok(format!("{arch}-{os}"))
 }
 
-/// Recursively searches for a file by name.
 fn find_file_recursively(dir: &Path, file_name: &str) -> Option<PathBuf> {
     for entry in walkdir::WalkDir::new(dir)
         .into_iter()
@@ -389,7 +358,6 @@ fn find_file_recursively(dir: &Path, file_name: &str) -> Option<PathBuf> {
     None
 }
 
-/// Atomically replaces the destination executable with the source file.
 fn replace_executable(src: &Path, dst: &Path) -> Result<()> {
     let parent = dst
         .parent()

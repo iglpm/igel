@@ -1,13 +1,4 @@
-//! Git-based registry indexes (`registry+https://…`, or a `[registries]`
-//! index URL without `sparse+`): the protocol registries used before sparse
-//! indexes, and still used by some private ones.
-//!
-//! The index is a git repository with the same file layout as a sparse index
-//! (`3/f/foo`, `se/rd/serde`, `config.json` at the root). Rune keeps a shallow
-//! clone under `RUNE_HOME/registry/git-index/`, made and updated with the
-//! system `git` (so credential helpers and `insteadOf` rules apply), and
-//! reads files from it. A clone is updated at most once per process: when
-//! asked to (`rune update`), or when a crate or version is missing.
+//! Git-based registry indexes: a shallow clone, updated at most once per process.
 
 use crate::index::{CrateIndex, IndexError, SparseIndexClient};
 use std::collections::HashSet;
@@ -21,15 +12,12 @@ pub struct GitIndex {
     offline: bool,
 }
 
-/// Clones updated in this process.
 fn updated() -> &'static Mutex<HashSet<PathBuf>> {
     static UPDATED: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
     UPDATED.get_or_init(Default::default)
 }
 
 impl GitIndex {
-    /// The clone of the index at `url` (`registry+` prefix optional),
-    /// cloning it first if there is none yet.
     pub fn open(url: &str, offline: bool) -> Result<GitIndex, IndexError> {
         let url = url.strip_prefix("registry+").unwrap_or(url).to_string();
         let dir = rune_common::settings::rune_home()
@@ -60,7 +48,6 @@ impl GitIndex {
                     &tmp.to_string_lossy(),
                 ],
             )?;
-            // Another process may have finished first; either clone will do.
             if std::fs::rename(&tmp, &index.dir).is_err() {
                 let _ = std::fs::remove_dir_all(&tmp);
             }
@@ -69,12 +56,10 @@ impl GitIndex {
         Ok(index)
     }
 
-    /// The working tree of the clone.
     pub fn dir(&self) -> &Path {
         &self.dir
     }
 
-    /// Brings the clone up to date with the remote (once per process).
     pub fn update(&self) -> Result<(), IndexError> {
         if self.offline || !updated().lock().unwrap().insert(self.dir.clone()) {
             return Ok(());
@@ -97,7 +82,6 @@ impl GitIndex {
         SparseIndexClient::parse_index_text(name, &text)
     }
 
-    /// A crate's entries, updating the clone once if it does not know it.
     pub fn read(&self, name: &str) -> Result<CrateIndex, IndexError> {
         match self.read_local(name) {
             Err(IndexError::CrateNotFound(_)) if !self.offline => {
@@ -108,7 +92,6 @@ impl GitIndex {
         }
     }
 
-    /// A crate's entries after bringing the clone up to date.
     pub fn refresh(&self, name: &str) -> Result<CrateIndex, IndexError> {
         self.update()?;
         self.read_local(name)
@@ -180,7 +163,6 @@ mod tests {
         assert_eq!(index.read("foo").unwrap().available_versions().len(), 1);
         assert!(index.dir().join("config.json").is_file());
 
-        // A new release: seen after an update, not before.
         let text = format!("{}{}", line("1.0.0"), line("1.1.0"));
         std::fs::write(remote.path().join("3/f/foo"), text).unwrap();
         run(&["commit", "-qam", "two"]);

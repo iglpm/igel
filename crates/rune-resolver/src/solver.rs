@@ -1,14 +1,5 @@
-//! A complete version solver for the conflicts the resolution walk cannot
-//! settle by itself.
-//!
-//! The walk in `resolver.rs` takes the newest version each requirement allows
-//! and repairs the rare leftover conflict — two versions in one compatible
-//! range — by preferring or backtracking one requirer at a time. Some graphs
-//! need several crates moved at once; for those, the version choice is posed
-//! as a PubGrub problem: one package per crate and compatible range (as Cargo
-//! allows one version per range), dependencies as the index records them.
-//! A solution becomes preferred versions for the walk to take; no solution
-//! comes with PubGrub's explanation of why.
+//! PubGrub solver for the conflicts the resolution walk can't settle by itself: one package per crate
+//! and compatible range.
 
 use crate::resolver::{DependencyResolver, PackageSource, ResolvedGraph};
 use pubgrub::{
@@ -22,7 +13,6 @@ use std::convert::Infallible;
 use std::fmt;
 use std::str::FromStr;
 
-/// A crate in one compatible range (`serde 1.x`), or the workspace.
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub(crate) enum Pkg {
     Root,
@@ -31,8 +21,6 @@ pub(crate) enum Pkg {
         name: String,
         class: (u64, u64, u64),
     },
-    /// A requirement that allows several compatible ranges (`*`,
-    /// `>=0.3, <0.5`): choosing its version chooses the range.
     Choice {
         registry: String,
         name: String,
@@ -41,7 +29,6 @@ pub(crate) enum Pkg {
 }
 
 impl fmt::Display for Pkg {
-    // The version set printed next to it says which range.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Pkg::Root => f.write_str("the workspace"),
@@ -50,7 +37,6 @@ impl fmt::Display for Pkg {
     }
 }
 
-/// Which versions Cargo counts as compatible (one allowed per class).
 pub(crate) fn compat_class(v: &Version) -> (u64, u64, u64) {
     match (v.major, v.minor) {
         (0, 0) => (0, 0, v.patch),
@@ -59,8 +45,6 @@ pub(crate) fn compat_class(v: &Version) -> (u64, u64, u64) {
     }
 }
 
-/// A requirement in force: `from` (a package id, `None` for a root) needs
-/// `name` from `registry` matching `req`.
 pub(crate) struct Requirement<'a> {
     pub from: Option<&'a str>,
     pub registry: &'a str,
@@ -70,17 +54,12 @@ pub(crate) struct Requirement<'a> {
 
 struct Provider<'r> {
     resolver: RefCell<&'r mut DependencyResolver>,
-    /// What the workspace (and path/git packages) require directly.
     root: Vec<(String, String, VersionReq)>,
-    /// Per registry crate: the dependencies (by package name) the current
-    /// graph has switched on — optional ones only count when on here.
     active: HashMap<(String, String), HashSet<String>>,
-    /// Versions to try first: what the graph (or lockfile) has now.
     current: HashMap<(String, String), Vec<Version>>,
 }
 
 impl Provider<'_> {
-    /// Non-yanked versions of a crate, newest first.
     fn versions(&self, registry: &str, name: &str) -> Vec<Version> {
         let mut r = self.resolver.borrow_mut();
         let Ok(index) = r.index_for(registry, name) else {
@@ -95,8 +74,6 @@ impl Provider<'_> {
         v
     }
 
-    /// The package and version set a requirement stands for: the newest
-    /// compatible range it allows (as the walk would take).
     fn constraint(&self, registry: &str, name: &str, req: &VersionReq) -> (Pkg, Ranges<Version>) {
         let matching: Vec<Version> = self
             .versions(registry, name)
@@ -119,7 +96,6 @@ impl Provider<'_> {
         }
         let class = match matching.first() {
             Some(v) => compat_class(v),
-            // Nothing matches: a range PubGrub will report as unsatisfiable.
             None => req
                 .comparators
                 .first()
@@ -161,7 +137,6 @@ impl DependencyProvider for Provider<'_> {
         range: &Ranges<Version>,
         stats: &PackageResolutionStatistics,
     ) -> Self::Priority {
-        // Decide the most contested, then the most constrained, first.
         let choices = match package {
             Pkg::Root => 1,
             Pkg::Crate { registry, name, .. } | Pkg::Choice { registry, name, .. } => self
@@ -183,7 +158,6 @@ impl DependencyProvider for Provider<'_> {
             return Ok(Some(Version::new(0, 0, 0)));
         };
         let key = (registry.clone(), name.clone());
-        // Keep what the graph has when it still fits, else the newest.
         if let Some(v) = self
             .current
             .get(&key)
@@ -204,8 +178,6 @@ impl DependencyProvider for Provider<'_> {
     ) -> Result<Dependencies<Pkg, Ranges<Version>, String>, Infallible> {
         let wanted: Vec<(String, String, VersionReq)> = match package {
             Pkg::Root => self.root.clone(),
-            // Taking this version of the requirement means taking it in its
-            // own range.
             Pkg::Choice { registry, name, .. } => {
                 let crate_pkg = Pkg::Crate {
                     registry: registry.clone(),
@@ -257,7 +229,6 @@ impl DependencyProvider for Provider<'_> {
         let mut deps: HashMap<Pkg, Ranges<Version>> = HashMap::new();
         for (registry, name, req) in wanted {
             let (pkg, range) = self.constraint(&registry, &name, &req);
-            // Several requirements on one range: all must hold.
             let range = match deps.remove(&pkg) {
                 Some(r) => r.intersection(&range),
                 None => range,
@@ -270,15 +241,11 @@ impl DependencyProvider for Provider<'_> {
     }
 }
 
-/// The outcome of [`solve`].
 pub(crate) enum Solution {
-    /// One version for every crate and compatible range the graph needs.
     Found(Vec<(String, String, Version)>),
-    /// No such choice exists; why, in words.
     Impossible(String),
 }
 
-/// Solves the version choice of `graph`'s registry crates as a whole.
 pub(crate) fn solve(
     resolver: &mut DependencyResolver,
     graph: &ResolvedGraph,

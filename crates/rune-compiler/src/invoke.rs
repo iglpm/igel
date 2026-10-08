@@ -11,7 +11,6 @@ pub enum InvokeError {
 
 pub type Result<T> = std::result::Result<T, InvokeError>;
 
-/// Engine for executing `rustc`.
 pub struct RustcInvoker {
     rustc_path: PathBuf,
 }
@@ -23,7 +22,6 @@ impl Default for RustcInvoker {
 }
 
 impl RustcInvoker {
-    /// Discovers rustc via the `RUSTC` env var or defaults to "rustc".
     pub fn new() -> Self {
         let rustc_path = std::env::var_os("RUSTC")
             .map(PathBuf::from)
@@ -31,17 +29,10 @@ impl RustcInvoker {
         Self { rustc_path }
     }
 
-    /// Returns the path to the rustc binary.
     pub fn rustc_path(&self) -> &PathBuf {
         &self.rustc_path
     }
 
-    /// Invoke `rustc` synchronously using a pre-built `Command`.
-    ///
-    /// The caller should have created the `Command` via
-    /// `RustcCommandBuilder::build()` which already sets the
-    /// program to `rustc`. This method just runs it and parses
-    /// the output.
     pub fn invoke(&self, mut cmd: Command) -> Result<CompilationResult> {
         let output = cmd.output()?;
         let stderr_raw = String::from_utf8_lossy(&output.stderr).into_owned();
@@ -57,12 +48,6 @@ impl RustcInvoker {
         })
     }
 
-    /// Invoke `rustc` and stream stderr, calling `on_metadata`
-    /// as soon as the `.rmeta` is ready.
-    ///
-    /// This is the key pipelining optimization: downstream crates
-    /// can begin compiling as soon as metadata is available, without
-    /// waiting for the full codegen/linking phase.
     pub fn invoke_pipelined(
         &self,
         cmd: Command,
@@ -78,11 +63,7 @@ impl RustcInvoker {
         })
     }
 
-    /// Invoke `rustc`, calling `on_artifact` for every artifact it announces
-    /// (`dep-info`, `metadata`, `link`) the moment it does. rustc announces
-    /// dep-info — which lists the environment variables read by `env!` — before
-    /// it announces metadata, so a caller can react to it before dependents
-    /// start.
+    /// Calls `on_artifact` as rustc announces each artifact; dep-info comes before metadata.
     pub fn invoke_streaming(
         &self,
         mut cmd: Command,
@@ -138,9 +119,6 @@ impl RustcInvoker {
     }
 }
 
-/// Waits for `child` and returns its exit status and peak memory: `wait4`
-/// hands back the process's resource usage with its status, which the
-/// scheduler uses to start only as many compilers as memory allows.
 #[cfg(unix)]
 fn wait_with_peak_memory(
     child: &mut std::process::Child,
@@ -158,7 +136,6 @@ fn wait_with_peak_memory(
         }
         let err = std::io::Error::last_os_error();
         if err.kind() != std::io::ErrorKind::Interrupted {
-            // Reaped elsewhere (should not happen): fall back to std.
             return child.wait().map(|s| (s, None));
         }
     }
@@ -172,16 +149,12 @@ fn wait_with_peak_memory(
     Ok((std::process::ExitStatus::from_raw(status), Some(bytes)))
 }
 
-/// Waits for `child` and returns its exit status and peak memory: the
-/// process's handle stays open after it exits (until `child` is dropped),
-/// and its counters with it.
 #[cfg(windows)]
 fn wait_with_peak_memory(
     child: &mut std::process::Child,
 ) -> std::io::Result<(std::process::ExitStatus, Option<u64>)> {
     use std::os::windows::io::AsRawHandle;
 
-    /// `PROCESS_MEMORY_COUNTERS`.
     #[repr(C)]
     #[derive(Default)]
     struct Counters {

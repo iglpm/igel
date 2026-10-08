@@ -1,5 +1,4 @@
-//! Dependency management: `add`, `remove`, `update`, `tree`, `why`, `fetch`,
-//! `generate-lockfile`, `metadata`, `locate-project`.
+//! `add`, `remove`, `update`, `tree`, `why`, `fetch`, `generate-lockfile`, `metadata`, `locate-project`.
 
 use anyhow::{Context, Result, bail};
 use colored::Colorize;
@@ -22,11 +21,6 @@ fn load(m: &ManifestArgs) -> Result<(Workspace, bool)> {
     Ok((ws, offline))
 }
 
-// ---------------------------------------------------------------------------
-// add / remove
-// ---------------------------------------------------------------------------
-
-/// The member whose manifest `add`/`remove` should edit.
 fn target_member(ws: &Workspace, package: Option<&str>) -> Result<usize> {
     if let Some(name) = package {
         return ws
@@ -47,16 +41,12 @@ fn target_member(ws: &Workspace, package: Option<&str>) -> Result<usize> {
     }
 }
 
-/// The features of a release — `+` for those that `requested` (and the
-/// defaults, when `defaults`) turn on — as `cargo add` lists them, then the
-/// release's `rust-version` and publication date when the index has them.
 fn release_notes(
     record: &rune_registry::IndexRecord,
     requested: &[String],
     defaults: bool,
 ) -> Vec<String> {
     let features = record.all_features();
-    // Optional dependencies are features too, unless a `dep:` hides them.
     let hidden: std::collections::HashSet<&str> = features
         .values()
         .flatten()
@@ -90,8 +80,7 @@ fn release_notes(
             if v.starts_with("dep:") {
                 continue;
             }
-            // `dep/feature` turns on the optional dependency `dep` (and its
-            // implicit feature); `dep?/feature` does not.
+            // `dep/feature` turns on optional `dep`; `dep?/feature` does not.
             let name = match v.split_once('/') {
                 Some((d, _)) if d.ends_with('?') => continue,
                 Some((d, _)) => d,
@@ -103,10 +92,8 @@ fn release_notes(
         }
     }
     let mut notes = Vec::new();
-    // Enabled first, as `cargo add` lists them.
     let (enabled, rest): (Vec<&String>, Vec<&String>) = all.iter().partition(|f| on.contains(*f));
     if all.len() > 40 {
-        // `windows-sys` has hundreds: the enabled ones and a count.
         notes.push(format!(
             "{} features in v{}, {} enabled (`rune info {}` lists them)",
             all.len(),
@@ -150,7 +137,6 @@ pub fn add(args: AddArgs) -> Result<()> {
     } else {
         "dependencies"
     };
-    // `--target 'cfg(unix)'` puts it under `[target.'cfg(unix)'.dependencies]`.
     let table: &mut Item = match &args.target {
         Some(t) => {
             if doc.get("target").is_none() {
@@ -161,7 +147,6 @@ pub fn add(args: AddArgs) -> Result<()> {
             if doc["target"].get(t).is_none() {
                 let mut platform = Table::new();
                 platform.set_implicit(true);
-                // `[target.'cfg(unix)'.dependencies]`, spelled as Cargo does.
                 let key = toml_edit::Key::parse(&format!("'{t}'"))
                     .ok()
                     .and_then(|mut k| k.pop())
@@ -192,14 +177,12 @@ pub fn add(args: AddArgs) -> Result<()> {
     let defs = rune_registry::source::defs();
     let index_url = defs.index_for_name(args.registry.as_deref())?;
     let client = rune_registry::source::IndexClient::for_registry(&index_url, offline)?;
-    // Dependencies the workspace declares once for all its members.
     let ws_deps: Vec<String> = ws
         .workspace_manifest()
         .map(|w| w.dependencies.keys().cloned().collect())
         .unwrap_or_default();
 
     let mut added = Vec::new();
-    // What to say under each added crate: its features and release facts.
     let mut notes: Vec<Vec<String>> = Vec::new();
     for spec in &args.crate_specs {
         let mut chosen: Option<rune_registry::IndexRecord> = None;
@@ -261,8 +244,6 @@ pub fn add(args: AddArgs) -> Result<()> {
             let requirement = match ver_req {
                 Some(v) => v,
                 None => {
-                    // Latest non-yanked, non-prerelease release — old enough
-                    // for `resolve.min-release-age`, when one is.
                     let cutoff = ws.config.settings.min_release_age().map(|age| {
                         std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
@@ -342,7 +323,6 @@ pub fn add(args: AddArgs) -> Result<()> {
             inline.insert("optional", Value::from(true));
         }
 
-        // A bare `name = "1.0"` when there's nothing else to say.
         let item = if inline.len() == 1 && inline.contains_key("version") {
             Item::Value(inline.get("version").unwrap().clone())
         } else {
@@ -373,7 +353,6 @@ pub fn add(args: AddArgs) -> Result<()> {
 
     fs::write(&manifest_path, doc.to_string())?;
 
-    // Re-resolve so the lockfile and downloads are ready.
     let ws = Workspace::load(Some(&manifest_path))?;
     refresh_lockfile(&ws, offline, false, &[])?;
     Ok(())
@@ -407,7 +386,6 @@ pub fn remove(args: RemoveArgs) -> Result<()> {
                 ui::action("removed", format!("{} from [{}]", name.bold(), t));
             }
         }
-        // Also `[target.'cfg(..)'.dependencies]` and friends.
         if let Some(targets) = doc.get_mut("target").and_then(|t| t.as_table_like_mut()) {
             let keys: Vec<String> = targets.iter().map(|(k, _)| k.to_string()).collect();
             for key in keys {
@@ -445,7 +423,6 @@ pub fn remove(args: RemoveArgs) -> Result<()> {
     Ok(())
 }
 
-/// Re-resolves and stores the lockfile, downloading whatever is now needed.
 pub(crate) fn refresh_lockfile(
     ws: &Workspace,
     offline: bool,
@@ -469,10 +446,6 @@ pub(crate) fn refresh_lockfile(
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// update / fetch / generate-lockfile
-// ---------------------------------------------------------------------------
-
 pub fn update(args: UpdateArgs) -> Result<()> {
     let (ws, offline) = load(&args.manifest)?;
     if offline {
@@ -480,8 +453,6 @@ pub fn update(args: UpdateArgs) -> Result<()> {
     }
     let before = LockfileManager::load_fast(ws.root());
 
-    // `NAME` or `NAME@VERSION` (to pick one of several locked versions),
-    // positional or with `-p` as in older Cargo.
     let specs: Vec<String> = args.packages.iter().chain(&args.package).cloned().collect();
     if args.precise.is_some() && specs.len() != 1 {
         bail!("`--precise` needs exactly one package: `rune update -p NAME --precise VERSION`");
@@ -556,7 +527,6 @@ pub fn update(args: UpdateArgs) -> Result<()> {
         graph::download_all(&resolved, false)?;
     }
 
-    // Report what moved, like Cargo does.
     let index = |l: &rune_resolver::Lockfile| -> BTreeMap<String, Vec<String>> {
         let mut m: BTreeMap<String, Vec<String>> = BTreeMap::new();
         for p in l.packages.iter().filter(|p| p.source.is_some()) {
@@ -645,10 +615,6 @@ pub fn locate_project(args: ManifestArgs) -> Result<()> {
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// tree / why
-// ---------------------------------------------------------------------------
-
 fn resolved_for_inspection(ws: &Workspace, offline: bool) -> Result<rune_resolver::ResolvedGraph> {
     let existing = LockfileManager::load_fast(ws.root());
     let (resolved, _) = graph::resolve_fresh(ws, offline, existing.as_ref(), false)?;
@@ -666,7 +632,6 @@ pub fn tree(args: TreeArgs) -> Result<()> {
         Some(t) => Some(t.to_string()),
         None => Some(rune_common::toolchain::global().host.to_string()),
     };
-    // What a build on that platform uses, with the features it is built with.
     let resolved = graph::tree_view(&ws, offline, target.as_deref())?;
     let selected = ws.select(&args.package, args.workspace, &[])?;
     let roots: Vec<String> = selected.iter().map(|&i| ws.members[i].id()).collect();
@@ -675,8 +640,6 @@ pub fn tree(args: TreeArgs) -> Result<()> {
         "none" => rune_resolver::tree::Prefix::None,
         _ => rune_resolver::tree::Prefix::Indent,
     };
-    // The resolved graph knows registry packages' feature tables; the
-    // workspace's own come from their manifests.
     let mut resolved = resolved;
     for m in &ws.members {
         if let Some(p) = resolved.packages.get_mut(&m.id())
@@ -711,8 +674,6 @@ pub fn tree(args: TreeArgs) -> Result<()> {
     Ok(())
 }
 
-/// `rune features [DEP]`: a package's features, which are on in a build on
-/// this platform, and what turned each on.
 pub fn features(args: crate::args::FeaturesArgs) -> Result<()> {
     let (ws, offline) = load(&args.manifest)?;
     let target = match args.target.as_deref() {
@@ -721,7 +682,6 @@ pub fn features(args: crate::args::FeaturesArgs) -> Result<()> {
     };
     let mut resolved = graph::tree_view(&ws, offline, Some(&target))?;
     let members: Vec<String> = ws.members.iter().map(|m| m.id()).collect();
-    // The workspace's own feature tables come from their manifests.
     for m in &ws.members {
         if let Some(p) = resolved.packages.get_mut(&m.id())
             && p.declared_features.is_empty()
@@ -736,7 +696,6 @@ pub fn features(args: crate::args::FeaturesArgs) -> Result<()> {
     }
 
     let Some(wanted) = &args.package else {
-        // The workspace's own packages: what they declare.
         let (with, without): (Vec<_>, Vec<_>) = ws
             .members
             .iter()
@@ -822,8 +781,6 @@ pub fn features(args: crate::args::FeaturesArgs) -> Result<()> {
         let on: BTreeSet<&str> = pkg.features.iter().map(String::as_str).collect();
         let mut all: BTreeSet<&str> = pkg.declared_features.keys().map(String::as_str).collect();
         all.extend(on.iter().copied());
-        // Optional dependencies are features too, when nothing names them
-        // with `dep:`.
         ui::out(format!(
             "{} {}  {}",
             ui::brand(&pkg.name),
@@ -873,9 +830,6 @@ pub fn features(args: crate::args::FeaturesArgs) -> Result<()> {
     Ok(())
 }
 
-/// What turns on feature `f` of `pkg` in `graph`, as display fragments:
-/// another feature of the package itself, dependents that ask for it, the
-/// dependents' default features, or a dependent's own feature (`serde/derive`).
 fn who_enables(
     graph: &rune_resolver::ResolvedGraph,
     pkg: &rune_resolver::ResolvedPackage,
@@ -895,7 +849,6 @@ fn who_enables(
     let mut declared: Vec<String> = Vec::new();
     let mut defaults: Vec<String> = Vec::new();
     let mut via_feature: Vec<String> = Vec::new();
-    // Inside the package: another feature that lists this one.
     let mut own: Vec<(&String, &Vec<String>)> = pkg.declared_features.iter().collect();
     own.sort();
     for (g, values) in own {
@@ -914,7 +867,6 @@ fn who_enables(
             {
                 continue;
             }
-            // An optional dependency the parent does not turn on adds nothing.
             let active = !dep.optional
                 || parent_on.contains(dep.name.as_str())
                 || parent.declared_features.iter().any(|(g, vals)| {
@@ -1030,10 +982,6 @@ pub fn why(args: WhyArgs) -> Result<()> {
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// metadata
-// ---------------------------------------------------------------------------
-
 pub fn metadata(args: MetadataArgs) -> Result<()> {
     if args.format_version != 1 {
         bail!("only `--format-version 1` is supported");
@@ -1053,8 +1001,6 @@ pub fn metadata(args: MetadataArgs) -> Result<()> {
         let existing = LockfileManager::load_fast(ws.root());
         let (resolved, lock) = graph::resolve_fresh(&ws, offline, existing.as_ref(), false)?;
         let reg_dl = rune_registry::CrateDownloader::default_downloader().offline(true);
-        // Every package of the resolution, with its manifest where it is on
-        // disk (a registry crate once downloaded, a git checkout, a path).
         let mut entries: Vec<(
             &rune_resolver::ResolvedPackage,
             String,
@@ -1120,7 +1066,6 @@ pub fn metadata(args: MetadataArgs) -> Result<()> {
                     "manifest_path": serde_json::Value::Null,
                 })),
             }
-            // The locked edges, with the name the package uses for each.
             let locked = lock.packages.iter().find(|l| {
                 l.name == p.name && l.version == p.version.to_string() && l.source == src
             });
@@ -1210,8 +1155,6 @@ pub fn metadata(args: MetadataArgs) -> Result<()> {
     Ok(())
 }
 
-/// Cargo's package id of a local package: `path+file:///w/foo#0.1.0`, with
-/// the name spelled out when the directory is named differently.
 fn path_id(dir: &std::path::Path, name: &str, version: &semver::Version) -> String {
     if dir.file_name().is_some_and(|n| n == name) {
         format!("path+{}#{version}", fsutil::file_url(dir))
@@ -1220,7 +1163,6 @@ fn path_id(dir: &std::path::Path, name: &str, version: &semver::Version) -> Stri
     }
 }
 
-/// One package as `cargo metadata` describes it.
 fn metadata_package(
     m: &crate::workspace::Member,
     id: &str,
@@ -1348,13 +1290,6 @@ fn metadata_package(
     })
 }
 
-// ---------------------------------------------------------------------------
-// pkgid / verify-project
-// ---------------------------------------------------------------------------
-
-/// `rune pkgid [SPEC]`: the fully qualified package id spec of a workspace
-/// member or a package in the dependency graph, as Cargo prints it
-/// (`path+file:///…#name@1.0.0`, `registry+https://…#serde@1.0.228`).
 pub fn pkgid(args: PkgidArgs) -> Result<()> {
     let (ws, offline) = load(&args.manifest)?;
     let spec = args.spec.clone().or(args.package.clone());
@@ -1438,8 +1373,6 @@ pub fn pkgid(args: PkgidArgs) -> Result<()> {
     }
 }
 
-/// `rune verify-project`: prints `{"success":"true"}` when the manifest (and
-/// its workspace) loads, else `{"invalid":"<why>"}` and exits 1.
 pub fn verify_project(args: ManifestArgs) -> Result<()> {
     match Workspace::load(args.manifest_path.as_deref()) {
         Ok(_) => {
@@ -1457,17 +1390,12 @@ pub fn verify_project(args: ManifestArgs) -> Result<()> {
     }
 }
 
-/// Published crates whose names are close to `name` (a typo, `_` for `-`),
-/// from a registry search; empty when the registry has no search or is
-/// unreachable.
 fn similar_crates(index_url: &str, name: &str) -> Vec<String> {
     let Ok(api) = rune_registry::api::RegistryApi::for_index(index_url) else {
         return Vec::new();
     };
     let wanted = name.to_lowercase().replace('_', "-");
     let limit = (wanted.len() / 3).clamp(1, 3);
-    // Search is by words, so a typo finds nothing: try the name cut short
-    // too (`serdee` → `serde`, `serd`).
     let chars: Vec<char> = name.chars().collect();
     let mut queries = vec![name.to_string()];
     for cut in 1..=2 {
@@ -1494,7 +1422,6 @@ fn similar_crates(index_url: &str, name: &str) -> Vec<String> {
     close.into_iter().take(3).map(|(_, n)| n).collect()
 }
 
-/// The candidate closest to `wanted` within a typo's distance, if any.
 pub fn closest<'a>(wanted: &str, candidates: impl IntoIterator<Item = &'a str>) -> Option<&'a str> {
     let wanted = wanted.to_lowercase().replace('_', "-");
     candidates
@@ -1510,7 +1437,6 @@ pub fn closest<'a>(wanted: &str, candidates: impl IntoIterator<Item = &'a str>) 
         .map(|(_, c)| c)
 }
 
-/// Levenshtein distance.
 fn edit_distance(a: &str, b: &str) -> usize {
     let b: Vec<char> = b.chars().collect();
     let mut prev: Vec<usize> = (0..=b.len()).collect();
