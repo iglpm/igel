@@ -149,10 +149,11 @@ pub const KEYS: &[KeyDef] = &[
         default: "default",
         description: "Which linker links binaries, tests and dynamic libraries. `default`: the \
                       one `rustc` and `.cargo/config.toml` choose. `hyprlnk`: the linker built \
-                      into Rune, about twice as fast as lld on Rune's own build; it takes \
+                      into Rune, faster than lld and Apple's ld on Rune's own build; it takes \
                       precedence over `target.<triple>.linker`. hyprlnk links Windows \
-                      (`*-pc-windows-msvc`: x64, ARM64, x86), PDBs included; other targets \
-                      keep their linker.",
+                      (`*-pc-windows-msvc`: x64, ARM64, x86), PDBs included, and macOS \
+                      (`*-apple-darwin`: arm64, arm64e, x86_64), debug maps and code \
+                      signatures included; other targets keep their linker.",
     },
     KeyDef {
         name: "build.target-dir",

@@ -18,7 +18,10 @@ The first stable release. Changes since the 0.1.0 preview:
   binaries, tests, build scripts and DLLs with it instead of the platform
   linker. It links Windows images for x64, ARM64 and x86 from
   `link.exe`-style command lines — PDBs, identical code folding and
-  resources included — in about half the time lld takes on Rune's own build.
+  resources included — in about half the time lld takes on Rune's own build,
+  and macOS images for arm64, arm64e and x86_64 from ld64-style command lines
+  — chained fixups, debug maps, code signatures and Objective-C included — in
+  less than half the time of Apple's ld (a quarter of ld64.lld's).
   `rune __hyprlnk <args>` runs it by hand; it also builds as a standalone
   `hyprlnk` executable.
 - `rune-bench` (in `bench/`): benchmarks Rune against Cargo on generated

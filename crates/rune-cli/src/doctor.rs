@@ -52,6 +52,8 @@ pub struct Environment {
     pub on_path: Box<dyn Fn(&str) -> bool>,
     pub rustflags: Vec<String>,
     pub configured_linker: Option<String>,
+    /// Rune's `build.linker` setting.
+    pub rune_linker: Option<String>,
     pub dev_debug_full_explicit: bool,
     pub full_dependency_debuginfo: bool,
     pub home: String,
@@ -139,7 +141,18 @@ pub fn diagnose(env: &Environment) -> Vec<Finding> {
             .rustflags
             .iter()
             .any(|f| f.contains("fuse-ld") || f.starts_with("linker=") || f.contains("-Clinker"));
-    if linker_chosen {
+    let hyprlnk_host = env.host.as_deref().is_some_and(hyprlnk::supports_target);
+    if hyprlnk_host && env.rune_linker.as_deref() == Some("hyprlnk") {
+        out.push(Finding::ok(
+            "linking with hyprlnk, the linker built into Rune",
+        ));
+    } else if hyprlnk_host && !linker_chosen {
+        out.push(Finding::warn(
+            "the linker built into Rune is not turned on",
+            "On this platform hyprlnk links about twice as fast as lld or the system linker, with nothing to install.",
+            "rune config set build.linker hyprlnk --global",
+        ));
+    } else if linker_chosen {
         out.push(Finding::ok("linker configured explicitly"));
     } else if let Some(fast) = ["mold", "wild"].into_iter().find(|t| has(t)) {
         let host = env.host.as_deref().unwrap_or("<your target triple>");
@@ -267,6 +280,7 @@ mod tests {
             on_path: Box::new(|t| matches!(t, "cc" | "git" | "pkg-config")),
             rustflags: vec![],
             configured_linker: None,
+            rune_linker: None,
             dev_debug_full_explicit: false,
             full_dependency_debuginfo: false,
             home: "/home/me/.rune".into(),
@@ -335,6 +349,20 @@ mod tests {
         let fix = w.fix.as_deref().unwrap();
         assert!(fix.contains("[target.x86_64-unknown-linux-gnu]"));
         assert!(fix.contains("-fuse-ld=mold"));
+    }
+
+    #[test]
+    fn hyprlnk_is_recommended_where_it_links() {
+        let mut e = env();
+        e.host = Some("aarch64-apple-darwin".into());
+        let findings = diagnose(&e);
+        let w = warnings(&findings);
+        assert!(w.iter().any(|t| t.contains("built into Rune")), "{w:?}");
+        e.rune_linker = Some("hyprlnk".into());
+        assert!(warnings(&diagnose(&e)).is_empty());
+        e.rune_linker = None;
+        e.configured_linker = Some("clang".into());
+        assert!(warnings(&diagnose(&e)).is_empty());
     }
 
     #[test]

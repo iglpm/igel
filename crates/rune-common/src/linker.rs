@@ -1,5 +1,6 @@
 //! The built-in linker, hyprlnk. Its cache-key identity is `rune:hyprlnk@<version>`; only when rustc runs
-//! does it become `-C linker=<this executable>` with [`EMBEDDED_ENV`] set.
+//! does it become `-C linker=<this executable>` with [`EMBEDDED_ENV`] set, plus the linker flavor
+//! for targets whose default flavor isn't the linker's own command line.
 
 use std::path::PathBuf;
 
@@ -24,6 +25,12 @@ pub fn for_rustc(linker: &str) -> (PathBuf, Option<(&'static str, &'static str)>
     }
 }
 
+/// `-C linker-flavor` for the embedded linker on `target`: Apple targets would otherwise get a
+/// `cc` command line; with `ld64.lld` rustc passes ld64's (and `-flavor darwin` first).
+pub fn rustc_flavor(linker: &str, target: &str) -> Option<&'static str> {
+    (is_embedded(linker) && target.contains("-apple-")).then_some("ld64.lld")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -38,5 +45,14 @@ mod tests {
         assert_eq!(exe, std::env::current_exe().unwrap());
         assert_eq!(env, Some((EMBEDDED_ENV, "1")));
         assert_eq!(for_rustc("rust-lld"), (PathBuf::from("rust-lld"), None));
+    }
+
+    #[test]
+    fn apple_targets_get_the_ld64_flavor() {
+        let l = embedded("0.1.0");
+        assert_eq!(rustc_flavor(&l, "aarch64-apple-darwin"), Some("ld64.lld"));
+        assert_eq!(rustc_flavor(&l, "x86_64-apple-darwin"), Some("ld64.lld"));
+        assert_eq!(rustc_flavor(&l, "x86_64-pc-windows-msvc"), None);
+        assert_eq!(rustc_flavor("cc", "aarch64-apple-darwin"), None);
     }
 }

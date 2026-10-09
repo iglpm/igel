@@ -3081,6 +3081,9 @@ pub fn build_rustc_command(
     if let (Some(linker), true) = (&unit.ext.linker, links_final_artifact) {
         let (exe, env) = rune_common::linker::for_rustc(linker);
         builder = builder.linker(&exe.to_string_lossy());
+        if let Some(flavor) = rune_common::linker::rustc_flavor(linker, compiled_for(unit)) {
+            builder = builder.extra_flags(vec!["-C".into(), format!("linker-flavor={flavor}")]);
+        }
         if let Some((k, v)) = env {
             builder = builder.env(k, v);
         }

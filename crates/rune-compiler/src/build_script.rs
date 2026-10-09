@@ -196,8 +196,12 @@ impl BuildScriptRunner {
             }
             cmd.args(&e.rustflags);
             if let Some(linker) = &e.linker {
-                let (exe, env) = rune_common::linker::for_rustc(&linker.to_string_lossy());
+                let name = linker.to_string_lossy();
+                let (exe, env) = rune_common::linker::for_rustc(&name);
                 cmd.arg("-C").arg(format!("linker={}", exe.display()));
+                if let Some(flavor) = rune_common::linker::rustc_flavor(&name, &e.host) {
+                    cmd.arg("-C").arg(format!("linker-flavor={flavor}"));
+                }
                 if let Some((k, v)) = env {
                     cmd.env(k, v);
                 }

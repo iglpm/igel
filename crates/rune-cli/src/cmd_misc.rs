@@ -928,6 +928,7 @@ pub fn doctor() -> Result<()> {
         on_path: Box::new(which_on_path),
         rustflags,
         configured_linker,
+        rune_linker: config.settings.linker(),
         dev_debug_full_explicit,
         full_dependency_debuginfo: config.settings.dependency_debuginfo(),
         home: home.display().to_string(),
