@@ -202,7 +202,7 @@ impl BuildScriptRunner {
                 if let Some(flavor) = rune_common::linker::rustc_flavor(&name, &e.host) {
                     cmd.arg("-C").arg(format!("linker-flavor={flavor}"));
                 }
-                if let Some((k, v)) = env {
+                for (k, v) in env {
                     cmd.env(k, v);
                 }
             }

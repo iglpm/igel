@@ -109,19 +109,20 @@ fn artifact_line(
     let mut artifacts = artifacts.to_vec();
     let mut executable = None;
     // `cargo test --no-run --message-format json` is how runners like nextest find test executables.
-    if (unit.crate_type == CrateType::Bin || unit.harness) && !unit.check_only {
-        if let Some(bin) = artifacts.iter_mut().find(|p| {
+    if (unit.crate_type == CrateType::Bin || unit.harness)
+        && !unit.check_only
+        && let Some(bin) = artifacts.iter_mut().find(|p| {
             matches!(
                 p.extension().and_then(|e| e.to_str()),
                 None | Some("exe" | "wasm" | "js")
             )
-        }) {
-            if !unit.harness {
-                *bin = rune_scheduler::executor::bin_dir_for(config, profile, unit)
-                    .join(unit.executable_name(&unit.crate_id.name));
-            }
-            executable = Some(bin.clone());
+        })
+    {
+        if !unit.harness {
+            *bin = rune_scheduler::executor::bin_dir_for(config, profile, unit)
+                .join(unit.executable_name(&unit.crate_id.name));
         }
+        executable = Some(bin.clone());
     }
     let mut m = common(unit, "compiler-artifact");
     m.insert(

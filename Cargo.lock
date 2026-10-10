@@ -698,10 +698,13 @@ version = "2027.0.0"
 dependencies = [
  "hashbrown",
  "libc",
+ "memchr",
  "mimalloc",
+ "miniz_oxide",
  "rayon",
  "rustc-demangle",
  "xxhash-rust",
+ "zstd",
 ]
 
 [[package]]

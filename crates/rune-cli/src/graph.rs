@@ -1199,16 +1199,14 @@ fn pick_targets(member: &Member, req: &Request, active: &[String]) -> Result<Vec
             .name
             .clone()
             .unwrap_or_else(|| member.name.replace('-', "_"));
-        if want_lib && !sel.doc_only {
-            if !test_mode || all {
-                out.push(Pick {
-                    kind: TargetKind::Lib,
-                    name: name.clone(),
-                    path: path.clone(),
-                    harness: false,
-                    spec: Some(lib.clone()),
-                });
-            }
+        if want_lib && !sel.doc_only && (!test_mode || all) {
+            out.push(Pick {
+                kind: TargetKind::Lib,
+                name: name.clone(),
+                path: path.clone(),
+                harness: false,
+                spec: Some(lib.clone()),
+            });
         }
         let want_lib_tests = (test_mode && (!explicit || sel.lib || all) && !sel.doc_only)
             || (all && !test_mode && !bench_mode);
@@ -1221,10 +1219,8 @@ fn pick_targets(member: &Member, req: &Request, active: &[String]) -> Result<Vec
                 spec: Some(lib.clone()),
             });
         }
-    } else if !sel.bin.is_empty() || sel.lib {
-        if sel.lib && !explicit_other_than_lib(sel) {
-            bail!("no library targets found in package `{}`", member.name);
-        }
+    } else if sel.lib && !explicit_other_than_lib(sel) {
+        bail!("no library targets found in package `{}`", member.name);
     }
 
     let want_all_bins = if explicit {
@@ -1439,12 +1435,10 @@ impl Roles {
         let tc = toolchain::global();
         let cfg = &ws.cargo_config;
         let cross = req.target.is_some();
-        let hyprlnk = match ws.config.settings.linker().as_deref() {
-            None | Some("default") => false,
-            Some("hyprlnk") => true,
-            Some(other) => {
-                bail!("unknown `build.linker` `{other}`: expected `default` or `hyprlnk`")
-            }
+        let hyprlnk = match ws.config.settings.linker().as_str() {
+            "hyprlnk" => true,
+            "default" => false,
+            other => bail!("unknown `build.linker` `{other}`: expected `hyprlnk` or `default`"),
         };
         let build = |arg: Option<&str>, role: Role| {
             // Flags can depend on cfgs and cfgs on flags (`-C target-feature`): ask bare, pick flags, ask again.
@@ -1456,7 +1450,16 @@ impl Roles {
                 TargetInfo::query(tc, arg, &flags)
             };
             let linker = if hyprlnk && hyprlnk::supports_target(&info.name) {
-                Some(rune_common::linker::embedded(hyprlnk::VERSION))
+                // On Linux hyprlnk links through a C compiler: the target's, if it names one.
+                let driver = toolchain::linker(cfg, &info)
+                    .filter(|l| {
+                        info.name.contains("-linux-") && rune_common::linker::is_c_compiler(l)
+                    })
+                    .map(|l| l.to_string_lossy().into_owned());
+                Some(rune_common::linker::embedded(
+                    hyprlnk::VERSION,
+                    driver.as_deref(),
+                ))
             } else {
                 toolchain::linker(cfg, &info).map(|p| p.to_string_lossy().into_owned())
             };

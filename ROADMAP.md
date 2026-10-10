@@ -317,9 +317,9 @@ setup in `.cargo/config.toml`.
   build of Rune itself went from 36.7 s to 33.1 s (median of 4 interleaved runs),
   and 29.7 s → 23.9 s when the workspace crates were trimmed too. `rune doctor`
   (F1) now detects an installed `mold`/`wild`/`lld` and prints the exact config.
-- *Still to do:* Optionally a
-  `build.linker = "auto"` setting that picks the fastest available linker and
-  keys its identity. Cache the *link step* in the CAS (key = all object keys +
+- **Done:** hyprlnk, the linker built into Rune, links by default on Linux,
+  Windows and macOS — nothing to install, no config.
+- *Still to do:* Cache the *link step* in the CAS (key = all object keys +
   linker identity + link args) so relinking an unchanged set of objects is free.
 
 **P5 — Nobody knows the knobs exist.** 42 % of survey respondents had tried no

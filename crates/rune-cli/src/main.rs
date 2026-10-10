@@ -43,8 +43,11 @@ use args::{Cli, Commands};
 use graph::Mode;
 
 fn main() {
-    // `build.linker = "hyprlnk"`: this process is rustc running "the linker".
-    if std::env::var_os(rune_common::linker::EMBEDDED_ENV).is_some() {
+    let sandbox = std::env::args_os().nth(1).as_deref()
+        == Some(std::ffi::OsStr::new(rune_common::sandbox::HELPER_ARG));
+    // `build.linker = "hyprlnk"`: this process is rustc running "the linker" — unless it is the
+    // sandbox that rustc runs in, which passes the variable on to it.
+    if !sandbox && std::env::var_os(rune_common::linker::EMBEDDED_ENV).is_some() {
         std::process::exit(hyprlnk::main_with_args(std::env::args_os()));
     }
     if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("__hyprlnk")) {
@@ -57,9 +60,7 @@ fn main() {
     unsafe {
         libc::signal(libc::SIGPIPE, libc::SIG_DFL);
     }
-    if std::env::args_os().nth(1).as_deref()
-        == Some(std::ffi::OsStr::new(rune_common::sandbox::HELPER_ARG))
-    {
+    if sandbox {
         let rest: Vec<OsString> = std::env::args_os().skip(2).collect();
         rune_common::sandbox::helper_main(&rest);
     }

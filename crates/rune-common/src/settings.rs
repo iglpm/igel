@@ -146,14 +146,17 @@ pub const KEYS: &[KeyDef] = &[
     KeyDef {
         name: "build.linker",
         kind: ValueKind::Text,
-        default: "default",
-        description: "Which linker links binaries, tests and dynamic libraries. `default`: the \
-                      one `rustc` and `.cargo/config.toml` choose. `hyprlnk`: the linker built \
-                      into Rune, faster than lld and Apple's ld on Rune's own build; it takes \
-                      precedence over `target.<triple>.linker`. hyprlnk links Windows \
-                      (`*-pc-windows-msvc`: x64, ARM64, x86), PDBs included, and macOS \
-                      (`*-apple-darwin`: arm64, arm64e, x86_64), debug maps and code \
-                      signatures included; other targets keep their linker.",
+        default: "hyprlnk",
+        description: "Which linker links binaries, tests and dynamic libraries. `hyprlnk`: the \
+                      linker built into Rune, with nothing to install. It takes precedence over \
+                      `target.<triple>.linker`; on Linux that names the C compiler hyprlnk \
+                      links through (for the C runtime), `cc` otherwise. hyprlnk links Linux \
+                      (glibc and musl on x86-64, x86, AArch64, ARM, RISC-V 64, POWER \
+                      little-endian, s390x and LoongArch), Windows (`*-pc-windows-msvc`: x64, \
+                      ARM64, x86), PDBs included, and macOS (`*-apple-darwin`: arm64, arm64e, \
+                      x86_64), debug maps and code signatures included; other targets keep \
+                      their linker. `default`: the linker `rustc` and `.cargo/config.toml` \
+                      choose.",
     },
     KeyDef {
         name: "build.target-dir",
@@ -555,10 +558,11 @@ impl Settings {
         }
     }
 
-    pub fn linker(&self) -> Option<String> {
+    /// `build.linker`, set or default.
+    pub fn linker(&self) -> String {
         match self.values.get("build.linker") {
-            Some((Value::Text(t), _)) => Some(t.clone()),
-            _ => None,
+            Some((Value::Text(t), _)) => t.clone(),
+            _ => "hyprlnk".into(),
         }
     }
 

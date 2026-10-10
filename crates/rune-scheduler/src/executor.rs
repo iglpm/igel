@@ -3078,14 +3078,16 @@ pub fn build_rustc_command(
     if !unit.ext.rustflags.is_empty() {
         builder = builder.extra_flags(unit.ext.rustflags.clone());
     }
-    if let (Some(linker), true) = (&unit.ext.linker, links_final_artifact) {
+    // Proc-macros are linked too: shared libraries rustc loads, linked by the host's linker.
+    let links = links_final_artifact || unit.crate_type == CrateType::ProcMacro;
+    if let (Some(linker), true) = (&unit.ext.linker, links) {
         let (exe, env) = rune_common::linker::for_rustc(linker);
         builder = builder.linker(&exe.to_string_lossy());
         if let Some(flavor) = rune_common::linker::rustc_flavor(linker, compiled_for(unit)) {
             builder = builder.extra_flags(vec!["-C".into(), format!("linker-flavor={flavor}")]);
         }
-        if let Some((k, v)) = env {
-            builder = builder.env(k, v);
+        for (k, v) in env {
+            builder = builder.env(k, &v);
         }
     }
 

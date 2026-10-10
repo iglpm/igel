@@ -52,8 +52,8 @@ pub struct Environment {
     pub on_path: Box<dyn Fn(&str) -> bool>,
     pub rustflags: Vec<String>,
     pub configured_linker: Option<String>,
-    /// Rune's `build.linker` setting.
-    pub rune_linker: Option<String>,
+    /// Rune's `build.linker` setting, set or default.
+    pub rune_linker: String,
     pub dev_debug_full_explicit: bool,
     pub full_dependency_debuginfo: bool,
     pub home: String,
@@ -80,11 +80,6 @@ pub fn fs_type_of(path: &Path, mounts: &str) -> Option<String> {
         })
         .max_by_key(|(len, _)| *len)
         .map(|(_, fs)| fs)
-}
-
-fn parse_release(release: &str) -> Option<(u32, u32)> {
-    let mut parts = release.split(['.', '-']);
-    Some((parts.next()?.parse().ok()?, parts.next()?.parse().ok()?))
 }
 
 fn human(bytes: u64) -> String {
@@ -129,27 +124,20 @@ pub fn diagnose(env: &Environment) -> Vec<Finding> {
         ));
     }
 
-    let linux_x86 = env.host.as_deref() == Some("x86_64-unknown-linux-gnu");
-    let already_lld = linux_x86
-        && env
-            .rustc_release
-            .as_deref()
-            .and_then(parse_release)
-            .is_some_and(|v| v >= (1, 90));
     let linker_chosen = env.configured_linker.is_some()
         || env
             .rustflags
             .iter()
             .any(|f| f.contains("fuse-ld") || f.starts_with("linker=") || f.contains("-Clinker"));
     let hyprlnk_host = env.host.as_deref().is_some_and(hyprlnk::supports_target);
-    if hyprlnk_host && env.rune_linker.as_deref() == Some("hyprlnk") {
+    if hyprlnk_host && env.rune_linker == "hyprlnk" {
         out.push(Finding::ok(
             "linking with hyprlnk, the linker built into Rune",
         ));
     } else if hyprlnk_host && !linker_chosen {
         out.push(Finding::warn(
-            "the linker built into Rune is not turned on",
-            "On this platform hyprlnk links about twice as fast as lld or the system linker, with nothing to install.",
+            "the linker built into Rune is turned off",
+            "On this platform hyprlnk links faster than lld, mold or the system linker, with nothing to install.",
             "rune config set build.linker hyprlnk --global",
         ));
     } else if linker_chosen {
@@ -163,7 +151,7 @@ pub fn diagnose(env: &Environment) -> Vec<Finding> {
                 "add to .cargo/config.toml:\n    [target.{host}]\n    rustflags = [\"-C\", \"link-arg=-fuse-ld={fast}\"]"
             ),
         ));
-    } else if !already_lld && has("ld.lld") {
+    } else if has("ld.lld") {
         let host = env.host.as_deref().unwrap_or("<your target triple>");
         out.push(Finding::warn(
             "`lld` is installed but not used for linking",
@@ -171,11 +159,6 @@ pub fn diagnose(env: &Environment) -> Vec<Finding> {
             format!(
                 "add to .cargo/config.toml:\n    [target.{host}]\n    rustflags = [\"-C\", \"link-arg=-fuse-ld=lld\"]"
             ),
-        ));
-    } else if already_lld {
-        out.push(Finding::note(
-            "linking with rust-lld (the default since Rust 1.90)",
-            "Installing `mold` or `wild` would make linking faster still.",
         ));
     } else {
         out.push(Finding::note(
@@ -280,7 +263,7 @@ mod tests {
             on_path: Box::new(|t| matches!(t, "cc" | "git" | "pkg-config")),
             rustflags: vec![],
             configured_linker: None,
-            rune_linker: None,
+            rune_linker: "hyprlnk".into(),
             dev_debug_full_explicit: false,
             full_dependency_debuginfo: false,
             home: "/home/me/.rune".into(),
@@ -341,51 +324,57 @@ mod tests {
 
     #[test]
     fn an_installed_but_unused_fast_linker_is_recommended_with_the_config_to_add() {
+        // Where hyprlnk doesn't link.
         let mut e = env();
+        e.host = Some("x86_64-unknown-freebsd".into());
         e.on_path = Box::new(|t| matches!(t, "cc" | "git" | "pkg-config" | "mold"));
         let f = diagnose(&e);
         let w = f.iter().find(|f| f.level == Level::Warn).unwrap();
         assert!(w.title.contains("mold"));
         let fix = w.fix.as_deref().unwrap();
-        assert!(fix.contains("[target.x86_64-unknown-linux-gnu]"));
+        assert!(fix.contains("[target.x86_64-unknown-freebsd]"));
         assert!(fix.contains("-fuse-ld=mold"));
+        e.on_path = Box::new(|t| matches!(t, "cc" | "git" | "pkg-config" | "ld.lld"));
+        assert!(warnings(&diagnose(&e))[0].contains("lld"));
     }
 
     #[test]
-    fn hyprlnk_is_recommended_where_it_links() {
-        let mut e = env();
-        e.host = Some("aarch64-apple-darwin".into());
-        let findings = diagnose(&e);
-        let w = warnings(&findings);
-        assert!(w.iter().any(|t| t.contains("built into Rune")), "{w:?}");
-        e.rune_linker = Some("hyprlnk".into());
-        assert!(warnings(&diagnose(&e)).is_empty());
-        e.rune_linker = None;
-        e.configured_linker = Some("clang".into());
-        assert!(warnings(&diagnose(&e)).is_empty());
+    fn hyprlnk_links_by_default_and_is_recommended_when_turned_off() {
+        for host in [
+            "x86_64-unknown-linux-gnu",
+            "aarch64-unknown-linux-gnu",
+            "aarch64-apple-darwin",
+            "x86_64-pc-windows-msvc",
+        ] {
+            let mut e = env();
+            e.host = Some(host.into());
+            e.on_path = Box::new(|t| matches!(t, "cc" | "git" | "pkg-config" | "mold"));
+            let findings = diagnose(&e);
+            assert!(warnings(&findings).is_empty(), "{host}");
+            assert!(
+                findings
+                    .iter()
+                    .any(|f| f.title.contains("linking with hyprlnk")),
+                "{host}"
+            );
+            e.rune_linker = "default".into();
+            let w = warnings(&diagnose(&e)).join("\n");
+            assert!(w.contains("built into Rune is turned off"), "{host}: {w}");
+            e.configured_linker = Some("clang".into());
+            assert!(warnings(&diagnose(&e)).is_empty(), "{host}");
+        }
     }
 
     #[test]
     fn a_configured_linker_is_left_alone() {
         let mut e = env();
+        e.rune_linker = "default".into();
         e.on_path = Box::new(|t| matches!(t, "cc" | "git" | "pkg-config" | "mold"));
         e.rustflags = vec!["-Clink-arg=-fuse-ld=mold".into()];
         assert!(warnings(&diagnose(&e)).is_empty());
         e.rustflags.clear();
         e.configured_linker = Some("clang".into());
         assert!(warnings(&diagnose(&e)).is_empty());
-    }
-
-    #[test]
-    fn lld_is_not_recommended_where_it_is_already_the_default() {
-        let mut e = env();
-        e.on_path = Box::new(|t| matches!(t, "cc" | "git" | "pkg-config" | "ld.lld"));
-        assert!(
-            warnings(&diagnose(&e)).is_empty(),
-            "1.98 on x86_64 linux already uses lld"
-        );
-        e.rustc_release = Some("1.85.0".into());
-        assert!(warnings(&diagnose(&e))[0].contains("lld"));
     }
 
     #[test]

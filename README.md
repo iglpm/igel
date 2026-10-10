@@ -162,7 +162,7 @@ pass under Rune as they do under Cargo. See
 | [Settings](docs/configuration.md) | `rune config` and every setting |
 | [Supply chain](docs/supply-chain.md) | sandboxing, audits, SBOMs |
 | [Performance](docs/performance.md) | how Rune uses the machine, build timelines |
-| [hyprlnk](hyprlnk/README.md) | the linker built into Rune (`build.linker = "hyprlnk"`) |
+| [hyprlnk](hyprlnk/README.md) | the linker built into Rune, and its default on Linux, Windows and macOS |
 | [All documentation](docs/README.md) | manifests, scripts, editor integration, architecture |
 
 ## Status

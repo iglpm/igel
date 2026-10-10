@@ -14,16 +14,21 @@ The first stable release. Changes since the 0.1.0 preview:
 
 ### Added
 - hyprlnk (the `hyprlnk/` submodule, github.com/runepm/hyprlnk), a linker
-  developed with Rune and built into it: `build.linker = "hyprlnk"` links
-  binaries, tests, build scripts and DLLs with it instead of the platform
-  linker. It links Windows images for x64, ARM64 and x86 from
+  developed with Rune and built into it, and Rune's default linker
+  (`build.linker = "hyprlnk"`; `"default"` keeps the one rustc and Cargo
+  choose): it links binaries, tests, build scripts, proc-macros and dynamic
+  libraries. It links Windows images for x64, ARM64 and x86 from
   `link.exe`-style command lines — PDBs, identical code folding and
-  resources included — in about half the time lld takes on Rune's own build,
-  and macOS images for arm64, arm64e and x86_64 from ld64-style command lines
+  resources included — in about half the time lld takes on Rune's own build;
+  macOS images for arm64, arm64e and x86_64 from ld64-style command lines
   — chained fixups, debug maps, code signatures and Objective-C included — in
-  less than half the time of Apple's ld (a quarter of ld64.lld's).
-  `rune __hyprlnk <args>` runs it by hand; it also builds as a standalone
-  `hyprlnk` executable.
+  less than half the time of Apple's ld (a quarter of ld64.lld's); and Linux
+  executables and shared objects for x86-64, x86, AArch64, ARM, RISC-V,
+  POWER, s390x and LoongArch (glibc and musl) from GNU ld command lines, in
+  45–65 % of lld's time and 55–70 % of mold's. On Linux it links through the
+  target's C compiler (`target.<triple>.linker`, else `cc`), which finds the C
+  runtime. `rune __hyprlnk <args>` runs it by hand; it also builds as a
+  standalone `hyprlnk` executable.
 - `rune-bench` (in `bench/`): benchmarks Rune against Cargo on generated
   workspaces or a copy of any project — startup, cold builds, no-op builds,
   rebuilds after edits, cache reuse, tests, inspection commands, disk and

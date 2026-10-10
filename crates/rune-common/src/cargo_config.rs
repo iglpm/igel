@@ -367,10 +367,10 @@ fn absolutize(root: &mut Table, base: &Path) {
         for (_, t) in sources.iter_mut() {
             let Value::Table(t) = t else { continue };
             for key in ["directory", "local-registry"] {
-                if let Some(Value::String(s)) = t.get_mut(key) {
-                    if !Path::new(s.as_str()).is_absolute() {
-                        *s = join_path(base, s);
-                    }
+                if let Some(Value::String(s)) = t.get_mut(key)
+                    && !Path::new(s.as_str()).is_absolute()
+                {
+                    *s = join_path(base, s);
                 }
             }
         }
