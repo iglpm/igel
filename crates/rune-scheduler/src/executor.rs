@@ -74,6 +74,22 @@ enum WorkerMsg {
         node_id: NodeId,
         lock: rune_common::fsutil::FileLock,
     },
+    /// An executable is compiled and waits, without a job slot, until every rlib it links exists;
+    /// a message on `resume` lets it link.
+    Compiled {
+        node_id: NodeId,
+        resume: Sender<()>,
+    },
+}
+
+/// Executables and tests compile against their dependencies' metadata, like libraries, and link
+/// once every rlib exists: rustc-runified's `no-link`/`link-only`. Not proc-macros (loaded by
+/// their dependents) nor dynamic or static libraries.
+fn links_late(unit: &CompilationUnit) -> bool {
+    !unit.check_only
+        && !unit.is_build_script
+        && unit.crate_type != CrateType::ProcMacro
+        && (unit.harness || unit.all_crate_types().all(|t| t == CrateType::Bin))
 }
 
 fn frontend_threads(
@@ -89,6 +105,24 @@ fn frontend_threads(
         FrontendThreads::Auto => (cpus.saturating_sub(busy + waiting) + 1).min(8),
     };
     (n > 1).then_some(n)
+}
+
+/// A step whose remaining chain is at least this share of the longest one is on the critical path.
+const CRITICAL_SHARE: f64 = 0.9;
+
+/// Whether a step heads the longest chain of work left: the build ends no sooner than it does.
+fn on_critical_path(
+    weights: &HashMap<NodeId, f64>,
+    completed: &HashSet<NodeId>,
+    id: NodeId,
+) -> bool {
+    let longest = weights
+        .iter()
+        .filter(|(n, _)| !completed.contains(*n))
+        .fold(0.0_f64, |m, (_, w)| m.max(*w));
+    weights
+        .get(&id)
+        .is_some_and(|w| *w > 0.0 && *w >= CRITICAL_SHARE * longest)
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -144,6 +178,15 @@ fn step_id(node: NodeId, script: bool) -> StepId {
     StepId {
         node: node.0,
         script,
+        link: false,
+    }
+}
+
+fn link_step_id(node: NodeId) -> StepId {
+    StepId {
+        node: node.0,
+        script: false,
+        link: true,
     }
 }
 
@@ -153,8 +196,9 @@ fn step_gates(
     script: bool,
     transitive_deps: &HashMap<NodeId, HashSet<NodeId>>,
     script_prereqs: &HashMap<NodeId, (Vec<NodeId>, Vec<NodeId>)>,
+    late: &HashSet<NodeId>,
 ) -> Vec<Gate> {
-    let end = |d: NodeId| Gate::End(step_id(d, false));
+    let end = |d: NodeId| Gate::End(end_step(d, late));
     let node = graph.node(id);
     if script {
         let Some((built, links)) = script_prereqs.get(&id) else {
@@ -172,7 +216,7 @@ fn step_gates(
             }))
             .collect();
     }
-    let mut gates: Vec<Gate> = if node.unit.produces_real_artifact() {
+    let mut gates: Vec<Gate> = if node.unit.produces_real_artifact() && !late.contains(&id) {
         transitive_deps[&id].iter().map(|d| end(*d)).collect()
     } else {
         node.dependencies
@@ -190,6 +234,30 @@ fn step_gates(
         gates.push(Gate::End(step_id(id, true)));
     }
     gates
+}
+
+/// The step after which a unit's outputs all exist: its link, for an executable that linked late.
+fn end_step(id: NodeId, late: &HashSet<NodeId>) -> StepId {
+    if late.contains(&id) {
+        link_step_id(id)
+    } else {
+        step_id(id, false)
+    }
+}
+
+/// A late link waits for its own compilation and for every rlib it links.
+fn link_gates(
+    id: NodeId,
+    transitive_deps: &HashMap<NodeId, HashSet<NodeId>>,
+    late: &HashSet<NodeId>,
+) -> Vec<Gate> {
+    std::iter::once(Gate::End(step_id(id, false)))
+        .chain(
+            transitive_deps[&id]
+                .iter()
+                .map(|d| Gate::End(end_step(*d, late))),
+        )
+        .collect()
 }
 
 fn unit_lock_path(
@@ -226,6 +294,8 @@ pub struct BuildExecutor {
     jobserver: Option<jobserver::Client>,
     tokens: Option<crate::tokens::JobTokens>,
     frontend_threads: rune_common::settings::FrontendThreads,
+    /// rustc-runified can compile executables before their dependencies' rlibs exist.
+    link_late: bool,
     cpus: usize,
     memory: fn() -> Option<rune_common::sysinfo::Memory>,
     sandbox: Option<std::sync::Arc<SandboxPolicy>>,
@@ -256,6 +326,10 @@ impl BuildExecutor {
             jobserver,
             tokens,
             frontend_threads: Default::default(),
+            link_late: toolchain::global()
+                .runified
+                .as_ref()
+                .is_some_and(|d| d.supports("no-link") && d.supports("link-only")),
             sandbox: None,
             cpus: std::thread::available_parallelism().map_or(1, |n| n.get()),
             memory: rune_common::sysinfo::memory,
@@ -286,10 +360,16 @@ impl BuildExecutor {
         self
     }
 
-    /// Under `auto`, `-Z threads` uses the cores nobody else will.
+    /// Under `auto`, `-Z threads` uses the cores nobody else will. rustc-runified always gets a
+    /// count, 1 when the setting is `off`: its output is the same for every count, so the setting
+    /// never changes what a cache key stands for.
     fn frontend_threads_for(&self, busy: usize, waiting: usize) -> Option<usize> {
-        frontend_threads(self.frontend_threads, self.cpus, busy, waiting)
-            .filter(|_| toolchain::global().accepts_unstable_flags())
+        let tc = toolchain::global();
+        let n = frontend_threads(self.frontend_threads, self.cpus, busy, waiting);
+        if tc.runified.as_ref().is_some_and(|d| d.supports("threads")) {
+            return Some(n.unwrap_or(1));
+        }
+        n.filter(|_| tc.accepts_unstable_flags())
     }
 
     pub fn with_cas(mut self, cas: CasStore) -> Self {
@@ -617,6 +697,22 @@ impl BuildExecutor {
             .collect();
         let mut script_done: HashSet<NodeId> = HashSet::new();
         let mut in_script_phase: HashSet<NodeId> = HashSet::new();
+        // Executables compiled before their dependencies, waiting to link (`links_late`).
+        // Not when a dependency is a Rust dylib: there is no rlib to link it from.
+        let late_ok = |id: NodeId| {
+            self.link_late
+                && links_late(&graph.node(id).unit)
+                && !transitive_deps[&id].iter().any(|d| {
+                    graph
+                        .node(*d)
+                        .unit
+                        .all_crate_types()
+                        .any(|t| t == CrateType::Dylib)
+                })
+        };
+        let mut late: HashSet<NodeId> = HashSet::new();
+        let mut awaiting_link: HashMap<NodeId, Sender<()>> = HashMap::new();
+        let mut compiled_at: HashMap<NodeId, f64> = HashMap::new();
         // Held from the script step through compilation so no other process reruns the script under a compiler.
         let mut held_locks: HashMap<NodeId, (rune_common::fsutil::FileLock, bool)> = HashMap::new();
         let mut lock_waiting: HashSet<NodeId> = HashSet::new();
@@ -638,6 +734,26 @@ impl BuildExecutor {
             }
 
             if failed.is_empty() {
+                // Every rlib an executable links exists: it links now (it needs a job slot again).
+                let linkable: Vec<NodeId> = awaiting_link
+                    .keys()
+                    .copied()
+                    .filter(|id| transitive_deps[id].iter().all(|d| completed.contains(d)))
+                    .collect();
+                for id in linkable {
+                    let step = link_step_id(id);
+                    first_ready.entry(step).or_insert_with(now);
+                    if in_flight.len() >= self.max_jobs {
+                        break;
+                    }
+                    if let Some(resume) = awaiting_link.remove(&id)
+                        && resume.send(()).is_ok()
+                    {
+                        in_flight.insert(id);
+                        started.insert(step, now());
+                    }
+                }
+
                 let mut ready: Vec<(NodeId, bool)> = unscheduled
                     .iter()
                     .copied()
@@ -653,7 +769,7 @@ impl BuildExecutor {
                                 });
                             return ready.then_some((id, true));
                         }
-                        let ready = if node.unit.produces_real_artifact() {
+                        let ready = if node.unit.produces_real_artifact() && !late_ok(id) {
                             transitive_deps[&id].iter().all(|d| completed.contains(d))
                         } else {
                             node.dependencies.iter().all(|dep_id| {
@@ -744,9 +860,11 @@ impl BuildExecutor {
                         );
                     }
                     started.insert(step_id(node_id, script_only), now());
+                    let link_late = !script_only && late_ok(node_id);
                     let mut job = self.prepare_job(
                         graph,
                         node_id,
+                        link_late,
                         &unit_base_keys[&node_id],
                         &unit_cas_keys[&node_id],
                         dep_keys_of(graph, node_id, &unit_cas_keys),
@@ -779,9 +897,38 @@ impl BuildExecutor {
                         job.script_cache_key = Some(key);
                         job.script_base = Some(base);
                     }
+                    // Critical path prioritization: allocates dedicated job tokens to scripts
+                    // and boosts frontend threads on critical compiles when parallel frontend is enabled.
+                    let experiment = std::env::var("RUNE_EXPERIMENT_CRITICAL")
+                        .unwrap_or_else(|_| "tokens".into());
+                    let has = |f: &str| experiment == "all" || experiment.split(',').any(|x| x == f);
+                    let critical = on_critical_path(&weights, &completed, node_id);
+                    let boost = critical
+                        && if script_only {
+                            has("tokens")
+                        } else {
+                            has("threads")
+                        };
+                    if boost {
+                        job.own_tokens = Some(self.cpus);
+                        debug!(
+                            "critical path: {} gets {} tokens of its own",
+                            graph.node(node_id).unit.crate_id.name,
+                            self.cpus
+                        );
+                    }
+                    if !critical && has("nice") {
+                        job.nice = Some(5);
+                    }
                     if !script_only {
                         job.frontend_threads =
                             self.frontend_threads_for(in_flight.len(), ready_count - index - 1);
+                        if boost
+                            && (job.frontend_threads.is_some()
+                                || self.frontend_threads == rune_common::settings::FrontendThreads::Auto)
+                        {
+                            job.frontend_threads = Some(self.cpus.min(8));
+                        }
                         job.read_script = self.read_mode(
                             graph,
                             node_id,
@@ -837,6 +984,13 @@ impl BuildExecutor {
                         });
                         build_script_outputs.insert(node_id, output);
                     }
+                    WorkerMsg::Compiled { node_id, resume } => {
+                        in_flight.remove(&node_id);
+                        predicted_running.remove(&node_id);
+                        late.insert(node_id);
+                        compiled_at.insert(node_id, now());
+                        awaiting_link.insert(node_id, resume);
+                    }
                     WorkerMsg::LockAcquired { node_id, lock } => {
                         lock_waiting.remove(&node_id);
                         held_locks.insert(node_id, (lock, true));
@@ -875,6 +1029,7 @@ impl BuildExecutor {
                                     true,
                                     &transitive_deps,
                                     &script_prereqs,
+                                    &late,
                                 ),
                             },
                         );
@@ -887,6 +1042,7 @@ impl BuildExecutor {
                             if id == node_id
                                 || completed.contains(&id)
                                 || (in_flight.contains(&id) && !in_script_phase.contains(&id))
+                                || late.contains(&id)
                                 || !graph
                                     .node(id)
                                     .dependencies
@@ -951,16 +1107,33 @@ impl BuildExecutor {
                                 ready: first_ready.get(&id).copied().unwrap_or(begun),
                                 start: begun,
                                 metadata: metadata_at.get(&node_id).copied(),
-                                end: now(),
+                                end: compiled_at.get(&node_id).copied().unwrap_or_else(now),
                                 gates: step_gates(
                                     graph,
                                     node_id,
                                     false,
                                     &transitive_deps,
                                     &script_prereqs,
+                                    &late,
                                 ),
                             },
                         );
+                        if late.contains(&node_id) {
+                            let id = link_step_id(node_id);
+                            let begun = started.get(&id).copied().unwrap_or(0.0);
+                            steps.insert(
+                                id,
+                                Step {
+                                    label: format!("{} (link)", span_name(unit)),
+                                    kind: "link",
+                                    ready: first_ready.get(&id).copied().unwrap_or(begun),
+                                    start: begun,
+                                    metadata: None,
+                                    end: now(),
+                                    gates: link_gates(node_id, &transitive_deps, &late),
+                                },
+                            );
+                        }
                         if restored {
                             cached += 1;
                         } else {
@@ -973,6 +1146,15 @@ impl BuildExecutor {
                         in_script_phase.remove(&node_id);
                         held_locks.remove(&node_id);
                         failed.push(node_id);
+                        // Dependents of an early `.rmeta` wait for the rest of it: it won't come.
+                        if let Some(rmeta) = metadata_paths.get(&node_id)
+                            && toolchain::global()
+                                .runified
+                                .as_ref()
+                                .is_some_and(|d| d.supports("early-metadata"))
+                        {
+                            rune_common::runified::metadata_never_completes(rmeta);
+                        }
                     }
                 }
             }
@@ -982,6 +1164,8 @@ impl BuildExecutor {
         }
         // Units report `Finished` before they are stored; the build ends once every store has landed.
         drop(held_locks);
+        // Executables still waiting to link after a failure: let them go.
+        drop(awaiting_link);
         for t in job_threads {
             let _ = t.join();
         }
@@ -1392,6 +1576,7 @@ impl BuildExecutor {
         &self,
         graph: &BuildGraph,
         node_id: NodeId,
+        link_late: bool,
         base_key: &str,
         cas_key: &str,
         dep_keys: Vec<(String, String)>,
@@ -1402,7 +1587,7 @@ impl BuildExecutor {
     ) -> UnitJob {
         let node = graph.node(node_id);
         let unit = node.unit.clone();
-        let mode = if unit.produces_real_artifact() {
+        let mode = if unit.produces_real_artifact() && !link_late {
             ExternMode::Link
         } else {
             ExternMode::Pipelined
@@ -1540,6 +1725,9 @@ impl BuildExecutor {
             lock: None,
             lock_waited: false,
             frontend_threads: None,
+            own_tokens: None,
+            nice: None,
+            link_late,
             script_base: None,
             script_cache_key: None,
             package_hash: String::new(),
@@ -1579,6 +1767,13 @@ struct UnitJob {
     lock: Option<rune_common::fsutil::FileLock>,
     lock_waited: bool,
     frontend_threads: Option<usize>,
+    /// On the critical path: a jobserver of its own with this many tokens, so what the step runs
+    /// in parallel (a build script's C compiles) isn't held to what other jobs leave of the shared one.
+    own_tokens: Option<usize>,
+    /// Off the critical path: this much lower CPU priority, so the critical path runs first.
+    nice: Option<i32>,
+    /// Compile against the dependencies' metadata now, link once their rlibs exist.
+    link_late: bool,
     script_base: Option<String>,
     script_cache_key: Option<String>,
     package_hash: String,
@@ -1721,7 +1916,7 @@ impl UnitJob {
 
     fn run(mut self) {
         // Claim a core without waiting behind other compilers' codegen threads (see `tokens`).
-        let token = self.tokens.as_ref().map(|t| t.start());
+        let mut token = self.tokens.as_ref().map(|t| t.start());
         let start = Instant::now();
         let mut unit_lock = self.lock.take();
         let node_id = self.node_id;
@@ -1884,6 +2079,9 @@ impl UnitJob {
                 if let Some(js) = &self.jobserver {
                     js.configure(cmd);
                 }
+                if let Some(n) = self.nice {
+                    rune_common::sysinfo::lower_priority_of(cmd, n);
+                }
             };
             let script_bin_dir =
                 config.build_script_bin_dir_by_key(profile.output_dir_name(), &script_key(unit));
@@ -1938,9 +2136,13 @@ impl UnitJob {
                     } else {
                         String::new()
                     };
+                    let own = self.own_tokens.and_then(|n| jobserver::Client::new(n).ok());
                     let run_configure = |cmd: &mut std::process::Command| {
-                        if let Some(js) = &self.jobserver {
+                        if let Some(js) = own.as_ref().or(self.jobserver.as_ref()) {
                             js.configure(cmd);
+                        }
+                        if let Some(n) = self.nice {
+                            rune_common::sysinfo::lower_priority_of(cmd, n);
                         }
                     };
                     // Registry/git packages are immutable and shared: their scripts may only write to `OUT_DIR`.
@@ -2092,17 +2294,31 @@ impl UnitJob {
         for (k, v) in &self.extra_env {
             cmd_builder = cmd_builder.env(k, v);
         }
-        if let Some(n) = self.frontend_threads {
-            cmd_builder = cmd_builder.extra_flags(vec![format!("-Zthreads={n}")]);
-        }
         for (k, v, force) in &self.config_env {
             if *force || std::env::var_os(k).is_none() {
                 cmd_builder = cmd_builder.env(k, v);
             }
         }
+        // What links the executable later: this command, minus what only compiling needs.
+        let link_builder = self.link_late.then(|| cmd_builder.clone());
+        if let Some(n) = self.frontend_threads {
+            cmd_builder = cmd_builder.extra_flags(vec![if self.toolchain.runified.is_some() {
+                format!("--runified=threads={n}")
+            } else {
+                format!("-Zthreads={n}")
+            }]);
+        }
+        if self.link_late {
+            cmd_builder = cmd_builder.extra_flags(vec!["--runified=no-link".into()]);
+        }
         let mut cmd = cmd_builder.build_with_command(self.compiler_command(unit.ext.member));
-        if let Some(js) = &self.jobserver {
+        // Alive until the compiler exits.
+        let own = self.own_tokens.and_then(|n| jobserver::Client::new(n).ok());
+        if let Some(js) = own.as_ref().or(self.jobserver.as_ref()) {
             js.configure(&mut cmd);
+        }
+        if let Some(n) = self.nice {
+            rune_common::sysinfo::lower_priority_of(&mut cmd, n);
         }
         debug!("Running {:?}", cmd);
 
@@ -2198,8 +2414,54 @@ impl UnitJob {
         });
 
         match result {
-            Ok(comp_res) if comp_res.success => {
-                let duration = start.elapsed();
+            Ok(mut comp_res) if comp_res.success => {
+                let mut waited = Duration::ZERO;
+                if let Some(link) = link_builder {
+                    // Compiled: wait for every rlib without a job slot or token, then link.
+                    drop(token.take());
+                    let (resume, resumed) = crossbeam_channel::bounded(1);
+                    let paused = Instant::now();
+                    let _ = self.worker_tx.send(WorkerMsg::Compiled { node_id, resume });
+                    if resumed.recv().is_err() {
+                        return; // the build stopped
+                    }
+                    waited = paused.elapsed();
+                    token = self.tokens.as_ref().map(|t| t.start());
+                    let rlink = out_dir.join(format!(
+                        "{}-{}.rlink",
+                        unit.rustc_crate_name(),
+                        unit.metadata_hash()
+                    ));
+                    let mut cmd = link
+                        .for_link_only(&rlink)
+                        .extra_flags(vec!["--runified=link-only".into()])
+                        .build_with_command(self.compiler_command(unit.ext.member));
+                    if let Some(js) = &self.jobserver {
+                        js.configure(&mut cmd);
+                    }
+                    debug!("Linking {:?}", cmd);
+                    let linked = RustcInvoker::new().invoke_streaming(cmd, &mut |_| {});
+                    let _ = std::fs::remove_file(&rlink);
+                    match linked {
+                        Ok(l) if l.success => {
+                            comp_res.artifacts.extend(l.artifacts);
+                            comp_res.diagnostics.extend(l.diagnostics);
+                            comp_res.stderr_raw.push_str(&l.stderr_raw);
+                            comp_res.peak_memory = comp_res.peak_memory.max(l.peak_memory);
+                        }
+                        Ok(l) => {
+                            let err_msg = render_compile_error(&l);
+                            let diagnostics = rune_compiler::diagnostic_lines(&l.stderr_raw);
+                            self.fail_with(err_msg.clone(), err_msg, diagnostics);
+                            return;
+                        }
+                        Err(e) => {
+                            self.fail(e.to_string(), e.to_string());
+                            return;
+                        }
+                    }
+                }
+                let duration = start.elapsed().saturating_sub(waited);
                 let warnings: String = if unit.crate_id.source == CrateSource::Local {
                     comp_res
                         .diagnostics
@@ -3127,6 +3389,14 @@ pub fn build_rustc_command(
         builder = builder.emit(&["dep-info", "link"]);
     } else {
         builder = builder.emit(&["dep-info", "metadata", "link"]);
+        // rustc-runified writes the `.rmeta` before monomorphization, the rest when it's known.
+        if toolchain::global()
+            .runified
+            .as_ref()
+            .is_some_and(|d| d.supports("early-metadata"))
+        {
+            builder = builder.extra_flags(vec!["--runified=early-metadata".into()]);
+        }
     }
 
     if eff.incremental && unit.crate_id.source == CrateSource::Local {
@@ -3139,6 +3409,14 @@ pub fn build_rustc_command(
                 unit.metadata_hash()
             ));
         builder = builder.incremental(&dir);
+        // rustc-runified keeps the output of derive macros known to be pure in that cache too.
+        if toolchain::global()
+            .runified
+            .as_ref()
+            .is_some_and(|d| d.supports("cache-derives"))
+        {
+            builder = builder.extra_flags(vec!["--runified=cache-derives".into()]);
+        }
     }
 
     builder = builder.search_path("dependency", &config.deps_dir(profile_dir_name));
@@ -3585,6 +3863,33 @@ mod tests {
         }
     }
 
+    #[test]
+    fn executables_and_tests_link_late_libraries_and_macros_never() {
+        let dir = tempfile::tempdir().unwrap();
+        let of = |crate_type, harness, check_only| CompilationUnit {
+            crate_type,
+            harness,
+            check_only,
+            ..unit("u", registry(), dir.path())
+        };
+        assert!(links_late(&of(CrateType::Bin, false, false)));
+        assert!(
+            links_late(&of(CrateType::Lib, true, false)),
+            "a test harness"
+        );
+        assert!(
+            !links_late(&of(CrateType::Bin, false, true)),
+            "checking links nothing"
+        );
+        assert!(!links_late(&of(CrateType::Lib, false, false)));
+        assert!(!links_late(&of(CrateType::ProcMacro, false, false)));
+        assert!(!links_late(&of(CrateType::Cdylib, false, false)));
+        assert!(!links_late(&CompilationUnit {
+            is_build_script: true,
+            ..of(CrateType::Bin, false, false)
+        }));
+    }
+
     fn registry() -> CrateSource {
         CrateSource::Registry {
             index: "x".into(),
@@ -3725,6 +4030,24 @@ mod tests {
         assert_eq!(frontend_threads(Auto, 4, 2, 0), Some(3));
         assert_eq!(frontend_threads(Off, 16, 1, 0), None);
         assert_eq!(frontend_threads(Fixed(4), 16, 16, 9), Some(4));
+    }
+
+    #[test]
+    fn only_the_head_of_the_longest_remaining_chain_is_critical() {
+        // 0 (script, 12 s) → 1 (big library, 25 s) → 2; 3 is a shorter chain beside them.
+        let weights: HashMap<NodeId, f64> = [(0, 40.0), (1, 28.0), (2, 3.0), (3, 20.0)]
+            .into_iter()
+            .map(|(id, w)| (NodeId(id), w))
+            .collect();
+        let mut completed = HashSet::new();
+        assert!(on_critical_path(&weights, &completed, NodeId(0)));
+        assert!(!on_critical_path(&weights, &completed, NodeId(3)));
+        completed.insert(NodeId(0));
+        assert!(on_critical_path(&weights, &completed, NodeId(1)));
+        assert!(!on_critical_path(&weights, &completed, NodeId(3)));
+        completed.extend([NodeId(1), NodeId(2)]);
+        assert!(on_critical_path(&weights, &completed, NodeId(3)));
+        assert!(!on_critical_path(&weights, &completed, NodeId(9)), "unknown");
     }
 
     #[test]

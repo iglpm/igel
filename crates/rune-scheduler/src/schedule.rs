@@ -8,6 +8,8 @@ use std::path::Path;
 pub struct StepId {
     pub node: usize,
     pub script: bool,
+    /// The link of an executable compiled before its dependencies were (rustc-runified).
+    pub link: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -383,6 +385,7 @@ mod tests {
         StepId {
             node: n,
             script: false,
+            link: false,
         }
     }
 
