@@ -4,3 +4,6 @@ target/
 
 # rune-bench output
 rune-bench-results/
+
+# Separate standalone repository
+/rustc-runified/
