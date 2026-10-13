@@ -136,12 +136,28 @@ pub const KEYS: &[KeyDef] = &[
         kind: ValueKind::Threads,
         default: "off",
         description: "Threads for rustc's parallel front end (`-Z threads`), which only nightly \
-                      compilers accept; ignored on stable. `auto`: a crate that starts while \
+                      compilers and rustc-runified (`build.compiler`) accept; ignored \
+                      otherwise. With rustc-runified the output is the same whatever the \
+                      thread count. `auto`: a crate that starts while \
                       cores are idle — typically the last, largest crates of a build, which \
                       otherwise type-check on one core — gets as many threads as there are idle \
                       cores (at most 8); crates started while the machine is busy get one. A \
                       number: that many for every crate. Whether it pays depends on the crate: \
-                      on Rune's own build (4 cores) it kept the cores busy but saved no time.",
+                      on Rune's own build it kept the cores busy but saved no time, on 4 cores \
+                      with nightly and on 12 with rustc-runified.",
+    },
+    KeyDef {
+        name: "build.compiler",
+        kind: ValueKind::Text,
+        default: "auto",
+        description: "Which compiler runs. `auto`: rustc-runified when it is installed for the \
+                      toolchain in use (`cargo runified driver --rune` in `rustc-runified/`, \
+                      or `RUSTC` naming it), the toolchain's `rustc` otherwise. rustc-runified \
+                      is that same compiler plus what stable rustc lacks: a parallel front end \
+                      (`build.frontend-threads`), and executables and tests that compile while \
+                      their dependencies are still generating code, linking once they are done. \
+                      `runified`: rustc-runified, or an error saying how to install it. `rustc`: \
+                      always the toolchain's `rustc`.",
     },
     KeyDef {
         name: "build.linker",
@@ -555,6 +571,23 @@ impl Settings {
                 .filter(|n| *n > 1)
                 .map_or(FrontendThreads::Off, FrontendThreads::Fixed),
             _ => FrontendThreads::Off,
+        }
+    }
+
+    /// `build.compiler`, set or default.
+    pub fn compiler(&self) -> Result<crate::runified::Choice, String> {
+        use crate::runified::Choice;
+        match self.values.get("build.compiler") {
+            None => Ok(Choice::Auto),
+            Some((Value::Text(t), _)) => match t.as_str() {
+                "auto" => Ok(Choice::Auto),
+                "runified" => Ok(Choice::Required),
+                "rustc" => Ok(Choice::Rustc),
+                other => Err(format!(
+                    "unknown `build.compiler` `{other}`: expected `auto`, `runified` or `rustc`"
+                )),
+            },
+            Some(_) => Ok(Choice::Auto),
         }
     }
 

@@ -139,6 +139,24 @@ pub fn lower_priority() {
     }
 }
 
+/// Starts `cmd` `by` steps below this process's CPU priority (`nice`), so what it competes with
+/// runs first. Children and threads inherit it.
+pub fn lower_priority_of(cmd: &mut std::process::Command, by: i32) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // SAFETY: `nice` is async-signal-safe.
+        unsafe {
+            cmd.pre_exec(move || {
+                libc::nice(by);
+                Ok(())
+            });
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = (cmd, by);
+}
+
 pub fn disk_size(path: &std::path::Path) -> Option<u64> {
     filesystem(path).map(|(total, _)| total)
 }

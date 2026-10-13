@@ -10,6 +10,7 @@ pub mod linker;
 pub mod manifest_file;
 pub mod net;
 pub mod progress;
+pub mod runified;
 pub mod sandbox;
 pub mod settings;
 pub mod sysinfo;

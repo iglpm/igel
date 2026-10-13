@@ -20,6 +20,8 @@ pub struct Toolchain {
     pub host: String,
     pub version: semver::Version,
     pub sysroot: Option<PathBuf>,
+    /// rustc-runified, when it runs in place of `rustc` (`exec` is then its path).
+    pub runified: Option<crate::runified::Driver>,
     probe_key: String,
     identity: String,
 }
@@ -136,6 +138,7 @@ impl Toolchain {
             host,
             version,
             sysroot,
+            runified: None,
             probe_key: probe.key.clone(),
             identity: String::new(),
         };
@@ -177,6 +180,9 @@ impl Toolchain {
                 .unwrap_or_else(|| "unknown".into()),
         );
         out.push('\n');
+        if let Some(d) = &self.runified {
+            out.push_str(&format!("runified={} {}\n", d.version, d.digest));
+        }
         for (label, tool) in [
             ("wrapper", &self.wrapper),
             ("workspace-wrapper", &self.workspace_wrapper),
@@ -187,6 +193,65 @@ impl Toolchain {
             }
         }
         out
+    }
+
+    /// `release:` of `rustc -vV`: `1.98.1`, `1.100.0-nightly`.
+    pub fn release(&self) -> &str {
+        self.verbose_version
+            .lines()
+            .find_map(|l| l.strip_prefix("release: "))
+            .unwrap_or("")
+            .trim()
+    }
+
+    /// Runs rustc-runified instead of `rustc` when `choice` asks for it and it is there: `RUSTC`
+    /// names it, or it is installed for this exact compiler build (`$RUNE_HOME/runified/<key>/`)
+    /// or shipped with the toolchain (`<sysroot>/bin/`).
+    pub fn with_compiler(mut self, choice: crate::runified::Choice) -> Result<Toolchain, String> {
+        use crate::runified::{self, Choice, Driver};
+        if choice == Choice::Rustc || self.verbose_version.is_empty() {
+            return Ok(self);
+        }
+        let key = self
+            .sysroot
+            .as_deref()
+            .and_then(|s| runified::toolchain_key(s, self.release(), &self.host));
+        let sysroot = self.sysroot.clone();
+        let found = Driver::probe(&self.exec, sysroot.as_deref()).or_else(|| {
+            let mut candidates = Vec::new();
+            if let Some(key) = &key {
+                candidates.push(runified::installed_path(key));
+            }
+            if let Some(sysroot) = &self.sysroot {
+                candidates.push(runified::shipped_path(sysroot));
+            }
+            candidates
+                .into_iter()
+                .filter(|p| p.is_file())
+                .find_map(|p| Driver::probe(&p, sysroot.as_deref()))
+        });
+        let wrapped = self.wrapper.is_some() || self.workspace_wrapper.is_some();
+        match found {
+            Some(driver) if !wrapped => {
+                self.exec = driver.path.clone();
+                self.runified = Some(driver);
+                self.identity = self.compute_identity();
+                Ok(self)
+            }
+            Some(_) if choice == Choice::Required => Err(
+                "`build.compiler = \"runified\"` can't run under `RUSTC_WRAPPER` or \
+                 `RUSTC_WORKSPACE_WRAPPER`, which would see options they don't know"
+                    .into(),
+            ),
+            None if choice == Choice::Required => Err(format!(
+                "`build.compiler = \"runified\"`, but rustc-runified is not installed for rustc {} \
+                 ({}): in `rustc-runified/`, `cargo runified driver --rune` builds it for this \
+                 toolchain",
+                self.release(),
+                key.as_deref().unwrap_or("unknown build")
+            )),
+            _ => Ok(self),
+        }
     }
 
     pub fn accepts_unstable_flags(&self) -> bool {
@@ -226,6 +291,9 @@ impl Toolchain {
         let mut cmd = Command::new(chain[0]);
         for extra in &chain[1..] {
             cmd.arg(extra);
+        }
+        if let (Some(_), Some(sysroot)) = (&self.runified, &self.sysroot) {
+            crate::runified::find_libraries_in(&mut cmd, sysroot);
         }
         cmd
     }
