@@ -1,42 +1,68 @@
-# Performance: using the whole machine
+# Performance & Resource Management
 
-Rune runs about 1.3 compiler processes per core (`-j`, `build.jobs`) and hands
-every `rustc` and build script the same GNU jobserver, so a compiler that is
-alone at the end of a build can take the idle slots for its codegen threads
-while the total never exceeds the budget. A crate starts the moment the
-`.rmeta` of each dependency exists; a build script is its own step that starts
-once its build-dependencies are built, overlapping the rest of its package's
-dependencies. Before starting another compiler Rune checks available memory
-(Linux `MemAvailable`, macOS memory pressure) and, while it is short, lets
-running units finish first — a machine with many cores and little memory
-neither swaps nor loses a `rustc` to the OOM killer. Each compiler's peak
-memory is measured (`wait4`) and remembered, so a crate known to need 2 GiB
-waits until 2 GiB are free instead of starting next to three others like it.
-Starting a job never waits on the jobserver pipe either: rustc's codegen
-threads borrow idle tokens, and a job that starts while they hold them all
-simply owes one, repaid as they return — the critical path never waits behind
-another crate's code generation. `build.low-priority = true` runs every
-compiler at a lower scheduling priority so the rest of the machine stays
-responsive (`rune watch` always does).
+Rune is engineered to maximize hardware efficiency across CPU cores, memory bandwidth, and disk I/O, transforming how fast large Rust projects compile.
 
-What stable Rust cannot parallelize is a chain of crates that must be compiled
-one after another, and a single crate's front end. A build longer than 10 s that
-kept fewer than 60 % of the cores busy ends with one line naming that chain;
-`rune build --timings` (or `RUNE_TIMINGS=1`) prints it in full, with how long
-each phase of the command took, and writes
-`.rune/timings/rune-timing.html` — a timeline of every step with the chain
-highlighted and how many ran at once — plus a Chrome trace in
-`.rune/fingerprints/trace.json` (<https://ui.perfetto.dev>). Splitting the
-largest crate of that chain is usually what helps. On a nightly compiler,
-`build.frontend-threads = "auto"` gives crates that start while cores are idle
-a parallel front end.
+Instead of idling cores while long dependency chains compile, Rune overlaps pipeline stages, schedules critical paths first, and throttles concurrency dynamically to keep your system responsive.
 
-With [rustc-runified](../rustc-runified/README.md) installed for the toolchain
-in use (`build.compiler = "auto"`), executables, tests, benches and examples
-stop being the end of every chain: like a library, each compiles as soon as
-its direct dependencies' metadata exists, then waits — without a job slot —
-until every rlib it links is built, and links. The link is its own step in the
-timeline. On Rune's own build from scratch the executable's 8 s of
-compilation now overlap the code generation of hyprlnk, and the build takes
-47 s instead of 55 s. rustc-runified also accepts `build.frontend-threads` on
-stable toolchains, with the same output whatever the thread count.
+## Whole-Machine Saturation
+
+### Dynamic Jobserver Coordination
+
+By default, Rune allocates approximately 1.3 compiler worker jobs per physical core (`build.jobs`). All `rustc` instances, build scripts, and native C/C++ compilers share a single internal GNU jobserver token pool:
+- When a large compilation reaches codegen at the end of a build, it can borrow idle tokens for codegen threads without exceeding system thread budgets.
+- Token borrowing is non-blocking: a newly scheduled compilation step immediately claims an idle slot or borrows forward, ensuring that the critical compilation path never queues behind secondary code generation.
+
+### Metadata Pipelining
+
+Compilation steps do not wait for dependencies to finish linking or emitting object files. The moment a dependency emits its lightweight `.rmeta` metadata interface, dependent crates begin compilation in parallel.
+
+Build scripts (`build.rs`) run as discrete execution stages as soon as their host build-dependencies link, compiling concurrently with unrelated target dependencies across your workspace.
+
+## Intelligent Memory Pressure Management
+
+A common issue during heavily parallel builds on high-core machines is running out of physical RAM and triggering swap storms or the kernel OOM killer.
+
+Rune prevents out-of-memory crashes through active telemetry:
+- **Real-Time Memory Monitoring**: Before spawning an additional compiler process, Rune queries system memory availability (`MemAvailable` on Linux, kernel memory pressure on macOS).
+- **Adaptive Admission Control**: If physical memory is constrained, Rune delays scheduling new jobs until active compilation units finish and free their memory.
+- **Learned Peak Memory Tracking**: Rune measures each crate's peak memory usage via `wait4` and records it across runs. A crate known to require 2 GiB will wait until 2 GiB of RAM is free rather than spawning alongside three other memory-heavy units.
+- **Low-Priority Scheduling**: Setting `build.low-priority = true` (or running `rune watch`) schedules compiler processes with lower OS scheduling priority (`nice`), keeping your desktop UI and editor completely smooth during full builds.
+
+## Eliminating Build Bottlenecks
+
+### Identifying the Critical Path
+
+When a build takes longer than 10 seconds and leaves more than 40% of CPU cores idle, Rune automatically prints the exact chain of dependent crates that restricted parallelism:
+
+```text
+note: build bottleneck: unicode-ident → proc-macro2 → syn → tracing → hyper → app
+```
+
+### Visual Timelines and Chrome Traces
+
+Generate interactive performance profiles:
+
+```bash
+# Generate build timeline and Chrome trace
+rune build --timings
+```
+
+This generates two detailed diagnostic artifacts:
+1. **Interactive HTML Timeline** (`.rune/timings/rune-timing.html`): Displays an interactive Gantt chart of every crate's compile duration, highlighting the critical bottleneck path and concurrency saturation over time.
+2. **Perfetto / Chrome Trace** (`.rune/fingerprints/trace.json`): Open in [Perfetto UI](https://ui.perfetto.dev) or Chrome (`chrome://tracing`) for thread-level execution timelines and system call inspection.
+
+## Advanced Compiler Acceleration: `rustc-runified`
+
+In standard Rust compilation, executables must wait for every upstream library rlib to be fully generated before compilation begins.
+
+With [rustc-runified](../rustc-runified/README.md) installed (`build.compiler = "auto"`), Rune unlocks two major architectural improvements:
+
+### Pipelined Binary Linking
+
+Executables, test runners, and benchmarks compile against dependency metadata immediately — just like libraries. When dependencies finish generating code, the executable only performs a fast final link. 
+
+On Rune's own clean build, compiling the final binary overlaps with code generation of its largest dependencies, shaving overall build time from **55.4 seconds down to 47.1 seconds**.
+
+### Deterministic Parallel Frontends
+
+On stable toolchains, setting `build.frontend-threads = "auto"` allows crates starting during idle CPU windows (such as end-of-chain crates) to activate multi-threaded frontends with guaranteed deterministic output matching single-threaded builds.

@@ -14,7 +14,6 @@ daily-driver update (§11). §1–§11 were developed and verified on Linux x86_
 and macOS aarch64 (Apple M5); §12 on Linux x86_64 (4 cores) — its notes say what
 to expect on a larger Mac. Windows has not been run._
 
----
 
 ## 1. What Rune can do today
 
@@ -100,7 +99,6 @@ where crates.io has published newer releases than the ones pinned).
   .rune/target` (0 compiled, 76 ms), and a no-op build takes ~50 ms of wall
   time (Cargo: 180–230 ms) — §12.
 
----
 
 ## 2. Conformance matrix (`new-spec.md`)
 
@@ -178,7 +176,6 @@ where crates.io has published newer releases than the ones pinned).
 | 71 | What is not globally shared | ✅ | Incremental state and mutable directories stay local. |
 | 72–73 | Architecture & principle | ✅ | |
 
----
 
 ## 3. Known gaps, and how to close them
 
@@ -225,7 +222,6 @@ and restores itself, and Cargo's `split-debuginfo = "unpacked"` default is appli
 (unstable in Cargo too), `hint-mostly-unused`, Cargo's `--unit-graph` schema,
 `--future-incompat-report`, `[hints]`.
 
----
 
 ## 4. Cargo pain points, and what Rune should do about them
 
@@ -474,7 +470,6 @@ Cheapest and most valuable first:
 7. Bigger bets: interface early-cutoff (P1), sandbox-as-security (P15), cached
    tests (P9), remote CAS (M5).
 
----
 
 ## 5. Feature ideas
 
@@ -546,7 +541,6 @@ checked by hand).
 **F14 — Programmatic API.** `rune-api` crate exposing planning, the unit graph
 and cache lookups for IDEs, Bazel-style wrappers and corporate tooling (see P17).
 
----
 
 ## 6. Milestones
 
@@ -562,7 +556,6 @@ and cache lookups for IDEs, Bazel-style wrappers and corporate tooling (see P17)
 | **M8** | Supply chain | *Done (§12):* exec-surface report, `min-release-age`, SBOM. *Open:* sandbox as a security boundary, attestation, reproducibility check. Builds on M1. |
 | **M9** | Faster than Cargo on edits | P9 cached tests: opt-in ✅, default-on after M1. P1 early cutoff is blocked on compiler support, see P1. |
 
----
 
 ## 7. How to verify the current state
 
@@ -586,7 +579,6 @@ rm Cargo.lock && rune generate-lockfile && diff /tmp/cargo.lock Cargo.lock
 Environment variables that isolate experiments: `RUNE_HOME` (settings, CAS,
 registry cache, git checkouts).
 
----
 
 ## 8. What changed in the performance-and-reliability update
 
@@ -737,7 +729,6 @@ changes what users see in backtraces and only matters once a remote CAS exists;
 the sandbox (P15) is a large, platform-specific piece of work. Each is in §4 with
 its plan.
 
----
 
 ## 9. What changed in the spec-conformance update
 
@@ -748,7 +739,6 @@ scripts saw the *host's* `CARGO_CFG_*` and empty `CARGO_PKG_*`; a re-run build
 script could write through hard links into the shared CAS; resolution depended
 on the command line, and `-p a` unified features requested only by `b`.
 
----
 
 ## 10. What changed in the macOS and check-reuse update (2026-09-24)
 
@@ -811,7 +801,6 @@ battery (`pmset -g log`). Rust's `Instant` on macOS does not count sleep, while
 artifacts), macOS SDK identity, a median-of-N cold-build comparison against Cargo
 on macOS.
 
----
 
 ## 11. What changed in the daily-driver update (2026-09-28)
 

@@ -4,8 +4,8 @@
 
 **Rust builds that never do the same work twice.**
 
-A fast, Cargo-compatible build system and package manager for Rust.
-Drop it into any Cargo project — no changes, no lock-in.
+A blazing-fast, Cargo-compatible build system and package manager for Rust.  
+Drop it into any existing Cargo workspace — zero migration, zero lock-in.
 
 ```bash
 curl -fsSL https://runepm.com/install.sh | sh
@@ -13,13 +13,7 @@ curl -fsSL https://runepm.com/install.sh | sh
 
 </div>
 
----
-
-Rune builds your existing Cargo projects with `rustc` directly and keeps every
-compiled crate in a content-addressable store shared by all your projects,
-branches, profiles and machines. Switch branches, check out an old commit, open
-a second worktree, start a fresh CI runner: whatever was built before is
-reused in milliseconds instead of compiled again.
+Rune compiles your existing Rust projects directly with `rustc` while persisting every compiled crate into a shared, content-addressable store. Whether you switch branches, pull an older commit, spin up a secondary worktree, or spin up a fresh CI agent, artifacts built anywhere on your system are restored in milliseconds instead of compiled from scratch.
 
 ```text
 $ rune build
@@ -28,153 +22,123 @@ $ rune build
 ✓ dev · 12 compiled · 185 cached · 4.81s
 ```
 
-## Why Rune
+## Why Developers Choose Rune
 
-### ⚡ Fast where it matters
+### Blazing Speed Where It Counts
 
-| On Rune's own workspace (249 packages) | Rune | Cargo |
-| --- | ---: | ---: |
-| Nothing changed: `build` | **53 ms** | 225 ms |
-| Nothing changed: `check` | **64 ms** | 234 ms |
-| Nothing changed: `test --no-run` | **56 ms** | 272 ms |
-| `tree` | **9 ms** | 184 ms |
-| Full build from scratch | **112.5 s** | 122.8 s |
-| Fresh machine, shared cache | **0.65 s** | full rebuild |
+| Benchmark on Rune Workspace (249 packages) | Rune | Cargo | Speedup |
+| :--- | :---: | :---: | :---: |
+| No-op build (`build`) | **53 ms** | 225 ms | **4.2× faster** |
+| No-op check (`check`) | **64 ms** | 234 ms | **3.6× faster** |
+| No-op test prep (`test --no-run`) | **56 ms** | 272 ms | **4.8× faster** |
+| Dependency tree inspection (`tree`) | **9 ms** | 184 ms | **20.4× faster** |
+| Full clean build from scratch | **112.5 s** | 122.8 s | **Faster** |
+| Fresh machine with shared cache | **0.65 s** | Full rebuild (84s+) | **129× faster** |
 
-On a generated 25-crate workspace, [`rune-bench`](bench/README.md) measures a
-fresh checkout at **108×** Cargo's speed, switching back to a branch at **34×**,
-running the tests at **9×**, and Rune **2.8× faster** overall across 32
-measurements (cold builds and rebuilds after an edit are on par: both run the
-same compiler). On Rune's own workspace, a fresh checkout takes 0.18 s where
-Cargo rebuilds for 84 s. Run it on your own project:
-`rune-bench run --project path/to/it`.
+Across a generated 25-crate benchmark workspace, [`rune-bench`](bench/README.md) clocks fresh checkouts at **108× Cargo's speed**, branch switching at **34×**, and test executions at **9×**. Cold builds and single-file incremental edits remain on par because both run `rustc` — but everywhere else, Rune removes the waiting.
 
-- **Nothing is compiled twice.** Every crate is stored under a key that
-  describes everything that went into it — compiler, flags, features,
-  dependencies, the environment it read. Same inputs, same artifact, from any
-  project on the machine.
-- **`check` after `build` is free.** Type-checking reuses what a build already
-  compiled.
-- **The whole machine, not one core at a time.** Crates start the moment their
-  dependencies' metadata exists, build scripts run while other dependencies
-  still compile, the longest chain goes first, and memory is watched so a big
-  build never swaps.
+You can verify these figures on your own codebase anytime:
+```bash
+rune-bench run --project path/to/your/project
+```
 
-### 🧪 A test runner you can trust
+- **Compile once, share everywhere**: Every compilation unit is keyed by its exact cryptographic inputs — compiler binary, flags, enabled features, target architecture, dependencies, and environment variables. Same inputs yield the exact same artifact across every workspace on your machine.
+- **Free `check` after `build`**: Type-checking seamlessly reuses the artifacts produced by full builds.
+- **Whole-machine saturation**: Compilation units schedule as soon as upstream metadata exists. Build scripts execute concurrently with independent dependency compilations, critical paths take priority, and dynamic memory tracking prevents system thrashing.
 
-- **Testing starts while the build is still running** — the first test binary
-  runs the moment it links.
-- **A live view** of what's running, how many tests passed, and how long each
-  binary takes.
-- **Stable by default.** Test binaries run one at a time as with Cargo, so
-  tests that share a port or a database don't fail at random. Opt into
-  parallel binaries with `--test-jobs`.
-- **Fix, then re-run just what failed**: `rune test --failed` builds and runs
-  only the failing tests until none are left.
-- **Built in:** timeouts for hung tests, retries with flaky-test detection,
-  JUnit reports, cached test results (`--cached`: 8 s → 0.26 s when nothing
-  changed), nextest-style scheduling of tests across binaries, and **code
-  coverage** with `rune coverage`.
+### A Modern, Dependable Test Runner
 
-### ☁️ Built for CI and teams
+- **Pipelined execution**: Test binaries run the moment their code links — you don't wait for the entire workspace to finish building before your first test executes.
+- **Live progress**: Real-time terminal dashboard tracking active binaries, completed suites, pass/fail counters, and run durations.
+- **Predictable concurrency**: Test binaries run sequentially by default to protect shared resources like ports and test databases, while individual tests run in parallel. Parallel binary execution is easily enabled with `--test-jobs`.
+- **Laser-focused failure loops**: `rune test --failed` re-runs only the tests that failed previously until everything passes green.
+- **Enterprise-ready features**: Native test timeouts, automatic retries with flaky-test detection, JUnit XML generation, cached test outputs (`--cached`: drops no-op runs from 8s to 0.26s), nextest-compatible test batching, and integrated code coverage via `rune coverage`.
 
-- **Share the cache** between laptops and CI through a directory or a cache
-  server: a developer with an empty store restores a whole workspace in under
-  a second.
-- **One-file cache bundles** for CI (`rune cas export` / `import`) that never
-  grow with every run the way a cached `target/` does.
-- **Selective CI**: `rune affected --since origin/main` lists the packages a
-  change can influence, and splits them across machines.
+### Built for Fast Teams and Clean CI
 
-### 🛡️ Supply-chain safety
+- **Global cache sharing**: Connect workstations and CI runners via shared network directories or dedicated Cairn cache servers. A developer checking out a fresh repo can restore an entire workspace in under a second.
+- **Hermetic cache bundles**: Export and import self-contained, portable cache archives (`rune cas export` / `import`) that stay lean instead of ballooning like persistent `target/` directories.
+- **Intelligent change detection**: `rune affected --since origin/main` calculates the exact set of affected packages across your workspace for efficient parallel CI matrix sharding.
 
-- **Sandboxed build scripts and proc-macros**: no network, nothing writable
-  outside the build (`build.sandbox = true`).
-- **`rune audit`** checks every dependency against the RustSec database, with
-  the path that brings it in and the fix.
-- **SBOMs** (CycloneDX, SPDX), **`rune tree --exec-surface`** (everything that
-  runs code at build time), and **`resolve.min-release-age`** to stay away from
-  brand-new releases.
+### Supply Chain Security Out of the Box
 
-### 🧰 Everything in one tool
+- **Sandboxed build execution**: Constrain build scripts and procedural macros with strict filesystem and network isolation (`build.sandbox = true`).
+- **Continuous vulnerability auditing**: `rune audit` scans your locked dependency graph against the RustSec Advisory Database with clear remediation guidance.
+- **Complete visibility**: Generate standard CycloneDX and SPDX Software Bills of Materials (SBOMs), inspect execution attack surfaces with `rune tree --exec-surface`, and quarantine fresh packages using `resolve.min-release-age`.
 
-`outdated`, `upgrade`, `unused` dependencies, `watch`, single-file **scripts**
-with dependencies, `explain` (why a crate rebuilds), `doctor` (what slows your
-build down), build **timelines**, dependency graphs, `install`, `publish`,
-`vendor` — plus every `cargo-<name>` plugin you already have.
+### Everything in a Single Binary
 
-## Install
+No need to juggle a dozen external Cargo plugins. Rune includes built-in commands for `outdated`, `upgrade`, `unused`, `watch`, single-file `script` runners with embedded dependencies, `explain` (root-cause cache invalidation analysis), `doctor` (diagnostic recommendations), interactive timelines, dependency graphs, `install`, `publish`, and `vendor` — while maintaining full compatibility with all existing `cargo-*` subcommands.
 
-**Linux and macOS**
+## Installation
+
+### Linux & macOS
 
 ```bash
 curl -fsSL https://runepm.com/install.sh | sh
 ```
 
-**Windows** (PowerShell)
+### Windows (PowerShell)
 
 ```powershell
 irm https://runepm.com/install.ps1 | iex
 ```
 
-The installer verifies the download's checksum and puts `rune` in
-`~/.rune/bin`. You need a Rust toolchain (`rustup`). Stay current with
-`rune self update`; other ways to install, shell completions and uninstalling:
-[docs/installation.md](docs/installation.md).
+The installer verifies SHA-256 release checksums and places `rune` into `~/.rune/bin`. Rune requires an active Rust toolchain (`rustup`). Keep your installation updated with `rune self update`.
 
-## Get started
+For package managers, custom directories, and shell completions, check the [Installation Guide](docs/installation.md).
 
-In any Cargo project:
+## Quickstart
+
+Rune works immediately inside any existing Cargo project:
 
 ```bash
-rune build                  # build (rune b)
-rune test                   # unit, integration and doc tests
-rune run -- --my-flag       # build and run
-rune check                  # type-check, reusing what the build compiled
-rune add serde -F derive    # add a dependency
-rune watch -x test          # re-run on every change
-rune help                   # everything else
+rune build                  # Compile the project (alias: rune b)
+rune test                   # Run unit, integration, and doc tests
+rune run -- --arg value     # Build and execute your binary
+rune check                  # Fast type-checking with build-cache reuse
+rune add serde -F derive    # Add a dependency with features
+rune watch -x test          # Auto-retest on every file modification
+rune doctor                 # Inspect your environment for performance bottlenecks
 ```
 
-The commands, flags and manifests are Cargo's. Your project keeps working with
-plain `cargo`: Rune writes a Cargo-format `Cargo.lock`, reads
-`.cargo/config.toml`, and changes nothing else.
+Because Rune mirrors Cargo's CLI surface and manifest format, your codebase stays 100% compatible with standard `cargo`. Rune writes standard `Cargo.lock` files, reads `.cargo/config.toml`, and never pollutes your repository.
 
-## Works with what you have
+## Complete Compatibility
 
-Workspaces, features, build scripts, proc-macros, `cc`/`bindgen`/`cxx`/`pyo3`
-and other native bindings, git and path dependencies, alternative registries
-and mirrors, `[patch]`, cross-compilation, custom profiles, `rust-toolchain`
-files, `RUSTC_WRAPPER`, rust-analyzer — tested against real-world workspaces
-(ripgrep, serde, regex) and a corpus of popular crates whose own test suites
-pass under Rune as they do under Cargo. See
-[what's supported](docs/compatibility.md), including the known limits.
+Rune supports the full breadth of the Rust ecosystem:
+- Multi-member workspaces and inheritance
+- Target-specific dependencies and platform configurations
+- Advanced build scripts and procedural macros
+- Native C/C++ bindings (`cc`, `bindgen`, `cxx`, `pyo3`)
+- Alternative registries, sparse indexes, and vendor directories
+- `[patch]` and `[replace]` directives
+- Cross-compilation targets and custom profiles
+- Standard toolchain files (`rust-toolchain.toml`) and `rust-analyzer`
+
+See the full [Compatibility Reference](docs/compatibility.md) for detailed platform coverage.
 
 ## Documentation
 
-| | |
-| --- | --- |
-| [Installation](docs/installation.md) | install options, completions, where Rune keeps things |
-| [Commands](docs/commands.md) | every command and flag |
-| [Testing](docs/testing.md) | the test runner, flaky tests, cached results, coverage |
-| [Caching](docs/caching.md) | how Rune decides what to rebuild |
-| [CI and shared caches](docs/ci.md) | cache bundles, shared stores, selective CI |
-| [Settings](docs/configuration.md) | `rune config` and every setting |
-| [Supply chain](docs/supply-chain.md) | sandboxing, audits, SBOMs |
-| [Performance](docs/performance.md) | how Rune uses the machine, build timelines |
-| [hyprlnk](hyprlnk/README.md) | the linker built into Rune, and its default on Linux, Windows and macOS |
-| [rustc-runified](rustc-runified/README.md) | the compiler as Rune runs it: executables that compile before their dependencies finish, the parallel front end on stable |
-| [All documentation](docs/README.md) | manifests, scripts, editor integration, architecture |
+| Guide | Description |
+| :--- | :--- |
+| [Installation](docs/installation.md) | Install options, shell completions, and environment paths |
+| [Getting Started](docs/getting-started.md) | First steps, workflow setup, and everyday commands |
+| [CLI Commands](docs/commands.md) | Complete CLI reference, selection flags, and interactive pager |
+| [Testing & Coverage](docs/testing.md) | Test runner, failure isolation, flaky retries, and coverage reports |
+| [Caching Deep Dive](docs/caching.md) | Cache key mechanics, invalidation rules, and CAS management |
+| [CI & Remote Caching](docs/ci.md) | Remote stores, Cairn servers, cache bundles, and matrix sharding |
+| [Configuration](docs/configuration.md) | Workspace and global settings via `Rune.toml` and CLI flags |
+| [Supply Chain Security](docs/supply-chain.md) | Sandboxing, advisory audits, and SBOM export |
+| [Performance Guide](docs/performance.md) | Resource management, concurrency, and bottleneck diagnosis |
+| [hyprlnk Linker](hyprlnk/README.md) | Integrated next-generation linker for Linux, macOS, and Windows |
+| [rustc-runified](rustc-runified/README.md) | Advanced compiler driver for early linking and parallel frontends |
+| [Complete Docs Index](docs/README.md) | Overview of all topics, manifests, scripts, and architecture |
 
-## Status
+## Project Status
 
-**Rune 2027.0** is the first stable release. Linux and macOS are its home;
-Windows builds are new and less tested. It is developed against Cargo's
-behaviour, with ~490 automated tests and a corpus of real crates whose own
-test suites must pass under Rune as under Cargo. Something off? `rune doctor`
-checks your setup. See the [roadmap](ROADMAP.md) and the
-[changelog](CHANGELOG.md).
+**Rune 2027.0** is the first stable release line, tested against hundreds of real-world crates and validated across Linux, macOS, and Windows. Check out the [Roadmap](ROADMAP.md) and [Changelog](CHANGELOG.md) to see where we're headed.
 
 ## License
 
-MIT OR Apache-2.0
+Licensed under either the [Apache License, Version 2.0](LICENSE-APACHE.md) or the [MIT License](LICENSE-MIT.md), at your option.

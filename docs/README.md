@@ -1,25 +1,30 @@
-# Rune documentation
+# Rune Documentation
 
-Start with [installation](installation.md) and the [commands](commands.md);
-everything else is reference.
+Welcome to the Rune documentation. Whether you are installing Rune for the first time, integrating it into your team's CI pipeline, or configuring remote caching, you will find comprehensive guides and references below.
 
-| Page | What it covers |
-| --- | --- |
-| [Installation](installation.md) | The install script and its options, building from source, shell completions, where Rune keeps its files |
-| [Commands](commands.md) | Everyday commands, Cargo's selection flags, help, the pager and progress display |
-| [Cargo compatibility](compatibility.md) | Manifests, dependencies, features, build scripts, native libraries, toolchains, profiles, resolution, the registry workflow — and the known limits |
-| [Manifests](manifests.md) | `Cargo.toml`, or a Rune-only `Rune.toml` |
-| [Settings](configuration.md) | `rune config` and every setting |
-| [Testing](testing.md) | How `rune test` runs tests, retries and flaky tests, cached test results, `rune coverage` |
-| [Caching](caching.md) | What goes into a unit's key, `check` after `build`, concurrent builds, feature unification, keeping the store small |
-| [Performance](performance.md) | How Rune uses cores and memory, and finding what makes a build long |
-| [CI and shared caches](ci.md) | Store bundles for CI, a store shared between machines, selective CI |
-| [Supply chain](supply-chain.md) | Sandboxed build scripts, resolution, `outdated`/`upgrade`/`unused`, SBOMs, `rune audit` |
-| [Scripts](scripts.md) | Single-file Rust scripts with dependencies |
-| [Editor integration](editor-integration.md) | JSON messages, rust-analyzer, the build plan as JSON |
-| [Architecture](architecture.md) | The crates Rune is made of, building and testing Rune itself |
-| [Benchmarks](../bench/README.md) | `rune-bench`: measuring Rune against Cargo on generated and real projects |
+If you are new to Rune, start with the [Installation Guide](installation.md) and the [Getting Started Tutorial](getting-started.md).
 
-[ROADMAP.md](../ROADMAP.md) has the status against the compatibility
-specification, measurements and what comes next; [CHANGELOG.md](../CHANGELOG.md)
-what changed in each release.
+## Guides and Reference
+
+| Topic | Description |
+| :--- | :--- |
+| [Installation](installation.md) | Official install scripts, custom directories, shell completions, and system requirements |
+| [Getting Started](getting-started.md) | Your first build, adding dependencies, and adopting Rune in existing Cargo projects |
+| [CLI Commands](commands.md) | Comprehensive command reference, Cargo-compatible flags, interactive pager, and progress monitoring |
+| [Cargo Compatibility](compatibility.md) | Manifest support, workspaces, build scripts, native dependencies, features, and platform targets |
+| [Manifests](manifests.md) | Working with standard `Cargo.toml` or standalone `Rune.toml` configurations |
+| [Configuration](configuration.md) | Complete settings reference, precedence hierarchy, and global/project options via `rune config` |
+| [Testing & Coverage](testing.md) | Pipelined test execution, failure isolation, flaky-test retries, cached runs, and `rune coverage` |
+| [Caching Deep Dive](caching.md) | Cryptographic unit keys, invalidation triggers, concurrent process safety, and store maintenance |
+| [Performance Tuning](performance.md) | Scheduler mechanics, jobserver sharing, memory management, and bottleneck diagnosis |
+| [CI & Remote Caching](ci.md) | Setting up remote stores, Cairn cache servers, portable cache bundles, and matrix sharding |
+| [Supply Chain Security](supply-chain.md) | Build script sandboxing, dependency resolution rules, SBOM generation, and `rune audit` |
+| [Single-File Scripts](scripts.md) | Writing and running standalone Rust scripts with embedded dependencies and shebang support |
+| [Editor Integration](editor-integration.md) | Configuring rust-analyzer, JSON compiler messages, and editor build plans |
+| [Architecture](architecture.md) | Internal crate structure, design principles, and building Rune from source |
+| [Troubleshooting](troubleshooting.md) | Common errors, diagnostic commands, and debugging unexpected cache behavior |
+| [Benchmarks](../bench/README.md) | Benchmarking methodology and measuring performance differences with `rune-bench` |
+
+## Project Status and Updates
+
+For upcoming milestones and compatibility progress, see the [Roadmap](../ROADMAP.md). For detailed release notes and recent updates, check the [Changelog](../CHANGELOG.md).

@@ -1,22 +1,22 @@
-# Rune Demo Project (`rune-test`)
+# Rune Demonstration Workspace (`rune-test`)
 
-This is a multi-crate demo project designed to test and showcase the **Rune** build system.
+This multi-crate project serves as a practical, lightweight showcase for testing and exploring the **Rune** build system.
 
-## Project Structure
+## Workspace Layout
 
-```
+```text
 rune-test/
 ├── Cargo.toml
 ├── src/
-│   └── main.rs                  (Binary application: CLI runner and statistics presenter)
+│   └── main.rs                  # CLI runner and presentation layer
 └── crates/
-    ├── math-engine/             (Library: Prime generation, primality testing, stats)
+    ├── math-engine/             # Library: Prime generation, primality testing, statistics
     │   ├── Cargo.toml
     │   └── src/
     │       ├── lib.rs
     │       ├── primes.rs
     │       └── stats.rs
-    └── text-processor/          (Library: ASCII banners & formatted tables)
+    └── text-processor/          # Library: Terminal banners and ASCII tables
         ├── Cargo.toml
         └── src/
             ├── lib.rs
@@ -24,30 +24,37 @@ rune-test/
             └── table.rs
 ```
 
-## How to Build & Run with Rune
+## Quickstart
 
-### 1. Build in Dev Mode
+Run these everyday commands from within this directory to see Rune in action:
+
+### 1. Compile in Development Mode
+
 ```bash
 ../target/release/rune build
 ```
 
-### 2. Run the Compiled Binary
+### 2. Execute the Compiled Application
+
 ```bash
 ./.rune/target/debug/rune-demo
 ```
 
-### 3. Build in Release Mode
+### 3. Build with Optimizations
+
 ```bash
 ../target/release/rune build --release
 ./.rune/target/release/rune-demo
 ```
 
-### 4. Check CAS Cache Statistics
+### 4. Inspect Cache Telemetry
+
 ```bash
-../target/release/rune cas stats
+../target/release/rune cas du
 ```
 
-### 5. Clean Generated Artifacts
+### 5. Clean Generated Workspace Outputs
+
 ```bash
 ../target/release/rune clean
 ```

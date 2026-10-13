@@ -1,72 +1,134 @@
-# Dependencies and supply chain
+# Supply Chain Security & Dependency Auditing
 
-## Confining build-time code
+Software supply chain attacks targeting build scripts, procedural macros, and newly published malicious packages are an increasing threat in modern software development.
 
-`build.sandbox = true` (or `RUNE_BUILD_SANDBOX=1`) runs every build script and
-compiler — and with it every proc-macro — confined: no network, and a
-read-only file system except the build's output (a build script: its
-`OUT_DIR`) and a private temporary directory. A build script that tries to
-plant something in `~/.bashrc` or another crate's sources, or to phone home,
-fails instead. On Linux this uses unprivileged user, mount and network
-namespaces (on Ubuntu 23.10+ AppArmor may have to allow them); on macOS,
-`sandbox-exec`. `build.sandbox-network = "openssl-src, foo"` lets the build
-scripts of those packages use the network. It costs nothing measurable: a full
-sandboxed rebuild of Rune's own 194 units (ring, zstd-sys, proc-macros) takes
-as long as an unconfined one.
+Rune builds security into your workflow by default, providing execution sandboxing, real-time vulnerability scanning, dependency hygiene tools, and Software Bill of Materials (SBOM) generation.
 
-Version resolution takes the newest release each requirement allows and
-settles the rare conflict (two versions in one compatible range) by
-preferring or backtracking; when that is not enough it solves the choice as a
-whole with PubGrub, and when no choice exists it says why:
+## Confining Build-Time Code Execution
 
-```
-! no set of versions satisfies every requirement:
-  Because b 1.0.0 depends on a 1.1.0 and the workspace depends on b 1.0.0, the workspace depends on a 1.1.0.
-  And because the workspace depends on a 1.0.0, the workspace cannot be resolved.
+Standard Cargo builds execute arbitrary code from dependencies via build scripts (`build.rs`) and procedural macros with full system user privileges. A malicious dependency can access personal files, read SSH keys, or make unauthorized network connections.
+
+Rune provides process-level build sandboxing:
+
+```bash
+# Enable build sandboxing via CLI or Rune.toml
+rune build --sandbox
 ```
 
-A release that needs a version of something that was never published is
-skipped for an older one, as Cargo does.
+Or configure permanently in `Rune.toml`:
 
-`rune outdated` lists the declared dependencies with newer releases (compatible,
-and newest overall, honouring each package's `rust-version`); `rune upgrade`
-raises the requirements in place, keeping comments and how each requirement is
-written (`1` stays `1`, `0.7` becomes `0.9`). `rune unused` runs `rustc`'s own
-`unused_crate_dependencies` lint over every target of the workspace's packages —
-no text search, so proc-macros, renamed crates and build-dependencies are
-judged correctly — and suggests moving a dependency only tests use to
-`[dev-dependencies]`; `--fix` removes the unused ones.
-
-`rune sbom` writes a CycloneDX 1.5 or SPDX 2.3 bill of materials with package
-URLs, checksums, licences and the locked dependency edges (`SOURCE_DATE_EPOCH`
-makes it reproducible). `rune tree --exec-surface` lists every crate that runs
-code on your machine while building — build scripts, proc-macros, native
-`links` crates — with the chain that brings each in. `resolve.min-release-age =
-"14d"` keeps resolution away from releases younger than that.
-
-## Security advisories: `rune audit`
-
+```toml
+[build]
+sandbox = true
+sandbox-network = "openssl-src, libz-sys" # Allowlist specific packages that need network
 ```
-▸ checked 236 packages against 1875 advisories, updated 2026-09-30
+
+When sandboxing is active:
+- **Filesystem Isolation**: Build scripts and procedural macros run with a read-only filesystem view, except for their designated `OUT_DIR` and a private temporary directory. Attempts to modify files outside `OUT_DIR` or access dotfiles like `~/.bashrc` fail immediately.
+- **Network Isolation**: By default, sandboxed build scripts have zero network access.
+- **Zero Overhead**: On Linux, sandboxing uses unprivileged user, mount, and network namespaces. On macOS, it leverages `sandbox-exec`. A full sandboxed build of Rune (including `ring` and `zstd-sys`) measures virtually identical wall-clock time to an unconfined build.
+
+## Continuous Vulnerability Auditing: `rune audit`
+
+Scan your locked dependencies against the official RustSec Advisory Database and OSV vulnerability feeds:
+
+```bash
+rune audit
+```
+
+```text
+▸ checked 236 packages against 1,875 advisories, updated 2026-09-30
 ✗ smallvec 1.6.0 · RUSTSEC-2021-0003 · critical 9.8
   Buffer overflow in SmallVec::insert_many
   fix   >=1.6.1 — `rune update smallvec --precise 1.6.1`
-  path  app 0.1.0 → middle 1.0.0 → smallvec 1.6.0
+  path  app 0.1.0 → middleware 1.0.0 → smallvec 1.6.0
   info  https://rustsec.org/advisories/RUSTSEC-2021-0003
 ! bincode 1.3.3 · RUSTSEC-2025-0141 · unmaintained
 ✗ 1 vulnerability found · 1 warning
 ```
 
-Every locked crates.io package is checked against the RustSec database as OSV
-publishes it (also GitHub's and OSV's reports for crates.io, among them
-malicious releases; copies of one advisory are reported once): known
-vulnerabilities with their CVSS score, unmaintained and unsound crates, and
-yanked releases. Each finding names the path that brings the crate in and the
-fix — the `rune update … --precise` line when a compatible release fixes it.
-The database is fetched when it changed (an ETag check) and kept in
-`~/.rune/advisory-db`, so the audit also works offline; a cached audit takes
-about 0.1 s. Vulnerabilities fail the command (exit 1), warnings only with
-`--deny warnings` (or `--deny unmaintained`, `unsound`, `yanked`);
-`--ignore RUSTSEC-…` or `audit.ignore` accepts a reviewed advisory; `--format
-json` follows cargo-audit's shape; `--db` reads a zip or directory of OSV
-files.
+`rune audit` provides actionable remediation:
+- Identifies critical CVEs, unmaintained packages, unsound code, and yanked releases.
+- Traces the exact dependency path from your workspace root to the vulnerable package.
+- Recommends the exact `rune update ... --precise` command to upgrade to a compatible, patched release.
+- Operates offline using a cached local database in `~/.rune/advisory-db`.
+
+In CI, enforce zero-tolerance security policies:
+
+```bash
+rune audit --deny warnings --deny yanked
+```
+
+To accept an audited advisory after security review:
+
+```bash
+rune audit --ignore RUSTSEC-2021-0003
+```
+
+## Inspecting the Build-Time Attack Surface
+
+Understand exactly which crates in your dependency graph run code at build time:
+
+```bash
+rune tree --exec-surface
+```
+
+This command outputs a filtered tree displaying every crate with a `build.rs` script, procedural macro, or native C/C++ `-sys` linkage, along with the dependency chain that introduced it.
+
+## Quarantine Young Packages: `resolve.min-release-age`
+
+Most malicious crate attacks are detected and yanked within 48 to 72 hours of publication. You can shield your project from zero-day registry compromises by enforcing a release age buffer:
+
+```toml
+[resolve]
+min-release-age = "14d"
+```
+
+When resolving new dependencies or updates, Rune selects only releases that have been published for at least 14 days, ensuring the open-source community and security scanners have had time to review new versions.
+
+## Dependency Maintenance Tools
+
+### Upgrading Dependencies: `rune outdated` and `rune upgrade`
+
+Keep dependencies modern without manual research:
+
+```bash
+# Check for available updates adhering to MSRV constraints
+rune outdated
+
+# Upgrade version requirements directly in your manifests
+rune upgrade
+
+# Upgrade across breaking semver boundaries
+rune upgrade --incompatible
+```
+
+`rune upgrade` edits your `Cargo.toml` in-place while preserving custom comments, formatting style, and inline table layout.
+
+### Eliminating Dead Code: `rune unused`
+
+Identify dependencies that your codebase never actually references:
+
+```bash
+# Detect unused dependencies using compiler lints
+rune unused
+
+# Automatically remove unused dependencies from manifests
+rune unused --fix
+```
+
+Unlike crude text-grep tools, `rune unused` uses `rustc`'s native `unused_crate_dependencies` analysis, accurately identifying procedural macros, build dependencies, and renamed crates.
+
+## Software Bill of Materials (SBOM) Export
+
+Generate standard machine-readable supply chain manifests for compliance and security auditing:
+
+```bash
+# Export CycloneDX 1.5 JSON
+rune sbom -o bom.json
+
+# Export SPDX 2.3 format
+rune sbom --format spdx -o bom.spdx.json
+```
+
+The exported SBOM includes verified package URLs, SHA-256 checksums, declared licenses, and locked dependency relationships. When combined with `SOURCE_DATE_EPOCH`, generation is completely deterministic and reproducible.

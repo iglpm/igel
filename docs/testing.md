@@ -1,10 +1,10 @@
-# Testing: `rune test`, `rune bench`, `rune coverage`
+# Testing & Code Coverage
 
-## How a test run works
+Testing in Rune is built directly into the core build scheduler. Instead of waiting for every library, executable, and benchmark in the workspace to finish compiling before launching your test suite, Rune runs tests the moment the first test binary links.
 
-Test binaries are part of the same build graph as everything else. Testing
-starts the moment the first test binary links, while the rest of the
-workspace is still compiling, instead of after a full build:
+## Pipelined Test Execution
+
+When you run `rune test`, testing runs concurrently with ongoing compilations:
 
 ```text
 ▸ ok app (unit tests: lib) · 41 passed · 0.12s
@@ -13,97 +13,78 @@ workspace is still compiling, instead of after a full build:
 ⠼ testing  ━━━━━━━━╾──────────────── 2/6 · 53 passed · app (test integration) 7/30 4s
 ```
 
-The *testing* line shows how many binaries are done, how many tests have
-passed so far (counted from each binary's output as its tests finish), and
-what runs now with its own progress and time. Each binary's result is printed
-as soon as it is in; a failure shows while the rest still runs.
+The terminal display reports completed suites, total passed tests, and active test runs in real time. If a test fails, the failure details print immediately while the remainder of the suite continues running.
 
-- **One test binary at a time**, as with Cargo, while the build goes on.
-  Tests in different binaries often share a port, a file or a database;
-  running two binaries at once makes such suites fail now and then.
-  `rune test --test-jobs 4` (or `test.jobs = 4`) runs binaries side by side
-  when your tests don't share anything. Each binary still runs its own tests
-  in parallel, as libtest does. Doc tests run after the test binaries, in
-  Cargo's order.
-- **The slowest binaries are built first.** Rune remembers how long each test
-  binary ran; the scheduler builds the binaries a run will wait longest on
-  (and the programs their tests start) before the quick ones.
-- **Programs a test starts are ready.** A package's binaries and examples are
-  built before its tests run (`CARGO_BIN_EXE_<name>` works), as with Cargo.
-- **Leftover processes don't hang the run.** A test that starts a server and
-  forgets it no longer keeps `rune test` waiting once the test binary exits.
-- **A hung test can't hang CI.** With `--timeout 10m` (or `test.timeout`), a
-  test binary that runs longer is stopped and reported as failed, with the
-  tests that had not finished named:
+### Key Architectural Behaviors
 
-  ```text
-  ✗ FAILED app (test api) · 600.00s
-  stopped after 600.00s: the test binary ran longer than the timeout (`--timeout`, `test.timeout`) (41 of 42 tests had finished)
-  still running or not started: upload_resumes_after_disconnect
-  ```
-- **The environment is Cargo's**: `CARGO`, `CARGO_MANIFEST_DIR`,
-  `CARGO_MANIFEST_PATH`, every `CARGO_PKG_*`, `CARGO_TARGET_TMPDIR`, and the
-  library paths of build scripts' native libraries.
+- **Isolated Binary Execution**: By default, test binaries execute sequentially (`test.jobs = 1`) while the build continues in parallel. Because tests in separate binaries often share resources like network ports, temporary files, or databases, sequential execution eliminates flaky concurrency failures. If your test binaries are fully isolated, run them concurrently with `rune test --test-jobs 4`.
+- **Intelligent Prioritization**: Rune tracks historical test run durations across runs. Binaries that historically take the longest to finish are scheduled and compiled first, minimizing total wall-clock time.
+- **Process Cleanup**: If a test spawns background worker processes or mock servers and fails to terminate them, Rune guarantees they will not hang the test runner when the parent binary exits.
+- **Strict Timeouts**: Stop hanging tests from blocking CI runners. Pass `--timeout 10m` (or configure `test.timeout = "10m"`) to terminate runs that exceed your threshold and report which individual tests stalled:
+
+```text
+✗ FAILED app (test api) · 600.00s
+stopped after 600.00s: test binary exceeded timeout (--timeout, test.timeout) (41 of 42 tests finished)
+stalled test: upload_resumes_after_disconnect
+```
+
+## Everyday Testing Commands
 
 ```bash
-rune test                          # unit, integration and doc tests
-rune test parse -- --nocapture     # a filter, and arguments for the test binaries
-rune test --no-fail-fast           # run every binary even after a failure
-rune test --failed                 # only the tests that failed last time
-rune test --retries 2              # re-run failed tests; ones that pass are reported as flaky
-rune test --junit report.xml       # a JUnit report for CI
-rune test --timeout 10m            # stop a test binary that hangs
-rune test --message-format json    # one `test-suite-finished` line per binary
-rune test --schedule tests         # split binaries into batches spread over every core
-rune bench                         # benchmarks, one binary at a time
+# Basic Execution
+rune test                           # Run unit, integration, and doc tests
+rune test parse -- --nocapture      # Filter test names and pass args to test binaries
+rune test --no-fail-fast            # Execute all test binaries even after failures
+rune bench                          # Run benchmarks
+
+# Targeted Workflows
+rune test --failed                  # Re-run only the tests that failed previously
+rune test --retries 2               # Automatically retry failures and report flaky tests
+rune test --schedule tests          # Distribute tests across all cores (nextest-style)
+rune test --cached                  # Skip test binaries whose inputs haven't changed
+rune test --junit report.xml        # Export JUnit XML test report for CI
 ```
 
-At the end, a run longer than a few seconds names its slowest binaries; a
-filter that matched no test says so. `-q` leaves out everything but the
-result line (and failures).
+## Fast Failure Iteration: `rune test --failed`
 
-## Scheduling tests across binaries
+Fixing broken tests shouldn't require re-running your entire test suite.
 
-`--schedule tests` (or `test.schedule = "tests"`) lists each binary's tests
-and splits them into batches, each its own process, scheduled across all
-binaries at once — like cargo-nextest. A suite dominated by one large binary
-finishes sooner; the price is that tests no longer share a process (a test
-that relies on another's global state in the same binary may notice).
+Rune persists the exact set of failing test names per project and profile:
+- Running `rune test --failed` compiles and executes only the binaries containing failing tests, running only those specific test names.
+- When an individual test passes, Rune clears it from the failure cache. Repeating `rune test --failed` progressively narrows execution until the entire suite is green.
+- Combine with filters (`rune test --failed parse`) to target specific subsets of broken tests.
 
-## Re-running what failed
+## Flaky Test Detection: `--retries`
 
-Rune remembers which tests failed (per project and profile). `rune test
---failed` builds and runs only the binaries those tests are in, and only
-those tests, by exact name — the edit-and-retry loop while fixing a test,
-without the rest of the suite. A test that passes is forgotten, so repeating
-`--failed` narrows down to what is still broken; once nothing failed, it runs
-every test. A binary that crashed or did not build runs whole. A filter
-(`rune test --failed parse`) narrows the remembered tests further.
+Flaky tests degrade CI reliability. The `--retries N` flag automatically re-runs failing tests by exact name up to `N` times:
+- If a test passes on a subsequent attempt, Rune marks it as **flaky** in the terminal summary and JUnit XML report without failing the CI pipeline.
+- Tests that consistently fail across all attempts are marked as failed, halting the build.
 
-## Flaky tests
+## Instant Cached Test Runs: `--cached`
 
-`--retries N` runs a binary's failed tests again, by exact name, up to N
-times. A test that passes on a later attempt is reported as flaky (in the
-summary and in the JUnit report) instead of failing the run; one that keeps
-failing fails it. A binary that crashed without a failing test is not retried.
+When code and test inputs haven't changed, re-running hundreds of unit tests wastes time:
 
-## Cached test results
-
-`rune test --cached` (or `test.cache = true`) remembers a passing test binary under
-a key made of the binary's bytes (which cover code, dependencies and compiler),
-every file in the package directory (fixtures), the arguments, and the
-`RUST_*`/`CARGO_*`/`RUNE_*` environment. Change any of them and the binary runs
-again; a failing run is never remembered; `--cached=false` forces a run; doc-tests
-always run. On Rune's own 285 tests: about 8 s → 0.26 s when nothing changed.
-
-It is opt-in because Rune can only key what it can see. **Do not enable it** for
-tests that depend on the network, the clock, randomness, other environment
-variables or files outside the package — they would keep "passing" from the cache
-while the world they test has changed.
-
-## Code coverage: `rune coverage`
-
+```bash
+rune test --cached
 ```
+
+Rune hashes the test binary executable, package fixture files, command-line arguments, and relevant environment variables (`RUST_*`, `CARGO_*`, `RUNE_*`). If all inputs match a previous successful run, Rune skips execution and reports cached results instantly.
+
+On Rune's own 285 tests, running `rune test --cached` drops execution time from **8.0s down to 0.26s**. Failed tests and documentation tests are never cached.
+
+> **Caution**: Enable test caching only for hermetic tests. Tests that depend on external live databases, external HTTP services, or system clocks should run without caching.
+
+## Parallel Test Scheduling: `--schedule tests`
+
+For large integration test suites dominated by a single heavy binary, enable `--schedule tests` (or `test.schedule = "tests"`). 
+
+Rune queries the binary's test list and partitions tests into parallel batches distributed across every available core — similar to `cargo-nextest`. This cuts wall-clock time dramatically on multi-core systems.
+
+## Native Code Coverage: `rune coverage`
+
+Rune includes built-in source-based code coverage powered by LLVM profiling:
+
+```text
 file                       lines             functions               regions
 src/lib.rs         8/17  47.06 %          2/3  66.67 %         9/19  47.37 %
   not run: 5, 11-17
@@ -111,16 +92,17 @@ total              8/17  47.06 %          2/3  66.67 %         9/19  47.37 %
 ✓ 47.06 % of lines covered (8 of 17) · 1 files
 ```
 
-Source-based coverage like `cargo llvm-cov`: only the workspace's own crates
-are compiled with `-C instrument-coverage` (dependencies stay shared with
-ordinary builds), the tests run — programs they start through
-`CARGO_BIN_EXE_*` count too — and the profiles are merged and reported with the
-toolchain's `llvm-profdata`/`llvm-cov` (the `llvm-tools` component is added on
-first use). `--show-missing-lines`, `--lcov` (demangled names),
-`--json`, `--cobertura`, `--html`, `--fail-under 80`,
-`--ignore-filename-regex`; a failing test ends the run unless
-`--no-fail-fast`, which reports what ran. `cfg(coverage)` is set, as with
-cargo-llvm-cov. The instrumented build lives in `<target>/coverage/build`, so
-`rune coverage` and `rune build`/`rune test` never replace each other's files
-and each stays warm; a profile cut short (a test binary killed mid-write) is
-left out with a warning rather than failing the report.
+Generate comprehensive coverage reports without installing external tools:
+
+```bash
+# Terminal summary with missing line annotations
+rune coverage --show-missing-lines
+
+# Export in standard formats for CI services
+rune coverage --lcov -o lcov.info
+rune coverage --cobertura -o coverage.xml
+rune coverage --html -o coverage_html/
+rune coverage --fail-under 80       # Enforce minimum coverage threshold
+```
+
+Coverage builds are isolated inside `.rune/target/coverage/build`, preventing instrumented binaries from invalidating your normal development cache.

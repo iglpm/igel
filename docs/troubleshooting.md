@@ -1,27 +1,36 @@
-# Troubleshooting
+# Troubleshooting Guide
 
-What to do when a build fails or does something you did not expect. Most
-problems fall into one of three groups: the project itself (it fails with
-Cargo too), the machine (a missing tool, little memory or disk), or Rune.
-Start by telling them apart.
+When a build fails or behaves unexpectedly, this guide will help you quickly isolate the root cause and resolve it.
 
-## First steps
+Most build issues fall into one of three categories:
+1. **The project itself**: The error occurs under both `cargo` and `rune`.
+2. **Environment & tools**: A missing C compiler, insufficient disk space, or low memory.
+3. **Rune-specific behavior**: Invalidation rules, cache configuration, or concurrency edge cases.
+
+## Initial Diagnostic Steps
+
+Run these three commands to isolate the problem:
 
 ```bash
-rune doctor          # missing tools, slow linkers, disk and memory, with the fix
-cargo build          # does the project build with Cargo? (in its own target/)
-rune explain         # which units the next build would compile, and why
+# 1. Inspect environment, linkers, disk space, and toolchain setup
+rune doctor
+
+# 2. Check if the project compiles under Cargo
+cargo build
+
+# 3. Inspect what Rune is scheduling to compile and why
+rune explain
 ```
 
-If `cargo build` fails the same way, the problem is in the project, not in
-Rune. If only Rune fails, the sections below cover the usual causes; if none
-fits, [report it](#reporting-a-bug).
+If `cargo build` produces the exact same failure, the issue lies within your project code or dependency requirements rather than Rune.
 
-## The build compiles more than it should
+## Unexpected Recompilations
 
-`rune explain` lists every unit the next build would compile and what changed
-in each — a source file, a feature, a flag, an environment variable a build
-script watches, a dependency:
+If Rune compiles crates that you expected to be restored from cache, use `rune explain`:
+
+```bash
+rune explain
+```
 
 ```text
 ▸ 1 of 197 units would be compiled (0 come from the store)
@@ -30,139 +39,108 @@ script watches, a dependency:
     · sources changed: src/main.rs (modified)
 ```
 
-Common causes:
+Common causes of unexpected cache invalidations:
 
-- **A build script without `rerun-if-changed`** is rerun (and its crate
-  recompiled) when *any* file of its package changes, as with Cargo. Add
-  `println!("cargo::rerun-if-changed=build.rs")` and the files it reads.
-- **An environment variable a build script reads** (`rerun-if-env-changed`)
-  differs between shells, IDEs and CI. `rune explain` names it.
-- **Different flags** — `RUSTFLAGS`, `--features`, `--profile`, a
-  `RUSTC_WRAPPER` — make different artifacts; each is stored separately and
-  stays in the store.
-- **A new Rune version** may change how crates are compiled; the first build
-  after an update then compiles everything once.
+- **Build scripts without `rerun-if-changed`**: If a `build.rs` script does not declare `println!("cargo::rerun-if-changed=...")`, Cargo and Rune assume that *any* file change in the package requires re-running the script and recompiling the crate. Always declare explicit change filters in your build scripts.
+- **Environment variable drift**: If a build script accesses environment variables via `rerun-if-env-changed`, differing variables across terminals, IDEs, and CI environments will produce different cache keys.
+- **Varying compiler flags**: Differences in `RUSTFLAGS`, active features, profiles, or wrappers (`RUSTC_WRAPPER`) generate distinct artifacts.
+- **Toolchain or Rune updates**: Upgrading your Rust toolchain or Rune release updates compiler fingerprints, intentionally requiring a clean recompilation.
 
-## The build is slow
+## Slow Builds
 
-A build longer than 10 seconds that left cores idle ends with a note naming the
-chain of crates that had to be built one after another. `rune build --timings`
-writes a timeline to `.rune/timings/rune-timing.html` with that chain
-highlighted. See [performance](performance.md) for what helps: splitting the
-largest crate of the chain, a faster linker (`rune doctor` says which), more
-memory.
+- **Critical Path Bottlenecks**: If a build takes over 10 seconds and leaves CPU cores underutilized, Rune names the bottleneck dependency chain in your terminal. Run `rune build --timings` to inspect the visual timeline in `.rune/timings/rune-timing.html`. Splitting the largest crate on the critical path often provides the greatest speedup.
+- **Memory Throttling Notifications**: A notice stating `note: memory ran short, so fewer compilers ran at once` indicates that Rune paused spawning new compiler workers to prevent swap thrashing or OOM crashes. Close memory-intensive background apps or adjust `-j`.
 
-`note: memory ran short, so fewer compilers ran at once` means Rune held back
-compilers so the machine would not swap. Close memory-hungry programs or lower
-`-j`; it is not an error.
-
-## Errors from the compiler about crates
+## Compiler Errors About Dependencies
 
 ```text
 error[E0463]: can't find crate for `tracing`
 error[E0460]: found possibly newer version of crate `dep` which `mid` depends on
 ```
 
-when the same project builds with Cargo, rustc found two different builds of
-one dependency side by side. Rune records, for every stored crate, the builds of
-its dependencies it was compiled against, and restores it only next to those,
-so this should not happen; if it does, it is a bug — please
-[report it](#reporting-a-bug). To get going again, rebuild everything once:
+If these errors occur under Rune but not Cargo, rustc encountered mismatched dependency builds. Rebuild the workspace with clean artifacts:
 
 ```bash
-rune build --rebuild-all     # compile every unit, dependencies included
+rune build --rebuild-all
 ```
 
-## Errors about the lockfile or resolution
+If the issue persists, please [report a bug](#reporting-a-bug).
 
-`the dependency resolution does not contain …` — a dependency a build needs has
-no package in the lockfile, and resolving again did not find one either. Check
-that the dependency's version requirement can be met (`rune update -p <name>`
-tries again for one package), and that a `[patch]` or source replacement in
-`.cargo/config.toml` provides it.
+## Lockfile and Resolution Errors
 
-`failed to select a version for …` — the requirements of your dependencies
-cannot all be met at once; the message explains which ones conflict.
-`rune tree -i <name>` and `rune why <name>` show who asks for what.
+- **`the dependency resolution does not contain ...`**: A requested dependency is missing from the lockfile. Run `rune update -p <name>` to re-resolve the specific crate, and ensure that any `[patch]` directives in `Cargo.toml` or `.cargo/config.toml` point to valid sources.
+- **`failed to select a version for ...`**: Dependency version requirements conflict across your workspace graph. Use `rune tree -i <name>` and `rune why <name>` to trace which crates are demanding conflicting versions.
+- **`the lock file ... needs to be updated but --locked was passed`**: Manifest requirements were edited without updating `Cargo.lock`. Run `rune build` without `--locked` (or run `rune update`) and commit the updated lockfile.
 
-`the lock file … needs to be updated but --locked was passed` — the manifests
-changed since `Cargo.lock` was written. Run `rune build` once without
-`--locked` (or `rune update`) and commit the new `Cargo.lock`.
+## Native Dependencies & Build Scripts
 
-Offline (`--offline`, `net.offline`): only versions already in the local index
-cache can be chosen. Run once with the network to fill it.
+Crates that compile native C/C++ libraries (such as `ring`, `openssl-sys`, `libz-sys`) require system build tools like `cc`, `cmake`, and `pkg-config`:
+- **Linux**: Install your distribution's development meta-packages (e.g. `build-essential` on Debian/Ubuntu, `base-devel` on Arch, or `gcc` on Fedora).
+- **Windows**: Install the *Desktop development with C++* workload via the Visual Studio Installer.
+- **Build Sandboxing**: If `build.sandbox = true` is active, build scripts cannot access the internet to download prebuilt binaries. Add the package to the network allowlist in `Rune.toml`: `build.sandbox-network = "openssl-src"`.
 
-## Build scripts and native code
+## Storage and Cache Management
 
-Crates with C code (`ring`, `openssl-sys`, `libz-sys`, …) need a C compiler
-and often `pkg-config` or the library's headers. A failing build script prints
-its output, and Rune adds a hint when it recognizes a missing tool. On Windows,
-install the *Desktop development with C++* workload of the Visual Studio Build
-Tools.
-
-With `build.sandbox = true`, build scripts cannot use the network or write
-outside the build. A script that downloads something needs an exception:
-`rune config set build.sandbox-network <package>` (see
-[supply chain](supply-chain.md#confining-build-time-code)).
-
-## Disk space
-
-The store keeps itself under a tenth of its disk (5–50 GiB, `cas.max-size`) and
-drops entries no build has used for 30 days. To see and reclaim space now:
+Rune automatically cleans up idle artifacts, but you can inspect and reclaim storage space on demand:
 
 ```bash
-rune cas du                       # which packages take the space, and how much is idle
-rune cas gc --max-age 7d          # remove entries unused for a week
-rune cas gc --max-size 10GB       # shrink to 10 GB, least recently used first
-rune clean                        # this project's build output (.rune/target)
+# View disk usage by package and age
+rune cas du
+
+# Clean local project build outputs (.rune/target)
+rune clean
+
+# Prune cache entries unused for more than 7 days
+rune cas gc --max-age 7d
+
+# Cap cache storage to 10 GB (removes least-recently-used artifacts)
+rune cas gc --max-size 10GB
 ```
 
-Nothing is lost for good: anything removed is compiled again when needed.
+## Platform Notes (Windows)
 
-## Windows
+- **"Access is denied" on `rune.exe`**: Occurs if an existing `rune` process is currently running when you try to replace it. Wait for the active process to finish or build into an alternate `--target-dir`.
+- **Long Path Exceeded**: Very deeply nested directories can exceed the legacy Windows 260-character path limit. Enable `LongPathsEnabled` in the Windows Registry or clone repositories closer to your drive root.
+- **Antivirus Interference**: Real-time scanners can introduce noticeable latency during compilation. Adding folder exclusions for `~/.rune` and project `.rune` directories significantly improves build speeds.
 
-- **"Access is denied" replacing `rune.exe`** while building Rune itself: a
-  `rune` started from that binary is still running. Wait for it, or build into
-  another `--target-dir`.
-- **Long paths**: very deep project directories can exceed Windows' 260
-  character path limit inside `.rune/target`. Enable long paths
-  (`LongPathsEnabled` in the registry, or the group policy), or move the project
-  closer to the drive root.
-- **Antivirus**: real-time scanning of `.rune/` and `~/.rune/` slows builds a
-  lot. Excluding both directories (as is commonly done for `target/`) helps.
+## Resetting to a Clean State
 
-## Starting from a clean slate
-
-In order of how much they throw away:
+If you want to start fresh:
 
 ```bash
-rune build --rebuild-all     # compile everything again; the store keeps the results
-rune clean                   # delete this project's build output
-rm -rf ~/.rune/cas           # delete the whole store (every project compiles again)
+# Recompile everything without deleting existing cache entries
+rune build --rebuild-all
+
+# Remove workspace target outputs
+rune clean
+
+# Wipe the local content-addressable store completely
+rm -rf ~/.rune/cas
 ```
 
-None of these touch your sources, `Cargo.lock` or settings.
+## Verbose Telemetry and Debugging
 
-## Seeing what Rune does
+Inspect Rune's internal operations with verbosity and tracing flags:
 
 ```bash
-rune build -v                          # verbose output
-RUST_LOG=debug rune build              # Rune's internal log (cache hits, restores, rustc commands)
-RUNE_TIMINGS=1 rune build              # how long each phase of the command took
-rune graph --units --format json       # the build plan: every unit, its key, whether it is stored
+# Verbose command execution
+rune build -v
+
+# Detailed execution logs (cache hits, compiler invocations)
+RUST_LOG=debug rune build
+
+# Trace scheduler worker commands specifically
+RUST_LOG=rune_scheduler=debug rune build
+
+# Print stage duration breakdown
+RUNE_TIMINGS=1 rune build
 ```
 
-`RUST_LOG=rune_scheduler=debug` shows, among other things, every `rustc`
-command line (`Running …`) and why a stored unit was not reused.
+## Reporting a Bug
 
-## Reporting a bug
-
-Open an issue at <https://github.com/runepm/rune/issues> with:
-
-- `rune version -v` (Rune, its commit, and the toolchain it found);
-- your operating system;
-- the command and its full output, ideally with `RUST_LOG=debug`;
-- whether `cargo build` succeeds on the same project;
-- if you can, a small project that shows the problem.
-
-A crash prints what happened and where to report it; include that text.
+If you encounter unexpected behavior, please submit an issue at [https://github.com/runepm/rune/issues](https://github.com/runepm/rune/issues) including:
+- Output of `rune version -v`
+- Your operating system and architecture
+- The exact command invoked and terminal output (ideally with `RUST_LOG=debug`)
+- Whether the failure reproduces under standard `cargo build`
+- A minimal reproduction project if possible

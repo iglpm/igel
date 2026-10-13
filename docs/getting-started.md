@@ -1,30 +1,33 @@
-# Getting started
+# Getting Started with Rune
 
-This page takes you from a fresh install to everyday use: a first project, an
-existing Cargo project, and the handful of commands you will use every day.
-Rune is a drop-in for Cargo: the same manifests, the same commands, the same
-flags. Where it differs is *what happens underneath* — every compiled crate goes
-into a store shared by all your projects, so work done once is never done again.
+This guide walks you through setting up Rune, creating your first project, and adopting Rune in existing Cargo repositories without any friction.
 
-## Install
+Rune is designed as a drop-in replacement for Cargo. It uses the exact same manifests, understands the same flags, and runs the same commands. The difference lies entirely in execution: Rune persists every compilation unit into a cryptographic, content-addressable store shared across all your projects. Work compiled once is instantly available everywhere on your machine.
+
+## Installation
+
+Install the official pre-built binary for your platform:
 
 ```bash
-curl -fsSL https://runepm.com/install.sh | sh        # Linux and macOS
-irm https://runepm.com/install.ps1 | iex             # Windows (PowerShell)
+# Linux and macOS
+curl -fsSL https://runepm.com/install.sh | sh
+
+# Windows (PowerShell)
+irm https://runepm.com/install.ps1 | iex
 ```
 
-Rune needs a Rust toolchain (`rustup` or a `rustc` on `PATH`). Check that it
-found one, and what it thinks of your machine:
+Rune uses your existing Rust toolchain (managed via `rustup` or directly available on your `PATH`). Verify your setup and check system diagnostics:
 
 ```bash
 rune version -v
 rune doctor
 ```
 
-More options — a given version, another directory, building from source — are
-in [installation](installation.md).
+For advanced options like custom installation directories, specific release tags, or compiling from source, see the [Installation Guide](installation.md).
 
-## A first project
+## Creating a New Project
+
+Creating and launching a project with Rune feels completely familiar:
 
 ```bash
 rune new hello
@@ -38,91 +41,77 @@ rune run
 Hello, world!
 ```
 
-`rune new` creates the same project `cargo new` would (with a `.gitignore` that
-leaves out `target/` and `.rune/`). Run it again and nothing is compiled: the
-result comes from the store.
+`rune new` initializes a standard Rust workspace with a `.gitignore` configured to ignore both `target/` and `.rune/`. If you run `rune run` immediately again, nothing recompiles — Rune restores the output in milliseconds directly from the cache.
 
-Add a dependency and use it:
+Add a dependency and compile:
 
 ```bash
-rune add serde -F derive      # lists the release's features, + for those turned on
+rune add serde -F derive
 rune build
 rune test
 ```
 
-## An existing Cargo project
+## Adopting Rune in an Existing Project
 
-There is nothing to convert. In any directory with a `Cargo.toml`:
+Adopting Rune requires zero configuration files, zero migrations, and zero lock-in. Simply navigate to any directory containing a `Cargo.toml` and run:
 
 ```bash
 rune build
 ```
 
-Rune reads `Cargo.toml`, `Cargo.lock` and `.cargo/config.toml` as Cargo does,
-keeps the versions your `Cargo.lock` pins, and builds. Your project keeps
-working with `cargo` — you can switch back and forth.
+Rune parses `Cargo.toml`, respects `Cargo.lock`, honors `.cargo/config.toml`, and builds with the versions you have already pinned. You can switch between `cargo` and `rune` at any time without conflict.
 
-What Rune adds to a project:
+### Workspace Files Overview
 
-| File | What it is | Commit it? |
-| --- | --- | --- |
-| `Cargo.lock` | The lockfile, in Cargo's format; created if missing, rewritten only when the set of locked packages changes | Yes, as with Cargo |
-| `Rune.lock.bin` | A binary copy of the resolution, so the next command skips resolving; rebuilt whenever a manifest or `Cargo.lock` changes | Not needed |
-| `.rune/` | Build output (`.rune/target/`), timings and fingerprints — Rune's `target/` | No: add `.rune/` to `.gitignore` |
-| `Rune.toml` | Only if you create it: project [settings](configuration.md) (or a Rune-only [manifest](manifests.md)) | Yes |
+When you run Rune in a workspace, it manages the following files:
 
-Build output goes to `.rune/target/<profile>/`, laid out as Cargo lays out
-`target/`: `rune build` puts your program at `.rune/target/debug/<name>`, and
-`--release` at `.rune/target/release/<name>`. `--target-dir` (or
-`CARGO_TARGET_DIR`, or the `build.target-dir` setting) puts it elsewhere.
+| File | Purpose | Version Control |
+| :--- | :--- | :--- |
+| `Cargo.lock` | Standard Cargo lockfile. Created if absent and updated only when dependency requirements change. | Commit to Git (same as Cargo). |
+| `Rune.lock.bin` | Fast binary cache of dependency resolution for instant command startup. Rebuilt automatically if manifests change. | Ignore (not required in Git). |
+| `.rune/` | Build artifacts, compilation timings, and dependency fingerprints (Rune's target directory). | Add `.rune/` to `.gitignore`. |
+| `Rune.toml` | Optional configuration file for project-specific [settings](configuration.md) or standalone manifests. | Commit to Git if used. |
 
-## The everyday loop
+Build binaries are placed in `.rune/target/<profile>/` following standard layout conventions: debug binaries appear in `.rune/target/debug/<name>` and release builds in `.rune/target/release/<name>`. You can customize this anytime using `--target-dir` or the `build.target-dir` setting.
+
+## The Everyday Developer Workflow
+
+Rune gives you instant, responsive feedback throughout your development cycle:
 
 ```bash
-rune check                 # type-check: fastest feedback while editing
-rune build                 # compile (rune b)
-rune run -- --my-flag      # build and run; arguments after --
-rune test                  # unit, integration and doc tests
-rune test my_filter        # only tests whose name contains my_filter
-rune test --failed         # only what failed last time
-rune watch -x check        # re-run on every change
+rune check                 # Fast type-checking (reuses existing build outputs)
+rune build                 # Compile your active target (alias: rune b)
+rune run -- --arg value    # Compile and execute with command-line arguments
+rune test                  # Run unit, integration, and doc tests
+rune test my_filter        # Filter tests by matching string
+rune test --failed         # Re-run only previously failed tests
+rune watch -x check        # Automatically re-run checks on file modifications
 ```
 
-Each command ends with one line saying what happened:
+Every command finishes with a clear summary:
 
 ```text
 ✓ dev · 3 compiled · 194 cached · 2.71s
 ```
 
-*compiled* units ran the compiler; *cached* ones came from the store. The
-first build of a project compiles everything that no other project on your
-machine has compiled before; later builds compile only what you changed and
-what depends on it.
+Units labeled *compiled* ran through `rustc`, while units marked *cached* were restored instantly from the store. When you start working on a new project, Rune only compiles dependencies that have never been built before on your system.
 
-## Why it is fast
+## Why Rune Is So Fast
 
-Every compiled crate is stored under a key that describes everything that went
-into it: the compiler, flags, features, dependencies and — for your own crates
-— the files the compiler read. Same inputs, same key, same artifact, from any
-project. That is why
+Every compiled crate is indexed under a cryptographic key representing its complete input state: the compiler binary, compiler flags, target profile, active features, upstream dependencies, and the exact files read from disk.
 
-- **switching branches** or undoing an edit restores the earlier artifacts
-  instead of compiling them again;
-- **a second checkout or worktree** of the same project builds in a second;
-- **`rune check` after `rune build`** compiles nothing: a check reuses the
-  build's results;
-- **dependencies shared between your projects** (`serde`, `tokio`, `syn`) are
-  compiled once per machine, not once per project.
+Because identical inputs always produce the identical key:
+- **Instant branch switching**: Checking out an older commit or switching branches restores previously compiled binaries in milliseconds.
+- **Instant secondary worktrees**: Creating a new Git worktree or clone builds almost instantaneously by reusing existing artifacts.
+- **Free `check` after `build`**: Running `rune check` after a build compiles nothing — it verifies your code using the already compiled artifacts.
+- **Global dependency reuse**: Common crates across different projects (`serde`, `tokio`, `syn`, `regex`) are compiled once per machine rather than duplicated in every project's `target/` directory.
 
-[Caching](caching.md) explains what goes into a key and how the store is kept
-small; [CI and shared caches](ci.md) shows how to share it with CI and your
-team.
+To learn more about cache resolution, visit [Caching Mechanics](caching.md). To set up shared caching across your team or CI runners, check out [CI & Shared Caches](ci.md).
 
-## Where to go next
+## Next Steps
 
-- [Commands](commands.md) — every command, with Cargo's flags.
-- [Testing](testing.md) — retries, flaky tests, cached results, coverage.
-- [Settings](configuration.md) — `rune config` and every setting.
-- [Troubleshooting](troubleshooting.md) — when something does not work.
-- [Cargo compatibility](compatibility.md) — what is supported, and the known
-  limits.
+- [Command Reference](commands.md): Detailed reference for commands, flags, and options.
+- [Testing & Coverage](testing.md): Retries, flaky test isolation, nextest-style scheduling, and code coverage.
+- [Configuration Reference](configuration.md): Complete guide to workspace and global settings.
+- [Troubleshooting](troubleshooting.md): Diagnosing unexpected behaviors and compiler warnings.
+- [Cargo Compatibility](compatibility.md): Comprehensive compatibility matrix and supported ecosystem tools.

@@ -1,95 +1,128 @@
 # Installing Rune
 
-## The install script
+Rune distributes standalone binaries for Linux, macOS, and Windows. It integrates cleanly with your existing system and requires no special background daemons.
 
-Linux and macOS:
+## Quick Installation
+
+### Linux & macOS
+
+Run the official installer in your terminal:
 
 ```bash
 curl -fsSL https://runepm.com/install.sh | sh
 ```
 
-Windows (PowerShell):
+### Windows (PowerShell)
+
+Install via PowerShell:
 
 ```powershell
 irm https://runepm.com/install.ps1 | iex
 ```
 
-The script downloads the release for your machine (Linux, macOS or Windows;
-x86_64 or aarch64), checks it against its published SHA-256 and installs
-`rune` to `~/.rune/bin`. It tells you how to add that directory to your `PATH`
-(for your shell) if it is not there yet. On Apple silicon it installs the
-native build even from a terminal running under Rosetta. The Linux builds
-need glibc: on musl-based systems such as Alpine, build Rune from source.
+### What the Installer Does
 
-Options, passed after `sh -s --`:
+The installer automatically detects your operating system and architecture (`x86_64` or `aarch64`), verifies the download against its published SHA-256 signature, and places the `rune` binary into `~/.rune/bin`. If that directory is not currently in your system `PATH`, the script displays instructions for your active shell (`bash`, `zsh`, `fish`, `elvish`, or `powershell`).
+
+On Apple silicon, the installer selects native ARM64 binaries even when run from a Rosetta-emulated terminal. Pre-built Linux binaries link dynamically against glibc; for musl-based distributions such as Alpine, build Rune directly from source.
+
+### Customizing the Installation
+
+Pass installation flags using `sh -s --`:
 
 ```bash
-curl -fsSL https://runepm.com/install.sh | sh -s -- --version 2027.0       # a given release
-curl -fsSL https://runepm.com/install.sh | sh -s -- --to ~/.local/bin     # another directory
+# Install a specific release version
+curl -fsSL https://runepm.com/install.sh | sh -s -- --version 2027.0
+
+# Install to a custom directory
+curl -fsSL https://runepm.com/install.sh | sh -s -- --to ~/.local/bin
 ```
 
-`--version` takes `2027.0`, `2027.0.1` or the tag itself (`v2027.0.1`).
+You can configure the same settings via environment variables:
+- `RUNE_VERSION`: Desired version or release tag (`2027.0`, `v2027.0.1`).
+- `RUNE_INSTALL_DIR`: Custom destination directory for the executable.
+- `RUNE_DOWNLOAD_BASE`: Base URL for air-gapped corporate environments or local mirror servers.
 
-The same through the environment: `RUNE_VERSION`, `RUNE_INSTALL_DIR`, and
-`RUNE_DOWNLOAD_BASE` for a mirror that holds the release files (an internal
-artifact server, an air-gapped network).
+## Building from Source
 
-## From source
-
-Rune builds with stable Rust:
+You can build Rune from source using any stable Rust toolchain:
 
 ```bash
 cargo install --git https://github.com/runepm/rune rune-cli
 ```
 
-or, in a checkout, `cargo build --release` (the binary is
-`target/release/rune`).
-
-## After installing
+Or clone the repository and build a release binary locally:
 
 ```bash
-rune version -v                                   # version, commit, toolchain it found
-rune completions zsh > ~/.zfunc/_rune             # or bash, fish, elvish, powershell
-rune doctor                                       # what slows your builds down, with the fix
+git clone https://github.com/runepm/rune.git
+cd rune
+cargo build --release
+# The compiled executable is located at target/release/rune
 ```
 
-Rune needs a Rust toolchain (`rustup` or a `rustc` on `PATH`), and `git` for
-git dependencies. `rune coverage` adds the `llvm-tools` component on first use.
+## Post-Installation Verification
 
-## Where Rune keeps things
-
-| Path | What |
-| --- | --- |
-| `~/.rune/bin` | the `rune` binary (install script default) |
-| `~/.rune/cas` | the content-addressable store of compiled artifacts, shared by all projects |
-| `~/.rune/registry`, `~/.rune/cache`, `~/.rune/git` | registry indexes, downloaded crates, git checkouts, compiler probes |
-| `~/.rune/advisory-db` | the advisory database `rune audit` checks against |
-| `~/.rune/config.toml` | global settings (`rune config set --global …`) |
-| `<project>/.rune/` | the project's build output (`target/`), timings and fingerprints |
-
-`rune install` puts programs where `cargo install` does (`~/.cargo/bin`, or
-`CARGO_INSTALL_ROOT`), and records them in Cargo's own `.crates.toml`.
-
-`RUNE_HOME` moves everything under `~/.rune` elsewhere. The store cleans
-itself up (see [caching](caching.md#keeping-the-store-small)).
-
-## Updating
+Confirm your installation and inspect your development environment:
 
 ```bash
-rune self update            # to the latest release
-rune self update --check    # only say whether there is a newer one
+# Verify the installed binary and detected toolchain
+rune version -v
+
+# Generate shell completions (bash, zsh, fish, elvish, powershell)
+rune completions zsh > ~/.zfunc/_rune
+
+# Run system and toolchain diagnostics
+rune doctor
+```
+
+Rune uses your system Rust toolchain (`rustup` or `rustc` on `PATH`) and standard `git` for resolving Git dependencies. When you run `rune coverage`, the `llvm-tools` component is installed automatically on first use.
+
+## Filesystem Layout
+
+Rune organizes its files systematically:
+
+| Location | Contents |
+| :--- | :--- |
+| `~/.rune/bin` | The `rune` binary (default installation directory) |
+| `~/.rune/cas` | Global content-addressable store containing compiled crate artifacts shared across all workspaces |
+| `~/.rune/registry`, `~/.rune/cache`, `~/.rune/git` | Sparse registry indexes, downloaded package tarballs, Git checkouts, and compiler capabilities probes |
+| `~/.rune/advisory-db` | Local cache of the RustSec security advisory database used by `rune audit` |
+| `~/.rune/config.toml` | Global user configuration set via `rune config set --global` |
+| `<project>/.rune/` | Workspace-specific build outputs (`target/`), compilation fingerprints, and timing profiles |
+
+When installing CLI binaries via `rune install`, binaries are placed in Cargo's standard binary directory (`~/.cargo/bin` or `CARGO_INSTALL_ROOT`) and tracked in Cargo's `.crates.toml`.
+
+To relocate all Rune data, set the `RUNE_HOME` environment variable. The cache automatically manages its footprint (see [Caching Deep Dive](caching.md#managing-store-size)).
+
+## Managing Updates
+
+Keep Rune current using the built-in update command:
+
+```bash
+# Update to the latest stable release
+rune self update
+
+# Check if a newer version is available without installing
+rune self update --check
+
+# Switch to a specific release tag
 rune self update --version v2027.1.0
 ```
 
 ## Uninstalling
 
+Remove Rune whenever you choose:
+
 ```bash
-rune self uninstall              # the binary
-rune self uninstall --purge      # and ~/.rune: the store, caches and settings
-curl -fsSL https://runepm.com/uninstall.sh | sh            # without Rune itself
-irm https://runepm.com/uninstall.ps1 | iex                  # Windows
+# Remove only the binary
+rune self uninstall
+
+# Remove the binary and purge all cached artifacts (~/.rune)
+rune self uninstall --purge
+
+# Uninstall via script if the binary was already removed
+curl -fsSL https://runepm.com/uninstall.sh | sh
+irm https://runepm.com/uninstall.ps1 | iex
 ```
 
-Projects keep working with Cargo: Rune writes a Cargo-format `Cargo.lock` and
-changes nothing else in your manifests (delete a project's `.rune/` directory
-to drop its build output).
+Because Rune maintains standard `Cargo.lock` and `Cargo.toml` files, your projects remain fully operational with standard `cargo` before, during, and after using Rune. To clear local project artifacts, simply delete the `.rune/` directory inside your workspace.

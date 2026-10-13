@@ -1,94 +1,85 @@
-# rune-bench
+# `rune-bench`: Build System Benchmarking Suite
 
-Measures Rune against Cargo on the situations that decide how a build tool
-feels day to day: starting up, building from scratch, finding out nothing
-changed, rebuilding after an edit, reusing earlier work, running tests, and
-answering questions about the project.
+`rune-bench` is an automated, rigorous benchmarking framework designed to compare Rune and Cargo across everyday developer workflows: cold builds, no-op checks, incremental code edits, branch switching, test execution, and project graph queries.
+
+## Quickstart
+
+Build the benchmark runner and launch a benchmark suite:
 
 ```bash
+# Build release binaries
 cargo build --release -p rune-cli -p rune-bench
-./target/release/rune-bench run                 # quick suite: tiny + medium (~10 min)
-./target/release/rune-bench run --suite full    # + large, release builds, more runs
-./target/release/rune-bench run --project ~/src/my-app --edit-core crates/core/src/lib.rs
-./target/release/rune-bench list                # workloads and scenarios
+
+# Run quick benchmark suite (~10 minutes: tiny and medium workloads)
+./target/release/rune-bench run
+
+# Run full comprehensive suite (includes large workloads and release profiles)
+./target/release/rune-bench run --suite full
+
+# Benchmark your own codebase
+./target/release/rune-bench run --project ~/src/my-service --edit-core crates/core/src/lib.rs
+
+# List all available workloads and scenarios
+./target/release/rune-bench list
 ```
 
-Results go to `./rune-bench-results/<date-time>/`: `results.json` (every run),
-`report.md` and `report.html` (tables, per-scenario charts, CPU time, peak
-memory). They are rewritten after each workload, so an interrupted run keeps
-what it measured. Each tool builds its own copy of every workload, so a run
-needs free disk space where the results go — about 3 GiB for the quick
-suite, 12 GiB for `large`, 8 GiB for a mid-sized `--project` — and stops up
-front, saying so, when there is not enough. The copies are removed at the
-end (`--keep-work` keeps them).
+## Generated Reports
 
-## What is measured
+Benchmark results are saved automatically to `./rune-bench-results/<timestamp>/`:
+- `results.json`: Full machine-readable dataset containing raw metrics for every run.
+- `report.md`: GitHub-flavored Markdown summary tables and speedup factors.
+- `report.html`: Interactive HTML report with charts, peak memory plots, and CPU consumption graphs.
 
-| Category | Scenarios | The situation |
-| --- | --- | --- |
-| Startup | `startup` | `--version`: the floor under every command, editor request and script |
-| Cold build | `cold-build`, `cold-check`, `cold-release` | No build output and no cache: a new machine, a CI runner without a cache |
-| Disk | `disk` | Bytes after a cold build (Rune: project output plus its store, hard links counted once) |
-| Nothing changed | `noop-build`, `noop-check`, `noop-test` | The cost of finding out there is nothing to do |
-| After an edit | `edit-leaf`, `edit-core`, `edit-leaf-check`, `edit-leaf-test`, `edit-test`, `edit-unread` | The edit-compile(-test) loop, at the top and the bottom of the dependency graph; an integration test of a package with a build script; and a file no crate reads (notes, a log) changing in the bottom crate |
-| Caching | `fresh-checkout`, `branch-switch` | Same code built before on this machine: a second worktree, `git clean`, switching branches back and forth |
-| Tests | `test-run` | Running every test binary when they are built |
-| Inspection | `metadata`, `tree`, `lockfile` | What IDEs and tools ask; resolving from scratch |
+Reports are saved progressively after each workload finishes, preserving completed data even if a benchmark is interrupted.
 
-Each scenario is the same command for both tools, from the same starting
-state. "Cold" removes Rune's store too; downloaded crates and registry
-indexes stay for both tools (neither is benchmarked on network speed).
+## What Scenarios Are Measured
 
-## Workloads
+Every scenario executes identical commands for both tools from identical initial states:
 
-Generated, deterministic workspaces (no network needed):
+| Category | Scenarios | Workflow Evaluated |
+| :--- | :--- | :--- |
+| **Startup** | `startup` | CLI initialization overhead via `--version`. |
+| **Cold Build** | `cold-build`, `cold-check`, `cold-release` | Compiling with an empty target directory and empty cache (fresh machines, uncached CI). |
+| **Disk Footprint** | `disk` | Total disk bytes consumed after a clean build (including CAS artifacts). |
+| **No-Op Latency** | `noop-build`, `noop-check`, `noop-test` | The overhead of determining that all targets are up to date. |
+| **Incremental Edits** | `edit-leaf`, `edit-core`, `edit-leaf-check`, `edit-test`, `edit-unread` | The inner edit-compile-test loop at the leaf, core, and build-script levels of the dependency DAG. |
+| **Cache Invalidation** | `fresh-checkout`, `branch-switch` | Checking out previous commits or switching branches back and forth. |
+| **Test Runner** | `test-run` | Executing compiled test suites. |
+| **Project Queries** | `metadata`, `tree`, `lockfile` | Language server queries and dependency tree generation. |
 
-| Name | Shape |
-| --- | --- |
-| `tiny` | a library and an app: where tool overhead dominates |
-| `medium` | 25 crates in 4 layers: the size of a typical service |
-| `large` | 73 crates in 6 layers (full suite) |
+## Standard Workloads
 
-Every crate of a layer depends on two of the layer below, layer 1 on the
-`core` crate, and the `app` (library, binary, integration test) on the top
-layer: editing `core` rebuilds everything, editing `app` only `app`.
+`rune-bench` generates deterministic, standalone synthetic workspaces requiring zero network access:
 
-`--project DIR` benchmarks a real project. It is copied first (without
-`target/`, `.rune/` or VCS data), so the original is never touched. Edit
-scenarios change `--edit-leaf FILE` (default `src/main.rs` or `src/lib.rs`)
-and `--edit-core FILE` by appending a comment; without `--edit-core`, the
-core-edit and branch-switch scenarios are skipped.
+- `tiny`: 2 crates (a library and binary application) measuring pure tool overhead.
+- `medium`: 25 crates in 4 hierarchical layers, typical of mid-sized microservices.
+- `large`: 73 crates across 6 layers, representative of enterprise multi-crate workspaces.
 
-## Method
+You can benchmark any real-world repository using `--project DIR`. The runner creates a temporary working copy (leaving out `.git` and `target/`), ensuring your original repository is never modified.
 
-- Each tool works in its own copy of a workload, with its own build output
-  and (Rune) its own `RUNE_HOME`, so neither benefits from the other.
-- Runs alternate between the tools (rune, cargo, cargo, rune, …) so a
-  machine warming up or getting busier does not favour whichever went first.
-- Cheap scenarios get warm-up runs that are not recorded; expensive ones
-  (builds from scratch) start from their prepared state every run.
-- Wall time, CPU time (user + system of the whole process tree, from
-  `wait4`) and the peak memory of the largest process are recorded for every
-  run. Reports show medians with the coefficient of variation; the overall
-  figure is the geometric mean of Rune's speedups.
-- The caller's environment cannot tilt the result: `CARGO_TARGET_DIR`,
-  `RUSTFLAGS`, `RUSTC_WRAPPER` (sccache) and `RUNE_*` are removed for both
-  tools.
+## Methodology & Statistical Rigor
 
-## Catching regressions
+Benchmarking compilers reliably requires eliminating external system noise:
+
+- **Interleaved Execution**: Runs alternate strictly between tools (`rune`, `cargo`, `cargo`, `rune`...) to prevent thermal throttling or background system load from skewing comparisons.
+- **Process Isolation**: Each tool operates within its own directory copy and isolated cache environments.
+- **Warm-Up Cycles**: Inexpensive scenarios run unrecorded warm-up iterations to prime OS disk caches.
+- **Precise Telemetry**: Measures wall-clock time, user+system CPU time across child processes via `wait4`, and peak resident memory (RSS).
+- **Environment Sanitization**: Strips caller environment overrides (`CARGO_TARGET_DIR`, `RUSTFLAGS`, `RUSTC_WRAPPER`, `RUNE_*`) to guarantee parity.
+
+## Detecting Performance Regressions in CI
+
+Use `compare` to enforce performance budgets:
 
 ```bash
-rune-bench run --out before ...   # on the old version
-rune-bench run --out after  ...   # on the new one
-rune-bench compare before/results.json after/results.json --threshold 10
+# Benchmark baseline commit
+rune-bench run --out /tmp/bench-base
+
+# Benchmark candidate commit
+rune-bench run --out /tmp/bench-candidate
+
+# Compare with automated statistical significance threshold
+rune-bench compare /tmp/bench-base/results.json /tmp/bench-candidate/results.json --threshold 10
 ```
 
-`compare` lists every measurement of Rune that changed and exits 1 when one
-got slower by more than the threshold, by more than the runs' own noise
-(twice their coefficient of variation) *and* in every run (no new run as
-fast as the slowest old one): usable as a CI gate. Cargo, measured in the
-same runs, is the control: the "vs cargo" column is Rune's change once
-Cargo's own change is taken out, and that is what is judged, so a machine
-that is busier the second time does not read as a regression. `--tool
-cargo` compares Cargo's numbers instead. `rune-bench report results.json --format html|markdown|terminal`
-renders a results file again.
+`rune-bench compare` checks for statistically significant regressions against Cargo as an internal control. If candidate performance degrades beyond the noise margin across all runs, the command exits with code 1, making it a reliable automated CI gate.
