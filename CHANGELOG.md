@@ -29,6 +29,20 @@ The first stable release. Changes since the 0.1.0 preview:
   target's C compiler (`target.<triple>.linker`, else `cc`), which finds the C
   runtime. `rune __hyprlnk <args>` runs it by hand; it also builds as a
   standalone `hyprlnk` executable.
+- rustc-runified (in `rustc-runified/`): the toolchain's own compiler plus
+  what a stable `rustc` lacks, which Rune uses whenever it is installed for
+  the toolchain in use (`build.compiler = "auto"`; `"runified"` requires it,
+  `"rustc"` never uses it; `cargo runified driver --rune` installs it).
+  Executables, tests, benches and examples compile against their
+  dependencies' metadata as soon as it exists, like libraries, and link once
+  every rlib does — the link shows as its own step in `--timings`; and stable
+  toolchains get the parallel front end (`build.frontend-threads`), with the
+  same output whatever the thread count. Rune's own build from scratch:
+  55.4 s → 47.1 s. With a runified toolchain (rustc-runified's patches),
+  libraries also write their `.rmeta` before monomorphization, so dependents
+  start sooner (a chain of libraries builds 3.7% faster), and derive macros
+  known to be pure are cached in the workspace's incremental builds.
+  `rune doctor` reports it.
 - `rune-bench` (in `bench/`): benchmarks Rune against Cargo on generated
   workspaces or a copy of any project — startup, cold builds, no-op builds,
   rebuilds after edits, cache reuse, tests, inspection commands, disk and

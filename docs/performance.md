@@ -30,3 +30,13 @@ highlighted and how many ran at once — plus a Chrome trace in
 largest crate of that chain is usually what helps. On a nightly compiler,
 `build.frontend-threads = "auto"` gives crates that start while cores are idle
 a parallel front end.
+
+With [rustc-runified](../rustc-runified/README.md) installed for the toolchain
+in use (`build.compiler = "auto"`), executables, tests, benches and examples
+stop being the end of every chain: like a library, each compiles as soon as
+its direct dependencies' metadata exists, then waits — without a job slot —
+until every rlib it links is built, and links. The link is its own step in the
+timeline. On Rune's own build from scratch the executable's 8 s of
+compilation now overlap the code generation of hyprlnk, and the build takes
+47 s instead of 55 s. rustc-runified also accepts `build.frontend-threads` on
+stable toolchains, with the same output whatever the thread count.
