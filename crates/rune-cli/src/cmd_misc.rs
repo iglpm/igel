@@ -929,6 +929,17 @@ pub fn doctor() -> Result<()> {
         rustflags,
         configured_linker,
         rune_linker: config.settings.linker(),
+        runified: rune_common::toolchain::global()
+            .clone()
+            .with_compiler(
+                config
+                    .settings
+                    .compiler()
+                    .unwrap_or(rune_common::runified::Choice::Auto),
+            )
+            .ok()
+            .and_then(|t| t.runified)
+            .map(|d| d.version),
         dev_debug_full_explicit,
         full_dependency_debuginfo: config.settings.dependency_debuginfo(),
         home: home.display().to_string(),

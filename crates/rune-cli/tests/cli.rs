@@ -6711,3 +6711,56 @@ fn a_mistyped_command_suggests_the_real_one() {
     assert!(err.starts_with("✗ unexpected argument '--relase'"), "{err}");
     assert!(err.contains("'--release'"), "{err}");
 }
+
+#[test]
+fn with_rustc_runified_executables_compile_early_and_link_on_their_own() {
+    // Needs rustc-runified built for the toolchain the tests run with (`cargo runified driver` in
+    // `rustc-runified/`): RUNE_TEST_RUNIFIED names it.
+    let Some(driver) = std::env::var_os("RUNE_TEST_RUNIFIED") else {
+        eprintln!("skipped: RUNE_TEST_RUNIFIED names no rustc-runified");
+        return;
+    };
+    let p = Project::new();
+    p.write(
+        "Cargo.toml",
+        "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    p.write(
+        "src/lib.rs",
+        "pub fn answer() -> u32 { 42 }\n\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn unit() { assert_eq!(super::answer(), 42); }\n}\n",
+    );
+    p.write(
+        "src/main.rs",
+        "fn main() { println!(\"answer={}\", demo::answer()); }\n",
+    );
+    p.write(
+        "tests/it.rs",
+        "#[test]\nfn the_binary_runs() {\n    let out = std::process::Command::new(env!(\"CARGO_BIN_EXE_demo\")).output().unwrap();\n    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), \"answer=42\");\n}\n",
+    );
+    let rune = |args: &[&str]| {
+        let out = rune_command()
+            .args(args)
+            .current_dir(p.path())
+            .env("RUNE_HOME", p.home())
+            .env("NO_COLOR", "1")
+            .env("RUSTC", &driver)
+            .env("RUNE_TIMINGS", "1")
+            .output()
+            .unwrap();
+        let text = text(&out);
+        assert!(out.status.success(), "`rune {}` failed:\n{text}", args.join(" "));
+        text
+    };
+    let doctor = rune(&["doctor"]);
+    assert!(doctor.contains("compiling with rustc-runified"), "{doctor}");
+    let tests = rune(&["test"]);
+    assert!(tests.contains("test it"), "{tests}");
+    let timeline =
+        std::fs::read_to_string(p.path().join(".rune/timings/rune-timing.html")).unwrap();
+    assert!(
+        timeline.contains("(link)"),
+        "the binary and the tests link as steps of their own"
+    );
+    let run = rune(&["run"]);
+    assert!(run.contains("answer=42"), "{run}");
+}

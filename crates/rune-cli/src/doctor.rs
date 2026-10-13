@@ -54,6 +54,8 @@ pub struct Environment {
     pub configured_linker: Option<String>,
     /// Rune's `build.linker` setting, set or default.
     pub rune_linker: String,
+    /// rustc-runified's version, when it compiles in place of `rustc` (`build.compiler`).
+    pub runified: Option<String>,
     pub dev_debug_full_explicit: bool,
     pub full_dependency_debuginfo: bool,
     pub home: String,
@@ -129,6 +131,12 @@ pub fn diagnose(env: &Environment) -> Vec<Finding> {
             .rustflags
             .iter()
             .any(|f| f.contains("fuse-ld") || f.starts_with("linker=") || f.contains("-Clinker"));
+    if let Some(driver) = &env.runified {
+        out.push(Finding::ok(format!(
+            "compiling with {driver}: a parallel front end, and executables that compile before \
+             their dependencies are done"
+        )));
+    }
     let hyprlnk_host = env.host.as_deref().is_some_and(hyprlnk::supports_target);
     if hyprlnk_host && env.rune_linker == "hyprlnk" {
         out.push(Finding::ok(
@@ -264,6 +272,7 @@ mod tests {
             rustflags: vec![],
             configured_linker: None,
             rune_linker: "hyprlnk".into(),
+            runified: None,
             dev_debug_full_explicit: false,
             full_dependency_debuginfo: false,
             home: "/home/me/.rune".into(),
@@ -277,6 +286,23 @@ mod tests {
             disk_free: vec![("the store".into(), 50 << 30)],
             memory_total: Some(32 << 30),
         }
+    }
+
+    #[test]
+    fn the_compiler_driver_is_reported_when_it_compiles() {
+        assert!(
+            !diagnose(&env())
+                .iter()
+                .any(|f| f.title.contains("rustc-runified"))
+        );
+        let mut e = env();
+        e.runified = Some("rustc-runified 2027.0.0".into());
+        let f = diagnose(&e);
+        let found = f
+            .iter()
+            .find(|f| f.title.contains("rustc-runified 2027.0.0"))
+            .unwrap();
+        assert_eq!(found.level, Level::Ok);
     }
 
     #[test]
