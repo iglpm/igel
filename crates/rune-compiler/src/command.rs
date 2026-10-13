@@ -224,6 +224,27 @@ impl RustcCommandBuilder {
         self
     }
 
+    /// The same command, linking `rlink` (written by a compilation that stopped before linking)
+    /// instead of compiling: the rlink as the input, no incremental state.
+    pub fn for_link_only(mut self, rlink: &Path) -> Self {
+        self.source_root = rlink.to_path_buf();
+        let mut flags = Vec::with_capacity(self.flags.len());
+        let mut it = std::mem::take(&mut self.flags).into_iter().peekable();
+        while let Some(flag) = it.next() {
+            if flag == "-C"
+                && it
+                    .peek()
+                    .is_some_and(|v| v.to_string_lossy().starts_with("incremental="))
+            {
+                it.next();
+                continue;
+            }
+            flags.push(flag);
+        }
+        self.flags = flags;
+        self
+    }
+
     pub fn current_dir(mut self, dir: impl Into<PathBuf>) -> Self {
         self.current_dir = Some(dir.into());
         self
@@ -270,5 +291,30 @@ mod tests {
         let cmd = builder.build();
         let prog = cmd.get_program();
         assert_eq!(prog, "rustc");
+    }
+
+    #[test]
+    fn link_only_links_the_rlink_without_incremental_state() {
+        let builder = RustcCommandBuilder::new(PathBuf::from("src/main.rs"))
+            .crate_name("app")
+            .incremental(Path::new("/t/incremental/app-1"))
+            .codegen_flag("linker=cc");
+        let cmd = builder
+            .for_link_only(Path::new("/t/deps/app-1.rlink"))
+            .build();
+        let args: Vec<_> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            args,
+            [
+                "/t/deps/app-1.rlink",
+                "--crate-name",
+                "app",
+                "-C",
+                "linker=cc"
+            ]
+        );
     }
 }
