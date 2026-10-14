@@ -1,3 +1,7 @@
 [submodule "hyprlnk"]
 	path = hyprlnk
 	url = git@github.com:runepm/hyprlnk.git
+[submodule "hyprcross"]
+	path = hyprcross
+	url = git@github.com:runepm/hyprcross.git
+	branch = main

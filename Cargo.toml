@@ -13,6 +13,7 @@ members = [
     "crates/rune-cli",
     "bench",
     "hyprlnk",
+    "hyprcross",
 ]
 # Its own workspace, built with the compiler it patches; rust-lang/rust inside it has crates
 # that belong to no workspace, and Cargo must not take them for members of this one.
