@@ -573,6 +573,7 @@ mod tests {
                         package: None,
                         target: None,
                         registry: None,
+                        path: None,
                     })
                     .collect(),
                 features: vec![],
@@ -716,6 +717,7 @@ mod tests {
             package: None,
             target: None,
             registry: None,
+            path: None,
         }
     }
 

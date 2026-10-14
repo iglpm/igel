@@ -102,6 +102,7 @@ pub struct ResolvedDependencyRef {
     pub package: Option<String>,
     pub target: Option<String>,
     pub registry: Option<String>,
+    pub path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1132,6 +1133,7 @@ fn resolve_one_queue_item(
                         package: spec.package.clone(),
                         target: dep_spec.target.clone(),
                         registry: spec.registry.as_ref().map(|_| child_registry.clone()),
+                        path: child_local_dir.clone(),
                     });
 
                     if !spec.optional && dep_spec.kind != DependencyKind::Dev {
@@ -1408,6 +1410,7 @@ fn resolve_one_queue_item(
             package: dep.package.clone(),
             target: dep.target.clone(),
             registry: dep.registry.as_deref().map(normalize_registry),
+            path: None,
         };
         let dep_registry = dep_ref.registry.clone().unwrap_or_else(|| registry.clone());
         dep_refs.push(dep_ref);
@@ -1520,7 +1523,7 @@ fn activate_newly_enabled_optional_deps(
                     dep_req,
                     dep_ref.features.clone(),
                     dep_ref.default_features,
-                    None,
+                    dep_ref.path.clone(),
                     registry,
                 ));
                 queued_anything = true;

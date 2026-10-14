@@ -868,6 +868,7 @@ fn cached_resolution(ws: &Workspace) -> Option<(ResolvedGraph, Lockfile)> {
                     package: d.renamed.then(|| uni.name[t].clone()),
                     target: d.target.clone(),
                     registry: None,
+                    path: None,
                 })
             })
             .collect();
