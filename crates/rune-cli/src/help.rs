@@ -7,7 +7,10 @@ use clap::{CommandFactory, Parser};
 use colored::Colorize;
 
 const EVERYDAY: &[(&str, &[&str])] = &[
-    ("Build", &["build", "check", "run", "test", "watch"]),
+    (
+        "Build",
+        &["build", "check", "run", "test", "cross", "watch"],
+    ),
     (
         "Dependencies",
         &["add", "remove", "update", "outdated", "tree", "audit"],
@@ -24,7 +27,7 @@ const ALL: &[(&str, &[&str])] = &[
     (
         "Build and run",
         &[
-            "build", "check", "run", "test", "bench", "watch", "clean", "explain",
+            "build", "check", "run", "test", "bench", "cross", "watch", "clean", "explain",
         ],
     ),
     ("Code", &["fmt", "clippy", "fix", "doc", "coverage"]),
@@ -78,6 +81,7 @@ fn short(name: &str) -> Option<&'static str> {
         "run" => "Build and run a binary or example",
         "test" => "Build and run the tests",
         "bench" => "Build and run the benchmarks",
+        "cross" => "Build, test and run for other targets",
         "watch" => "Re-run a command whenever files change",
         "clean" => "Remove build output",
         "explain" => "Show what a build would compile, and why",

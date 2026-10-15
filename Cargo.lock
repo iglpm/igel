@@ -693,6 +693,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "hyprcross"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "colored",
+ "console",
+ "dunce",
+ "indicatif",
+ "libc",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+ "walkdir",
+]
+
+[[package]]
 name = "hyprlnk"
 version = "2027.0.0"
 dependencies = [
@@ -1305,6 +1326,7 @@ dependencies = [
  "flate2",
  "glob",
  "home",
+ "hyprcross",
  "hyprlnk",
  "indicatif",
  "libc",

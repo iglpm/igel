@@ -353,6 +353,7 @@ pub fn coverage(args: CoverageArgs) -> Result<()> {
     let test_args = TestArgs {
         common,
         targets: args.targets.clone(),
+        cross: Default::default(),
         filter: args.filter.clone(),
         doc: false,
         no_doc: true,

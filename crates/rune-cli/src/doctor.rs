@@ -56,6 +56,9 @@ pub struct Environment {
     pub rune_linker: String,
     /// rustc-runified's version, when it compiles in place of `rustc` (`build.compiler`).
     pub runified: Option<String>,
+    /// The Rust releases rustc-runified is installed for in Rune's home (`cargo runified driver
+    /// --rune`), whether or not one of them is in use.
+    pub runified_installed_for: Vec<String>,
     pub dev_debug_full_explicit: bool,
     pub full_dependency_debuginfo: bool,
     pub home: String,
@@ -136,6 +139,18 @@ pub fn diagnose(env: &Environment) -> Vec<Finding> {
             "compiling with {driver}: a parallel front end, and executables that compile before \
              their dependencies are done"
         )));
+    } else if !env.runified_installed_for.is_empty() {
+        // Installed, but for another toolchain: a toolchain update leaves builds on plain rustc.
+        let release = env.rustc_release.as_deref().unwrap_or("the rustc in use");
+        out.push(Finding::warn(
+            format!(
+                "rustc-runified is installed for {}, not for {release}",
+                env.runified_installed_for.join(", ")
+            ),
+            "A driver works with the toolchain it was built for, so builds use plain rustc: \
+             no parallel front end, and executables wait for all their dependencies.",
+            format!("in rustc-runified/: RUSTUP_TOOLCHAIN={release} cargo runified driver --rune"),
+        ));
     }
     let hyprlnk_host = env.host.as_deref().is_some_and(hyprlnk::supports_target);
     if hyprlnk_host && env.rune_linker == "hyprlnk" {
@@ -273,6 +288,7 @@ mod tests {
             configured_linker: None,
             rune_linker: "hyprlnk".into(),
             runified: None,
+            runified_installed_for: vec![],
             dev_debug_full_explicit: false,
             full_dependency_debuginfo: false,
             home: "/home/me/.rune".into(),
@@ -303,6 +319,23 @@ mod tests {
             .find(|f| f.title.contains("rustc-runified 2027.0.0"))
             .unwrap();
         assert_eq!(found.level, Level::Ok);
+
+        // Installed for another release only: say so, with the command that fixes it.
+        let mut e = env();
+        e.runified_installed_for = vec!["1.99.0".into()];
+        let f = diagnose(&e);
+        let found = f
+            .iter()
+            .find(|f| f.title.contains("installed for 1.99.0, not for 1.98.1"))
+            .unwrap();
+        assert_eq!(found.level, Level::Warn);
+        assert!(
+            found
+                .fix
+                .as_deref()
+                .unwrap()
+                .contains("RUSTUP_TOOLCHAIN=1.98.1")
+        );
     }
 
     #[test]

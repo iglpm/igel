@@ -303,16 +303,21 @@ fn spawn_daily_gc(root: &std::path::Path, max_age_secs: Option<u64>, compress: O
 
 impl Session {
     pub fn command_for(&self, exe: &std::path::Path) -> std::process::Command {
-        if let Some(target) = &self.target {
-            let tc = rune_common::toolchain::global();
-            let info = rune_common::toolchain::TargetInfo::query(tc, Some(target), &[]);
-            if let Some(runner) = rune_common::toolchain::runner(&self.ws.cargo_config, &info) {
-                let mut cmd = std::process::Command::new(&runner[0]);
-                cmd.args(&runner[1..]).arg(exe);
-                return cmd;
-            }
+        if let Some(runner) = self.runner() {
+            let mut cmd = std::process::Command::new(&runner[0]);
+            cmd.args(&runner[1..]).arg(exe);
+            return cmd;
         }
         std::process::Command::new(exe)
+    }
+
+    /// What runs the programs of `--target` (`target.<triple>.runner`, or
+    /// `CARGO_TARGET_<TRIPLE>_RUNNER`), when one is configured.
+    pub fn runner(&self) -> Option<Vec<String>> {
+        let target = self.target.as_ref()?;
+        let tc = rune_common::toolchain::global();
+        let info = rune_common::toolchain::TargetInfo::query(tc, Some(target), &[]);
+        rune_common::toolchain::runner(&self.ws.cargo_config, &info)
     }
 
     pub fn rustdoc_flags(&self) -> Vec<String> {

@@ -940,6 +940,25 @@ pub fn doctor() -> Result<()> {
             .ok()
             .and_then(|t| t.runified)
             .map(|d| d.version),
+        // `<release>-<hash>-<host>/rustc-runified`, one per toolchain build.
+        runified_installed_for: std::fs::read_dir(
+            rune_common::settings::rune_home().join("runified"),
+        )
+        .map(|dir| {
+            let mut releases: Vec<String> = dir
+                .flatten()
+                .filter(|e| {
+                    e.path()
+                        .join(format!("rustc-runified{}", std::env::consts::EXE_SUFFIX))
+                        .is_file()
+                })
+                .filter_map(|e| Some(e.file_name().to_str()?.split('-').next()?.to_string()))
+                .collect();
+            releases.sort();
+            releases.dedup();
+            releases
+        })
+        .unwrap_or_default(),
         dev_debug_full_explicit,
         full_dependency_debuginfo: config.settings.dependency_debuginfo(),
         home: home.display().to_string(),

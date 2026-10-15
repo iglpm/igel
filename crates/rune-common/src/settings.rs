@@ -328,6 +328,63 @@ pub const KEYS: &[KeyDef] = &[
         default: "true",
         description: "Run documentation tests as part of `rune test`.",
     },
+    KeyDef {
+        name: "cross.default-target",
+        kind: ValueKind::Text,
+        default: "none",
+        description: "The target `rune cross` builds for when none is given, and `--cross` \
+                      without a value. A triple such as `aarch64-unknown-linux-gnu`. Plain \
+                      `rune build` is unaffected.",
+    },
+    KeyDef {
+        name: "cross.engine",
+        kind: ValueKind::Text,
+        default: "auto",
+        description: "Where cross builds run. `auto`: on this machine when it can build the \
+                      target (its own target, targets that need no C toolchain, targets whose C \
+                      cross compiler is installed), else in a container from the target's \
+                      image. `direct`: always here. `container`: always in a container.",
+    },
+    KeyDef {
+        name: "cross.daemon",
+        kind: ValueKind::Bool,
+        default: "true",
+        description: "Keep one warm container per project and target, which builds start in \
+                      at once (its agent takes them over a socket, without asking Docker or \
+                      Podman). `false`: a fresh container for every build.",
+    },
+    KeyDef {
+        name: "cross.idle-timeout",
+        kind: ValueKind::Duration,
+        default: "15m",
+        description: "How long a warm container waits for the next build before it stops \
+                      (`15m`, `2h`; `0`: until stopped with `rune cross daemon stop`).",
+    },
+    KeyDef {
+        name: "cross.container-engine",
+        kind: ValueKind::Text,
+        default: "auto",
+        description: "What runs the containers: `auto` (the first of Podman, Docker, Finch and \
+                      nerdctl that is installed), or one of `podman`, `docker`, `finch`, \
+                      `nerdctl`.",
+    },
+    KeyDef {
+        name: "cross.image-repository",
+        kind: ValueKind::Text,
+        default: "ghcr.io/runepm/hyprcross",
+        description: "Where the per-target images come from: `<repository>/<target>:<tag>`. \
+                      Targets without an image there use cross-rs' images. Per target, \
+                      `[cross.target.<triple>]` can name an image (`image`) or a Dockerfile \
+                      (`dockerfile`) of your own.",
+    },
+    KeyDef {
+        name: "cross.image-tag",
+        kind: ValueKind::Text,
+        default: "latest",
+        description: "The tag of the per-target images: `latest` (rebuilt weekly with the \
+                      base system's updates), a date (`20261015`) or a hyprcross release \
+                      (`0.2`).",
+    },
 ];
 
 pub fn key_def(name: &str) -> Option<&'static KeyDef> {
@@ -379,6 +436,18 @@ impl fmt::Display for Origin {
 pub enum Scope {
     Global,
     Project,
+}
+
+/// `cross.*`, as far as set: see [`Settings::cross`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CrossSettings {
+    pub default_target: Option<String>,
+    pub engine: Option<String>,
+    pub daemon: Option<bool>,
+    pub idle_timeout_mins: Option<u32>,
+    pub container_engine: Option<String>,
+    pub image_repository: Option<String>,
+    pub image_tag: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -476,6 +545,32 @@ impl Settings {
         match self.values.get(key) {
             Some((Value::Bool(b), _)) => *b,
             _ => default,
+        }
+    }
+
+    fn text(&self, key: &str) -> Option<String> {
+        match self.values.get(key) {
+            Some((Value::Text(t), _)) | Some((Value::Path(t), _)) => Some(t.clone()),
+            _ => None,
+        }
+    }
+
+    /// The `cross.*` settings that are set; what isn't keeps hyprcross' own files and defaults.
+    pub fn cross(&self) -> CrossSettings {
+        CrossSettings {
+            default_target: self.text("cross.default-target").filter(|t| t != "none"),
+            engine: self.text("cross.engine"),
+            daemon: match self.values.get("cross.daemon") {
+                Some((Value::Bool(b), _)) => Some(*b),
+                _ => None,
+            },
+            idle_timeout_mins: self
+                .text("cross.idle-timeout")
+                .and_then(|t| crate::time::parse_duration(&t))
+                .map(|secs| u32::try_from(secs.div_ceil(60)).unwrap_or(u32::MAX)),
+            container_engine: self.text("cross.container-engine"),
+            image_repository: self.text("cross.image-repository"),
+            image_tag: self.text("cross.image-tag"),
         }
     }
 
@@ -1230,6 +1325,36 @@ mod tests {
             "RUNE_BUILD_RELEASE_REBUILD_ALL"
         );
         assert_eq!(env_var_name("cas.max-size"), "RUNE_CAS_MAX_SIZE");
+    }
+
+    #[test]
+    fn cross_settings_are_only_what_is_set() {
+        let dir = tempdir().unwrap();
+        let none = dir.path().join("none");
+        let empty = Settings::load_from(Some(dir.path()), &none, &|_| None).unwrap();
+        assert_eq!(empty.cross(), CrossSettings::default());
+
+        std::fs::write(
+            dir.path().join("Rune.toml"),
+            "[cross]\ndefault-target = \"aarch64-unknown-linux-gnu\"\nidle-timeout = \"90s\"\n\
+             daemon = false\n\n[cross.target.aarch64-unknown-linux-gnu]\nimage = \"mine:1\"\n",
+        )
+        .unwrap();
+        let env = |k: &str| (k == "RUNE_CROSS_ENGINE").then(|| "container".to_string());
+        let s = Settings::load_from(Some(dir.path()), &none, &env).unwrap();
+        let cross = s.cross();
+        assert_eq!(
+            cross.default_target.as_deref(),
+            Some("aarch64-unknown-linux-gnu")
+        );
+        assert_eq!(cross.engine.as_deref(), Some("container"));
+        assert_eq!(cross.daemon, Some(false));
+        assert_eq!(
+            cross.idle_timeout_mins,
+            Some(2),
+            "rounded up to whole minutes"
+        );
+        assert_eq!(cross.image_tag, None);
     }
 
     #[test]

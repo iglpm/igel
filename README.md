@@ -68,7 +68,7 @@ rune-bench run --project path/to/your/project
 
 ### Everything in a Single Binary
 
-No need to juggle a dozen external Cargo plugins. Rune includes built-in commands for `outdated`, `upgrade`, `unused`, `watch`, single-file `script` runners with embedded dependencies, `explain` (root-cause cache invalidation analysis), `doctor` (diagnostic recommendations), interactive timelines, dependency graphs, `install`, `publish`, and `vendor` — while maintaining full compatibility with all existing `cargo-*` subcommands.
+No need to juggle a dozen external Cargo plugins. Rune includes built-in commands for cross-compilation (`rune cross`, `rune build --cross <target>`: on this machine when it can, in a warm container when it can't), `outdated`, `upgrade`, `unused`, `watch`, single-file `script` runners with embedded dependencies, `explain` (root-cause cache invalidation analysis), `doctor` (diagnostic recommendations), interactive timelines, dependency graphs, `install`, `publish`, and `vendor` — while maintaining full compatibility with all existing `cargo-*` subcommands.
 
 ## Installation
 
@@ -130,6 +130,7 @@ See the full [Compatibility Reference](docs/compatibility.md) for detailed platf
 | [CI & Remote Caching](docs/ci.md) | Remote stores, Cairn servers, cache bundles, and matrix sharding |
 | [Configuration](docs/configuration.md) | Workspace and global settings via `Rune.toml` and CLI flags |
 | [Supply Chain Security](docs/supply-chain.md) | Sandboxing, advisory audits, and SBOM export |
+| [Cross-Compilation](docs/cross-compilation.md) | `rune cross` and `--cross`: other targets, here or in warm containers |
 | [Performance Guide](docs/performance.md) | Resource management, concurrency, and bottleneck diagnosis |
 | [hyprlnk Linker](hyprlnk/README.md) | Integrated next-generation linker for Linux, macOS, and Windows |
 | [rustc-runified](rustc-runified/README.md) | Advanced compiler driver for early linking and parallel frontends |

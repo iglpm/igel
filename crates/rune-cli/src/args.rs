@@ -54,6 +54,18 @@ pub enum Commands {
     /// Type-check the package without producing binaries
     #[command(visible_alias = "c")]
     Check(BuildArgs),
+    /// Build, test and run for other targets: here when this machine can, in a container when it can't
+    #[command(
+        disable_help_flag = true,
+        after_help = crate::help::examples(&[
+            ("rune cross build -t aarch64-unknown-linux-gnu", "build for ARM64 Linux"),
+            ("rune cross test -t x86_64-pc-windows-gnu", "run the tests under Wine"),
+            ("rune build --cross aarch64-unknown-linux-gnu -r", "the same as a flag of `rune build`"),
+            ("rune cross targets", "the targets with images, and how each builds here"),
+            ("rune cross help", "every cross command"),
+        ])
+    )]
+    Cross(CrossArgs),
     /// Compile and run the package's tests
     #[command(visible_alias = "t")]
     #[command(after_help = crate::help::examples(&[("rune test", "every test of the package"), ("rune test parse", "only tests whose name contains \"parse\""), ("rune test --workspace --retries 2", "the whole workspace, retrying flaky tests"), ("rune test -- --nocapture", "pass arguments to the test binaries")]))]
@@ -176,6 +188,38 @@ pub enum Commands {
     /// Update Rune to the latest release (alias for `rune self update`)
     #[command(name = "self-update", hide = true)]
     SelfUpdate(SelfUpdateArgs),
+}
+
+/// `rune cross <command> …`: hyprcross' command line (`rune cross help`).
+#[derive(Args, Debug)]
+pub struct CrossArgs {
+    /// build, check, test, run, bench, clippy, doc, clean, targets, doctor, daemon, images, init
+    #[arg(
+        trailing_var_arg = true,
+        allow_hyphen_values = true,
+        value_name = "COMMAND"
+    )]
+    pub args: Vec<std::ffi::OsString>,
+}
+
+/// `--cross` on the build commands. `crate::cross` takes them before these are parsed: they are
+/// here for `--help` and completions.
+#[derive(Args, Debug, Clone, Default)]
+pub struct CrossOpts {
+    /// Cross-compile for TRIPLE (else `--target`, else `cross.default-target`): on this machine
+    /// when it can build the target, in a container from the target's image when it can't
+    #[arg(
+        long,
+        value_name = "TRIPLE",
+        num_args = 0..=1,
+        default_missing_value = "",
+        help_heading = "Cross Compilation"
+    )]
+    pub cross: Option<String>,
+
+    /// Where a cross build runs: auto, direct or container (default: `cross.engine`)
+    #[arg(long, value_name = "ENGINE", help_heading = "Cross Compilation")]
+    pub cross_engine: Option<String>,
 }
 
 /// Flags shared by every command that resolves and builds.
@@ -343,6 +387,8 @@ pub struct BuildArgs {
     pub common: CommonArgs,
     #[command(flatten)]
     pub targets: TargetArgs,
+    #[command(flatten)]
+    pub cross: CrossOpts,
 
     /// Build only the dependencies of the selected packages, not the packages
     /// themselves: the step for a container image layer or CI cache that
@@ -357,6 +403,8 @@ pub struct TestArgs {
     pub common: CommonArgs,
     #[command(flatten)]
     pub targets: TargetArgs,
+    #[command(flatten)]
+    pub cross: CrossOpts,
 
     /// Only run tests whose name contains this string
     #[arg(value_name = "TESTNAME")]
@@ -437,6 +485,8 @@ pub struct TestArgs {
 pub struct RunArgs {
     #[command(flatten)]
     pub common: CommonArgs,
+    #[command(flatten)]
+    pub cross: CrossOpts,
 
     /// The binary to run
     #[arg(long, value_name = "NAME")]
@@ -478,6 +528,8 @@ pub struct FmtArgs {
 pub struct DocArgs {
     #[command(flatten)]
     pub common: CommonArgs,
+    #[command(flatten)]
+    pub cross: CrossOpts,
 
     /// Don't build documentation for dependencies
     #[arg(long)]

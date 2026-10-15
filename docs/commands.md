@@ -8,7 +8,9 @@ Rune provides a comprehensive command-line interface that mirrors Cargo's comman
 # Compilation & Execution
 rune build                         # Compile active package or workspace (alias: rune b)
 rune build --release -j 8          # Multi-threaded release build
-rune build --target aarch64-unknown-linux-gnu # Cross-compile to target triple
+rune build --target aarch64-unknown-linux-gnu # Build for a target triple (its toolchain installed here)
+rune build --cross aarch64-unknown-linux-gnu # Cross-compile, in a container when this machine can't
+rune cross test -t x86_64-pc-windows-gnu # Run the tests of another target (here: under Wine)
 rune build --deps-only             # Compile only external dependencies (ideal for Docker layers)
 rune check                         # Fast type-checking, reusing cached build outputs
 rune run -- --arg value            # Compile and execute binary with arguments

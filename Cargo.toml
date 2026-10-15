@@ -91,6 +91,9 @@ rune-cas = { path = "crates/rune-cas" }
 rune-registry = { path = "crates/rune-registry" }
 rune-resolver = { path = "crates/rune-resolver" }
 hyprlnk = { path = "hyprlnk" }
+# Cross-compilation (`rune cross`, `--cross`), without the hyprlnk it would bring: Rune links
+# with its own.
+hyprcross = { path = "hyprcross", default-features = false }
 
 [profile.release]
 lto = "thin"

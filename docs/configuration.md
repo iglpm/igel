@@ -83,6 +83,20 @@ rune config unset build.release-rebuild-all
 | `test.schedule` | `binaries` | Test scheduling strategy. `tests` splits individual test cases into parallel batches across all CPU cores (nextest-style). |
 | `test.doctests` | `true` | Automatically includes documentation tests during `rune test`. |
 
+### Cross-Compilation (`[cross]`)
+
+| Key | Default | Description |
+| :--- | :--- | :--- |
+| `cross.default-target` | none | The target `rune cross` and `--cross` build for when none is given. Plain `rune build` is unaffected. |
+| `cross.engine` | `auto` | Where cross builds run: `auto` (here when this machine can build the target, else in a container), `direct` or `container`. |
+| `cross.daemon` | `true` | Keep a warm container per project and target, which builds start in at once. |
+| `cross.idle-timeout` | `15m` | How long a warm container waits for the next build before it stops (`0`: until stopped). |
+| `cross.container-engine` | `auto` | `podman`, `docker`, `finch` or `nerdctl`; `auto` takes the first one installed. |
+| `cross.image-repository` | `ghcr.io/runepm/hyprcross` | Where the per-target images come from (`<repository>/<target>:<tag>`). |
+| `cross.image-tag` | `latest` | The images' tag: `latest`, a date, or a hyprcross release. |
+
+Per-target settings (`pre-build`, `env`, `image`, `dockerfile`, `volumes`, `runner`, `sysroot`) go in `[cross.target.<triple>]` tables; see [Cross-Compilation](cross-compilation.md).
+
 ### Network Settings (`[net]`)
 
 | Key | Default | Description |

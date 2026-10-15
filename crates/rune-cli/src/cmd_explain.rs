@@ -11,6 +11,12 @@ use rune_scheduler::executor::{UnitIdentity, load_identities};
 use std::collections::BTreeSet;
 
 pub fn explain(args: BuildArgs) -> Result<()> {
+    if args.cross.cross.is_some() {
+        anyhow::bail!(
+            "`rune explain` shows builds on this machine; `--cross` works with build, check, \
+             test, run, bench, clippy and doc"
+        );
+    }
     let sess = Session::new(&args.common, "dev")?;
     let plan = plan_for(&sess, Mode::Build, &selection(&args.targets))?;
     let executor = sess.executor();

@@ -17,6 +17,7 @@ mod cmd_unused;
 mod cmd_upgrade;
 mod cmd_vendor;
 mod cmd_watch;
+mod cross;
 mod doctor;
 mod external;
 mod fix;
@@ -64,6 +65,10 @@ fn main() {
         let rest: Vec<OsString> = std::env::args_os().skip(2).collect();
         rune_common::sandbox::helper_main(&rest);
     }
+    // A warm cross-compilation container's agent: this Rune, mounted into it.
+    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("__agent")) {
+        std::process::exit(cross::agent(std::env::args_os().collect()));
+    }
     if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("__demangle")) {
         cmd_coverage::demangle_stdin();
         return;
@@ -73,6 +78,16 @@ fn main() {
 
     let args = external::expand(std::env::args_os().collect());
     apply_color_flag(&args);
+    // `rune cross …` and `--cross`: hyprcross' command line, not Rune's.
+    if let Some(result) = cross::intercept(&args) {
+        match result {
+            Ok(code) => std::process::exit(code),
+            Err(err) => {
+                ui::error(render_error(&err));
+                std::process::exit(1);
+            }
+        }
+    }
     if help::intercept(&args) {
         return;
     }
@@ -96,6 +111,8 @@ fn main() {
     rune_common::cargo_config::set_cli_overrides(cli.config_overrides.clone());
 
     let result = match cli.command {
+        // Reached only when the cross command line wasn't recognised before parsing.
+        Commands::Cross(a) => cross::command(a.args),
         Commands::Build(a) => cmd_build::build(a, Mode::Build),
         Commands::Check(a) => cmd_build::build(a, Mode::Check),
         Commands::Test(a) => cmd_test::run(a, Mode::Test),

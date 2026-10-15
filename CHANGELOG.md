@@ -13,6 +13,22 @@ always safe; the first stable release is 2027.0.0.
 The first stable release. Changes since the 0.1.0 preview:
 
 ### Added
+- Cross-compilation, built in: `rune cross build|check|test|run|bench|clippy|doc
+  -t <triple>`, and `--cross[=<triple>]` on those commands (`rune build --cross
+  aarch64-unknown-linux-gnu -r`). hyprcross (the `hyprcross/` submodule) does
+  it inside Rune: on this machine when it can build the target, with the
+  target's C compiler as the linker's driver and QEMU, Wine or Wasmtime running
+  the tests; else in a warm container from the target's image
+  (`ghcr.io/runepm/hyprcross/<target>`, 30 targets), where this Rune builds
+  with the host's toolchain and shared cache, mounted at their own paths. A
+  cached build in a warm container takes about as long as on the host.
+  `rune cross targets`, `doctor`, `init`, `daemon` and `images` manage it;
+  `cross.*` settings (`default-target`, `engine`, `daemon`, `idle-timeout`,
+  `container-engine`, `image-repository`, `image-tag`) and
+  `[cross.target.<triple>]` tables (`pre-build`, `env`, `image`, `dockerfile`,
+  `volumes`, `runner`, `sysroot`) configure it, and `Hyprcross.toml` and
+  cross-rs' `Cross.toml` are read too. `rune cross` used to run an installed
+  `cargo-cross`; the built-in command takes its place.
 - hyprlnk (the `hyprlnk/` submodule, github.com/runepm/hyprlnk), a linker
   developed with Rune and built into it, and Rune's default linker
   (`build.linker = "hyprlnk"`; `"default"` keeps the one rustc and Cargo
@@ -75,6 +91,15 @@ The first stable release. Changes since the 0.1.0 preview:
   run time, as Cargo sets them.
 
 ### Fixed
+- After a toolchain update, rustc-runified quietly stopped compiling: a driver
+  works only with the toolchain it was built for, so builds fell back to plain
+  `rustc` and `rune doctor` said nothing. Doctor now warns when the driver is
+  installed only for other releases, with the command that builds it for the
+  one in use.
+- `rune test --target <triple>` warned that test binaries run directly on this
+  machine even with a runner configured (`target.<triple>.runner` or
+  `CARGO_TARGET_<TRIPLE>_RUNNER`), which runs them; it now warns only without
+  one.
 - Where the store can't hard-link into the target directory (another file
   system, or another mount of the same one, as with a container's bind mounts
   of the project and `~/.rune`), every build copied each artifact out of the

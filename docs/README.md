@@ -19,6 +19,7 @@ If you are new to Rune, start with the [Installation Guide](installation.md) and
 | [Performance Tuning](performance.md) | Scheduler mechanics, jobserver sharing, memory management, and bottleneck diagnosis |
 | [CI & Remote Caching](ci.md) | Setting up remote stores, Cairn cache servers, portable cache bundles, and matrix sharding |
 | [Supply Chain Security](supply-chain.md) | Build script sandboxing, dependency resolution rules, SBOM generation, and `rune audit` |
+| [Cross-Compilation](cross-compilation.md) | `rune cross` and `--cross`: building, testing and running for other targets, here or in warm containers |
 | [Single-File Scripts](scripts.md) | Writing and running standalone Rust scripts with embedded dependencies and shebang support |
 | [Editor Integration](editor-integration.md) | Configuring rust-analyzer, JSON compiler messages, and editor build plans |
 | [Architecture](architecture.md) | Internal crate structure, design principles, and building Rune from source |

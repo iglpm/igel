@@ -1247,10 +1247,19 @@ fn is_program(p: &std::path::Path) -> bool {
     }
 }
 
+/// Another target's tests with nothing configured to run them: they run here as they are, which
+/// works only where the kernel can (binfmt_misc, Rosetta) or the target is compatible.
 fn warn_cross(sess: &Session) {
-    if let Some(t) = &sess.target {
+    if let Some(t) = &sess.target
+        && *t != rune_common::toolchain::global().host
+        && sess.runner().is_none()
+    {
         ui::warn(format!(
             "testing with --target {t}: test binaries are executed directly on this machine"
+        ));
+        ui::hint(format!(
+            "`rune test --cross {t}` runs them under QEMU, Wine or Wasmtime, here or in a \
+             container"
         ));
     }
 }
