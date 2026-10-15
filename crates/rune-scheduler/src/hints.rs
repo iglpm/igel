@@ -202,8 +202,68 @@ const RULES: &[Rule] = &[
     },
 ];
 
+/// The cross compiler cc-rs looked for and didn't find (`failed to find tool
+/// "aarch64-linux-gnu-gcc"`): a target prefix, unlike the host's own `cc`, `gcc` or `clang`.
+fn missing_cross_compiler(lower: &str) -> Option<String> {
+    const NEEDLE: &str = "failed to find tool \"";
+    let start = lower.find(NEEDLE)? + NEEDLE.len();
+    let rest = &lower[start..];
+    let tool = &rest[..rest.find('"')?];
+    let (prefix, _) = tool.rsplit_once('-')?;
+    prefix.contains('-').then(|| tool.to_string())
+}
+
+/// How to install the cross compiler `tool` (`aarch64-linux-gnu-gcc`), where distributions
+/// package it.
+fn cross_compiler_package(tool: &str, family: Family) -> Option<String> {
+    let (prefix, _) = tool.rsplit_once('-')?;
+    let arch = prefix.split('-').next()?;
+    if prefix.contains("-linux-gnu") {
+        let debian = prefix.replace("x86_64", "x86-64");
+        return match family {
+            Family::Debian => Some(format!("sudo apt install gcc-{debian} g++-{debian}")),
+            Family::Fedora => Some(format!("sudo dnf install gcc-{prefix}")),
+            Family::Arch => Some(format!("sudo pacman -S {prefix}-gcc")),
+            _ => None,
+        };
+    }
+    if prefix.ends_with("-w64-mingw32") {
+        return match family {
+            Family::Debian => Some(format!(
+                "sudo apt install gcc-mingw-w64-{}",
+                arch.replace("x86_64", "x86-64")
+            )),
+            Family::Fedora => Some(format!(
+                "sudo dnf install {}-gcc",
+                if arch == "x86_64" {
+                    "mingw64"
+                } else {
+                    "mingw32"
+                }
+            )),
+            Family::Arch => Some("sudo pacman -S mingw-w64-gcc".to_string()),
+            _ => None,
+        };
+    }
+    None
+}
+
 pub fn hint_for_failure(output: &str, family: Family) -> Option<String> {
     let lower = output.to_lowercase();
+
+    if let Some(tool) = missing_cross_compiler(&lower) {
+        let mut hint = format!(
+            "hint: the cross compiler `{tool}` is missing: build scripts compile C for the target \
+             with it."
+        );
+        if let Some(cmd) = cross_compiler_package(&tool, family) {
+            hint.push_str(&format!(" Install it with:\n    {cmd}"));
+        }
+        hint.push_str(
+            "\n    (or build in a container that has it: hyprcross build --target <triple>)",
+        );
+        return Some(hint);
+    }
 
     if let Some(pc) = missing_pkg_config_package(&lower)
         && (!lower.contains("openssl") || !lower.contains("could not find directory of openssl"))
@@ -301,6 +361,46 @@ mod tests {
             hint_for_failure(out, Family::MacOs)
                 .unwrap()
                 .contains("xcode-select --install")
+        );
+    }
+
+    #[test]
+    fn a_missing_cross_compiler_is_not_mistaken_for_the_hosts() {
+        let out = "error occurred in cc-rs: failed to find tool \"riscv64-linux-gnu-gcc\": No such file or directory (os error 2)";
+        let arch = hint_for_failure(out, Family::Arch).unwrap();
+        assert!(arch.contains("`riscv64-linux-gnu-gcc`"), "{arch}");
+        assert!(arch.contains("pacman -S riscv64-linux-gnu-gcc"), "{arch}");
+        assert!(!arch.contains("base-devel"), "{arch}");
+        assert!(
+            hint_for_failure(out, DEBIAN)
+                .unwrap()
+                .contains("apt install gcc-riscv64-linux-gnu")
+        );
+
+        let musl = "failed to find tool \"x86_64-linux-musl-gcc\": No such file";
+        let h = hint_for_failure(musl, DEBIAN).unwrap();
+        assert!(
+            h.contains("x86_64-linux-musl-gcc") && h.contains("container"),
+            "{h}"
+        );
+        assert!(
+            !h.contains("apt install"),
+            "no package for musl cross compilers: {h}"
+        );
+
+        let mingw = "failed to find tool \"x86_64-w64-mingw32-gcc\"";
+        assert!(
+            hint_for_failure(mingw, DEBIAN)
+                .unwrap()
+                .contains("gcc-mingw-w64-x86-64")
+        );
+
+        // The host's own compiler keeps the generic advice.
+        let host = "failed to find tool \"cc\": No such file or directory";
+        assert!(
+            hint_for_failure(host, Family::Arch)
+                .unwrap()
+                .contains("base-devel")
         );
     }
 
