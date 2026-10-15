@@ -75,6 +75,21 @@ The first stable release. Changes since the 0.1.0 preview:
   run time, as Cargo sets them.
 
 ### Fixed
+- Where the store can't hard-link into the target directory (another file
+  system, or another mount of the same one, as with a container's bind mounts
+  of the project and `~/.rune`), every build copied each artifact out of the
+  store again and hashed the copy: a build with nothing to do took 1.5 s
+  instead of 30 ms on hyprcross itself. Copies now carry the stored file's
+  modification time, and one of the same length and time counts as restored.
+- An inherited `HYPRLNK_CC` chose the C compiler hyprlnk links through for
+  targets that name none, host build scripts included: in a cross container
+  exporting the target's compiler they failed with "unrecognized command-line
+  option '-m64'". The variable is now always set for the links Rune runs
+  (empty means `cc`), and so can't differ from what the cache key says.
+- A missing C cross compiler (`failed to find tool "riscv64-linux-gnu-gcc"`)
+  was reported as a missing host compiler, with `pacman -S base-devel` and the
+  like as the fix. The hint now names the cross compiler, its package where
+  distributions have one, and building in a container as the alternative.
 - A build script's stored result could carry another project's absolute
   paths into a build: a project restored `ISLE_DIR`, link search paths or
   `DEP_*` values pointing into the target directory of whichever project ran
