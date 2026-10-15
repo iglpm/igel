@@ -32,11 +32,17 @@ pub fn embedded(version: &str, driver: Option<&str>) -> String {
 pub fn for_rustc(linker: &str) -> (PathBuf, Vec<(&'static str, String)>) {
     if is_embedded(linker) {
         let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("rune"));
-        let mut env = vec![(EMBEDDED_ENV, "1".to_string())];
-        if let Some((_, driver)) = linker.split_once(DRIVER_SEP) {
-            env.push((DRIVER_ENV, driver.to_string()));
-        }
-        (exe, env)
+        // Always set the driver: an inherited one (a cross container exporting the target's
+        // C compiler) would otherwise link host build scripts, and it is not in the cache key.
+        // hyprlnk takes an empty one for `cc`.
+        let driver = linker
+            .split_once(DRIVER_SEP)
+            .map(|(_, d)| d.to_string())
+            .unwrap_or_default();
+        (
+            exe,
+            vec![(EMBEDDED_ENV, "1".to_string()), (DRIVER_ENV, driver)],
+        )
     } else {
         (PathBuf::from(linker), Vec::new())
     }
@@ -77,7 +83,11 @@ mod tests {
         assert!(!is_embedded("rust-lld"));
         let (exe, env) = for_rustc(&l);
         assert_eq!(exe, std::env::current_exe().unwrap());
-        assert_eq!(env, vec![(EMBEDDED_ENV, "1".to_string())]);
+        assert_eq!(
+            env,
+            vec![(EMBEDDED_ENV, "1".to_string()), (DRIVER_ENV, String::new())],
+            "an inherited HYPRLNK_CC must not pick the C compiler"
+        );
         assert_eq!(for_rustc("rust-lld"), (PathBuf::from("rust-lld"), vec![]));
     }
 
