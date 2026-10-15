@@ -13,11 +13,12 @@ members = [
     "crates/rune-cli",
     "bench",
     "hyprlnk",
-    "hyprcross",
 ]
-# Its own workspace, built with the compiler it patches; rust-lang/rust inside it has crates
-# that belong to no workspace, and Cargo must not take them for members of this one.
-exclude = ["rustc-runified"]
+# rustc-runified: its own workspace, built with the compiler it patches; rust-lang/rust inside
+# it has crates that belong to no workspace, and Cargo must not take them for members of this
+# one. hyprcross: a project of its own, with its own hyprlnk submodule (pinned by hyprcross);
+# two packages named hyprlnk can't share a workspace.
+exclude = ["rustc-runified", "hyprcross"]
 
 [workspace.package]
 version = "2027.0.0"
