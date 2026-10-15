@@ -124,7 +124,13 @@ pub fn replace_with_link(src: &Path, dest: &Path) -> io::Result<()> {
     let tmp = temp_sibling(dest);
     let staged = match fs::hard_link(src, &tmp) {
         Ok(()) => Ok(()),
-        Err(_) => fs::copy(src, &tmp).map(|_| ()),
+        // Across file systems, or mounts of the same one (a container's bind mounts): a copy,
+        // dated like the original so the next restore can tell it is one (`is_copy_of`).
+        Err(_) => fs::copy(src, &tmp).map(|_| {
+            let _ = fs::metadata(src)
+                .and_then(|m| m.modified())
+                .and_then(|t| open_for_times(&tmp)?.set_modified(t));
+        }),
     };
     if let Err(e) = staged {
         let _ = fs::remove_file(&tmp);
@@ -133,6 +139,41 @@ pub fn replace_with_link(src: &Path, dest: &Path) -> io::Result<()> {
     rename_over(&tmp, dest).inspect_err(|_| {
         let _ = fs::remove_file(&tmp);
     })
+}
+
+/// A handle that may change `path`'s timestamps, even when the file is read-only.
+fn open_for_times(path: &Path) -> io::Result<fs::File> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_WRITE_ATTRIBUTES: u32 = 0x100;
+        fs::OpenOptions::new()
+            .access_mode(FILE_WRITE_ATTRIBUTES)
+            .open(path)
+    }
+    #[cfg(not(windows))]
+    {
+        fs::File::open(path)
+    }
+}
+
+/// Whether `dest` is a copy [`replace_with_link`] made of `src`: the same length, and the same
+/// modification time to the nanosecond. Times in whole seconds can't tell copies apart: no.
+pub fn is_copy_of(src: &Path, dest: &Path) -> bool {
+    let (Ok(s), Ok(d)) = (fs::metadata(src), fs::metadata(dest)) else {
+        return false;
+    };
+    if s.len() != d.len() || !d.is_file() {
+        return false;
+    }
+    match (s.modified(), d.modified()) {
+        (Ok(a), Ok(b)) => {
+            a == b
+                && a.duration_since(std::time::UNIX_EPOCH)
+                    .is_ok_and(|t| t.subsec_nanos() != 0)
+        }
+        _ => false,
+    }
 }
 
 /// [`fs::rename`] that also replaces read-only files (Windows refuses by default).
@@ -339,6 +380,54 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use std::sync::atomic::AtomicUsize;
+
+    #[test]
+    fn copies_are_recognised_by_length_and_exact_mtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = (dir.path().join("a"), dir.path().join("b"));
+        fs::write(&a, b"artifact").unwrap();
+        fs::copy(&a, &b).unwrap();
+        let mtime = fs::metadata(&a).unwrap().modified().unwrap();
+        let fresh = fs::metadata(&b).unwrap().modified().unwrap();
+        assert_eq!(
+            is_copy_of(&a, &b),
+            fresh == mtime,
+            "a plain copy has its own mtime"
+        );
+        open_for_times(&b).unwrap().set_modified(mtime).unwrap();
+        let precise = mtime
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .subsec_nanos()
+            != 0;
+        assert_eq!(is_copy_of(&a, &b), precise);
+        fs::write(&b, b"other length").unwrap();
+        open_for_times(&b).unwrap().set_modified(mtime).unwrap();
+        assert!(!is_copy_of(&a, &b), "a different length never is a copy");
+    }
+
+    /// `/dev/shm` and the temporary directory are separate mounts on Linux: hard links between
+    /// them fail like those between a container's bind mounts.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_copy_made_across_mounts_is_recognised_next_time() {
+        use std::os::unix::fs::MetadataExt;
+        let Ok(shm) = tempfile::tempdir_in("/dev/shm") else {
+            return;
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let dev = |p: &Path| fs::metadata(p).map(|m| m.dev()).ok();
+        if dev(shm.path()) == dev(tmp.path()) {
+            return;
+        }
+        let src = shm.path().join("lib.rlib");
+        fs::write(&src, vec![7u8; 4096]).unwrap();
+        let dest = tmp.path().join("lib.rlib");
+        replace_with_link(&src, &dest).unwrap();
+        let ino = |p: &Path| fs::metadata(p).unwrap().ino();
+        assert_ne!(ino(&src), ino(&dest), "a copy, not a link");
+        assert!(is_copy_of(&src, &dest), "dated like the original");
+    }
 
     #[test]
     fn replacing_a_link_never_leaves_the_destination_missing() {

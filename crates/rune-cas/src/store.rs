@@ -164,7 +164,14 @@ fn make_read_only(path: &Path) {
     }
 }
 
+/// Whether `dest` already is `src`: a hard link to it, or the copy made where links can't be
+/// (another file system, or another mount of it, as with a container's bind mounts). Without
+/// the second, every build there would copy and hash each artifact again.
 fn already_linked(src: &Path, dest: &Path) -> bool {
+    hard_linked(src, dest) || rune_common::fsutil::is_copy_of(src, dest)
+}
+
+fn hard_linked(src: &Path, dest: &Path) -> bool {
     same_file::is_same_file(src, dest).unwrap_or(false)
 }
 
@@ -624,8 +631,7 @@ impl CasStore {
             }
 
             rune_common::fsutil::replace_with_link(&src, &dest)?;
-            let hard_linked = already_linked(&src, &dest);
-            if hard_linked {
+            if hard_linked(&src, &dest) {
                 linked_files.push(dest);
                 continue;
             }
