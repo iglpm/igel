@@ -50,6 +50,11 @@ jobs:
             name: windows
     runs-on: ${{ matrix.os }}
     steps:
+      - name: Configure Git Credentials for Submodules
+        env:
+          TOKEN: ${{ secrets.RUNIFIED_TOKEN }}
+        run: |
+          git config --global url."https://x-access-token:${TOKEN}@github.com/".insteadOf "https://github.com/"
       - uses: actions/checkout@v4
         with:
           submodules: true  # hyprlnk/
@@ -64,6 +69,11 @@ jobs:
     # Release binaries are built for Windows: keep the code compiling there.
     runs-on: windows-2022
     steps:
+      - name: Configure Git Credentials for Submodules
+        env:
+          TOKEN: ${{ secrets.RUNIFIED_TOKEN }}
+        run: |
+          git config --global url."https://x-access-token:${TOKEN}@github.com/".insteadOf "https://github.com/"
       - uses: actions/checkout@v4
         with:
           submodules: true  # hyprlnk/
@@ -118,6 +128,11 @@ jobs:
   msrv:
     runs-on: [self-hosted, ci]
     steps:
+      - name: Configure Git Credentials for Submodules
+        env:
+          TOKEN: ${{ secrets.RUNIFIED_TOKEN }}
+        run: |
+          git config --global url."https://x-access-token:${TOKEN}@github.com/".insteadOf "https://github.com/"
       - uses: actions/checkout@v4
         with:
           submodules: true  # hyprlnk/
@@ -130,6 +145,11 @@ jobs:
     # Rune builds and tests itself.
     runs-on: [self-hosted, ci]
     steps:
+      - name: Configure Git Credentials for Submodules
+        env:
+          TOKEN: ${{ secrets.RUNIFIED_TOKEN }}
+        run: |
+          git config --global url."https://x-access-token:${TOKEN}@github.com/".insteadOf "https://github.com/"
       - uses: actions/checkout@v4
         with:
           submodules: true  # hyprlnk/
@@ -145,6 +165,11 @@ jobs:
     # noisy to gate on; use `rune-bench compare` on a quiet machine for that).
     runs-on: [self-hosted, ci]
     steps:
+      - name: Configure Git Credentials for Submodules
+        env:
+          TOKEN: ${{ secrets.RUNIFIED_TOKEN }}
+        run: |
+          git config --global url."https://x-access-token:${TOKEN}@github.com/".insteadOf "https://github.com/"
       - uses: actions/checkout@v4
         with:
           submodules: true  # hyprlnk/
