@@ -21,7 +21,7 @@ env:
 jobs:
   wiki-sync:
     name: Publish Documentation to Wiki
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, ci]
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -58,7 +58,7 @@ jobs:
           echo "skip=false" >> "$GITHUB_OUTPUT"
 
       - name: Synchronize docs to GitHub Wiki
-        if: steps:check-wiki.outputs.skip != 'true'
+        if: steps['check-wiki'].outputs.skip != 'true'
         env:
           AUTH_TOKEN: ${{ secrets.RUNIFIED_TOKEN || secrets.GITHUB_TOKEN }}
         run: |
