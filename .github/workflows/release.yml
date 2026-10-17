@@ -21,48 +21,66 @@ jobs:
       matrix:
         include:
           - target: x86_64-unknown-linux-gnu
-            os: ubuntu-22.04
           - target: aarch64-unknown-linux-gnu
-            os: ubuntu-22.04-arm
           - target: x86_64-apple-darwin
-            os: macos-15-intel
           - target: aarch64-apple-darwin
-            os: macos-14
           - target: x86_64-pc-windows-msvc
-            os: windows-2022
-    runs-on: ${{ matrix.os }}
+    runs-on: [self-hosted, docker-builds]
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: true  # hyprlnk/
           token: ${{ secrets.RUNIFIED_TOKEN || github.token }}
+
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
-      # .cargo/config.toml links aarch64-apple-darwin with lld.
-      - if: runner.os == 'macOS'
-        run: brew install lld
-      - name: Build
+
+      - name: Set up Podman and build environment
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y podman uidmap slirp4netns
+          podman info || true
+
+      - name: Build hyprcross / rune locally first
         env:
           RUNE_BUILD_COMMIT: ${{ github.sha }}
-        run: cargo build --release --locked -p rune-cli --target ${{ matrix.target }}
+        run: |
+          cargo build --release --locked -p rune-cli
+          echo "$PWD/target/release" >> $GITHUB_PATH
+
+      - name: Cross-compile target with hyprcross
+        env:
+          RUNE_BUILD_COMMIT: ${{ github.sha }}
+          HYPRCROSS_CONTAINER_ENGINE: podman
+        run: |
+          rune cross build --release --locked --target ${{ matrix.target }} || \
+          cargo run --release -p rune-cli -- cross build --release --locked --target ${{ matrix.target }}
+
       - name: Package
         shell: bash
         run: |
           name=rune-${{ matrix.target }}
           mkdir "$name"
           bin="rune"
-          if [ -f "target/${{ matrix.target }}/release/rune.exe" ]; then
-            bin="rune.exe"
+          
+          bin_path=$(find target/ -name "rune" -o -name "rune.exe" | grep "${{ matrix.target }}" | head -n 1)
+          if [ -z "$bin_path" ]; then
+            bin_path="target/release/rune"
+            if [ ! -f "$bin_path" ]; then bin_path="target/release/rune.exe"; fi
           fi
-          cp "target/${{ matrix.target }}/release/$bin" README.md LICENSE-MIT.md LICENSE-APACHE.md "$name/"
-          "$name/$bin" --version
+
+          cp "$bin_path" README.md LICENSE-MIT.md LICENSE-APACHE.md "$name/"
+          
+          if [[ "${{ matrix.target }}" == "x86_64-unknown-linux-gnu" ]]; then
+            "$name/$(basename "$bin_path")" --version
+          fi
+
           tar -czf "$name.tar.gz" "$name"
           if command -v sha256sum >/dev/null; then
             sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
           else
             shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256"
           fi
+
       - uses: actions/upload-artifact@v4
         with:
           name: rune-${{ matrix.target }}
@@ -70,7 +88,7 @@ jobs:
 
   publish:
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, ci]
     steps:
       - uses: actions/checkout@v4
         with:
