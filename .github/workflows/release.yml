@@ -27,6 +27,11 @@ jobs:
           - target: x86_64-pc-windows-msvc
     runs-on: [self-hosted, docker-builds]
     steps:
+      - name: Configure Git Credentials for Submodules
+        env:
+          TOKEN: ${{ secrets.RUNIFIED_TOKEN }}
+        run: |
+          git config --global url."https://x-access-token:${TOKEN}@github.com/".insteadOf "https://github.com/"
       - uses: actions/checkout@v4
         with:
           submodules: true  # hyprlnk/
@@ -90,6 +95,11 @@ jobs:
     needs: build
     runs-on: [self-hosted, ci]
     steps:
+      - name: Configure Git Credentials for Submodules
+        env:
+          TOKEN: ${{ secrets.RUNIFIED_TOKEN }}
+        run: |
+          git config --global url."https://x-access-token:${TOKEN}@github.com/".insteadOf "https://github.com/"
       - uses: actions/checkout@v4
         with:
           submodules: true  # hyprlnk/
