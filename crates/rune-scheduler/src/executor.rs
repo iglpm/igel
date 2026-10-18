@@ -901,7 +901,8 @@ impl BuildExecutor {
                     // and boosts frontend threads on critical compiles when parallel frontend is enabled.
                     let experiment = std::env::var("RUNE_EXPERIMENT_CRITICAL")
                         .unwrap_or_else(|_| "tokens".into());
-                    let has = |f: &str| experiment == "all" || experiment.split(',').any(|x| x == f);
+                    let has =
+                        |f: &str| experiment == "all" || experiment.split(',').any(|x| x == f);
                     let critical = on_critical_path(&weights, &completed, node_id);
                     let boost = critical
                         && if script_only {
@@ -925,7 +926,8 @@ impl BuildExecutor {
                             self.frontend_threads_for(in_flight.len(), ready_count - index - 1);
                         if boost
                             && (job.frontend_threads.is_some()
-                                || self.frontend_threads == rune_common::settings::FrontendThreads::Auto)
+                                || self.frontend_threads
+                                    == rune_common::settings::FrontendThreads::Auto)
                         {
                             job.frontend_threads = Some(self.cpus.min(8));
                         }
@@ -4047,7 +4049,10 @@ mod tests {
         assert!(!on_critical_path(&weights, &completed, NodeId(3)));
         completed.extend([NodeId(1), NodeId(2)]);
         assert!(on_critical_path(&weights, &completed, NodeId(3)));
-        assert!(!on_critical_path(&weights, &completed, NodeId(9)), "unknown");
+        assert!(
+            !on_critical_path(&weights, &completed, NodeId(9)),
+            "unknown"
+        );
     }
 
     #[test]

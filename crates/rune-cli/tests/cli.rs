@@ -6748,7 +6748,11 @@ fn with_rustc_runified_executables_compile_early_and_link_on_their_own() {
             .output()
             .unwrap();
         let text = text(&out);
-        assert!(out.status.success(), "`rune {}` failed:\n{text}", args.join(" "));
+        assert!(
+            out.status.success(),
+            "`rune {}` failed:\n{text}",
+            args.join(" ")
+        );
         text
     };
     let doctor = rune(&["doctor"]);
