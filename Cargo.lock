@@ -694,7 +694,7 @@ dependencies = [
 
 [[package]]
 name = "hyprcross"
-version = "0.2.0"
+version = "2027.0.0-rc.2"
 dependencies = [
  "anyhow",
  "clap",
