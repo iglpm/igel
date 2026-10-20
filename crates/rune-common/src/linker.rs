@@ -68,7 +68,16 @@ pub fn is_c_compiler(linker: &Path) -> bool {
 /// `-C linker-flavor` for the embedded linker on `target`: Apple targets would otherwise get a
 /// `cc` command line; with `ld64.lld` rustc passes ld64's (and `-flavor darwin` first).
 pub fn rustc_flavor(linker: &str, target: &str) -> Option<&'static str> {
-    (is_embedded(linker) && target.contains("-apple-")).then_some("ld64.lld")
+    if !is_embedded(linker) {
+        return None;
+    }
+    if target.contains("-apple-") {
+        return Some("ld64.lld");
+    }
+    if cfg!(not(unix)) && (target.contains("-linux-") || target.contains("-freebsd")) {
+        return Some("ld.lld");
+    }
+    None
 }
 
 #[cfg(test)]
@@ -137,7 +146,10 @@ mod tests {
         assert_eq!(rustc_flavor(&l, "aarch64-apple-darwin"), Some("ld64.lld"));
         assert_eq!(rustc_flavor(&l, "x86_64-apple-darwin"), Some("ld64.lld"));
         assert_eq!(rustc_flavor(&l, "x86_64-pc-windows-msvc"), None);
+        #[cfg(unix)]
         assert_eq!(rustc_flavor(&l, "x86_64-unknown-linux-gnu"), None);
+        #[cfg(not(unix))]
+        assert_eq!(rustc_flavor(&l, "x86_64-unknown-linux-gnu"), Some("ld.lld"));
         assert_eq!(rustc_flavor("cc", "aarch64-apple-darwin"), None);
     }
 }
