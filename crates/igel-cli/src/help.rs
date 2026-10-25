@@ -241,19 +241,19 @@ fn overview(all: bool) {
         + 3;
 
     let mut page = Page::new(if all { "igl help --all" } else { "igl help" });
-    page.line(format!(
+    let heading = format!(
         "{} {}  {}",
         ui::brand("igl"),
         env!("CARGO_PKG_VERSION").dimmed(),
         "fast Rust builds, one shared build cache".dimmed()
-    ));
-    page.blank();
-    page.line(format!(
+    );
+    let usage = format!(
         "{}  {} {}",
         "Usage".bold(),
         "igl".bold(),
         "<command> [options]".dimmed()
-    ));
+    );
+    add_heading(&mut page, &heading, &usage);
     for (title, names) in &sections {
         page.blank();
         page.line(title.bold().to_string());
@@ -301,12 +301,40 @@ fn overview(all: bool) {
     page.show();
 }
 
+const LOGO: [&str; 5] = [
+    r"    /\/\/\/\",
+    r"  /          \__",
+    r" /   o           `>",
+    r" \       ____  __/",
+    r"  `-----'    `-'",
+];
+
+fn add_heading(page: &mut Page, heading: &str, usage: &str) {
+    let logo_width = LOGO
+        .iter()
+        .map(|line| line.chars().count())
+        .max()
+        .unwrap_or(0);
+    let width = ui::term_width().min(120);
+    if width < 68 {
+        page.line(heading);
+        page.blank();
+        page.line(usage);
+        return;
+    }
+
+    for (left, logo) in [heading, "", usage, "", ""].into_iter().zip(LOGO) {
+        let gap = width.saturating_sub(ui::width_of(left) + logo_width).max(2);
+        page.line(format!("{left}{:gap$}{}", "", ui::brand(logo)));
+    }
+}
+
 pub fn styles() -> clap::builder::Styles {
     use clap::builder::styling::{Ansi256Color, AnsiColor, Color, Style};
-    let violet = Some(Color::Ansi256(Ansi256Color(141)));
+    let quill = Some(Color::Ansi256(Ansi256Color(179)));
     clap::builder::Styles::styled()
-        .header(Style::new().bold().fg_color(violet))
-        .usage(Style::new().bold().fg_color(violet))
+        .header(Style::new().bold().fg_color(quill))
+        .usage(Style::new().bold().fg_color(quill))
         .literal(Style::new().bold())
         .placeholder(Style::new().dimmed())
         .valid(Style::new().fg_color(Some(Color::Ansi(AnsiColor::Green))))
@@ -322,7 +350,7 @@ pub fn examples(rows: &[(&str, &str)]) -> String {
     use clap::builder::styling::{Ansi256Color, Color, Style};
     let header = Style::new()
         .bold()
-        .fg_color(Some(Color::Ansi256(Ansi256Color(141))));
+        .fg_color(Some(Color::Ansi256(Ansi256Color(179))));
     let literal = Style::new().bold();
     let width = rows.iter().map(|(c, _)| c.len()).max().unwrap_or(0) + 3;
     let mut out = format!("{}Examples:{}\n", header.render(), header.render_reset());

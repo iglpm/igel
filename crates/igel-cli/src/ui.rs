@@ -150,7 +150,7 @@ where
     }
 }
 
-/// Without 24-bit colour, violet is sent as its 256-colour neighbour rather than rounded to blue.
+/// Without 24-bit colour, the logo's warm quill colour uses its closest 256-colour neighbour.
 fn truecolor() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
@@ -172,9 +172,9 @@ fn paint(s: impl Display, bold: bool) -> String {
     }
     let weight = if bold { "1;" } else { "" };
     if truecolor() {
-        format!("\x1b[{weight}38;2;167;139;250m{s}\x1b[0m")
+        format!("\x1b[{weight}38;2;215;154;98m{s}\x1b[0m")
     } else {
-        format!("\x1b[{weight}38;5;141m{s}\x1b[0m")
+        format!("\x1b[{weight}38;5;179m{s}\x1b[0m")
     }
 }
 
@@ -293,7 +293,7 @@ pub fn kv_lines(rows: &[(&str, String)], indent: usize) -> Vec<String> {
 fn spinner_style() -> ProgressStyle {
     ProgressStyle::default_spinner()
         .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏ ")
-        .template("{spinner:.141} {prefix:.141.bold} {wide_msg:.dim}")
+        .template("{spinner:.179} {prefix:.179.bold} {wide_msg:.dim}")
         .expect("valid template")
 }
 
