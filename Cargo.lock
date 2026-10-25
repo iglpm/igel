@@ -928,6 +928,211 @@ dependencies = [
 ]
 
 [[package]]
+name = "igel-bench"
+version = "2027.0.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "libc",
+ "same-file",
+ "serde",
+ "serde_json",
+ "walkdir",
+]
+
+[[package]]
+name = "igel-cas"
+version = "2027.0.0"
+dependencies = [
+ "blake3",
+ "filetime",
+ "flate2",
+ "igel-common",
+ "reqwest",
+ "same-file",
+ "serde",
+ "serde_json",
+ "tar",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "walkdir",
+ "zstd",
+]
+
+[[package]]
+name = "igel-cli"
+version = "2027.0.0"
+dependencies = [
+ "anyhow",
+ "blake3",
+ "clap",
+ "clap_complete",
+ "colored",
+ "console",
+ "crossbeam-channel",
+ "filetime",
+ "flate2",
+ "glob",
+ "home",
+ "hyprc",
+ "hyprcross",
+ "hyprlnk",
+ "igel-cas",
+ "igel-common",
+ "igel-fingerprint",
+ "igel-graph",
+ "igel-manifest",
+ "igel-registry",
+ "igel-resolver",
+ "igel-scheduler",
+ "indicatif",
+ "libc",
+ "mimalloc",
+ "rayon",
+ "reqwest",
+ "rustc-demangle",
+ "semver",
+ "serde",
+ "serde_json",
+ "tar",
+ "tempfile",
+ "toml",
+ "toml_edit",
+ "tracing",
+ "tracing-subscriber",
+ "walkdir",
+]
+
+[[package]]
+name = "igel-common"
+version = "2027.0.0"
+dependencies = [
+ "blake3",
+ "dunce",
+ "home",
+ "libc",
+ "rustix",
+ "semver",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "toml",
+ "toml_edit",
+ "xxhash-rust",
+]
+
+[[package]]
+name = "igel-compiler"
+version = "2027.0.0"
+dependencies = [
+ "igel-common",
+ "libc",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tracing",
+]
+
+[[package]]
+name = "igel-fingerprint"
+version = "2027.0.0"
+dependencies = [
+ "igel-common",
+ "rayon",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "walkdir",
+]
+
+[[package]]
+name = "igel-graph"
+version = "2027.0.0"
+dependencies = [
+ "igel-common",
+ "semver",
+]
+
+[[package]]
+name = "igel-manifest"
+version = "2027.0.0"
+dependencies = [
+ "glob",
+ "igel-common",
+ "semver",
+ "serde",
+ "tempfile",
+ "thiserror",
+ "toml",
+]
+
+[[package]]
+name = "igel-registry"
+version = "2027.0.0"
+dependencies = [
+ "bincode",
+ "blake3",
+ "flate2",
+ "home",
+ "igel-common",
+ "rayon",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tar",
+ "tempfile",
+ "thiserror",
+ "toml",
+ "tracing",
+]
+
+[[package]]
+name = "igel-resolver"
+version = "2027.0.0"
+dependencies = [
+ "bincode",
+ "cfg-expr",
+ "colored",
+ "igel-common",
+ "igel-manifest",
+ "igel-registry",
+ "pubgrub",
+ "semver",
+ "serde",
+ "tempfile",
+ "thiserror",
+ "toml",
+ "tracing",
+]
+
+[[package]]
+name = "igel-scheduler"
+version = "2027.0.0"
+dependencies = [
+ "console",
+ "crossbeam-channel",
+ "igel-cas",
+ "igel-common",
+ "igel-compiler",
+ "igel-fingerprint",
+ "igel-graph",
+ "indicatif",
+ "jobserver",
+ "rayon",
+ "semver",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tracing",
+ "walkdir",
+]
+
+[[package]]
 name = "indexmap"
 version = "2.14.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1369,211 +1574,6 @@ dependencies = [
  "libc",
  "untrusted",
  "windows-sys 0.52.0",
-]
-
-[[package]]
-name = "igel-bench"
-version = "2027.0.0"
-dependencies = [
- "anyhow",
- "clap",
- "libc",
- "same-file",
- "serde",
- "serde_json",
- "walkdir",
-]
-
-[[package]]
-name = "igel-cas"
-version = "2027.0.0"
-dependencies = [
- "blake3",
- "filetime",
- "flate2",
- "reqwest",
- "igel-common",
- "same-file",
- "serde",
- "serde_json",
- "tar",
- "tempfile",
- "thiserror",
- "tokio",
- "tokio-util",
- "tracing",
- "walkdir",
- "zstd",
-]
-
-[[package]]
-name = "igel-cli"
-version = "2027.0.0"
-dependencies = [
- "anyhow",
- "blake3",
- "clap",
- "clap_complete",
- "colored",
- "console",
- "crossbeam-channel",
- "filetime",
- "flate2",
- "glob",
- "home",
- "hyprc",
- "hyprcross",
- "hyprlnk",
- "indicatif",
- "libc",
- "mimalloc",
- "rayon",
- "reqwest",
- "igel-cas",
- "igel-common",
- "igel-fingerprint",
- "igel-graph",
- "igel-manifest",
- "igel-registry",
- "igel-resolver",
- "igel-scheduler",
- "rustc-demangle",
- "semver",
- "serde",
- "serde_json",
- "tar",
- "tempfile",
- "toml",
- "toml_edit",
- "tracing",
- "tracing-subscriber",
- "walkdir",
-]
-
-[[package]]
-name = "igel-common"
-version = "2027.0.0"
-dependencies = [
- "blake3",
- "dunce",
- "home",
- "libc",
- "rustix",
- "semver",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror",
- "toml",
- "toml_edit",
- "xxhash-rust",
-]
-
-[[package]]
-name = "igel-compiler"
-version = "2027.0.0"
-dependencies = [
- "libc",
- "igel-common",
- "serde",
- "serde_json",
- "thiserror",
- "tracing",
-]
-
-[[package]]
-name = "igel-fingerprint"
-version = "2027.0.0"
-dependencies = [
- "rayon",
- "igel-common",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror",
- "walkdir",
-]
-
-[[package]]
-name = "igel-graph"
-version = "2027.0.0"
-dependencies = [
- "igel-common",
- "semver",
-]
-
-[[package]]
-name = "igel-manifest"
-version = "2027.0.0"
-dependencies = [
- "glob",
- "igel-common",
- "semver",
- "serde",
- "tempfile",
- "thiserror",
- "toml",
-]
-
-[[package]]
-name = "igel-registry"
-version = "2027.0.0"
-dependencies = [
- "bincode",
- "blake3",
- "flate2",
- "home",
- "rayon",
- "reqwest",
- "igel-common",
- "serde",
- "serde_json",
- "tar",
- "tempfile",
- "thiserror",
- "toml",
- "tracing",
-]
-
-[[package]]
-name = "igel-resolver"
-version = "2027.0.0"
-dependencies = [
- "bincode",
- "cfg-expr",
- "colored",
- "pubgrub",
- "igel-common",
- "igel-manifest",
- "igel-registry",
- "semver",
- "serde",
- "tempfile",
- "thiserror",
- "toml",
- "tracing",
-]
-
-[[package]]
-name = "igel-scheduler"
-version = "2027.0.0"
-dependencies = [
- "console",
- "crossbeam-channel",
- "indicatif",
- "jobserver",
- "rayon",
- "igel-cas",
- "igel-common",
- "igel-compiler",
- "igel-fingerprint",
- "igel-graph",
- "semver",
- "serde",
- "serde_json",
- "tempfile",
- "tracing",
- "walkdir",
 ]
 
 [[package]]
