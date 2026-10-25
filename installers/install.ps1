@@ -1,30 +1,30 @@
 <#
 .SYNOPSIS
-    Installs the latest (or a given) release of Rune on Windows / PowerShell.
+    Installs the latest (or a given) release of Igel on Windows / PowerShell.
 
 .DESCRIPTION
     Downloads the release archive for this machine from GitHub, verifies it
     against its published SHA-256 checksum, extracts the binary, and installs
-    it to ~/.rune/bin (or a custom directory).
+    it to ~/.igel/bin (or a custom directory).
 
 .EXAMPLE
     irm https://runepm.com/install.ps1 | iex
 
 .EXAMPLE
-    & ([scriptblock]::Create((irm https://runepm.com/install.ps1))) -Version 2027.0 -To "C:\Tools\Rune"
+    & ([scriptblock]::Create((irm https://runepm.com/install.ps1))) -Version 2027.0 -To "C:\Tools\Igel"
 #>
 
 [CmdletBinding()]
 param(
     [Alias("v")]
-    [string]$Version = $(if ($env:RUNE_VERSION) { $env:RUNE_VERSION } else { "latest" }),
+    [string]$Version = $(if ($env:IGEL_VERSION) { $env:IGEL_VERSION } else { "latest" }),
 
     [Alias("InstallDir")]
-    [string]$To = $(if ($env:RUNE_INSTALL_DIR) { $env:RUNE_INSTALL_DIR } else {
+    [string]$To = $(if ($env:IGEL_INSTALL_DIR) { $env:IGEL_INSTALL_DIR } else {
         if ($env:USERPROFILE) {
-            Join-Path $env:USERPROFILE ".rune\bin"
+            Join-Path $env:USERPROFILE ".igel\bin"
         } else {
-            Join-Path $HOME ".rune\bin"
+            Join-Path $HOME ".igel\bin"
         }
     }),
 
@@ -63,7 +63,7 @@ if ([Net.SecurityProtocolType].GetMember("Tls13").Count -gt 0) {
     [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls13
 }
 
-$Repo = "runepm/rune"
+$Repo = "runepm/igel"
 
 # Detect OS
 if ($PSVersionTable.PSEdition -eq "Core" -and (-not $IsWindows)) {
@@ -95,7 +95,7 @@ switch -Regex ($rawArch) {
         switch -Regex ($runtimeArch) {
             "^(X64|x86_64)$"  { $arch = "x86_64" }
             "^(Arm64|ARM64)$" { $arch = "aarch64" }
-            default { Die "no prebuilt Rune for architecture: $rawArch" }
+            default { Die "no prebuilt Igel for architecture: $rawArch" }
         }
     }
 }
@@ -112,10 +112,10 @@ if ($Version -ne "latest") {
 }
 
 $target = "$arch-$os"
-$archive = "rune-$target.tar.gz"
+$archive = "igel-$target.tar.gz"
 
-if ($env:RUNE_DOWNLOAD_BASE) {
-    $base = $env:RUNE_DOWNLOAD_BASE.TrimEnd('/')
+if ($env:IGEL_DOWNLOAD_BASE) {
+    $base = $env:IGEL_DOWNLOAD_BASE.TrimEnd('/')
 } elseif ($Version -eq "latest") {
     $base = "https://github.com/$Repo/releases/latest/download"
 } else {
@@ -123,11 +123,11 @@ if ($env:RUNE_DOWNLOAD_BASE) {
 }
 
 # Create a temporary directory
-$tmp = Join-Path ([System.IO.Path]::GetTempPath()) ("rune-install-" + [System.Guid]::NewGuid().ToString("N"))
+$tmp = Join-Path ([System.IO.Path]::GetTempPath()) ("igel-install-" + [System.Guid]::NewGuid().ToString("N"))
 New-Item -ItemType Directory -Path $tmp -Force | Out-Null
 
 try {
-    Say "downloading Rune ($Version, $target)"
+    Say "downloading Igel ($Version, $target)"
 
     $archiveUrl = "$base/$archive"
     $sha256Url = "$base/$archive.sha256"
@@ -172,8 +172,8 @@ try {
         New-Item -ItemType Directory -Path $To -Force | Out-Null
     }
 
-    $binName = "rune$binExt"
-    $srcBin = Join-Path $tmp (Join-Path "rune-$target" $binName)
+    $binName = "igl$binExt"
+    $srcBin = Join-Path $tmp (Join-Path "igel-$target" $binName)
     if (-not (Test-Path $srcBin)) {
         # Search recursively in extracted directory if layout is flat
         $found = Get-ChildItem -Path $tmp -Filter $binName -Recurse | Select-Object -First 1
@@ -192,7 +192,7 @@ try {
     if ($LASTEXITCODE -eq 0 -and $versionOutput) {
         SaySuccess "installed $versionOutput to $targetBin"
     } else {
-        SaySuccess "installed Rune to $targetBin"
+        SaySuccess "installed Igel to $targetBin"
     }
 
     # Check and update PATH

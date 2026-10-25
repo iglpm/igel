@@ -1,16 +1,16 @@
 #!/bin/sh
-# Installs the latest (or a given) release of Rune.
+# Installs the latest (or a given) release of Igel.
 #
 #   curl -fsSL https://runepm.com/install.sh | sh
 #   curl -fsSL https://runepm.com/install.sh | sh -s -- --version 2027.0 --to ~/.local/bin
 #
 # Downloads the release archive for this machine from GitHub, checks it
-# against its published SHA-256, and puts `rune` in ~/.rune/bin (or --to).
+# against its published SHA-256, and puts `igl` in ~/.igel/bin (or --to).
 set -eu
 
-REPO="runepm/rune"
-VERSION="${RUNE_VERSION:-latest}"
-DEST="${RUNE_INSTALL_DIR:-$HOME/.rune/bin}"
+REPO="runepm/igel"
+VERSION="${IGEL_VERSION:-latest}"
+DEST="${IGEL_INSTALL_DIR:-$HOME/.igel/bin}"
 
 if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
     say() { printf '\033[1;35m▸\033[0m %s\n' "$*"; }
@@ -25,16 +25,16 @@ fi
 
 usage() {
     cat <<'EOF'
-Installs Rune.
+Installs Igel.
 
   curl -fsSL https://runepm.com/install.sh | sh -s -- [options]
 
 Options:
   --version <v>  a release, e.g. 2027.0 or v2027.0.1 (default: the latest)
-  --to <dir>     where to put `rune` (default: ~/.rune/bin)
+  --to <dir>     where to put `igl` (default: ~/.igel/bin)
   -h, --help     this text
 
-RUNE_VERSION and RUNE_INSTALL_DIR do the same; RUNE_DOWNLOAD_BASE points
+IGEL_VERSION and IGEL_INSTALL_DIR do the same; IGEL_DOWNLOAD_BASE points
 at a mirror holding the release files.
 EOF
 }
@@ -71,18 +71,18 @@ case "$(uname -s)" in
         os="unknown-linux-gnu"
         # The Linux builds link glibc dynamically.
         if ldd --version 2>&1 | grep -qi musl; then
-            die "no prebuilt Rune for musl-based Linux (e.g. Alpine) yet; build it with: cargo install --locked --git https://github.com/$REPO rune-cli"
+            die "no prebuilt Igel for musl-based Linux (e.g. Alpine) yet; build it with: cargo install --locked --git https://github.com/$REPO igel-cli"
         fi
         ;;
     Darwin) os="apple-darwin" ;;
     MINGW*|MSYS*|CYGWIN*)
         die "on Windows, install from PowerShell: irm https://runepm.com/install.ps1 | iex" ;;
-    *) die "no prebuilt Rune for $(uname -s); build it with: cargo install --locked --git https://github.com/$REPO rune-cli" ;;
+    *) die "no prebuilt Igel for $(uname -s); build it with: cargo install --locked --git https://github.com/$REPO igel-cli" ;;
 esac
 case "$(uname -m)" in
     x86_64|amd64) arch="x86_64" ;;
     arm64|aarch64) arch="aarch64" ;;
-    *) die "no prebuilt Rune for $(uname -m); build it with: cargo install --locked --git https://github.com/$REPO rune-cli" ;;
+    *) die "no prebuilt Igel for $(uname -m); build it with: cargo install --locked --git https://github.com/$REPO igel-cli" ;;
 esac
 # A shell running under Rosetta on Apple silicon reports x86_64: install the
 # native build.
@@ -91,11 +91,11 @@ if [ "$os" = "apple-darwin" ] && [ "$arch" = "x86_64" ] \
     arch="aarch64"
 fi
 target="$arch-$os"
-archive="rune-$target.tar.gz"
+archive="igel-$target.tar.gz"
 
-if [ -n "${RUNE_DOWNLOAD_BASE:-}" ]; then
+if [ -n "${IGEL_DOWNLOAD_BASE:-}" ]; then
     # A mirror holding the release files.
-    base="${RUNE_DOWNLOAD_BASE%/}"
+    base="${IGEL_DOWNLOAD_BASE%/}"
 elif [ "$VERSION" = "latest" ]; then
     base="https://github.com/$REPO/releases/latest/download"
 else
@@ -104,7 +104,7 @@ fi
 
 # HTTPS only, redirects included (a mirror may be plain HTTP or a file://).
 proto="=https"
-[ -z "${RUNE_DOWNLOAD_BASE:-}" ] || proto="all"
+[ -z "${IGEL_DOWNLOAD_BASE:-}" ] || proto="all"
 if command -v curl >/dev/null 2>&1; then
     fetch() { curl -fsSL --proto "$proto" --proto-redir "$proto" --retry 3 -o "$2" "$1"; }
 elif command -v wget >/dev/null 2>&1; then
@@ -121,12 +121,12 @@ else
 fi
 command -v tar >/dev/null 2>&1 || die "tar is needed"
 
-tmp="$(mktemp -d 2>/dev/null || mktemp -d -t rune-install)"
+tmp="$(mktemp -d 2>/dev/null || mktemp -d -t igel-install)"
 trap 'rm -rf "$tmp"' EXIT
 
-say "downloading Rune ($VERSION, $target)"
+say "downloading Igel ($VERSION, $target)"
 if ! fetch "$base/$archive" "$tmp/$archive"; then
-    if [ "$VERSION" = "latest" ] || [ -n "${RUNE_DOWNLOAD_BASE:-}" ]; then
+    if [ "$VERSION" = "latest" ] || [ -n "${IGEL_DOWNLOAD_BASE:-}" ]; then
         die "download failed: $base/$archive"
     fi
     die "download failed: $base/$archive (is $VERSION a release? see https://github.com/$REPO/releases)"
@@ -139,12 +139,12 @@ actual="$(sha256 "$tmp/$archive")"
 
 tar -xzf "$tmp/$archive" -C "$tmp"
 mkdir -p "$DEST" || die "cannot create $DEST (pick another place with --to)"
-# Replace the file rather than overwrite it in place: a running `rune` keeps
+# Replace the file rather than overwrite it in place: a running `igl` keeps
 # its old copy.
-cp "$tmp/rune-$target/rune" "$DEST/.rune.new" || die "cannot write to $DEST (pick another place with --to)"
-chmod 755 "$DEST/.rune.new"
-mv -f "$DEST/.rune.new" "$DEST/rune"
-say "installed $("$DEST/rune" --version) to $DEST/rune"
+cp "$tmp/igel-$target/igl" "$DEST/.igel.new" || die "cannot write to $DEST (pick another place with --to)"
+chmod 755 "$DEST/.igel.new"
+mv -f "$DEST/.igel.new" "$DEST/igl"
+say "installed $("$DEST/igl" --version) to $DEST/igl"
 
 case ":$PATH:" in
     *":$DEST:"*) ;;

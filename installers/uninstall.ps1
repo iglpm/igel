@@ -1,10 +1,10 @@
 <#
 .SYNOPSIS
-    Uninstalls Rune on Windows / PowerShell.
+    Uninstalls Igel on Windows / PowerShell.
 
 .DESCRIPTION
-    Removes the `rune` binary from ~/.rune/bin (or a custom directory). Pass
-    -Purge to also remove Rune's cache and configuration directory (~/.rune).
+    Removes the `igl` binary from ~/.igel/bin (or a custom directory). Pass
+    -Purge to also remove Igel's cache and configuration directory (~/.igel).
     Also cleans up the User PATH environment variable if necessary.
 
 .EXAMPLE
@@ -17,11 +17,11 @@
 [CmdletBinding()]
 param(
     [Alias("InstallDir", "To")]
-    [string]$From = $(if ($env:RUNE_INSTALL_DIR) { $env:RUNE_INSTALL_DIR } else {
+    [string]$From = $(if ($env:IGEL_INSTALL_DIR) { $env:IGEL_INSTALL_DIR } else {
         if ($env:USERPROFILE) {
-            Join-Path $env:USERPROFILE ".rune\bin"
+            Join-Path $env:USERPROFILE ".igel\bin"
         } else {
-            Join-Path $HOME ".rune\bin"
+            Join-Path $HOME ".igel\bin"
         }
     }),
 
@@ -58,19 +58,19 @@ if ($Help) {
     exit 0
 }
 
-$runeHome = if ($env:RUNE_HOME) {
-    $env:RUNE_HOME
+$igelHome = if ($env:IGEL_HOME) {
+    $env:IGEL_HOME
 } else {
     if ($env:USERPROFILE) {
-        Join-Path $env:USERPROFILE ".rune"
+        Join-Path $env:USERPROFILE ".igel"
     } else {
-        Join-Path $HOME ".rune"
+        Join-Path $HOME ".igel"
     }
 }
 
 if (-not $Yes -and [Environment]::UserInteractive) {
-    $title = "Uninstall Rune"
-    $prompt = "Are you sure you want to uninstall Rune from '$From'?"
+    $title = "Uninstall Igel"
+    $prompt = "Are you sure you want to uninstall Igel from '$From'?"
     Write-Host -NoNewline "$prompt [y/N] "
     $response = [Console]::ReadLine()
     if ($response -notmatch '^(y|yes)$') {
@@ -79,12 +79,12 @@ if (-not $Yes -and [Environment]::UserInteractive) {
     }
 }
 
-Say "uninstalling Rune..."
+Say "uninstalling Igel..."
 
-# Look for rune.exe or rune
+# Look for igl.exe or igl
 $candidates = @(
-    Join-Path $From "rune.exe",
-    Join-Path $From "rune"
+    Join-Path $From "igl.exe",
+    Join-Path $From "igl"
 )
 
 $removedBin = $false
@@ -104,27 +104,27 @@ if (-not $removedBin) {
     Say "binary not found in $From"
 }
 
-# Remove directory if empty and within ~/.rune
+# Remove directory if empty and within ~/.igel
 if (Test-Path $From) {
     $items = Get-ChildItem -Path $From -Force -ErrorAction SilentlyContinue
-    if (-not $items -and $From.StartsWith($runeHome)) {
+    if (-not $items -and $From.StartsWith($igelHome)) {
         Remove-Item -Path $From -Force -ErrorAction SilentlyContinue
     }
 }
 
 # Purge cache and configuration if requested
 if ($Purge) {
-    if (Test-Path $runeHome) {
+    if (Test-Path $igelHome) {
         try {
-            Remove-Item -Path $runeHome -Recurse -Force
-            SaySuccess "removed $runeHome (cache and configuration)"
+            Remove-Item -Path $igelHome -Recurse -Force
+            SaySuccess "removed $igelHome (cache and configuration)"
         } catch {
-            Die "failed to remove $runeHome: $($_.Exception.Message)"
+            Die "failed to remove $igelHome: $($_.Exception.Message)"
         }
     }
 } else {
-    if (Test-Path $runeHome) {
-        Say "configuration and cache preserved at $runeHome (pass -Purge to remove)"
+    if (Test-Path $igelHome) {
+        Say "configuration and cache preserved at $igelHome (pass -Purge to remove)"
     }
 }
 
@@ -154,4 +154,4 @@ if ($PSVersionTable.PSEdition -ne "Core" -or $IsWindows) {
     }
 }
 
-SaySuccess "Rune uninstalled successfully"
+SaySuccess "Igel uninstalled successfully"

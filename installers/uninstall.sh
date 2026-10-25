@@ -1,15 +1,15 @@
 #!/bin/sh
-# Uninstalls Rune.
+# Uninstalls Igel.
 #
 #   curl -fsSL https://runepm.com/uninstall.sh | sh
 #   curl -fsSL https://runepm.com/uninstall.sh | sh -s -- --from ~/.local/bin --purge
 #
-# Removes the `rune` binary from ~/.rune/bin (or --from). Pass --purge to also
-# remove Rune's cache and configuration directory (~/.rune).
+# Removes the `igl` binary from ~/.igel/bin (or --from). Pass --purge to also
+# remove Igel's cache and configuration directory (~/.igel).
 set -eu
 
-DEST="${RUNE_INSTALL_DIR:-$HOME/.rune/bin}"
-RUNE_HOME="${RUNE_HOME:-$HOME/.rune}"
+DEST="${IGEL_INSTALL_DIR:-$HOME/.igel/bin}"
+IGEL_HOME="${IGEL_HOME:-$HOME/.igel}"
 PURGE=0
 ASSUME_YES=0
 
@@ -30,7 +30,7 @@ while [ $# -gt 0 ]; do
 done
 
 if [ "$ASSUME_YES" -eq 0 ] && [ -t 0 ]; then
-    printf 'Are you sure you want to uninstall Rune from %s? [y/N] ' "$DEST"
+    printf 'Are you sure you want to uninstall Igel from %s? [y/N] ' "$DEST"
     read -r answer
     case "$answer" in
         [yY]|[yY][eE][sS]) ;;
@@ -38,30 +38,30 @@ if [ "$ASSUME_YES" -eq 0 ] && [ -t 0 ]; then
     esac
 fi
 
-say "uninstalling Rune..."
+say "uninstalling Igel..."
 
 bin_removed=0
-if [ -f "$DEST/rune" ]; then
-    rm -f "$DEST/rune"
-    success "removed $DEST/rune"
+if [ -f "$DEST/igl" ]; then
+    rm -f "$DEST/igl"
+    success "removed $DEST/igl"
     bin_removed=1
 else
-    say "binary not found at $DEST/rune"
+    say "binary not found at $DEST/igl"
 fi
 
-# Clean up empty bin directory if within ~/.rune
-if [ -d "$DEST" ] && [ "$DEST" = "$RUNE_HOME/bin" ]; then
+# Clean up empty bin directory if within ~/.igel
+if [ -d "$DEST" ] && [ "$DEST" = "$IGEL_HOME/bin" ]; then
     rmdir "$DEST" 2>/dev/null || true
 fi
 
 if [ "$PURGE" -eq 1 ]; then
-    if [ -d "$RUNE_HOME" ]; then
-        rm -rf "$RUNE_HOME"
-        success "removed $RUNE_HOME (cache and configuration)"
+    if [ -d "$IGEL_HOME" ]; then
+        rm -rf "$IGEL_HOME"
+        success "removed $IGEL_HOME (cache and configuration)"
     fi
 else
-    if [ -d "$RUNE_HOME" ]; then
-        say "configuration and cache preserved at $RUNE_HOME (use --purge to delete)"
+    if [ -d "$IGEL_HOME" ]; then
+        say "configuration and cache preserved at $IGEL_HOME (use --purge to delete)"
     fi
 fi
 
@@ -73,4 +73,4 @@ case ":$PATH:" in
         ;;
 esac
 
-success "Rune uninstalled successfully"
+success "Igel uninstalled successfully"

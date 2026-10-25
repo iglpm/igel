@@ -82,18 +82,18 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo build --release -p rune-cli
-      - run: ./target/release/rune.exe --version
+      - run: cargo build --release -p igel-cli
+      - run: ./target/release/igl.exe --version
       - name: Smoke test (new, add, build, run, test, cached rebuild)
         shell: bash
         run: |
           set -eux
-          rune="$PWD/target/release/rune.exe"
-          export RUNE_HOME="$RUNNER_TEMP/rune-home"
+          igl="$PWD/target/release/igl.exe"
+          export IGEL_HOME="$RUNNER_TEMP/igel-home"
           cd "$RUNNER_TEMP"
-          "$rune" new smoke
+          "$igl" new smoke
           cd smoke
-          "$rune" add itoa
+          "$igl" add itoa
           cat > src/lib.rs <<'EOF'
           /// Formats a number.
           ///
@@ -114,15 +114,15 @@ jobs:
               println!("{}", smoke::fmt(7));
           }
           EOF
-          "$rune" build
-          test "$("$rune" run -q)" = "7"
-          test -f .rune/target/debug/smoke.exe
-          "$rune" test 2>&1 | tee test.log
+          "$igl" build
+          test "$("$igl" run -q)" = "7"
+          test -f .igel/target/debug/smoke.exe
+          "$igl" test 2>&1 | tee test.log
           grep -q "doc-tests" test.log
-          "$rune" check
+          "$igl" check
           # A fresh checkout restores everything from the store.
-          rm -rf .rune
-          "$rune" build 2>&1 | tee build.log
+          rm -rf .igel
+          "$igl" build 2>&1 | tee build.log
           grep -q "0 compiled" build.log
 
   msrv:
@@ -142,7 +142,7 @@ jobs:
       - run: cargo check --workspace
 
   self-host:
-    # Rune builds and tests itself.
+    # Igel builds and tests itself.
     runs-on: [self-hosted, ci]
     steps:
       - name: Configure Git Credentials for Submodules
@@ -155,14 +155,14 @@ jobs:
           submodules: true  # hyprlnk/
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo build --release -p rune-cli
-      - run: ./target/release/rune build --release
-      - run: ./target/release/rune test --no-doc -p rune-resolver -p rune-cas
+      - run: cargo build --release -p igel-cli
+      - run: ./target/release/igl build --release
+      - run: ./target/release/igl test --no-doc -p igel-resolver -p igel-cas
 
   bench:
-    # A short benchmark against Cargo on every change: keeps rune-bench
+    # A short benchmark against Cargo on every change: keeps igel-bench
     # working and leaves the report as an artifact (shared runners are too
-    # noisy to gate on; use `rune-bench compare` on a quiet machine for that).
+    # noisy to gate on; use `igel-bench compare` on a quiet machine for that).
     runs-on: [self-hosted, ci]
     steps:
       - name: Configure Git Credentials for Submodules
@@ -176,13 +176,13 @@ jobs:
           token: ${{ secrets.RUNIFIED_TOKEN || github.token }}
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo build --release -p rune-cli -p rune-bench
+      - run: cargo build --release -p igel-cli -p igel-bench
       - run: >
-          ./target/release/rune-bench run --workload tiny --workload medium
-          --runs 3 --runs-heavy 2 --rune target/release/rune --out bench-results
+          ./target/release/igel-bench run --workload tiny --workload medium
+          --runs 3 --runs-heavy 2 --igl target/release/igl --out bench-results
       - uses: actions/upload-artifact@v4
         with:
-          name: rune-bench-report
+          name: igel-bench-report
           path: |
             bench-results/report.html
             bench-results/report.md

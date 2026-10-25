@@ -45,32 +45,32 @@ jobs:
           sudo apt-get install -y podman uidmap slirp4netns
           podman info || true
 
-      - name: Build hyprcross / rune locally first
+      - name: Build hyprcross / igl locally first
         env:
-          RUNE_BUILD_COMMIT: ${{ github.sha }}
+          IGEL_BUILD_COMMIT: ${{ github.sha }}
         run: |
-          cargo build --release --locked -p rune-cli
+          cargo build --release --locked -p igel-cli
           echo "$PWD/target/release" >> $GITHUB_PATH
 
       - name: Cross-compile target with hyprcross
         env:
-          RUNE_BUILD_COMMIT: ${{ github.sha }}
+          IGEL_BUILD_COMMIT: ${{ github.sha }}
           HYPRCROSS_CONTAINER_ENGINE: podman
         run: |
-          rune cross build --release --locked --target ${{ matrix.target }} || \
-          cargo run --release -p rune-cli -- cross build --release --locked --target ${{ matrix.target }}
+          igl cross build --release --locked --target ${{ matrix.target }} || \
+          cargo run --release -p igel-cli -- cross build --release --locked --target ${{ matrix.target }}
 
       - name: Package
         shell: bash
         run: |
-          name=rune-${{ matrix.target }}
+          name=igel-${{ matrix.target }}
           mkdir "$name"
-          bin="rune"
+          bin="igl"
           
-          bin_path=$(find target/ -name "rune" -o -name "rune.exe" | grep "${{ matrix.target }}" | head -n 1)
+          bin_path=$(find target/ -name "igl" -o -name "igl.exe" | grep "${{ matrix.target }}" | head -n 1)
           if [ -z "$bin_path" ]; then
-            bin_path="target/release/rune"
-            if [ ! -f "$bin_path" ]; then bin_path="target/release/rune.exe"; fi
+            bin_path="target/release/igl"
+            if [ ! -f "$bin_path" ]; then bin_path="target/release/igl.exe"; fi
           fi
 
           cp "$bin_path" README.md LICENSE-MIT.md LICENSE-APACHE.md "$name/"
@@ -88,8 +88,8 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: rune-${{ matrix.target }}
-          path: rune-${{ matrix.target }}.tar.gz*
+          name: igel-${{ matrix.target }}
+          path: igel-${{ matrix.target }}.tar.gz*
 
   publish:
     needs: build
