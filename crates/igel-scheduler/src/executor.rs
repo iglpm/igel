@@ -360,13 +360,13 @@ impl BuildExecutor {
         self
     }
 
-    /// Under `auto`, `-Z threads` uses the cores nobody else will. rustc-runified always gets a
-    /// count, 1 when the setting is `off`: its output is the same for every count, so the setting
-    /// never changes what a cache key stands for.
+    /// Under `auto`, the compiler uses the cores nobody else will. Parallel compilers always get
+    /// a count, 1 when the setting is `off`, so independent hyprc processes do not each create a
+    /// machine-sized Rayon pool and oversubscribe the build.
     fn frontend_threads_for(&self, busy: usize, waiting: usize) -> Option<usize> {
         let tc = toolchain::global();
         let n = frontend_threads(self.frontend_threads, self.cpus, busy, waiting);
-        if tc.runified.as_ref().is_some_and(|d| d.supports("threads")) {
+        if tc.hyprc || tc.runified.as_ref().is_some_and(|d| d.supports("threads")) {
             return Some(n.unwrap_or(1));
         }
         n.filter(|_| tc.accepts_unstable_flags())
@@ -2317,11 +2317,15 @@ impl UnitJob {
         // What links the executable later: this command, minus what only compiling needs.
         let link_builder = self.link_late.then(|| cmd_builder.clone());
         if let Some(n) = self.frontend_threads {
-            cmd_builder = cmd_builder.extra_flags(vec![if self.toolchain.runified.is_some() {
-                format!("--runified=threads={n}")
+            if self.toolchain.hyprc {
+                cmd_builder = cmd_builder.env("RAYON_NUM_THREADS", &n.to_string());
             } else {
-                format!("-Zthreads={n}")
-            }]);
+                cmd_builder = cmd_builder.extra_flags(vec![if self.toolchain.runified.is_some() {
+                    format!("--runified=threads={n}")
+                } else {
+                    format!("-Zthreads={n}")
+                }]);
+            }
         }
         if self.link_late {
             cmd_builder = cmd_builder.extra_flags(vec!["--runified=no-link".into()]);
