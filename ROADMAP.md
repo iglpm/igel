@@ -1,8 +1,8 @@
-# Rune roadmap
+# Igel roadmap
 
-Rune is a Cargo-compatible build system whose central idea is that **a cache
+Igel is a Cargo-compatible build system whose central idea is that **a cache
 key is the complete identity of a compilation unit**, not a hash of its source
-(see `new-spec.md`). This document records what Rune can do **today**, how that
+(see `new-spec.md`). This document records what Igel can do **today**, how that
 maps onto every section of the specification, what is still missing, and the
 order in which to close the gaps.
 
@@ -15,7 +15,7 @@ and macOS aarch64 (Apple M5); §12 on Linux x86_64 (4 cores) — its notes say w
 to expect on a larger Mac. Windows has not been run._
 
 
-## 1. What Rune can do today
+## 1. What Igel can do today
 
 **Build orchestration**
 - Direct `rustc` invocation, parallel critical-path scheduling weighted by
@@ -32,18 +32,18 @@ to expect on a larger Mac. Windows has not been run._
 - Cargo's selection flags, `--locked/--offline/--frozen`, `--target`,
   `--ignore-rust-version`, `--timings` (with a Chrome trace of the schedule),
   `--deps-only`, `--message-format json`.
-- Several `rune` processes on one project at once: no directory lock, atomic file
+- Several `igl` processes on one project at once: no directory lock, atomic file
   replacement, per-unit locks, results shared through the store (§8).
-- `rune doctor` (toolchain/linker/profile/machine diagnosis), `rune cas du`,
-  `rune watch`, `rune affected --since [--partition N/M]`, `rune script`
+- `igl doctor` (toolchain/linker/profile/machine diagnosis), `igl cas du`,
+  `igl watch`, `igl affected --since [--partition N/M]`, `igl script`
   (single-file scripts), and install advice when a build script fails on a
   missing system package, opt-in cached test results, test retries with flaky
-  detection and JUnit/JSON reports, `rune cas export/import` bundles for CI
+  detection and JUnit/JSON reports, `igl cas export/import` bundles for CI
   caches, and a shared store (`cas.remote`, a directory or **Cairn** servers —
   the companion project in `../cairn`) for CI and teams.
 
 **Manifests, workspaces, targets** — the full compilation-relevant manifest, from
-`Cargo.toml` or from a `Rune.toml` (a Rune-only project needs no `Cargo.toml`);
+`Cargo.toml` or from a `Igel.toml` (a Igel-only project needs no `Cargo.toml`);
 workspace inheritance (also from *foreign* workspaces); all target kinds and
 options; `[lib] crate-type` with several crate types per unit; target
 auto-discovery incl. `autolib`; `[lints]`; profiles with `inherits`,
@@ -76,27 +76,27 @@ every hit, warnings replayed on hits.
 
 **Lockfile** — a Cargo-format `Cargo.lock` maintained like Cargo does (created
 if absent, updated when the package set changes, never touched when current).
-For Rune's own 229-package workspace it matches Cargo 1.98's output in package
+For Igel's own 229-package workspace it matches Cargo 1.98's output in package
 set, dependency edges, ordering and format (a regenerated lock differs only
 where crates.io has published newer releases than the ones pinned).
 
 **Proof points**
-- 452 automated tests (`cargo test --workspace` and `rune test` both pass),
+- 452 automated tests (`cargo test --workspace` and `igl test` both pass),
   including end-to-end tests for build scripts, host/target roles, features per
   selection, git (tag/branch/rev/submodules/foreign workspaces), patches,
   local/vendored/authenticated registries, wrappers, runners, config, CAS
   immutability and external-input invalidation, native libraries across
   dependency levels, installing, packaging and publishing against a mock
   registry API, and version unification with backtracking.
-- A fresh `rune generate-lockfile` for Rune's own 229-package workspace is
+- A fresh `igl generate-lockfile` for Igel's own 229-package workspace is
   byte-identical to `cargo generate-lockfile`'s.
 - Eleven binding scenarios build and run as with Cargo (§11): `cc` C/C++,
   `bindgen`, `cxx`, bundled SQLite, `libz-sys` + CoreFoundation, `pyo3`
   extension module and embedded Python, `cbindgen` + staticlib/cdylib used from C,
   `libloading` plugins.
-- Rune builds and tests **itself** (183 units, 452 tests) from an empty CAS
+- Igel builds and tests **itself** (183 units, 452 tests) from an empty CAS
   against live crates.io, restores everything from the CAS after `rm -rf
-  .rune/target` (0 compiled, 76 ms), and a no-op build takes ~50 ms of wall
+  .igel/target` (0 compiled, 76 ms), and a no-op build takes ~50 ms of wall
   time (Cargo: 180–230 ms) — §12.
 
 
@@ -104,14 +104,14 @@ where crates.io has published newer releases than the ones pinned).
 
 | § | Topic | Status | Notes |
 | --- | --- | --- | --- |
-| 1 | Compatibility goal | 🟡 | Verified on Rune's own graph, a 469-package corpus of popular crates, 72 crates' own test suites and the ripgrep, serde and regex workspaces, all ending as under Cargo (§12); a top-500 sweep in CI is milestone M2. |
-| 2 | Manifest fields | ✅ | Compilation-relevant fields honoured; packaging-only fields (`include/exclude/publish/keywords/…`) are parsed and ignored. The manifest may be `Cargo.toml` **or** `Rune.toml` (§8). |
+| 1 | Compatibility goal | 🟡 | Verified on Igel's own graph, a 469-package corpus of popular crates, 72 crates' own test suites and the ripgrep, serde and regex workspaces, all ending as under Cargo (§12); a top-500 sweep in CI is milestone M2. |
+| 2 | Manifest fields | ✅ | Compilation-relevant fields honoured; packaging-only fields (`include/exclude/publish/keywords/…`) are parsed and ignored. The manifest may be `Cargo.toml` **or** `Igel.toml` (§8). |
 | 3 | Workspaces | ✅ | members/exclude/default-members/resolver, `[workspace.package/dependencies/lints/metadata]`, `[patch]`, `[replace]`, `[profile]`. |
-| 4 | Package targets | ✅ | All target kinds/options; `doc = false` honoured by `rune doc`. |
+| 4 | Package targets | ✅ | All target kinds/options; `doc = false` honoured by `igl doc`. |
 | 5 | Crate types | ✅ | Several per unit; part of identity. |
 | 6 | Dependency types | ✅ | Normal/build/dev are distinct contexts; build deps compile for the host. |
 | 7 | Dependency sources | ✅ | Registry, alternative registries, git, path, multi-location, renamed, target-specific (+build). |
-| 8 | Git dependencies | ✅ | Resolved to a commit, submodule state in the identity, `rune update` moves the pin. Needs `git` on `PATH`. |
+| 8 | Git dependencies | ✅ | Resolved to a commit, submodule state in the identity, `igl update` moves the pin. Needs `git` on `PATH`. |
 | 9 | Registry package identity | ✅ | `index + name + version + checksum`; never reads the disk to key. |
 | 10 | Local package identity | ✅ | Package-wide, hidden files included; exclusions are the known non-inputs only. |
 | 11 | Local hash optimisation | ✅ | size+mtime cache: warm = walk+stat. |
@@ -143,7 +143,7 @@ where crates.io has published newer releases than the ones pinned).
 | 38 | `env!`/`option_env!` | ✅ | Read from rustc's dep-info; values are part of the key. |
 | 39 | Linker configuration | ✅ | `target.<t>.linker`, `runner` (used by `run` and `test`). |
 | 40 | Custom targets | 🟡 | See §17. |
-| 41 | Cargo/Rune configuration | 🟡 | `[build] [target] [env] [registries] [source] [patch] [profile] [alias]` ✅, `CARGO_PROFILE_*`, `--config KEY=VALUE`, malformed files are errors (§11). Config `include`, OS credential providers ⬜. |
+| 41 | Cargo/Igel configuration | 🟡 | `[build] [target] [env] [registries] [source] [patch] [profile] [alias]` ✅, `CARGO_PROFILE_*`, `--config KEY=VALUE`, malformed files are errors (§11). Config `include`, OS credential providers ⬜. |
 | 42 | Source replacement | 🟡 | registry/directory/local-registry ✅; git dependencies replaced by a vendor directory ✅ (§11); replacement *by* a git source ⬜. |
 | 43 | Alternative registries | 🟡 | Sparse index, `config.json` download templates, tokens (env/config/`token-from-stdout`) ✅. Git-based indexes and OS keychain providers ⬜. |
 | 44 | Dependency overrides | ✅ | `[patch]`, `[replace]`, config patches, "unused patch" warnings (§11). |
@@ -160,10 +160,10 @@ where crates.io has published newer releases than the ones pinned).
 | 55 | Complete unit key | ✅ | See docs/caching.md; every listed component is present. |
 | 56 | Recursive keys | ✅ | |
 | 57 | Diagnostics as part of result | 🟡 | See §33. |
-| 58 | Rustdoc | 🟡 | `rune doc` uses the toolchain's rustdoc/flags/target and skips crates whose identity (unit key + rustdoc + flags) is unchanged. Docs are not stored in the shared CAS. |
+| 58 | Rustdoc | 🟡 | `igl doc` uses the toolchain's rustdoc/flags/target and skips crates whose identity (unit key + rustdoc + flags) is unchanged. Docs are not stored in the shared CAS. |
 | 59 | Documentation tests | ✅ | Separate units via `rustdoc --test`. |
 | 60 | Tests | ✅ | |
-| 61 | Benchmarks | ✅ | `rune bench` (libtest benches need nightly, as in Cargo). |
+| 61 | Benchmarks | ✅ | `igl bench` (libtest benches need nightly, as in Cargo). |
 | 62 | Examples | ✅ | |
 | 63 | Effective profile | ✅ | |
 | 64 | MSRV | ✅ | `rust-version` enforced (`--ignore-rust-version` overrides); resolver 3 prefers compatible versions. |
@@ -189,7 +189,7 @@ non-hermetic (never stored globally). Extend native tool identity to `cmake`,
 
 **G2 — Resolver fidelity (§14).** *Done (§11):* one version per compatible range,
 settled by preference or by backtracking one requirer at a time; a fresh lock of
-Rune's own graph is byte-identical to Cargo's. *Done (§14):* PubGrub for conflicts
+Igel's own graph is byte-identical to Cargo's. *Done (§14):* PubGrub for conflicts
 that need several crates moved at once, with an explanation when none exists;
 backtracking from releases whose dependencies were never published. *Still to
 do:* a differential test over the top-N crates.
@@ -202,13 +202,13 @@ OS keychain credential providers, config `include`.
 **G4 — Structured diagnostics and build-result records (§33, §54, §57).** Store
 the JSON diagnostics (level, code, spans) in the CAS object, replay them
 faithfully (incl. `--message-format`), and record the identity breakdown for
-`rune cas inspect <key>` ("why did this miss?").
+`igl cas inspect <key>` ("why did this miss?").
 
 **G5 — Documentation in the CAS (§58).** Per-crate documentation trees with
 `--merge=none`/`--parts-out-dir` (nightly today) so docs can be shared across
 projects like compiled artifacts.
 
-**G6 — Platforms.** *macOS (aarch64):* the full test suite passes, Rune builds
+**G6 — Platforms.** *macOS (aarch64):* the full test suite passes, Igel builds
 and restores itself, and Cargo's `split-debuginfo = "unpacked"` default is applied
 (§10); the deployment target, SDK and developer tools are part of the identity
 (§12). Still to do: `rpath`/`.dylib` end-to-end tests, a CI job. *Windows:* path handling,
@@ -217,41 +217,41 @@ and restores itself, and Cargo's `split-debuginfo = "unpacked"` default is appli
 **G7 — Custom targets end to end (§17, §40).** A nightly CI job building a
 `no_std` project for a JSON target with `-Zbuild-std`.
 
-**G8 — Newer Cargo surface.** `rune vendor` ✅ (§11); the unit graph as JSON ✅
-(`rune graph --units --format json`, Rune's own schema, §12). Still: `trim-paths`
+**G8 — Newer Cargo surface.** `igl vendor` ✅ (§11); the unit graph as JSON ✅
+(`igl graph --units --format json`, Igel's own schema, §12). Still: `trim-paths`
 (unstable in Cargo too), `hint-mostly-unused`, Cargo's `--unit-graph` schema,
 `--future-incompat-report`, `[hints]`.
 
 
-## 4. Cargo pain points, and what Rune should do about them
+## 4. Cargo pain points, and what Igel should do about them
 
-Rune only earns its place if it is *noticeably* better than Cargo where Cargo
+Igel only earns its place if it is *noticeably* better than Cargo where Cargo
 hurts. This section collects what Rust users actually complain about, checks it
-against what Rune does today, and says what to build. Evidence comes from the
+against what Igel does today, and says what to build. Evidence comes from the
 Rust project's own surveys and Cargo's design discussions (each entry names its source);
 entries without a source are my own suggestions and are marked *(idea)*.
 
-"Rune today" describes the code **as of the start of the 2026-09-20 work**;
+"Igel today" describes the code **as of the start of the 2026-09-20 work**;
 the table below says what has been done since. Items marked *verify* still need
 a test or benchmark before they are claimed in the README.
 
 | Item | Status |
 | --- | --- |
-| P2 check ⇄ build sharing | ✅ `check` after `build` compiles nothing (Rune itself: 148 → 0 units, 6.1 s → 0.3 s); tested end to end (§10). `build` after `check` still compiles, as it must. |
+| P2 check ⇄ build sharing | ✅ `check` after `build` compiles nothing (Igel itself: 148 → 0 units, 6.1 s → 0.3 s); tested end to end (§10). `build` after `check` still compiles, as it must. |
 | P3 concurrent processes | ✅ fixed and tested (§8): it was a real bug — 3 of 4 concurrent builds failed. |
-| P4 debuginfo | ✅ dependencies default to `line-tables-only` (−10 % cold build); `split-debuginfo = "unpacked"` on macOS (−11 %, §10); `rune doctor` covers linkers. Link-step caching ⬜. |
-| P5 self-diagnosis | ✅ `rune doctor`; a build that left cores idle names the chain of crates responsible; `--timings` writes an HTML timeline with that chain highlighted; `rune explain` (§12). |
-| P6 disk | ✅ `rune cas du`; cleanup after 30 days unused (§12); automatic size cap, `rune cas pin`, zstd for idle entries (§14). |
-| P7 CI/Docker | ✅ `rune build --deps-only`; `rune cas export/import` bundles (§12). |
+| P4 debuginfo | ✅ dependencies default to `line-tables-only` (−10 % cold build); `split-debuginfo = "unpacked"` on macOS (−11 %, §10); `igl doctor` covers linkers. Link-step caching ⬜. |
+| P5 self-diagnosis | ✅ `igl doctor`; a build that left cores idle names the chain of crates responsible; `--timings` writes an HTML timeline with that chain highlighted; `igl explain` (§12). |
+| P6 disk | ✅ `igl cas du`; cleanup after 30 days unused (§12); automatic size cap, `igl cas pin`, zstd for idle entries (§14). |
+| P7 CI/Docker | ✅ `igl build --deps-only`; `igl cas export/import` bundles (§12). |
 | P8 path in keys | 🟡 verified: keys do **not** contain the checkout path (a shared store works across paths). Artifacts still embed absolute paths in debuginfo/panics; remapping is only needed for byte-identical builds. |
-| P17 machine interface | 🟡 `--message-format json` for build/check/test ✅, `rune graph --units --format json` ✅ (§12); `rune-api` ⬜. |
+| P17 machine interface | 🟡 `--message-format json` for build/check/test ✅, `igl graph --units --format json` ✅ (§12); `igel-api` ⬜. |
 | P1 early cutoff | ⛔ not possible on stable (see P1): `.rmeta` changes on any edit. |
 | P9 cached tests | 🟡 opt-in `--cached` ✅ (285 tests: 8 s → 0.26 s); default-on needs G1. |
-| P11 unused dependencies | ✅ `rune unused [--fix]` on rustc's own lint (§12). |
-| P12 upgrading | ✅ `rune outdated`, `rune upgrade [--incompatible]`; `rune add` lists the release's features (enabled ones marked, as Cargo does), its `rust-version` and publication date (§12). Licence and download trend ⬜ (not in the index). |
-| P15 build-time code | ✅ `rune tree --exec-surface`, `resolve.min-release-age` (§12); `build.sandbox` (§14). |
-| P16 provenance | 🟡 `rune sbom` (CycloneDX/SPDX) ✅ (§12); attestation, reproducibility check ⬜. |
-| P10 feature questions | 🟡 `rune features <crate>` lists which features are on and who turned each on (§13); `rune tree -e features -i <crate>` draws it as a tree (§12). Workspace-wide unification ✅ (`build.feature-unification`, §14). |
+| P11 unused dependencies | ✅ `igl unused [--fix]` on rustc's own lint (§12). |
+| P12 upgrading | ✅ `igl outdated`, `igl upgrade [--incompatible]`; `igl add` lists the release's features (enabled ones marked, as Cargo does), its `rust-version` and publication date (§12). Licence and download trend ⬜ (not in the index). |
+| P15 build-time code | ✅ `igl tree --exec-surface`, `resolve.min-release-age` (§12); `build.sandbox` (§14). |
+| P16 provenance | 🟡 `igl sbom` (CycloneDX/SPDX) ✅ (§12); attestation, reproducibility check ⬜. |
+| P10 feature questions | 🟡 `igl features <crate>` lists which features are on and who turned each on (§13); `igl tree -e features -i <crate>` draws it as a tree (§12). Workspace-wide unification ✅ (`build.feature-unification`, §14). |
 | P13, P14 | ⬜ |
 
 ### 4.1 Build speed and feedback loop
@@ -261,7 +261,7 @@ common complaint in the 2025 compiler-performance survey (3,700+ responses; 55 %
 wait more than 10 s after a change). Three causes were named: a change deep in a
 workspace recompiles everything above it, linking always starts from scratch, and
 derive-macro expansion is not cached.
-- *Rune today:* content hashing, a ~0.02 s no-op build, `.rmeta` pipelining,
+- *Igel today:* content hashing, a ~0.02 s no-op build, `.rmeta` pipelining,
   critical-path scheduling; switching branches or reverting an edit is a CAS hit.
   But a dependent's key includes the dependency's *key*, so any edit inside a
   crate (even a private function body) changes the keys of everything above it.
@@ -273,15 +273,15 @@ derive-macro expansion is not cached.
   "dependents keep their result if the `.rmeta` is unchanged" rule can never fire.
   What would work needs compiler support (a stable, span-free interface hash, or
   `-Zbinary-dep-depinfo`-style tracking on nightly); until then dependents of an
-  edited crate are rebuilt, exactly as with Cargo. What Rune *can* do: keep the
-  rebuild small — measured on Rune itself, an edit to a leaf crate rebuilds in
+  edited crate are rebuilt, exactly as with Cargo. What Igel *can* do: keep the
+  rebuild small — measured on Igel itself, an edit to a leaf crate rebuilds in
   0.8 s and an edit deep in the graph (10 dependent units) in 1.3 s, with ~60 ms
-  of Rune overhead; a no-op build takes 59 ms.
+  of Igel overhead; a no-op build takes 59 ms.
 
 **P2 — `cargo check` and `cargo build` do not share work.** Named explicitly in
 the survey ("requiring redundant compilation when developers run check multiple
 times before building").
-- *Rune today:* measured on a small project (9 units): `build` after `check`
+- *Igel today:* measured on a small project (9 units): `build` after `check`
   compiled 3 and restored 6; `check` after `build` likewise. The shared ones are
   the registry crates; local crates and the proc-macro are built twice.
 - *Done (§10):* a `check` unit takes the stored result of the equivalent
@@ -294,7 +294,7 @@ say IDE and Cargo "block one another"; the rust-analyzer issue tracker is full o
 the standard workaround is a *second* target directory (double the disk, double
 the CPU). Cargo's answer is `-Zfine-grain-locking` (nightly, still being
 split into separate locks).
-- *Rune today:* it was **not** safe: a probe of 4 concurrent `rune build`s on one
+- *Igel today:* it was **not** safe: a probe of 4 concurrent `igl build`s on one
   project failed 3 of 4 (files deleted under a running compiler, corrupted
   build-script binaries). Fixed — see §8.
 - *Done:* (a) concurrency tests (6 parallel builds; interleaved check/build);
@@ -307,13 +307,13 @@ survey measured 2–30 % faster edit cycles from `debug = "line-tables-only"`, y
 25 % of those who kept full debuginfo never use a debugger. Faster linkers
 (`mold`, `lld`, `wild`) give several-fold gains on big binaries but need manual
 setup in `.cargo/config.toml`.
-- *Rune today:* `target.<t>.linker` and rustflags are honoured and part of the
+- *Igel today:* `target.<t>.linker` and rustflags are honoured and part of the
   identity, so a user *can* opt in. **Done:** registry/git dependencies default to
   `line-tables-only` in dev (`build.dependency-debuginfo` turns it off): a cold
-  build of Rune itself went from 36.7 s to 33.1 s (median of 4 interleaved runs),
-  and 29.7 s → 23.9 s when the workspace crates were trimmed too. `rune doctor`
+  build of Igel itself went from 36.7 s to 33.1 s (median of 4 interleaved runs),
+  and 29.7 s → 23.9 s when the workspace crates were trimmed too. `igl doctor`
   (F1) now detects an installed `mold`/`wild`/`lld` and prints the exact config.
-- **Done:** hyprlnk, the linker built into Rune, links by default on Linux,
+- **Done:** hyprlnk, the linker built into Igel, links by default on Linux,
   Windows and macOS — nothing to install, no config.
 - *Still to do:* Cache the *link step* in the CAS (key = all object keys +
   linker identity + link args) so relinking an unchanged set of objects is free.
@@ -321,7 +321,7 @@ setup in `.cargo/config.toml`.
 **P5 — Nobody knows the knobs exist.** 42 % of survey respondents had tried no
 build-performance mechanism at all.
 - *Plan:* make the slow case self-diagnosing: after a build slower than a
-  threshold, print one line ("3 units = 70 % of the time; run `rune doctor`"),
+  threshold, print one line ("3 units = 70 % of the time; run `igl doctor`"),
   and turn `--timings` into an HTML/Chrome-trace report with the critical path
   highlighted and a "split this crate?" hint for a single dominant unit *(idea)*.
 
@@ -331,11 +331,11 @@ build-performance mechanism at all.
 reported problem in the 2025 State of Rust survey (22 % of respondents; slow
 compilation 27 %). The Cargo team is experimenting with `-Zembed-metadata=no` to
 shrink `rlib`s.
-- *Rune today:* CAS objects are hardlinked into `target/`, so a project's
+- *Igel today:* CAS objects are hardlinked into `target/`, so a project's
   `target/` is nearly free — but the CAS itself is unbounded (~16 GB on the
-  author's machine); `rune cas gc --max-size` exists.
-- *Plan:* `rune cas du` (by package / profile / age), gc by *last use* rather
-  than size alone, `rune clean --unused-for 30d`, pinning of the current
+  author's machine); `igl cas gc --max-size` exists.
+- *Plan:* `igl cas du` (by package / profile / age), gc by *last use* rather
+  than size alone, `igl clean --unused-for 30d`, pinning of the current
   project's keys so gc never evicts what `Cargo.lock` needs, zstd for cold
   objects, and adopting `embed-metadata=no` once it is stable.
 
@@ -344,9 +344,9 @@ CI users call performance a major problem and ~36 % of those use no cache at all
 Cargo has no `--only-deps`, and its mtime-based fingerprints break Docker layer
 reuse, which is why `cargo-chef` exists (5× faster Docker builds in its author's
 measurements).
-- *Done:* `rune build --deps-only` (all registry/git units, no workspace
+- *Done:* `igl build --deps-only` (all registry/git units, no workspace
   members) — replaces `cargo-chef` and needs no recipe file; content-hash keys are
-  independent of mtimes, so the layer is stable. *Still to do:* `rune cas
+  independent of mtimes, so the layer is stable. *Still to do:* `igl cas
   export/import <bundle>` for exactly the keys a lockfile needs (CI cache
   save/restore as one file). Remote CAS is M5.
 
@@ -354,28 +354,28 @@ measurements).
 working directory is part of its key, so copies of a project or several `git
 worktree`s (very common with parallel coding agents) never share results; and a
 single shared `CARGO_TARGET_DIR` serialises them behind Cargo's lock.
-- *Rune today:* keys are content-based, but *checked*: Rune passes no
+- *Igel today:* keys are content-based, but *checked*: Igel passes no
   `--remap-path-prefix` / `trim-paths`, so absolute paths are baked into debuginfo
-  and panic messages. Registry units live under `RUNE_HOME`, so machines with a
-  different home or `RUNE_HOME` produce different bytes for the same key.
+  and panic messages. Registry units live under `IGEL_HOME`, so machines with a
+  different home or `IGEL_HOME` produce different bytes for the same key.
   That does not break a local CAS but **would break a remote one (M5)**.
-- *Plan:* remap the workspace, `RUNE_HOME` registry/git roots and the sysroot to
+- *Plan:* remap the workspace, `IGEL_HOME` registry/git roots and the sysroot to
   fixed prefixes (and implement `trim-paths`, G8); add a test that the same
   project at two paths yields byte-identical artifacts and one shared key.
   Worktrees then share automatically.
 
 **P9 — Test results are never cached.** Listed in the Cargo vision post; every
 `cargo test` re-runs every test even when nothing that could affect it changed.
-- *Done (opt-in):* `rune test --cached` / `test.cache`. A passing libtest binary is
+- *Done (opt-in):* `igl test --cached` / `test.cache`. A passing libtest binary is
   remembered under blake3(binary bytes, package-directory hash, arguments,
-  `RUST_*`/`CARGO_*`/`RUNE_*` environment); failures are never stored; doc-tests
-  are not cached. Measured on Rune's own suite: 285 tests, ~8 s → 0.26 s when
+  `RUST_*`/`CARGO_*`/`IGEL_*` environment); failures are never stored; doc-tests
+  are not cached. Measured on Igel's own suite: 285 tests, ~8 s → 0.26 s when
   nothing changed. Tested end to end (code change, fixture change, arguments,
   `--cached=false`, failures).
-- *Still to do:* it is only sound for tests whose inputs Rune can see, so the flag
+- *Still to do:* it is only sound for tests whose inputs Igel can see, so the flag
   stays opt-in. Making it default needs G1 (recording what a test actually reads,
   via the sandbox/tracer) to classify a test binary as hermetic; then
-  `[package.metadata.rune] cache-tests = true` per package could replace the flag,
+  `[package.metadata.igel] cache-tests = true` per package could replace the flag,
   and the key could use the *recorded* environment instead of a prefix list.
 
 ### 4.3 Dependencies and resolution
@@ -386,28 +386,28 @@ several times with different features; `cargo-hakari` exists to force a
 "workspace-hack" crate that unifies them (reported 50 %+ faster consecutive
 builds in big workspaces), at the cost of a generated crate in every manifest.
 Cargo's RFC 3692 (feature unification) is still evolving.
-- *Rune today:* features are resolved per selection, so `-p a` does not pick up
+- *Igel today:* features are resolved per selection, so `-p a` does not pick up
   features only `b` wants; different feature sets are different units and all
   live in the CAS, so alternating between them is cheap.
-- *Plan:* `rune build --unify-features=workspace` computes a hakari-style
-  unification *in memory* (no extra crate, no manifest changes), and `rune
+- *Plan:* `igl build --unify-features=workspace` computes a hakari-style
+  unification *in memory* (no extra crate, no manifest changes), and `igl
   features <crate>` explains why a feature is on ("enabled by X via Y"). Reuse
-  the machinery behind `rune why`.
+  the machinery behind `igl why`.
 
 **P11 — Unused dependencies.** `cargo-machete` is fast but text-based (false
 positives with proc-macros and build scripts); `cargo-udeps` is accurate but
 needs nightly and a full compile.
-- *Plan:* `rune unused` built on stable rustc's `unused-crate-dependencies` lint
-  plus Rune's own dependency graph, run as part of a normal build/check so it is
+- *Plan:* `igl unused` built on stable rustc's `unused-crate-dependencies` lint
+  plus Igel's own dependency graph, run as part of a normal build/check so it is
   nearly free on a warm CAS. Also flags unused *features* and dev/build
   dependencies used by nothing *(idea)*.
 
 **P12 — Upgrading is costly and finding good crates takes insider knowledge**
 (both named in the Cargo vision post).
-- *Plan:* `rune outdated` and `rune upgrade [--incompatible]` (with MSRV
-  awareness, as resolver 3 already has), `rune add` printing licence, MSRV, last
+- *Plan:* `igl outdated` and `igl upgrade [--incompatible]` (with MSRV
+  awareness, as resolver 3 already has), `igl add` printing licence, MSRV, last
   release, download trend and enabled features before writing the manifest, and
-  an optional `rune semver-check` wrapping `cargo-semver-checks` for libraries.
+  an optional `igl semver-check` wrapping `cargo-semver-checks` for libraries.
 
 **P13 — Resolver: no backtracking, error messages.** Already G2. Cargo itself is
 migrating to PubGrub; adopt it for the same reason (readable "no version of X
@@ -418,7 +418,7 @@ long-running Cargo efforts (RFC 1977 public-dependency; RFC 3028 binary/artifact
 dependencies).
 - *Plan:* parse and preserve `public = true` and lint leaks of private types in
   public API once rustc supports it; artifact dependencies (`artifact = "bin"`)
-  as a second-tier feature — Rune's unit model (host/target roles) already
+  as a second-tier feature — Igel's unit model (host/target roles) already
   matches what they need (G8).
 
 ### 4.4 Security and trust
@@ -428,21 +428,21 @@ privileges.** Stable Cargo has no way to turn either off or confine them; the
 2026 `arrayref`/`internment` incident shows the attack is real (a poisoned
 proc-macro dependency ran at build time). `cargo audit` also misses *deleted*
 malicious versions and has no exploitability data.
-- *Rune today:* G1's sandbox is planned for **hermeticity**; declared-input
+- *Igel today:* G1's sandbox is planned for **hermeticity**; declared-input
   enforcement is there for immutable sources only.
 - *Plan:* promote the sandbox to a **security feature** as well as a
   correctness one: `--sandbox` runs build scripts and proc-macros with no network
   and a read-only filesystem except `OUT_DIR`, with an allow-list in
-  `[workspace.metadata.rune.sandbox]` for crates that legitimately need more
-  (`openssl-sys`, `bindgen`). `rune tree --exec-surface` lists every crate that
+  `[workspace.metadata.igel.sandbox]` for crates that legitimately need more
+  (`openssl-sys`, `bindgen`). `igl tree --exec-surface` lists every crate that
   runs code at build time (build script, proc-macro, native `-sys`). Add a
   `resolve.min-release-age` setting (do not pick a version published in the last
   N days) and a warning when a locked version no longer exists in the index.
 
 **P16 — Provenance.** *(idea)* Because keys already record everything that went
-into an artifact, Rune is well placed to emit an SBOM (`rune sbom`, CycloneDX
+into an artifact, Igel is well placed to emit an SBOM (`igl sbom`, CycloneDX
 and SPDX) and a build attestation (in-toto/SLSA) straight from the graph,
-plus `rune build --verify-reproducible` (build twice, compare bytes, report the
+plus `igl build --verify-reproducible` (build twice, compare bytes, report the
 non-deterministic crates).
 
 ### 4.5 Extensibility
@@ -452,9 +452,9 @@ programmatic interfaces blocks Docker, corporate and tooling integrations.
 - *Done:* `--message-format json` for build/check (compiler messages replayed
   from the store on cache hits, artifact paths, `fresh`, `build-finished`).
 - *Still to do:* the same for `test`, unit keys in the output, a versioned schema,
-  `rune unit-graph` (units, keys, edges, cache status), `rune build-plan`, and a
-  library crate (`rune-api`) with the same data. This unblocks rust-analyzer
-  (P3), CI dashboards and `rune affected` (F6).
+  `igl unit-graph` (units, keys, edges, cache status), `igl build-plan`, and a
+  library crate (`igel-api`) with the same data. This unblocks rust-analyzer
+  (P3), CI dashboards and `igl affected` (F6).
 
 ### 4.6 Priority
 
@@ -463,43 +463,43 @@ Cheapest and most valuable first:
 1. ✅ **Concurrency tests + per-unit locks** (P3) — was a correctness bug.
 2. **Path remapping / `trim-paths`** (P8) — precondition for the remote CAS and
    for worktree sharing.
-3. ✅ **`rune build --deps-only`** (P7) — small, and beats `cargo-chef`.
+3. ✅ **`igl build --deps-only`** (P7) — small, and beats `cargo-chef`.
 4. ✅ **`--message-format=json`** (P3, P17); rust-analyzer recipe written, unverified live.
 5. ✅ **check ⇄ build metadata sharing** (P2).
-6. ✅ **`rune doctor` and `rune cas du`** (P4–P6).
+6. ✅ **`igl doctor` and `igl cas du`** (P4–P6).
 7. Bigger bets: interface early-cutoff (P1), sandbox-as-security (P15), cached
    tests (P9), remote CAS (M5).
 
 
 ## 5. Feature ideas
 
-Beyond fixing Cargo's pain points: things a Rune-shaped tool can do *because*
+Beyond fixing Cargo's pain points: things a Igel-shaped tool can do *because*
 every unit has a complete identity. Ordered roughly by value/cost.
 
-**F1 — `rune doctor`.** ✅ *(first version)* Inspects toolchain, linker,
-debuginfo, jobs, store size/idleness, RAM-backed `RUNE_HOME`, `RUSTC_WRAPPER` and
-the `git`/`cc`/`pkg-config` binaries Rune shells out to, and prints concrete
+**F1 — `igl doctor`.** ✅ *(first version)* Inspects toolchain, linker,
+debuginfo, jobs, store size/idleness, RAM-backed `IGEL_HOME`, `RUSTC_WRAPPER` and
+the `git`/`cc`/`pkg-config` binaries Igel shells out to, and prints concrete
 fixes (P4–P6). Every rule is unit-tested. To add: profile/opt-level advice, a
 "this build was slow because…" hint after a slow build.
 
-**F2 — `rune explain-miss <unit>` / `rune why-rebuilt`.** Diff the identity
+**F2 — `igl explain-miss <unit>` / `igl why-rebuilt`.** Diff the identity
 breakdown of the last stored key against the current one: "rebuilt because
 `RUSTFLAGS` changed", "…because `build.rs` read `/usr/include/foo.h`, size
 differs". Needs G4's recorded breakdown. This is the single feature that makes
 the cache trustworthy to users.
 
-**F3 — Remote / read-through CAS.** ✅ *(shared directory and HTTP; see §8 and the companion project **Cairn**, `../cairn`)* Done: a shared directory; an HTTP backend with bearer tokens (read/write roles), client-side sharding by rendezvous hashing with replicas, failover and a circuit breaker; and the Cairn server (integrity checks, LRU eviction, peers with read-through and replication, metrics). Still to do: TLS in Cairn itself (today: a reverse proxy), signed manifests, S3-compatible backends, cluster-wide eviction, `rune cas export/import` ✅ (§12). A "trusted peer" mode lets a team share proc-macro and `-sys` builds, the most expensive units.
+**F3 — Remote / read-through CAS.** ✅ *(shared directory and HTTP; see §8 and the companion project **Cairn**, `../cairn`)* Done: a shared directory; an HTTP backend with bearer tokens (read/write roles), client-side sharding by rendezvous hashing with replicas, failover and a circuit breaker; and the Cairn server (integrity checks, LRU eviction, peers with read-through and replication, metrics). Still to do: TLS in Cairn itself (today: a reverse proxy), signed manifests, S3-compatible backends, cluster-wide eviction, `igl cas export/import` ✅ (§12). A "trusted peer" mode lets a team share proc-macro and `-sys` builds, the most expensive units.
 
-**F4 — `rune watch`.** ✅ *(polling; `-x` commands, restart on change, `--ignore`)* Rebuild/check/test on save using the same CAS, so
+**F4 — `igl watch`.** ✅ *(polling; `-x` commands, restart on change, `--ignore`)* Rebuild/check/test on save using the same CAS, so
 reverting an edit or switching branches is instantaneous (a `bacon`/`cargo-watch`
 replacement that understands keys instead of polling timestamps).
 
-**F5 — Single-file scripts.** ✅ `rune script file.rs` with a `---cargo` front-matter
+**F5 — Single-file scripts.** ✅ `igl script file.rs` with a `---cargo` front-matter
 block for dependencies (the format Cargo is stabilising), compiled through the
-normal pipeline and cached in the CAS; `#!/usr/bin/env rune` shebang. Runs in
+normal pipeline and cached in the CAS; `#!/usr/bin/env igl` shebang. Runs in
 milliseconds after the first time.
 
-**F6 — `rune affected --since <git-ref>`.** ✅ *(package level: owner + transitive dependents; `--partition N/M` ✅ §12)* Given a diff, print the packages
+**F6 — `igl affected --since <git-ref>`.** ✅ *(package level: owner + transitive dependents; `--partition N/M` ✅ §12)* Given a diff, print the packages
 whose unit keys change — exactly, not by path heuristics — so CI can build and
 test only what a PR can influence, and `--partition N/M` to shard tests over CI
 machines.
@@ -507,7 +507,7 @@ machines.
 **F7 — A better test runner.** 🟡 *(retries with flaky marking, JUnit XML, JSON results, slowest binaries ✅ §12; scheduling batches of tests across binaries ✅ §14)* Per-test parallelism, retries and flaky-test
 marking, JUnit/JSON output, slowest-tests summary, `--fail-fast` iteration mode
 (all named in the Cargo vision post or done today by `cargo-nextest`). Runs
-inside the pipelined runner already in `rune test`.
+inside the pipelined runner already in `igl test`.
 
 **F8 — `-Zbuild-std` in the CAS.** Cargo rebuilds `core`/`alloc`/`std` per
 project; keyed by compiler + target + flags they are perfect CAS objects. Makes
@@ -519,18 +519,18 @@ for the detected distro ("`openssl-sys` needs `libssl-dev` / `openssl-devel`").
 Among the commonest first-run failures for newcomers.
 
 **F10 — Timings and regression tracking.** 🟡 *(Chrome trace, HTML timeline with the critical chain ✅ §12; `--compare` ⬜)* Export Chrome-trace / OpenTelemetry
-spans; `rune timings --compare <ref>` to fail CI when the build gets slower by a
+spans; `igl timings --compare <ref>` to fail CI when the build gets slower by a
 threshold; feed the same data into the scheduler (already weighted by measured
 compile times).
 
-**F11 — Packaging tooling.** ✅ *(§11)* `rune package --list`, `rune publish
---dry-run` that builds the packaged tarball, `rune vendor`, `rune
+**F11 — Packaging tooling.** ✅ *(§11)* `igl package --list`, `igl publish
+--dry-run` that builds the packaged tarball, `igl vendor`, `igl
 yank`/`owner`/`login`. `audit`, `deny`, `outdated`, `coverage` run as the usual
 Cargo plugins through external subcommands; built-in versions are not planned.
 
-**F12 — Workspace ergonomics.** 🟡 *(`rune graph` ✅ §12)* `rune graph` (DOT/Mermaid of packages and
-units), `rune run -p x` from anywhere, `[workspace.metadata.rune]` for
-Rune-only settings so plain `cargo` users are unaffected, `rune new --template`
+**F12 — Workspace ergonomics.** 🟡 *(`igl graph` ✅ §12)* `igl graph` (DOT/Mermaid of packages and
+units), `igl run -p x` from anywhere, `[workspace.metadata.igel]` for
+Igel-only settings so plain `cargo` users are unaffected, `igl new --template`
 (including the "mod-level templates" idea from the vision post).
 
 **F13 — Toolchain handling.** Offer to install a missing `rust-toolchain.toml`
@@ -538,7 +538,7 @@ toolchain or target (`rustup target add`) with a clear message instead of a raw
 rustc error; verify the `rust-toolchain` path in the test suite (§28, currently
 checked by hand).
 
-**F14 — Programmatic API.** `rune-api` crate exposing planning, the unit graph
+**F14 — Programmatic API.** `igel-api` crate exposing planning, the unit graph
 and cache lookups for IDEs, Bazel-style wrappers and corporate tooling (see P17).
 
 
@@ -549,10 +549,10 @@ and cache lookups for IDEs, Bazel-style wrappers and corporate tooling (see P17)
 | **M1** | Hermeticity | G1: sandboxed/recorded build-script reads, non-hermetic class, full native tool identity. |
 | **M2** | Ecosystem confidence | *Started (§12):* a 469-package corpus builds (faster than Cargo) with a byte-identical lockfile; 72 crates' own test suites end as under Cargo after nine fixes. *Open:* the top ~500 crates in CI; G2's full solver; two packages with the same name and version from different sources. |
 | **M3** | Registry & tooling | *Done:* `install`/`uninstall`, `package`, `publish`, `login`/`logout`, `yank`, `owner`, `search`, `info`, `vendor`, `pkgid`, `verify-project`, external subcommands and aliases (§11). *Open:* the rest of G3. |
-| **M4** | Observability | G4 + `rune cas inspect`, `rune explain-miss` (F2), structured diagnostics. |
+| **M4** | Observability | G4 + `igl cas inspect`, `igl explain-miss` (F2), structured diagnostics. |
 | **M5** | Sharing | *Done:* shared-directory store ✅, HTTP backend ✅, **Cairn** server with peers/replication/sharding ✅, `--deps-only` ✅. `cas export/import` ✅ (§12). *Open:* signed manifests, TLS in Cairn, S3 backend; G5 shared documentation. |
 | **M6** | Platforms | *Started:* macOS aarch64 test suite passes, Apple debuginfo default ✅, Apple deployment target/SDK identity ✅ (§12). *Open:* G6 (Windows, macOS SDK identity) + G7 + CI on Windows/macOS; `-Zbuild-std` in the CAS (F8). |
-| **M7** | Daily driver | *Started:* P3 concurrency ✅, P4–P6 `rune doctor`/`cas du`/dependency debuginfo ✅, `--message-format=json` ✅, `--deps-only` ✅. `rune watch` ✅, scripts ✅, `rune affected` ✅, build-script hints ✅, P2 check ⇄ build ✅, `fix`/`clippy --fix`/`clippy -- flags`/`fmt -- --check`/`rustc`/`rustdoc`, `update --precise`, `add --git/--rename/--target`, status on stderr (§11). Test runner retries/flaky/JUnit/JSON, `outdated`/`upgrade`, `unused`, `graph`, `explain` ✅ (§12). `rune features` (§13). Per-test scheduling, workspace feature unification (§14). |
+| **M7** | Daily driver | *Started:* P3 concurrency ✅, P4–P6 `igl doctor`/`cas du`/dependency debuginfo ✅, `--message-format=json` ✅, `--deps-only` ✅. `igl watch` ✅, scripts ✅, `igl affected` ✅, build-script hints ✅, P2 check ⇄ build ✅, `fix`/`clippy --fix`/`clippy -- flags`/`fmt -- --check`/`rustc`/`rustdoc`, `update --precise`, `add --git/--rename/--target`, status on stderr (§11). Test runner retries/flaky/JUnit/JSON, `outdated`/`upgrade`, `unused`, `graph`, `explain` ✅ (§12). `igl features` (§13). Per-test scheduling, workspace feature unification (§14). |
 | **M8** | Supply chain | *Done (§12):* exec-surface report, `min-release-age`, SBOM. *Open:* sandbox as a security boundary, attestation, reproducibility check. Builds on M1. |
 | **M9** | Faster than Cargo on edits | P9 cached tests: opt-in ✅, default-on after M1. P1 early cutoff is blocked on compiler support, see P1. |
 
@@ -563,26 +563,26 @@ and cache lookups for IDEs, Bazel-style wrappers and corporate tooling (see P17)
 cargo test --workspace                       # 482 tests, no network needed
 cargo clippy --workspace --all-targets
 
-# Rune builds and tests itself against live crates.io (use a scratch copy
-# and a scratch RUNE_HOME on a disk-backed path; /tmp may be RAM):
-export RUNE_HOME=~/.cache/rune-scratch/home
-cp -r Cargo.toml Cargo.lock crates ~/.cache/rune-scratch/selfhost && cd ~/.cache/rune-scratch/selfhost
-rune build && rm -rf .rune/target && rune build   # second run: "0 compiled"
-rune test --workspace
-diff Cargo.lock /path/to/rune/Cargo.lock          # must be identical
+# Igel builds and tests itself against live crates.io (use a scratch copy
+# and a scratch IGEL_HOME on a disk-backed path; /tmp may be RAM):
+export IGEL_HOME=~/.cache/igel-scratch/home
+cp -r Cargo.toml Cargo.lock crates ~/.cache/igel-scratch/selfhost && cd ~/.cache/igel-scratch/selfhost
+igl build && rm -rf .igel/target && igl build   # second run: "0 compiled"
+igl test --workspace
+diff Cargo.lock /path/to/igl/Cargo.lock          # must be identical
 
 # Lockfile fidelity against Cargo (differences should only be newer releases):
 cargo generate-lockfile && cp Cargo.lock /tmp/cargo.lock
-rm Cargo.lock && rune generate-lockfile && diff /tmp/cargo.lock Cargo.lock
+rm Cargo.lock && igl generate-lockfile && diff /tmp/cargo.lock Cargo.lock
 ```
 
-Environment variables that isolate experiments: `RUNE_HOME` (settings, CAS,
+Environment variables that isolate experiments: `IGEL_HOME` (settings, CAS,
 registry cache, git checkouts).
 
 
 ## 8. What changed in the performance-and-reliability update
 
-**Reliability — concurrent processes (P3), a real bug.** Four `rune build`s
+**Reliability — concurrent processes (P3), a real bug.** Four `igl build`s
 started at once on one project: three failed (`failed to open object file`,
 `memory map must have a non-zero length`, `undefined hidden symbol` from a
 half-written build-script binary). Causes: every process wrote the same
@@ -598,12 +598,12 @@ concurrent builds of an 8-crate chain with build scripts, and interleaved
 builds compiled 10 units in total instead of 36 and all succeeded.
 
 **Cold builds — what was measured (the 0.1 % CPU / 80 MB observation).** That
-figure is Rune's *own* process; the compilers are children. Measured properly, a
-cold build of Rune's 182 units on a 12-thread machine (i5-10400F: 6 cores + SMT)
+figure is Igel's *own* process; the compilers are children. Measured properly, a
+cold build of Igel's 182 units on a 12-thread machine (i5-10400F: 6 cores + SMT)
 kept the CPU at ~99 % for the first 13 s and ~80 % overall. The wall time (28.7 s)
 was **equal to the length of one dependency chain** — `unicode-ident →
 proc-macro2 → quote → syn → tracing-attributes → tracing → h2 → hyper →
-hyper-util → reqwest → rune-registry → rune-resolver → rune` — so more jobs
+hyper-util → reqwest → igel-registry → igel-resolver → igl` — so more jobs
 cannot help once the machine is full; only shortening that chain can. Run alone
 (`-j 1`) the same units take 2–3× less time than inside the parallel build (`syn`
 3.6 s vs 8.8 s), which is SMT and shared-cache contention.
@@ -620,13 +620,13 @@ What was tried:
 Benchmark noise on this machine was ±10 % between identical runs, so every number
 above is a median of interleaved runs, not a single measurement.
 
-**New surface:** `rune build --deps-only`; `--message-format json` (Cargo-shaped
+**New surface:** `igl build --deps-only`; `--message-format json` (Cargo-shaped
 `compiler-message`/`compiler-artifact`/`build-finished`, diagnostics stored in the
-CAS and replayed on hits); `rune doctor`; `rune cas du`; `--timings` writes
-`.rune/fingerprints/trace.json` (Chrome trace of the schedule); tests
+CAS and replayed on hits); `igl doctor`; `igl cas du`; `--timings` writes
+`.igel/fingerprints/trace.json` (Chrome trace of the schedule); tests
 (332 in total).
 
-**Second batch (same day):** `rune watch`, `rune affected`, `rune script`, install
+**Second batch (same day):** `igl watch`, `igl affected`, `igl script`, install
 hints for failed build scripts (see F4–F6, F9), opt-in cached test results (P9), a shared store (F3), and a fix so a `KeyUpdate` recomputes
 only the units that depend on the changed one instead of every pending unit.
 Measured along the way: no-op build 59 ms; edit-and-rebuild 0.8 s (leaf) / 1.3 s
@@ -640,59 +640,59 @@ impossible on stable Rust (see P1).
 **Shared store (F3, M5).** `cas.remote` / `cas.remote-write`: a directory (network
 share, CI volume) consulted on a local miss and published to after a store, slot by
 slot with the marker file last, so readers never see half an entry and any number
-of writers can race (first publisher wins). Measured on Rune's own 182 units
+of writers can race (first publisher wins). Measured on Igel's own 182 units
 (770 MB): a developer with an empty local store and a read-only remote restored
 everything in 0.72 s (a cold build takes ~30 s), and the restored binary ran.
 Publishing initially cost the CI build ~10 % (synchronous copies inside a compiler
 slot); moved to a two-thread background pool flushed at the end of the build, it is
 ~1 % (3 runs each, inside the noise). Verified end to end that a different checkout
-path and a separate `RUNE_HOME` still hit: keys contain no checkout path. The HTTP
+path and a separate `IGEL_HOME` still hit: keys contain no checkout path. The HTTP
 backend and the Cairn server (next paragraphs) followed; not done: signing, S3,
 eviction of a shared *directory*.
 
-**`Rune.toml` as a manifest.** Rune's project settings file can now also be the
+**`Igel.toml` as a manifest.** Igel's project settings file can now also be the
 manifest, so a project needs no `Cargo.toml` at all. One function
-(`rune_common::manifest_file::find_manifest`) decides what a directory's manifest
-is — `Rune.toml` if it has a `[package]`/`[workspace]` table, else `Cargo.toml`,
-`Rune.toml` winning if both are manifests — and every place that used to say
+(`igel_common::manifest_file::find_manifest`) decides what a directory's manifest
+is — `Igel.toml` if it has a `[package]`/`[workspace]` table, else `Cargo.toml`,
+`Igel.toml` winning if both are manifests — and every place that used to say
 `dir.join("Cargo.toml")` (workspace roots and members, path and git dependencies,
 `[patch]`, package hashing, declared inputs, `CARGO_MANIFEST_PATH`, `add`/`remove`,
 `metadata`, `locate-project`, JSON messages, scaffolding) asks it, so they cannot
-disagree. A settings-only `Rune.toml` beside a `Cargo.toml` is unchanged. Design
-points: a broken `Rune.toml` that *looks* like a manifest is reported, not skipped
+disagree. A settings-only `Igel.toml` beside a `Cargo.toml` is unchanged. Design
+points: a broken `Igel.toml` that *looks* like a manifest is reported, not skipped
 for the `Cargo.toml` beside it; a `[test]` settings table is tolerated in a
-`Rune.toml` manifest (as a list, `[[test]]`, it is the test targets and
-`rune config set test.*` refuses with the way out); `rune doctor` warns when two
-manifests compete; `rune new/init --manifest rune`, and `init` keeps an existing
+`Igel.toml` manifest (as a list, `[[test]]`, it is the test targets and
+`igl config set test.*` refuses with the way out); `igl doctor` warns when two
+manifests compete; `igl new/init --manifest igl`, and `init` keeps an existing
 settings-only file's settings. 24 new tests (unit + end to end, including a
-`Rune.toml`-only git dependency and a mixed workspace). Real check: Rune's own
+`Igel.toml`-only git dependency and a mixed workspace). Real check: Igel's own
 workspace with all 11 `Cargo.toml` renamed — 182 units, `0 compiled` after wiping
 `target`, 332 tests pass, `Cargo.lock` identical, and the renamed copy restores every
 unit from the `Cargo.toml` original's cache (the file name is not in any key). Not
-done: Windows path handling (as everywhere), a `Rune.toml`-aware `rust-analyzer`
+done: Windows path handling (as everywhere), a `Igel.toml`-aware `rust-analyzer`
 recipe (rust-analyzer itself only looks for `Cargo.toml`), and registry crates
 (always `Cargo.toml`, as `cargo publish` writes them).
 
-**Cairn — the remote cache server (M5).** A new project next to Rune (`../cairn`, its
-own README): one Rust binary over a directory of plain files, speaking Rune's own
+**Cairn — the remote cache server (M5).** A new project next to Igel (`../cairn`, its
+own README): one Rust binary over a directory of plain files, speaking Igel's own
 layout (`GET`/`PUT /v1/o/{key}/{file}`). It refuses a marker file unless the slot it
 names is complete, verifies an announced BLAKE3 hash while an upload streams, is
 immutable (first writer wins, `409` otherwise), has `read`/`write`/`admin` tokens
 (only hashes stored), LRU eviction, Prometheus metrics, and `verify`/`gc`/`stats`
 commands. **Multi-server:** nodes are peers (`read_through` on a miss with one fetch
 per key however many clients wait; `replicate` in the background with retries;
-`max_hops` so mutual peers terminate), and Rune shards across servers itself
+`max_hops` so mutual peers terminate), and Igel shards across servers itself
 (`cas.remote = http://a,http://b`, rendezvous hashing, `cas.remote-replicas`,
 failover, a 30 s circuit breaker). 46 tests, including a contract suite that drives
-Rune's real client against real servers; Cairn builds and tests with Rune (146 units,
-24 s, 46 tests). Measured on Rune's 182 units (811 MB): CI publishes at no visible
+Igel's real client against real servers; Cairn builds and tests with Igel (146 units,
+24 s, 46 tests). Measured on Igel's 182 units (811 MB): CI publishes at no visible
 cost; a fresh developer restores everything in **0.65 s**; with two replicated
 nodes and one killed, still 0.65 s.
 
 Three findings from getting there — each would have shipped otherwise:
 - **The restored binary was not executable.** Rewriting the shared-store code around
   a transport abstraction wrote pulled files through a fresh file, dropping the
-  execute bit, so `rune run` said "Permission denied" for anything from a shared
+  execute bit, so `igl run` said "Permission denied" for anything from a shared
   store (directory *or* HTTP). Fixed end to end (an `X-Cairn-Exec` header; `0555`
   vs `0444`; carried through peers) with regression tests in both projects. It was
   caught only by running the real acceptance, not by the unit tests.
@@ -705,20 +705,20 @@ Three findings from getting there — each would have shipped otherwise:
   connection). A pool of blocking clients helped (7.3 → 3.4 s) but the real fix for
   scaling was a private multi-thread runtime driven with `block_on`.
 
-**`rustc_driver` / `rustc_interface` (evaluated, not adopted).** Rune runs `rustc`
+**`rustc_driver` / `rustc_interface` (evaluated, not adopted).** Igel runs `rustc`
 as a child process. Linking `rustc_driver` and compiling in-process was evaluated
 and rejected for now:
 - *Gain:* a `rustc` process costs ~9 ms to start (~15 ms for a trivial crate). Over
-  Rune's 182 units that is ~1.6 s of ~231 s CPU (0.7 %), about 0.1 s of a 28 s cold
+  Igel's 182 units that is ~1.6 s of ~231 s CPU (0.7 %), about 0.1 s of a 28 s cold
   build's critical chain, and nothing on warm builds (nothing is spawned).
 - *Cost:* both crates are compiler internals (`#![feature(rustc_private)]`): they
   need a nightly and the `rustc-dev` component and change with every nightly, so
-  Rune could no longer build itself or serve projects on the stable toolchain.
+  Igel could no longer build itself or serve projects on the stable toolchain.
 - *Hazards:* `env!` and proc-macros read the **process** environment, so parallel
   in-process compiles with different `CARGO_*` values could produce wrong output —
   a correctness violation (§70); diagnostics go to the process's stderr unless a
   custom `Emitter` is written against unstable internals; an ICE or an LLVM abort
-  takes Rune down with it; sessions leak memory.
+  takes Igel down with it; sessions leak memory.
 - *If this is ever revisited:* the only sound shape is a pool of worker processes
   each hosting `rustc_driver` behind an opt-in cargo feature, so env and stderr
   stay per-process. That saves the same ~9 ms and adds all the maintenance above.
@@ -732,8 +732,8 @@ its plan.
 
 ## 9. What changed in the spec-conformance update
 
-Fixed along the way (all covered by tests): `rune new` scaffolded an unbuildable
-project (wrote the manifest to `Rune.toml`); `[lib] crate-type` was silently
+Fixed along the way (all covered by tests): `igl new` scaffolded an unbuildable
+project (wrote the manifest to `Igel.toml`); `[lib] crate-type` was silently
 ignored (`cdylib`/`staticlib` never built); `autolib` was misspelt; build
 scripts saw the *host's* `CARGO_CFG_*` and empty `CARGO_PKG_*`; a re-run build
 script could write through hard links into the shared CAS; resolution depended
@@ -743,14 +743,14 @@ on the command line, and `-p a` unified features requested only by `b`.
 ## 10. What changed in the macOS and check-reuse update (2026-09-24)
 
 First run on macOS (aarch64-apple-darwin, Apple M5, 10 cores, rustc 1.98.1):
-all 332 existing tests passed unchanged. A cold build of Rune itself took 13.7 s
-with Rune and 11.5 s with Cargo, so Rune was ~20 % *slower* on macOS despite
+all 332 existing tests passed unchanged. A cold build of Igel itself took 13.7 s
+with Igel and 11.5 s with Cargo, so Igel was ~20 % *slower* on macOS despite
 cheaper dependency debuginfo.
 
 **macOS debuginfo default (P4, G6).** Cargo compiles with
 `split-debuginfo = "unpacked"` on Apple targets whenever there is debuginfo;
 rustc's own default there is `packed`, which runs `dsymutil` over every binary it
-links. Rune passed nothing, so it paid for `dsymutil` on every binary and test.
+links. Igel passed nothing, so it paid for `dsymutil` on every binary and test.
 Now `Profile::split_debuginfo_for(target)` applies Cargo's rule (an explicit
 setting always wins), the value goes to rustc for both units and build scripts,
 and it is in the key, so old `packed` results are not reused. Measured: cold build
@@ -768,7 +768,7 @@ stay in `examples/`. Test:
 
 **`check` after `build` (P2).** Before: `check` right after `build` recompiled 148
 of 181 units (6.1 s); only host-side units were shared. Now it compiles 0
-(0.3 s). An edit to `rune-common` rechecks just the 10 crates above it, and
+(0.3 s). An edit to `igel-common` rechecks just the 10 crates above it, and
 `build` → `check` → `build` → `check` stays at 0 after each switch.
 
 The finding that shaped the design: on stable rustc, a check-only `.rmeta` and a
@@ -795,7 +795,7 @@ warnings replayed by the check.
 wall-clock for builds that reported ~14 s. Sampling showed `rustc` processes
 "alive for 15 minutes". Cause: the laptop went into idle/maintenance sleep on
 battery (`pmset -g log`). Rust's `Instant` on macOS does not count sleep, while
-`ps` and the wall clock do. Not a Rune bug. Run benchmarks under `caffeinate -i`.
+`ps` and the wall clock do. Not a Igel bug. Run benchmarks under `caffeinate -i`.
 
 **Not done:** P8 path remapping (still the precondition for byte-identical shared
 artifacts), macOS SDK identity, a median-of-N cold-build comparison against Cargo
@@ -810,24 +810,24 @@ here moves about 1.5 MB/s, which bounds every cold number below.
 **Resolver speed.** On a warm cache every command was already fast (a
 re-resolution after a manifest edit: 55 ms; `tree`/`metadata`: 0.12 s, like
 Cargo's 0.10 s). The slow paths were network ones:
-- `rune update` took 3.2 s (Cargo: 1.7 s): the index was revalidated one
+- `igl update` took 3.2 s (Cargo: 1.7 s): the index was revalidated one
   dependency *level* at a time, 17 sequential waves. The crates the current
   lockfile names are now requested in one concurrent wave before the walk
   (`DependencyResolver::with_prefetch_hint`); the walk then reads from memory.
   Now 0.7–1.2 s.
-- A cold `fetch` (empty `RUNE_HOME`, lockfile present) measured 62 s vs Cargo's
+- A cold `fetch` (empty `IGEL_HOME`, lockfile present) measured 62 s vs Cargo's
   36 s. Most of that was the bug below; with it fixed, 34 s vs Cargo's 35–38 s.
   The rest is bandwidth: `curl` alone needs 25 s for the same 221 `.crate` files,
   and the index server sends uncompressed responses whatever is asked for.
 
 **A lockfile bug that looked like a slow resolver.** `LockfileManager::load_fast`
-preferred Rune's binary cache (`Rune.lock.bin`) over `Cargo.lock`. After a
+preferred Igel's binary cache (`Igel.lock.bin`) over `Cargo.lock`. After a
 `git pull`, a checkout of an older commit or a `cargo update --precise`, the next
-Rune command re-resolved from the *stale* cache and wrote the old versions back
+Igel command re-resolved from the *stale* cache and wrote the old versions back
 into `Cargo.lock` — a full resolution with network traffic each time, and with
 rust-analyzer running `cargo` next door, a tug of war. `Cargo.lock` is now the
 source of truth; the binary cache is used only while it describes the same
-packages. Test: `a_cargo_lock_changed_outside_rune_is_respected_not_reverted`.
+packages. Test: `a_cargo_lock_changed_outside_igel_is_respected_not_reverted`.
 
 **Resolution fidelity (G2).** Cargo allows one version per semver-compatible range
 of a crate. The greedy walk took the newest version per requirement, so a stricter
@@ -837,9 +837,9 @@ if one version satisfies all the requirements in force (optional dependencies on
 when activated), it is preferred and the walk re-run; if none does, the requirement
 that is the odd one out is found and its requirer's release excluded, so an older
 release that agrees is picked. Each round reuses the in-memory index, so a graph
-without conflicts costs one extra scan. A fresh lock for Rune's 229-package
+without conflicts costs one extra scan. A fresh lock for Igel's 229-package
 workspace is byte-identical to `cargo generate-lockfile`'s; on the backtracking
-test graph old Rune produced `a 1.0.0 + a 1.1.0 + b 2.0.0`, new Rune and Cargo
+test graph old Igel produced `a 1.0.0 + a 1.1.0 + b 2.0.0`, new Igel and Cargo
 `a 1.0.0 + b 1.0.0`. Not a full PubGrub solver: see G2.
 
 **Bindings.** Eleven scenarios, each compared with Cargo (the two `pyo3` ones set
@@ -849,45 +849,45 @@ from Python, `pyo3` embedding Python, `cbindgen` + `staticlib` linked from a C
 program, a `cdylib` loaded with `libloading`. What was wrong:
 - *Native search paths did not propagate.* A library records which native
   libraries it needs, not where they are; Cargo passes every dependency build
-  script's `rustc-link-search` to each rustc invocation above it. Rune passed only
+  script's `rustc-link-search` to each rustc invocation above it. Igel passed only
   the unit's own, so any `-sys` crate linking a **dynamic** library from a
   non-default directory failed at the final link (embedding Python:
   `library 'python3.9' not found`). Static libraries worked because they are
   bundled into the rlib.
-- *`rune run`/`test` could not load them either:* only `LD_LIBRARY_PATH` was
+- *`igl run`/`test` could not load them either:* only `LD_LIBRARY_PATH` was
   set (ignored on macOS). Now `DYLD_FALLBACK_LIBRARY_PATH`/`LD_LIBRARY_PATH`/`PATH`
   with build-script library directories inside the build directory, `deps/` and
   the profile directory, plus macOS's defaults.
 - *No plain library names.* Cargo puts `libfoo.a`, `libfoo.dylib`/`.so`,
-  `foo.dll`, `libfoo.rlib` of workspace libraries in `target/debug/`; Rune only had
+  `foo.dll`, `libfoo.rlib` of workspace libraries in `target/debug/`; Igel only had
   hash-named files in `deps/`.
-- *Doc tests and `rune doc` lacked the build script's `OUT_DIR`, `cfg`s and
+- *Doc tests and `igl doc` lacked the build script's `OUT_DIR`, `cfg`s and
   environment:* a bindings crate (`include!(concat!(env!("OUT_DIR"), …))`)
   could not be documented, and its doc tests failed.
 - *Dependency build scripts' warnings leaked* (`--cap-lints` was not passed when
   compiling them).
 
 **Commands.** `install` from crates.io/git/path with Cargo's tracking files
-(verified: `cargo install --list` and `cargo uninstall` see Rune's installs),
+(verified: `cargo install --list` and `cargo uninstall` see Igel's installs),
 `uninstall`, `package`, `publish`, `login`, `logout`, `yank`, `owner`, `search`,
-`info`, `vendor` (Rune and Cargo both build offline from it with empty caches),
+`info`, `vendor` (Igel and Cargo both build offline from it with empty caches),
 `fix` and `clippy --fix` (applying machine-applicable suggestions from the JSON
-diagnostics Rune already stores), `rustc`/`rustdoc` with extra arguments,
+diagnostics Igel already stores), `rustc`/`rustdoc` with extra arguments,
 `pkgid`, `verify-project`, `clippy -- <lint flags>` (in the key, so a cached
 warning never passes `-D warnings`), `fmt -- --check`, `update --precise
 --dry-run -p`, `add --git/--branch/--tag/--rev/--rename/--target/--registry
 --dry-run` (and `{ workspace = true }` when the workspace declares the
-dependency), `[alias]`, external `rune-*`/`cargo-*` subcommands, `--config`,
+dependency), `[alias]`, external `igel-*`/`cargo-*` subcommands, `--config`,
 `[profile]` in configuration and `CARGO_PROFILE_*`, unused-`[patch]` warnings.
 
 **Behaviour fixes found on the way.** Status lines went to stdout, so
-`rune vendor > config.toml` or anything piping a command's output got them mixed
+`igl vendor > config.toml` or anything piping a command's output got them mixed
 in; they now go to stderr like Cargo's. A malformed `.cargo/config.toml` was
 silently ignored (a vendoring or mirror setup would just not apply); it is now an
-error. `rune doc --open` used `xdg-open` everywhere.
+error. `igl doc --open` used `xdg-open` everywhere.
 
 **Tests:** 353 (18 new: 12 end-to-end, 6 unit), all passing under
-`cargo test` and under `rune test` on Rune's own workspace; clippy clean.
+`cargo test` and under `igl test` on Igel's own workspace; clippy clean.
 
 **Not done:** Windows, full PubGrub, P8 `trim-paths` (unstable in Cargo too),
 structured diagnostics (G4), JSON test output, `-Z` flags, config `include`,
@@ -896,19 +896,19 @@ OS keychain credential providers.
 ## 12. What changed in the build-speed and tooling update (2026-09-28)
 
 Asked for: use the whole machine (a 32 GB Apple M5 barely saw its CPU and
-memory used), make Rune faster, and close roadmap items. Developed and measured
-on Linux x86_64 with **4 cores** and 15 GB, rustc 1.98.1, on Rune's own
+memory used), make Igel faster, and close roadmap items. Developed and measured
+on Linux x86_64 with **4 cores** and 15 GB, rustc 1.98.1, on Igel's own
 workspace unless stated. The M5 was not available: numbers there will differ,
 and what to expect is said where it matters.
 
 **What limits a build is rarely the job count.** On 4 cores a cold build of
-Rune's own workspace keeps the machine ~86 % busy with Rune and with Cargo alike
+Igel's own workspace keeps the machine ~86 % busy with Igel and with Cargo alike
 (55.3–55.7 s vs Cargo's 54.4–55.0 s,
-two runs each, empty store; 170 s vs 168 s of CPU, of which Rune's own process
+two runs each, empty store; 170 s vs 168 s of CPU, of which Igel's own process
 2.6 s and Cargo's 1.3 s). With more cores, what stops a build from using them is the chain
 of crates that must be compiled one after another and the one-core front end of
 each large crate — no job count changes that on stable Rust. So this update
-removes what made Rune's chains longer than they need to be, keeps memory from
+removes what made Igel's chains longer than they need to be, keeps memory from
 becoming the limit, and makes the remaining limit visible:
 - *Build scripts are their own step*, as in Cargo. A crate with a `build.rs`
   used to start only once every transitive dependency was compiled and
@@ -929,7 +929,7 @@ becoming the limit, and makes the remaining limit visible:
   recorded, and the chain of steps that set the build's length is found. A
   build over 10 s that kept fewer than 60 % of the cores busy says so in one
   line with that chain; `--timings` prints it and writes
-  `.rune/timings/rune-timing.html`.
+  `.igel/timings/igel-timing.html`.
 - *Front-end threads* (`build.frontend-threads`, nightly only): `auto` gives a
   crate that starts while cores are idle as many `-Z threads` as there are idle
   cores. On 4 cores it kept the tail busy but saved nothing (47.4 s vs 47.9 s);
@@ -942,7 +942,7 @@ becoming the limit, and makes the remaining limit visible:
 - *No-op build 137 → 49 ms* (Cargo: 179 ms). Every command used to start
   `rustc` four times through the rustup proxy before doing anything, and `cc`/
   `ar` for their versions. Probes are now cached in
-  `RUNE_HOME/cache/toolchains.json`, trusted only while the sysroot's `rustc`
+  `IGEL_HOME/cache/toolchains.json`, trusted only while the sysroot's `rustc`
   and `librustc_driver` are unchanged, and `rustc` is started from its sysroot
   (no proxy per unit, one compiler for the whole build even if rustup updates
   mid-build).
@@ -975,31 +975,31 @@ becoming the limit, and makes the remaining limit visible:
   every index request used to fail and was reported as "crate not found".
 - The merge of the Windows branch had left the workspace uncompilable (three
   stray braces); fixed.
-- `rune-common` lacked the `libc` dependency its macOS memory probe needs — found
-  by `rune unused`, invisible to Linux builds.
+- `igel-common` lacked the `libc` dependency its macOS memory probe needs — found
+  by `igl unused`, invisible to Linux builds.
 
 **Commands.**
-- `rune outdated` / `rune upgrade [--incompatible] [--pinned] [--dry-run]`:
+- `igl outdated` / `igl upgrade [--incompatible] [--pinned] [--dry-run]`:
   newer releases per declared dependency (honouring `rust-version`), and
   requirements raised in place with their style and comments kept, then only
-  those crates re-resolved. Rune's 34 declared dependencies: 0.19 s.
-- `rune unused [--fix]`: rustc's `unused_crate_dependencies` lint over every
+  those crates re-resolved. Igel's 34 declared dependencies: 0.19 s.
+- `igl unused [--fix]`: rustc's `unused_crate_dependencies` lint over every
   target of the workspace's packages; a dependency is unused when every
   compilation given it reports it; one used only by tests is suggested as a
   dev-dependency; a name still appearing in the sources is reported, never
-  removed. It found 23 in Rune's own crates, each confirmed by hand.
-- `rune sbom` (CycloneDX 1.5 / SPDX 2.3), `rune tree --exec-surface` (32 of 187
-  packages in Rune's graph run code at build time), `resolve.min-release-age`
+  removed. It found 23 in Igel's own crates, each confirmed by hand.
+- `igl sbom` (CycloneDX 1.5 / SPDX 2.3), `igl tree --exec-surface` (32 of 187
+  packages in Igel's graph run code at build time), `resolve.min-release-age`
   (from the index's `pubtime`; locked versions stay).
-- `rune test --retries N` (flaky tests are warned about, not failed),
+- `igl test --retries N` (flaky tests are warned about, not failed),
   `--junit PATH`, `--message-format json` results per binary, the three slowest
   binaries after a run of 5 s or more.
-- `rune cas export/import`: the store entries a build needs as one (gzip) tar,
-  imported as untrusted (paths, hashes, whole trees checked). Rune's workspace:
+- `igl cas export/import`: the store entries a build needs as one (gzip) tar,
+  imported as untrusted (paths, hashes, whole trees checked). Igel's workspace:
   219 entries, 739 MiB (231 MiB gzipped), export 0.9 s, import 1.4 s, then a
   clean checkout builds with 0 compiled. Build-script results travel too.
-- `rune affected --partition N/M` for sharding CI.
-- `rune tree` shows what a build on this machine uses, like `cargo tree`: the
+- `igl affected --partition N/M` for sharding CI.
+- `igl tree` shows what a build on this machine uses, like `cargo tree`: the
   build's feature resolver runs for the host (`--target`, `--target all`), so
   other platforms' dependencies and optional dependencies nothing enables are
   gone and features are the ones built with; `[build-dependencies]` /
@@ -1008,10 +1008,10 @@ becoming the limit, and makes the remaining limit visible:
   `--prefix`, `name@version` specs; `-d` is `--duplicates` as in Cargo. On the
   469-package corpus below it matches `cargo tree` line for line except where
   Cargo draws a crate used at build time and at run time as two nodes.
-- `rune add` lists the added release's features with the enabled ones marked,
+- `igl add` lists the added release's features with the enabled ones marked,
   as `cargo add` does (a crate with hundreds, like `windows-sys`, gets the
   enabled ones and a count), plus its `rust-version` and publication date.
-- `rune graph`: the package graph (as locked; build/dev edges apart) or, with
+- `igl graph`: the package graph (as locked; build/dev edges apart) or, with
   `--units`, the units a build would run coloured by cache state, as DOT,
   Mermaid or JSON — the JSON unit graph is a machine-readable build plan.
 - Build scripts' compiler output is captured (a failure shows it; warnings of a
@@ -1022,21 +1022,21 @@ becoming the limit, and makes the remaining limit visible:
 (469 packages: tokio, axum, reqwest, tonic, clap, serde, regex, image, rusqlite
 with bundled SQLite, openssl, git2/libgit2, aws-lc-sys, ring, zstd, bzip2, xz,
 bindgen, ratatui, …):
-- `rune generate-lockfile` is byte-identical to `cargo generate-lockfile`.
+- `igl generate-lockfile` is byte-identical to `cargo generate-lockfile`.
 - It builds, and from an empty store **faster than Cargo: 112.5 s vs 122.8 s**
   (4 cores, same CPU time — the build-script steps overlap the heavy C builds).
-- `rune tree` matches `cargo tree` line for line but for host/target node
+- `igl tree` matches `cargo tree` line for line but for host/target node
   splitting (above).
 - 42 popular crates' own test suites (unit, integration, doc tests; 7,800+
   tests) run under both tools. Three real incompatibilities turned up and are
-  fixed: `rune test` did not build examples or run `test = true` ones
+  fixed: `igl test` did not build examples or run `test = true` ones
   (`once_cell`); `panic = "abort"` in `[profile.dev]` reached test harnesses
   (`winnow` — Cargo ignores `panic` for tests, proc-macros and build scripts);
-  `#[cfg(test)]` was an unexpected cfg under `deny(warnings)` because Rune did
+  `#[cfg(test)]` was an unexpected cfg under `deny(warnings)` because Igel did
   not declare Cargo's `cfg(docsrs,test)` (`http`, `httparse`). Now every crate
   ends as under Cargo, test for test: 36 pass identically; `unicode-ident`,
   `anyhow` and `glob` fail the same test under both, `mime`, `nom` fail to build under both; and
-  `same-file` passes only under Rune (Cargo cannot read the v1 lockfile it ships).
+  `same-file` passes only under Igel (Cargo cannot read the v1 lockfile it ships).
 - A second batch of 30 crates heavy on build scripts, proc-macros and C
   (`ring`, `blake3`, `zstd`, `rusqlite`, `libgit2-sys`, `tokio`, `rayon`,
   `regex`, `proc-macro2`, `serde_derive`, …) turned up five more, all fixed:
@@ -1068,27 +1068,27 @@ bindgen, ratatui, …):
   script cfgs resolve in the editor.
 
 **Disk.** The store is cleaned automatically: entries no build has used for
-`cas.max-age` (default 30 days) are removed by a `rune cas gc` a build starts in
+`cas.max-age` (default 30 days) are removed by a `igl cas gc` a build starts in
 the background at most once a day. Before, it only shrank when `cas.max-size`
 was set.
 
-**Measured end to end (4 cores, Rune's own workspace, 183 units):**
+**Measured end to end (4 cores, Igel's own workspace, 183 units):**
 
-| | Rune | Cargo |
+| | Igel | Cargo |
 | --- | --- | --- |
 | cold build, empty store | 55.3–55.7 s | 54.4–55.0 s |
 | no-op build | 53 ms | 231 ms |
 | after deleting the target directory | 76 ms (0 compiled) | a cold build |
 | `check` after `build` | 58 ms | compiles the workspace again |
 | edit a crate with a build script, rebuild | 0.19 s | 0.24 s |
-| `rune test` of the workspace | 429 passed, 52 s | |
+| `igl test` of the workspace | 429 passed, 52 s | |
 
 On a 10-core M5 a cold build is limited by the chain of crates rather than by
 the cores (the one-line hint and `--timings` show which); everything a store
 hit or a smaller rebuild saves above holds there as well.
 
-**Tests:** 452 (99 new), passing under `cargo test` and under `rune test` on
-Rune's own workspace; clippy clean.
+**Tests:** 452 (99 new), passing under `cargo test` and under `igl test` on
+Igel's own workspace; clippy clean.
 
 **Not done:** Windows; the sandbox (G1) and with it default-on cached tests;
 a PubGrub resolver; scheduling single tests across binaries; workspace-wide
@@ -1097,7 +1097,7 @@ the M5 itself.
 
 ## 13. What changed in the CLI and network update (2026-09-29)
 
-**The progress bar glitch.** `rune test` runs each test binary as soon as it
+**The progress bar glitch.** `igl test` runs each test binary as soon as it
 links, while other crates still compile, and its result lines (`▸ ok …`) were
 written straight to the terminal in the middle of the progress redraw: the text
 landed on the spinner row, the next redraw moved the cursor up too few rows, and
@@ -1108,13 +1108,13 @@ JSON, from any thread) goes through one lock that suspends the progress display,
 and the display is a single line — `⠹ building ━━━━╾──── 47/197 regex-syntax,
 memchr +3`, the crates in flight fitted to the width, the bar narrower on narrow
 terminals — which cannot wrap or outgrow the screen as the stack of one spinner
-per crate could. Across 400 sampled frames of `rune test` on Rune's workspace:
+per crate could. Across 400 sampled frames of `igl test` on Igel's workspace:
 one progress line at a time, nothing written into it, nothing left behind.
 
 **Progress for the network.** Resolution shows the index files fetched so far,
 then `▸ resolved 469 packages (0.84s)`; downloads a bar with crates, bytes and
 names, then `▸ downloaded 468 crates (76.4 MiB, 2.12s)`. The registry and
-resolver report through a small event sink in `rune-common`.
+resolver report through a small event sink in `igel-common`.
 
 **Faster resolution** (469-package corpus, same machine and network, runs
 interleaved with the previous binary):
@@ -1138,12 +1138,12 @@ interleaved with the previous binary):
   byte-identical to Cargo's.
 
 **Help and output.**
-- `rune help` shows 21 everyday commands in five groups (it listed 50);
-  `rune help --all` lists every command, grouped; `rune help <command>` equals
-  `rune <command> --help`, whose options are grouped like Cargo's (Package
+- `igl help` shows 21 everyday commands in five groups (it listed 50);
+  `igl help --all` lists every command, grouped; `igl help <command>` equals
+  `igl <command> --help`, whose options are grouped like Cargo's (Package
   Selection, Feature Selection, Compilation Options, …), wrap to the terminal
   and come with examples for build, test, run, add, watch, tree and search.
-- A built-in pager for long output (help, `rune search`, `rune config list`):
+- A built-in pager for long output (help, `igl search`, `igl config list`):
   scroll with keys or the mouse wheel, `/` to search with highlighted matches.
 - `search` (downloads, wrapped descriptions, next steps), `info` (a card:
   facts, features and what they enable, dependencies), `why` (paths drawn with
@@ -1158,22 +1158,22 @@ interleaved with the previous binary):
   paths that wrapped), panics name `src/main.rs`, and an artifact's paths no
   longer depend on where the checkout lives. A failed build ends with one line
   naming the crates that did not compile.
-- `rune features [crate]` (P10): a workspace package's features and what each
+- `igl features [crate]` (P10): a workspace package's features and what each
   enables, or a dependency's features that are on and who turned each on — a
   dependent asking for it, the dependents' default features, a dependent's own
   feature (`reqwest feature stream`), or another feature of the crate itself.
 - Friendlier failures (F13 in part): a `--target` whose standard library is not
   installed is reported before anything compiles, with the `rustup target add`
   line (an unknown triple is named as such), instead of rustc's "can't find crate
-  for `core`" in every crate; `rune add` of a crate that does not exist suggests
+  for `core`" in every crate; `igl add` of a crate that does not exist suggests
   the ones it probably meant (`serdee` → `serde`); outside a project, the error
   says how to create one.
 
 ## 14. What changed in the release-readiness update (2026-09-29)
 
-**"undeclared crate" after a lockfile from another resolution.** `Rune.lock.bin`
+**"undeclared crate" after a lockfile from another resolution.** `Igel.lock.bin`
 and the fingerprint of the inputs it was resolved from were two files; two
-`rune` processes at once, or a manifest saved during a resolution, could pair
+`igl` processes at once, or a manifest saved during a resolution, could pair
 the lockfile of one resolution with the fingerprint of another, and the next
 build trusted a lockfile without the new dependency. The fingerprint now lives
 inside the lockfile (format v3), taken from the inputs *before* resolving, and
@@ -1189,19 +1189,19 @@ repaid as tokens return).
 
 **Resources.** Each compiler's peak memory is measured (`wait4`) and kept with
 its timings; a unit waits until what it is expected to need is free.
-`build.low-priority` (always on for `rune watch` and the background cleanup)
+`build.low-priority` (always on for `igl watch` and the background cleanup)
 lowers the scheduling priority.
 
 **Store (P6).** `cas.max-size` defaults to a tenth of the disk (5–50 GiB);
 entries unused for 7 days are zstd-compressed by the daily cleanup and
-decompressed on their next use; `rune cas pin` keeps a workspace's build, check
+decompressed on their next use; `igl cas pin` keeps a workspace's build, check
 and test entries through every cleanup.
 
 **Workspace feature unification (P10).** `build.feature-unification =
 "workspace"` or Cargo's `resolver.feature-unification`.
 
-**Per-test scheduling (F7).** `rune test --schedule tests`: batches of tests,
-each its own process, from one queue across all binaries. On Rune's own suite
+**Per-test scheduling (F7).** `igl test --schedule tests`: batches of tests,
+each its own process, from one queue across all binaries. On Igel's own suite
 (4 cores, CPU-bound) it takes as long as per-binary scheduling (≈21 s both); it
 helps when a few binaries hold most tests on a machine with idle cores. Opt-in,
 since tests no longer share a process.
@@ -1212,34 +1212,34 @@ choice exists. A release whose dependency has no matching version is
 backtracked from. The corpus lock stays byte-identical.
 
 **Sandbox (G1 in part, P15).** `build.sandbox`: build scripts and rustc run
-through `rune __sandbox` — Linux user/mount/network namespaces with every mount
+through `igl __sandbox` — Linux user/mount/network namespaces with every mount
 read-only except the output directory and a private `TMPDIR`; macOS
-`sandbox-exec`. A full rebuild of Rune works confined at no measurable cost.
+`sandbox-exec`. A full rebuild of Igel works confined at no measurable cost.
 Recording undeclared *reads* (hermeticity) is still open.
 
-**Release.** `rune version -v` (commit, date, host, toolchain),
-`rune completions`, `install.sh` (checksummed), `CHANGELOG.md`, CI (fmt, clippy,
+**Release.** `igl version -v` (commit, date, host, toolchain),
+`igl completions`, `install.sh` (checksummed), `CHANGELOG.md`, CI (fmt, clippy,
 tests on Linux and macOS, MSRV 1.89, self-host) and a release workflow for four
-targets. `Rune.lock.bin` is no longer committed (it is machine-specific).
+targets. `Igel.lock.bin` is no longer committed (it is machine-specific).
 
 ## 15. What changed in the audit, coverage and edge-case update (2026-09-30)
 
-**`rune audit`.** The RustSec database as OSV publishes it (one 3.5 MB zip,
+**`igl audit`.** The RustSec database as OSV publishes it (one 3.5 MB zip,
 ~2,900 documents: RustSec, GitHub and OSV reports for crates.io, among them
 `MAL-` malicious-package reports); GitHub copies of RustSec advisories are
 dropped by alias, withdrawn ones skipped. OSV range semantics (`introduced`,
 `fixed`, `last_affected`), CVSS 3.x base scores computed from the vector
-(GitHub's rating where there is none), paths from `rune why`'s search, fixes
+(GitHub's rating where there is none), paths from `igl why`'s search, fixes
 from the ranges, yanked releases from the cached index (only lines with
-`"yanked":true` are parsed). Cached audit: ~0.1 s. On Rune itself: no
+`"yanked":true` are parsed). Cached audit: ~0.1 s. On Igel itself: no
 vulnerabilities, two unmaintained crates (bincode, number_prefix).
 
-**`rune coverage`.** Only workspace crates are instrumented (target role, not
+**`igl coverage`.** Only workspace crates are instrumented (target role, not
 build scripts or proc-macros), so dependencies keep their store entries; the
 test runner gained a hook (`cmd_test::run_with`) for the flags and
 `LLVM_PROFILE_FILE`, and reports the executables it ran; LCOV is post-processed
 (demangled with `rustc-demangle`, one entry per function across test
-binaries); `llvm-cov show` demangles through a hidden `rune __demangle`.
+binaries); `llvm-cov show` demangles through a hidden `igl __demangle`.
 
 **Edge cases.** Three sweeps (~90 scenarios, compared with Cargo) found:
 a dependency cycle hung the build (the executor's early error never ended its
@@ -1257,17 +1257,17 @@ Unicode, symlinked projects and sources, `kill -9` mid-build, concurrent
 **Speed.** An offline resolution of the 469-package corpus spent ~40 % in
 glibc's allocator: mimalloc makes it ~35 % faster (340–470 → 220–275 ms, lock
 byte-identical); parsed index files are cached in binary beside the JSON.
-Everyday commands against Cargo on Rune's workspace: no-op build 60 vs 220 ms,
+Everyday commands against Cargo on Igel's workspace: no-op build 60 vs 220 ms,
 check 65 vs 230, `test --no-run` 70 vs 250, tree 25 vs 200, metadata 90 vs 210.
 
 
 ## 16. What changed in the test-runner stability update (2026-09-30)
 
-**Why tests failed now and then.** Rune ran as many test binaries at once as
+**Why tests failed now and then.** Igel ran as many test binaries at once as
 it had compile jobs. Tests in different binaries that share something — a
 fixed port, a file, a database — then collided some of the time, and passed
 when run again. Reproduced with three integration tests binding one port:
-`cargo test` always passed, `rune test` failed about half the runs. Test
+`cargo test` always passed, `igl test` failed about half the runs. Test
 binaries (and doc-test runs) now run one at a time, as with Cargo, while the
 build goes on; `--test-jobs N` / `test.jobs` opts into more, and
 `--schedule tests` keeps one batch per core (one binary's tests, which libtest
@@ -1275,23 +1275,23 @@ runs in parallel anyway).
 
 **Other ways a run could fail or hang.**
 - A test that starts a process and leaves it running (a server) kept the
-  output pipe open, and `rune test` waited for that process. Output is now
+  output pipe open, and `igl test` waited for that process. Output is now
   streamed from reader threads; once the test binary exits, what is still in
   the pipes is taken and the rest not waited for.
 - Starting a binary that had just been linked could fail with `ETXTBSY` if a
   process forked in that instant; the start is retried briefly.
-- The store-restore pass did not take a unit's lock, so a second `rune` in the
+- The store-restore pass did not take a unit's lock, so a second `igl` in the
   same target directory could put a read-only store file where the first's
   compiler was writing ("output file is not writeable"). Busy units are now
   left to the scheduler, which waits its turn and restores them afterwards.
-- `rune coverage` builds the workspace's crates with other flags but the same
+- `igl coverage` builds the workspace's crates with other flags but the same
   file names; it and ordinary builds replaced each other's files. The
   instrumented build has its own directory (`<target>/coverage/build`), so
   both stay warm and can run at once. `llvm-profdata` leaves out a truncated
   profile (a killed test) with a warning instead of failing the report.
 - A target directory or store inside a package (`--target-dir out`, a CI's
-  `RUNE_HOME=$PWD/.cache`) was hashed as the package's sources, so every build
-  was a miss. Rune now tags both with `CACHEDIR.TAG` (as Cargo tags its target
+  `IGEL_HOME=$PWD/.cache`) was hashed as the package's sources, so every build
+  was a miss. Igel now tags both with `CACHEDIR.TAG` (as Cargo tags its target
   directory) and the hasher skips tagged directories.
 - Tests get `CARGO`, `CARGO_MANIFEST_PATH` and all `CARGO_PKG_*` variables at
   run time, as Cargo sets them (fixtures built through `$CARGO`, tests reading
@@ -1300,53 +1300,53 @@ runs in parallel anyway).
 **Feedback.** A live line under the build's: binaries done, tests passed so
 far (counted from libtest's output as each test finishes), and what runs now
 with its own `done/total` and elapsed time. Results print as each binary
-finishes. `rune coverage` shows its merge and report steps with durations; the
+finishes. `igl coverage` shows its merge and report steps with durations; the
 summary and LCOV exports run at once.
 
-**Rune's own suite.** Fixed sleeps that raced a loaded machine became waits
+**Igel's own suite.** Fixed sleeps that raced a loaded machine became waits
 for the event (`watch` waits for the first run's "waiting for changes"; a
 build-script ordering test has the slow script wait for the other's start);
-the CLI tests clear `RUNE_*`, `CARGO_TARGET_DIR` and flag variables from the
+the CLI tests clear `IGEL_*`, `CARGO_TARGET_DIR` and flag variables from the
 environment; a fake HTTP server's header/body writes stalled on Nagle's
-algorithm (rune-cas tests 2.9 → 0.5 s); a probe test slept a second it did
+algorithm (igel-cas tests 2.9 → 0.5 s); a probe test slept a second it did
 not need.
 
 ## 17. What changed in the docs, cold-start and timeout update (2026-10-01)
 
-**Documentation.** The README is now an introduction (what Rune does,
+**Documentation.** The README is now an introduction (what Igel does,
 measured against Cargo, install from runepm.com); the reference moved to
 `docs/`, one page per topic, with outdated statements corrected (the resolver
-does use PubGrub; `rune audit` is built in).
+does use PubGrub; `igl audit` is built in).
 
-**Cold starts.** A fresh `RUNE_HOME` used to start the compiler three times
+**Cold starts.** A fresh `IGEL_HOME` used to start the compiler three times
 in a row before anything was built (`-vV`, `--print sysroot`, then the host's
 `--print=cfg`); the third now runs beside the other two. Probes were also
 keyed by the working directory, so every new project and checkout probed
 again; they are now keyed by what selects the toolchain (a `rustup override`
-covering the directory, the nearest `rust-toolchain` file). Rune's own CLI
+covering the directory, the nearest `rust-toolchain` file). Igel's own CLI
 suite seeds each test's home with one shared probe: 29–30 s → 25–27 s.
 
-**Test scheduling.** `rune test` records each binary's run time
-(`.rune/fingerprints/test-times.json`) and hands it to the scheduler as work
+**Test scheduling.** `igl test` records each binary's run time
+(`.igel/fingerprints/test-times.json`) and hands it to the scheduler as work
 that follows the unit, so the binaries a run waits longest on — and the
 programs their package's tests start — are built first.
 
-**Timeouts.** `rune test --timeout 10m` / `test.timeout` stops a test binary
+**Timeouts.** `igl test --timeout 10m` / `test.timeout` stops a test binary
 or doc-test run that runs longer, counts what finished, and names the tests
 that never reported (the binary's `--list` minus the finished ones). libtest's
 "has been running for over 60 seconds" warnings show in the live line.
 
-**Release hygiene.** Rune type-checks for `x86_64-pc-windows-msvc` (checked
+**Release hygiene.** Igel type-checks for `x86_64-pc-windows-msvc` (checked
 here with a stub C compiler; two Unix-only assumptions fixed); CI gains a
 Windows job and now runs on pushes to `master`, the default branch.
-`rune self uninstall --purge` refuses to delete a `RUNE_HOME` that is the home
-directory, a root, or holds nothing of Rune's; `rune self update` uses Rune's
+`igl self uninstall --purge` refuses to delete a `IGEL_HOME` that is the home
+directory, a root, or holds nothing of Igel's; `igl self update` uses Igel's
 network settings and tolerates slow downloads.
 
 ## 18. What changed on the way to 2027.0 (2026-10-01)
 
 **Version.** The workspace is `2027.0.0`, the first stable release; versions
-are `YEAR.MINOR.PATCH` from here on (`rune self update --version 2027.1`
+are `YEAR.MINOR.PATCH` from here on (`igl self update --version 2027.1`
 names `v2027.1.0`).
 
 **Failure modes, tried one by one.** No `rustc` on `PATH` used to surface as
@@ -1355,7 +1355,7 @@ names `v2027.1.0`).
 the fix, checked once per command. A full disk was tried on a 64 MiB tmpfs:
 rustc dies with SIGBUS and a page of backtrace, so a failed build on a nearly
 full disk now ends naming the disk; builds warn under 1 GiB free and
-`rune doctor` under 2 GiB. A broken manifest printed its TOML error twice
+`igl doctor` under 2 GiB. A broken manifest printed its TOML error twice
 (an error type that includes its source, printed with its source chain): the
 error printer now skips a cause already contained in an earlier message.
 `edition = "2099"` silently compiled as 2015 and an invalid `version` became
@@ -1365,25 +1365,25 @@ failures end with what to check; a panic prints a bug-report request once.
 **Test runner.** The edge-case sweeps found that with one test process at a
 time, a doc-test run (ready long before the binaries link) ran first, so its
 failure stopped the run before a failing unit test was ever reported; doc
-tests now run after the binaries, as in Cargo. `rune test -q` printed nothing
-at all; it now prints the result. Rune's own warm `rune test`: 29–31 s.
+tests now run after the binaries, as in Cargo. `igl test -q` printed nothing
+at all; it now prints the result. Igel's own warm `igl test`: 29–31 s.
 
-## 19. What changed with rune-bench (2026-10-01)
+## 19. What changed with igel-bench (2026-10-01)
 
-**rune-bench** (`bench/`) measures Rune against Cargo in 19 scenarios —
+**igel-bench** (`bench/`) measures Igel against Cargo in 19 scenarios —
 startup, cold builds, no-op builds, rebuilds after an edit, cache reuse,
 tests, inspection commands, disk and memory — on generated workspaces or a
 copy of any project, with JSON/Markdown/HTML reports and a regression check
-(`rune-bench compare`). Verdicts are noise-aware: two sets of runs whose
+(`igel-bench compare`). Verdicts are noise-aware: two sets of runs whose
 ranges overlap and whose difference is within their spread are a tie.
 
 **Results.** Quick suite (2 and 25 crates): 2.6× faster overall; fresh
 checkout 32–39×, branch switch 5–15×, running tests 4–7×, no-op commands
 1.4–2.8×; cold builds and rebuilds after an edit on par (confirmed with more
 runs: every edit scenario within noise, the 2-crate cold build 1.2× faster).
-Rune's own workspace: a fresh checkout restores in 0.18 s where Cargo
+Igel's own workspace: a fresh checkout restores in 0.18 s where Cargo
 rebuilds for 84 s; `tree` 8.3×, `metadata` 3.3×, rebuilding after editing
-`rune-cli` 3.1 s against 3.6 s.
+`igel-cli` 3.1 s against 3.6 s.
 
 **What the measuring found.** Rayon's idle workers spun on two-item loops,
 making quick commands erratic (sequential below a threshold now). Writing a
@@ -1392,31 +1392,31 @@ package's library and everything above it, because a local crate was keyed
 by every file of its package: 21 of 26 crates for a new file in the bottom
 crate of the medium workspace, where Cargo rebuilds nothing. Crates are now
 keyed by the files rustc read for them, plus their build script's result
-(docs/caching.md); in Rune's own workspace, editing `rune-cli`'s
-integration tests no longer rebuilds the `rune` binary.
+(docs/caching.md); in Igel's own workspace, editing `igel-cli`'s
+integration tests no longer rebuilds the `igl` binary.
 
 **What dogfooding found.** A Windows smoke script run on Linux exposed the
-key problem above (it wrote its logs into the package). Building Rune with
-Rune after a `cargo update` on master downgraded `xxhash-rust` in
+key problem above (it wrote its logs into the package). Building Igel with
+Igel after a `cargo update` on master downgraded `xxhash-rust` in
 `Cargo.lock`: a locked release newer than the cached sparse index was
 re-resolved instead of fetched (fixed: the index is refreshed; offline, an
-error). `rune watch -x "test --junit report.xml"` restarted itself forever
+error). `igl watch -x "test --junit report.xml"` restarted itself forever
 (git-ignored files no longer count), and a test of that change found that
-writing to a child process that exited killed Rune silently with SIGPIPE
-(`rune login` with a failing credential helper; fixed). Cross-target clippy
-found `rune-bench` did not compile for Windows.
+writing to a child process that exited killed Igel silently with SIGPIPE
+(`igl login` with a failing credential helper; fixed). Cross-target clippy
+found `igel-bench` did not compile for Windows.
 
 **Profiling no-op builds.** On the 73-crate workload (callgrind, strace):
 unit keys were hashed twice per build (once more with a per-part breakdown
-for `rune explain`), explicit workspace members went through glob (two
+for `igl explain`), explicit workspace members went through glob (two
 stats of every directory from `/` down, per member) and the same absolute
 paths were canonicalized hundreds of times. No-op `check`/`build`/`test
---no-run` there: 32/39/37 ms against Cargo's 65/93/88 ms. Measuring Rune's
-own workspace against Cargo also showed Cargo rebuilding `rune-cli` on
+--no-run` there: 32/39/37 ms against Cargo's 65/93/88 ms. Measuring Igel's
+own workspace against Cargo also showed Cargo rebuilding `igel-cli` on
 every run: its build script watched a `.git/packed-refs` the clone did not
 have (fixed).
 
-**Also.** `rune test --failed` re-runs only the tests that failed; mistyped
+**Also.** `igl test --failed` re-runs only the tests that failed; mistyped
 commands get a "did you mean"; the install scripts take `--version 2027.0`,
 pick the native build under Rosetta and refuse musl with how to build from
 source; the Intel macOS release builds on a supported runner image; the
