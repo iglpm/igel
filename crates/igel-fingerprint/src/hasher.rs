@@ -8,7 +8,7 @@ use thiserror::Error;
 use walkdir::WalkDir;
 
 use crate::cache::{FileEntry, FingerprintCache};
-use rune_common::hash::{HashBuilder, xxhash3_file};
+use igel_common::hash::{HashBuilder, xxhash3_file};
 
 #[derive(Error, Debug)]
 pub enum HasherError {
@@ -67,7 +67,7 @@ const IGNORED_DIRS: &[&str] = &[
     ".git",
     ".hg",
     ".svn",
-    ".rune",
+    ".igel",
     ".cargo",
     ".idea",
     ".vscode",
@@ -84,7 +84,7 @@ fn is_editor_dropping(name: &str) -> bool {
 }
 
 /// Hash every input file of the package: all regular files except ignored/cache directories, editor
-/// droppings, nested packages, lock files and `Rune.toml`. Unchanged mtime+size reuses the cached hash.
+/// droppings, nested packages, lock files and `Igel.toml`. Unchanged mtime+size reuses the cached hash.
 pub fn compute_package_hash(package_dir: &Path, cache: &mut FingerprintCache) -> Result<String> {
     if let Some(hash) = cache.package_hashes.get(package_dir) {
         return Ok(hash.clone());
@@ -112,10 +112,10 @@ fn compute_package_hash_uncached(
             if IGNORED_DIRS.contains(&name.as_ref()) {
                 return false;
             }
-            if e.path().join(rune_common::fsutil::CACHEDIR_TAG).is_file() {
+            if e.path().join(igel_common::fsutil::CACHEDIR_TAG).is_file() {
                 return false;
             }
-            !rune_common::manifest_file::has_manifest(e.path())
+            !igel_common::manifest_file::has_manifest(e.path())
         });
     for entry in walker.filter_map(|e| e.ok()) {
         if !entry.file_type().is_file() {
@@ -126,10 +126,10 @@ fn compute_package_hash_uncached(
             continue;
         }
         // The manifest's relevant values are already in the unit's key; observed reads are declared inputs.
-        if rune_common::manifest_file::is_manifest_file_name(&name) && entry.depth() == 1 {
+        if igel_common::manifest_file::is_manifest_file_name(&name) && entry.depth() == 1 {
             continue;
         }
-        if name == "Cargo.lock" || name == "Rune.lock.bin" || name == "Rune.toml" {
+        if name == "Cargo.lock" || name == "Igel.lock.bin" || name == "Igel.toml" {
             continue;
         }
         files.push(entry.into_path());
