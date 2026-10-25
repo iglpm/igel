@@ -1,6 +1,6 @@
 //! Compiling and running `build.rs` following Cargo's contract (environment and `cargo::` directives).
 
-use rune_common::{BuildScriptOutput, LinkArg, LinkArgScope, LinkLib, LinkSearch, PackageMeta};
+use igel_common::{BuildScriptOutput, LinkArg, LinkArgScope, LinkLib, LinkSearch, PackageMeta};
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -64,6 +64,7 @@ pub struct BuildScriptEnv {
     pub links: Option<String>,
     pub rustflags: Vec<String>,
     pub config_env: Vec<(String, String, bool)>,
+    pub hyprc: bool,
 }
 
 impl BuildScriptEnv {
@@ -72,11 +73,11 @@ impl BuildScriptEnv {
         cmd.env("CARGO_PKG_VERSION", &self.pkg_version);
         cmd.env(
             "CARGO_MANIFEST_DIR",
-            rune_common::fsutil::simplified(&self.manifest_dir),
+            igel_common::fsutil::simplified(&self.manifest_dir),
         );
         cmd.env(
             "CARGO_MANIFEST_PATH",
-            rune_common::fsutil::simplified(&rune_common::manifest_file::manifest_in(
+            igel_common::fsutil::simplified(&igel_common::manifest_file::manifest_in(
                 &self.manifest_dir,
             )),
         );
@@ -173,12 +174,12 @@ impl BuildScriptRunner {
         configure: &dyn Fn(&mut Command),
     ) -> Result<(PathBuf, String)> {
         let _ = std::fs::create_dir_all(out_dir);
-        cmd.arg(rune_common::fsutil::simplified(build_rs_path));
+        cmd.arg(igel_common::fsutil::simplified(build_rs_path));
         cmd.arg("--crate-name").arg("build_script_build");
         cmd.arg("--crate-type").arg("bin");
         cmd.arg("--edition").arg(edition);
         cmd.arg("--out-dir")
-            .arg(rune_common::fsutil::simplified(out_dir));
+            .arg(igel_common::fsutil::simplified(out_dir));
         cmd.arg("--emit=dep-info,link");
 
         cmd.arg("-L")
@@ -197,9 +198,9 @@ impl BuildScriptRunner {
             cmd.args(&e.rustflags);
             if let Some(linker) = &e.linker {
                 let name = linker.to_string_lossy();
-                let (exe, env) = rune_common::linker::for_rustc(&name);
+                let (exe, env) = igel_common::linker::for_rustc(&name);
                 cmd.arg("-C").arg(format!("linker={}", exe.display()));
-                if let Some(flavor) = rune_common::linker::rustc_flavor(&name, &e.host) {
+                if let Some(flavor) = igel_common::linker::rustc_flavor(&name, &e.host, &e.host) {
                     cmd.arg("-C").arg(format!("linker-flavor={flavor}"));
                 }
                 for (k, v) in env {
@@ -254,16 +255,19 @@ impl BuildScriptRunner {
         configure(&mut cmd);
 
         // Cargo runs build scripts in the manifest directory; scripts rely on it for relative paths.
-        cmd.current_dir(rune_common::fsutil::simplified(&env.manifest_dir));
+        cmd.current_dir(igel_common::fsutil::simplified(&env.manifest_dir));
 
         env.apply_package_env(&mut cmd);
-        cmd.env("OUT_DIR", rune_common::fsutil::simplified(&env.out_dir));
+        cmd.env("OUT_DIR", igel_common::fsutil::simplified(&env.out_dir));
         cmd.env("TARGET", &env.target);
         cmd.env("HOST", &env.host);
         cmd.env("OPT_LEVEL", &env.opt_level);
         cmd.env("DEBUG", if env.debug { "true" } else { "false" });
         cmd.env("PROFILE", &env.profile);
         cmd.env("NUM_JOBS", env.num_jobs.to_string());
+        if env.hyprc {
+            cmd.env(igel_common::toolchain::EMBEDDED_HYPRC_ENV, "1");
+        }
         cmd.env("RUSTC", &env.rustc);
         cmd.env("RUSTDOC", &env.rustdoc);
         match &env.rustc_wrapper {
@@ -275,7 +279,7 @@ impl BuildScriptRunner {
             None => cmd.env_remove("RUSTC_WORKSPACE_WRAPPER"),
         };
         if let Some(linker) = &env.linker
-            && !rune_common::linker::is_embedded(&linker.to_string_lossy())
+            && !igel_common::linker::is_embedded(&linker.to_string_lossy())
         {
             cmd.env("RUSTC_LINKER", linker);
         }
