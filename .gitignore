@@ -1,7 +1,15 @@
 target/
+/.igel/
+/Igel.lock.bin
+
+# igel-bench output
+igel-bench-results/
+
+
+# Pre-rename local caches
 /.rune/
 /Rune.lock.bin
 
-# rune-bench output
-rune-bench-results/
-
+# Stray compiler output
+/*.rlib
+/*.rmeta
