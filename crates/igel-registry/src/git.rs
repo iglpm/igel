@@ -126,7 +126,7 @@ pub fn locate_dir(dir: &Path) -> Option<GitCheckout> {
 }
 
 fn git_root() -> PathBuf {
-    rune_common::settings::rune_home().join("git")
+    igel_common::settings::igel_home().join("git")
 }
 
 fn repo_key(url: &str) -> String {
@@ -188,7 +188,7 @@ pub fn checkout(url: &str, reference: &GitRef) -> Result<GitCheckout> {
         let commit = pinned.clone().ok_or_else(|| GitError::Command {
             args: format!("(vendored {url})"),
             stderr: "a vendored git dependency needs its commit in Cargo.lock; run \
-                     `rune vendor` again"
+                     `igl vendor` again"
                 .into(),
         })?;
         let checkout = GitCheckout {
@@ -302,7 +302,7 @@ fn resolve_commit(db: &Path, url: &str, reference: &GitRef) -> Result<String> {
 }
 
 fn materialize(db: &Path, dir: &Path, commit: &str) -> Result<String> {
-    let marker = dir.join(".rune-git-identity");
+    let marker = dir.join(".igel-git-identity");
     if let Ok(text) = std::fs::read_to_string(&marker) {
         let mut lines = text.lines();
         if lines.next() == Some(commit) {
@@ -354,14 +354,14 @@ fn materialize(db: &Path, dir: &Path, commit: &str) -> Result<String> {
         subs.sort();
         let submodules = subs.join(",");
         std::fs::write(
-            staging.join(".rune-git-identity"),
+            staging.join(".igel-git-identity"),
             format!("{commit}\n{submodules}\n"),
         )?;
         Ok(submodules)
     })();
     match result {
         Ok(subs) => {
-            if std::fs::rename(&staging, dir).is_err() && !dir.join(".rune-git-identity").is_file()
+            if std::fs::rename(&staging, dir).is_err() && !dir.join(".igel-git-identity").is_file()
             {
                 let _ = std::fs::remove_dir_all(&staging);
                 return Err(GitError::Io(std::io::Error::other(format!(
@@ -380,7 +380,7 @@ fn materialize(db: &Path, dir: &Path, commit: &str) -> Result<String> {
 
 pub fn find_package(checkout: &GitCheckout, name: &str) -> Result<PathBuf> {
     let declares = |dir: &Path| -> bool {
-        std::fs::read_to_string(rune_common::manifest_file::manifest_in(dir))
+        std::fs::read_to_string(igel_common::manifest_file::manifest_in(dir))
             .ok()
             .and_then(|t| t.parse::<toml::Table>().ok())
             .and_then(|t| {

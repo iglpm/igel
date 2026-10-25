@@ -1,11 +1,11 @@
 //! The HTTP client every registry request goes through, configured like Cargo's.
 
+use igel_common::net::{self, HttpConfig};
 use reqwest::blocking::{Client, ClientBuilder, RequestBuilder, Response};
-use rune_common::net::{self, HttpConfig};
 use std::time::Duration;
 use tracing::{debug, warn};
 
-pub const USER_AGENT: &str = concat!("rune/", env!("CARGO_PKG_VERSION"));
+pub const USER_AGENT: &str = concat!("igl/", env!("CARGO_PKG_VERSION"));
 
 pub fn configure(mut builder: ClientBuilder, http: &HttpConfig) -> ClientBuilder {
     builder = builder.user_agent(http.user_agent.as_deref().unwrap_or(USER_AGENT));

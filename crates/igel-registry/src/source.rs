@@ -5,7 +5,7 @@ use crate::index::{CrateIndex, IndexDependency, IndexError, IndexRecord, SparseI
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-pub const CRATES_IO: &str = rune_common::CRATES_IO_INDEX;
+pub const CRATES_IO: &str = igel_common::CRATES_IO_INDEX;
 
 #[derive(Debug, Clone, Default)]
 pub struct RegistryDefs {

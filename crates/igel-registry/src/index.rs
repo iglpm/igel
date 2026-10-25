@@ -16,7 +16,7 @@ pub enum IndexError {
     #[error("Crate not found in registry: {0}")]
     CrateNotFound(String),
     #[error(
-        "`{0}` is not in the local registry cache and Rune is offline \
+        "`{0}` is not in the local registry cache and Igel is offline \
          (run without `--offline` once to populate it)"
     )]
     Offline(String),
@@ -135,7 +135,7 @@ impl SparseIndexClient {
             .trim_end_matches('/')
             .to_string();
         let mut client = Self::new(
-            rune_common::settings::rune_home()
+            igel_common::settings::igel_home()
                 .join("registry")
                 .join("index")
                 .join(registry_dir_key(index)),
@@ -147,7 +147,7 @@ impl SparseIndexClient {
     }
 
     pub fn default_client() -> Self {
-        let cache_dir = rune_common::settings::rune_home()
+        let cache_dir = igel_common::settings::igel_home()
             .join("registry")
             .join("index")
             .join("crates.io-index");
@@ -232,7 +232,7 @@ impl SparseIndexClient {
 
         let url = format!("{}/{}", self.base_url, rel_path);
         let have_cache = cached_file.is_file();
-        use rune_common::progress::{Event, emit};
+        use igel_common::progress::{Event, emit};
         emit(Event::IndexStarted { name });
         struct Finished<'a>(&'a str);
         impl Drop for Finished<'_> {
@@ -350,7 +350,7 @@ impl SparseIndexClient {
 
 /// A binary copy (`.rbin`) beside the JSON is valid while size and mtime match; much faster to decode.
 fn read_cached(name: &str, json: &Path) -> Option<CrateIndex> {
-    const MAGIC: &[u8; 8] = b"RUNEIDX1";
+    const MAGIC: &[u8; 8] = b"IGELIDX1";
     let meta = fs::metadata(json).ok()?;
     let mtime = meta
         .modified()

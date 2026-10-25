@@ -44,7 +44,7 @@ impl RegistryApi {
         let token = defs.api_token(index)?;
         let name = defs.name_of(index);
         let base = if index == CRATES_IO {
-            std::env::var("RUNE_CRATES_IO_API").unwrap_or_else(|_| "https://crates.io".into())
+            std::env::var("IGEL_CRATES_IO_API").unwrap_or_else(|_| "https://crates.io".into())
         } else {
             let url = index
                 .strip_prefix("sparse+")
@@ -88,7 +88,7 @@ impl RegistryApi {
     fn token(&self) -> Result<&str> {
         self.token.as_deref().ok_or_else(|| {
             ApiError::Config(format!(
-                "no token for registry `{}`: run `rune login{}` or set {}",
+                "no token for registry `{}`: run `igl login{}` or set {}",
                 self.name,
                 if self.name == "crates-io" {
                     String::new()

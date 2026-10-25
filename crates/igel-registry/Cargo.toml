@@ -1,13 +1,13 @@
 [package]
-name = "rune-registry"
-description = "crates.io sparse index client, crate downloader, and extraction cache for Rune"
+name = "igel-registry"
+description = "crates.io sparse index client, crate downloader, and extraction cache for Igel"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-rune-common.workspace = true
+igel-common.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 bincode.workspace = true

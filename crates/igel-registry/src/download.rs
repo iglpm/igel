@@ -76,7 +76,7 @@ impl CrateDownloader {
         let backend = defs().backend_for(index)?;
         let mut d = Self::default_downloader();
         let key = crate::index::registry_dir_key(index);
-        let home = rune_common::settings::rune_home().join("registry");
+        let home = igel_common::settings::igel_home().join("registry");
         match backend {
             Backend::Sparse { url, token } => {
                 if index != CRATES_IO || url != CRATES_IO || token.is_some() {
@@ -139,7 +139,7 @@ impl CrateDownloader {
             None => {
                 if self.offline {
                     return Err(DownloadError::Archive(format!(
-                        "the registry config of {base} is not cached and Rune is offline"
+                        "the registry config of {base} is not cached and Igel is offline"
                     )));
                 }
                 let mut req = self.client.get(format!("{base}/config.json"));
@@ -189,7 +189,7 @@ impl CrateDownloader {
     }
 
     pub fn default_downloader() -> Self {
-        Self::new(rune_common::settings::rune_home().join("registry"))
+        Self::new(igel_common::settings::igel_home().join("registry"))
     }
 
     pub fn offline(mut self, offline: bool) -> Self {
@@ -236,7 +236,7 @@ impl CrateDownloader {
         if !tarball_path.exists() {
             if self.offline {
                 return Err(DownloadError::Archive(format!(
-                    "{crate_folder_name} is not in the local registry cache and Rune is offline"
+                    "{crate_folder_name} is not in the local registry cache and Igel is offline"
                 )));
             }
             if let DlBackend::LocalRegistry(dir) = &self.backend {
@@ -267,7 +267,7 @@ impl CrateDownloader {
                     ),
                 };
                 debug!("Downloading crate {} from {}", crate_folder_name, url);
-                use rune_common::progress::{CountingReader, Event, emit};
+                use igel_common::progress::{CountingReader, Event, emit};
                 emit(Event::DownloadStarted { name, version });
                 struct Finished<'a>(&'a str, &'a str, bool);
                 impl Drop for Finished<'_> {
@@ -285,7 +285,7 @@ impl CrateDownloader {
                 let tmp_tarball = self
                     .crates_dir
                     .join(format!(".{crate_folder_name}.{}.part", std::process::id()));
-                let retries = rune_common::net::global().retries;
+                let retries = igel_common::net::global().retries;
                 let mut attempt = 0;
                 loop {
                     let mut resp = crate::http::send_with_retry(|| {
@@ -318,7 +318,7 @@ impl CrateDownloader {
                         Err(e) if attempt < retries => {
                             attempt += 1;
                             debug!("download of {url} broke off ({e}); retry {attempt}/{retries}");
-                            std::thread::sleep(rune_common::net::retry_delay(attempt));
+                            std::thread::sleep(igel_common::net::retry_delay(attempt));
                         }
                         Err(e) => {
                             let _ = fs::remove_file(&tmp_tarball);
@@ -413,7 +413,7 @@ impl CrateDownloader {
                 })
                 .count();
             if to_fetch > 0 && !self.offline {
-                rune_common::progress::emit(rune_common::progress::Event::DownloadsQueued {
+                igel_common::progress::emit(igel_common::progress::Event::DownloadsQueued {
                     count: to_fetch,
                 });
             }

@@ -20,7 +20,7 @@ fn updated() -> &'static Mutex<HashSet<PathBuf>> {
 impl GitIndex {
     pub fn open(url: &str, offline: bool) -> Result<GitIndex, IndexError> {
         let url = url.strip_prefix("registry+").unwrap_or(url).to_string();
-        let dir = rune_common::settings::rune_home()
+        let dir = igel_common::settings::igel_home()
             .join("registry")
             .join("git-index")
             .join(crate::index::registry_dir_key(&url));
@@ -28,7 +28,7 @@ impl GitIndex {
         if !index.dir.join(".git").exists() {
             if offline {
                 return Err(IndexError::Config(format!(
-                    "the git index `{}` has not been cloned yet and Rune is offline",
+                    "the git index `{}` has not been cloned yet and Igel is offline",
                     index.url
                 )));
             }
@@ -126,8 +126,8 @@ mod tests {
     #[test]
     fn reads_and_updates_an_index_repository() {
         let home = tempfile::tempdir().unwrap();
-        // SAFETY: tests in this crate do not read RUNE_HOME concurrently.
-        unsafe { std::env::set_var("RUNE_HOME", home.path()) };
+        // SAFETY: tests in this crate do not read IGEL_HOME concurrently.
+        unsafe { std::env::set_var("IGEL_HOME", home.path()) };
         let remote = tempfile::tempdir().unwrap();
         let run = |args: &[&str]| {
             let ok = Command::new("git")

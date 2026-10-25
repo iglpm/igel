@@ -97,7 +97,7 @@ pub fn get(
                 .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
                 .filter(|t| !t.is_empty()))
         }
-        Provider::Wincred => Err("`cargo:wincred` is not supported by Rune yet".into()),
+        Provider::Wincred => Err("`cargo:wincred` is not supported by Igel yet".into()),
         Provider::External(cmd) => {
             let reply = external(
                 cmd,
@@ -149,7 +149,7 @@ pub fn store(provider: &Provider, registry: &Registry, token: &str) -> Result<bo
                 .spawn()
                 .map_err(|e| format!("`cargo:libsecret` needs `secret-tool`: {e}"))?;
             let mut stdin = child.stdin.take().ok_or("no stdin")?;
-            rune_common::sysinfo::without_sigpipe(|| stdin.write_all(token.as_bytes()))
+            igel_common::sysinfo::without_sigpipe(|| stdin.write_all(token.as_bytes()))
                 .map_err(|e| format!("`secret-tool store` stopped reading: {e}"))?;
             drop(stdin);
             if !child.wait().map_err(|e| e.to_string())?.success() {
@@ -157,7 +157,7 @@ pub fn store(provider: &Provider, registry: &Registry, token: &str) -> Result<bo
             }
             Ok(true)
         }
-        Provider::Wincred => Err("`cargo:wincred` is not supported by Rune yet".into()),
+        Provider::Wincred => Err("`cargo:wincred` is not supported by Igel yet".into()),
         Provider::External(cmd) => {
             external(
                 cmd,
@@ -188,7 +188,7 @@ pub fn erase(provider: &Provider, registry: &Registry) -> Result<bool, String> {
                 .output();
             Ok(true)
         }
-        Provider::Wincred => Err("`cargo:wincred` is not supported by Rune yet".into()),
+        Provider::Wincred => Err("`cargo:wincred` is not supported by Igel yet".into()),
         Provider::External(cmd) => {
             external(cmd, registry, serde_json::json!({ "kind": "logout" }))?;
             Ok(true)
@@ -258,7 +258,7 @@ fn external(
     if let (Some(obj), Some(extra)) = (req.as_object_mut(), request.as_object()) {
         obj.extend(extra.clone());
     }
-    rune_common::sysinfo::without_sigpipe(|| writeln!(stdin, "{req}"))
+    igel_common::sysinfo::without_sigpipe(|| writeln!(stdin, "{req}"))
         .map_err(|e| format!("credential provider `{prog}`: {e}"))?;
     let mut line = String::new();
     stdout
