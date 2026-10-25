@@ -104,7 +104,7 @@ pub fn bar_width() -> usize {
 pub fn bar_style(width: usize) -> ProgressStyle {
     ProgressStyle::default_bar()
         .template(&format!(
-            "{{spinner:.141}} {{prefix:.141.bold}} {{bar:{width}.141/238}} {{pos}}/{{len}} {{wide_msg:.dim}}"
+            "{{spinner:.179}} {{prefix:.179.bold}} {{bar:{width}.179/238}} {{pos}}/{{len}} {{wide_msg:.dim}}"
         ))
         .expect("valid template")
         .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏ ")

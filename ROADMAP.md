@@ -1151,8 +1151,8 @@ interleaved with the previous binary):
   `affected` explains a missing repository or revision; Cargo's plain formats
   stay where scripts read them (piped `search`, `pkgid`, `locate-project`,
   `verify-project`, `metadata`).
-- The brand violet falls back to its 256-colour neighbour where the terminal
-  has no truecolor (it was rounded to blue).
+- The warm quill colour from Igel's logo falls back to its 256-colour neighbour
+  where the terminal has no truecolor.
 - Workspace crates are compiled from the workspace root with relative paths,
   as Cargo does: errors point at `src/main.rs:1:26` (they showed long absolute
   paths that wrapped), panics name `src/main.rs`, and an artifact's paths no
