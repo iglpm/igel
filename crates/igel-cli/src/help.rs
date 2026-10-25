@@ -6,6 +6,8 @@ use crate::ui;
 use clap::{CommandFactory, Parser};
 use colored::Colorize;
 
+mod logo;
+
 const EVERYDAY: &[(&str, &[&str])] = &[
     (
         "Build",
@@ -301,32 +303,46 @@ fn overview(all: bool) {
     page.show();
 }
 
-const LOGO: [&str; 5] = [
-    r"    /\/\/\/\",
-    r"  /          \__",
-    r" /   o           `>",
-    r" \       ____  __/",
-    r"  `-----'    `-'",
-];
-
 fn add_heading(page: &mut Page, heading: &str, usage: &str) {
-    let logo_width = LOGO
-        .iter()
-        .map(|line| line.chars().count())
-        .max()
-        .unwrap_or(0);
-    let width = ui::term_width().min(120);
-    if width < 68 {
-        page.line(heading);
-        page.blank();
-        page.line(usage);
-        return;
+    // Help goes to stdout, as does the pager. Leave room for its right edge.
+    let width = console::Term::stdout()
+        .size_checked()
+        .map(|(_, width)| usize::from(width))
+        .unwrap_or_else(ui::term_width);
+    for line in heading_lines(heading, usage, width) {
+        page.line(line);
     }
+}
 
-    for (left, logo) in [heading, "", usage, "", ""].into_iter().zip(LOGO) {
-        let gap = width.saturating_sub(ui::width_of(left) + logo_width).max(2);
-        page.line(format!("{left}{:gap$}{}", "", ui::brand(logo)));
+fn heading_lines(heading: &str, usage: &str, width: usize) -> Vec<String> {
+    const MARGIN: usize = 4;
+    const GAP: usize = 6;
+    let width = width.min(120);
+    let left_width = ui::width_of(heading).max(ui::width_of(usage));
+    let mut lines = vec![String::new()];
+    if left_width + GAP + logo::WIDTH + MARGIN <= width {
+        let logo_start = width - MARGIN - logo::WIDTH;
+        for (row, logo) in logo::lines().into_iter().enumerate() {
+            let left = match row {
+                2 => heading,
+                4 => usage,
+                _ => "",
+            };
+            let gap = logo_start - ui::width_of(left);
+            lines.push(format!("{left}{:gap$}{logo}", ""));
+        }
+    } else {
+        lines.extend([heading.to_owned(), String::new(), usage.to_owned()]);
+        if logo::WIDTH + 2 * MARGIN <= width {
+            lines.push(String::new());
+            let indent = (width - logo::WIDTH) / 2;
+            for logo in logo::lines() {
+                lines.push(format!("{:indent$}{logo}", ""));
+            }
+        }
     }
+    lines.push(String::new());
+    lines
 }
 
 pub fn styles() -> clap::builder::Styles {
@@ -369,6 +385,29 @@ pub fn examples(rows: &[(&str, &str)]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn heading_keeps_logo_inside_terminal_with_padding() {
+        let heading = "igl 2027.0.0  fast Rust builds, one shared build cache";
+        let usage = "Usage  igl <command> [options]";
+        for width in [36, 40, 68, 80, 92, 100, 120, 160] {
+            let lines = heading_lines(heading, usage, width);
+            assert!(lines.first().unwrap().is_empty());
+            assert!(lines.last().unwrap().is_empty());
+            for line in lines
+                .iter()
+                .filter(|line| !line.is_empty() && !line.contains(heading) && !line.contains(usage))
+            {
+                assert!(line.starts_with("    "), "left padding at {width}");
+                assert!(
+                    ui::width_of(line) <= width.min(120) - 4,
+                    "logo clips at width {width}: {line:?}"
+                );
+            }
+        }
+        let lines = heading_lines(heading, usage, 32);
+        assert_eq!(lines.len(), 5, "omit logo when margins cannot fit");
+    }
 
     #[test]
     fn every_listed_command_exists_and_everyday_ones_have_short_descriptions() {
