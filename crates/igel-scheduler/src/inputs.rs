@@ -2,8 +2,8 @@
 //! Learned from build script declarations and dep-info, stored beside the base key; the effective key
 //! adds their current values, so an artifact is found again only when they are unchanged.
 
-use rune_common::BuildScriptOutput;
-use rune_common::hash::HashBuilder;
+use igel_common::BuildScriptOutput;
+use igel_common::hash::HashBuilder;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -261,7 +261,7 @@ pub fn effective_key(
 
 pub(crate) fn hash_path(path: &Path) -> String {
     match std::fs::metadata(path) {
-        Ok(m) if m.is_file() => rune_common::hash::xxhash3_file(path)
+        Ok(m) if m.is_file() => igel_common::hash::xxhash3_file(path)
             .map(|h| format!("{h:016x}"))
             .unwrap_or_else(|_| "unreadable".into()),
         Ok(m) if m.is_dir() => {
@@ -319,7 +319,7 @@ pub fn from_script_output(
         } else {
             manifest_dir.join(p)
         };
-        let is_manifest = abs == rune_common::manifest_file::manifest_in(manifest_dir);
+        let is_manifest = abs == igel_common::manifest_file::manifest_in(manifest_dir);
         if is_manifest || (!abs.starts_with(manifest_dir) && !abs.starts_with(out_dir)) {
             inputs.files.push(abs);
         }
@@ -328,7 +328,7 @@ pub fn from_script_output(
     if out.rerun_if_changed.is_empty() {
         inputs
             .files
-            .push(rune_common::manifest_file::manifest_in(manifest_dir));
+            .push(igel_common::manifest_file::manifest_in(manifest_dir));
     }
 
     let outside = |p: &Path| !p.starts_with(manifest_dir) && !p.starts_with(out_dir);
@@ -369,7 +369,7 @@ pub fn from_script_output(
                 if file.exists() {
                     inputs
                         .native
-                        .push(rune_common::fsutil::canonicalize(&file).unwrap_or(file));
+                        .push(igel_common::fsutil::canonicalize(&file).unwrap_or(file));
                     found = true;
                 }
             }
@@ -408,15 +408,15 @@ pub fn reads_manifest(dep_info: &Path, manifest: &Path, base: &Path) -> bool {
         return false;
     };
     let wanted =
-        rune_common::fsutil::canonicalize(manifest).unwrap_or_else(|_| manifest.to_path_buf());
+        igel_common::fsutil::canonicalize(manifest).unwrap_or_else(|_| manifest.to_path_buf());
     text.lines()
         .filter(|l| !l.starts_with('#'))
         .flat_map(|l| l.split_whitespace())
         .map(|t| t.trim_end_matches(':'))
-        .filter(|t| t.ends_with("Cargo.toml") || t.ends_with("Rune.toml"))
+        .filter(|t| t.ends_with("Cargo.toml") || t.ends_with("Igel.toml"))
         .any(|t| {
             let p = base.join(t);
-            rune_common::fsutil::canonicalize(&p).unwrap_or(p) == wanted
+            igel_common::fsutil::canonicalize(&p).unwrap_or(p) == wanted
         })
 }
 
@@ -459,9 +459,9 @@ pub fn native_tools_identity() -> &'static str {
             out.push_str(&format!(
                 "{var}={}|{}|",
                 program,
-                rune_common::toolchain::program_fingerprint(&path)
+                igel_common::toolchain::program_fingerprint(&path)
             ));
-            let version = rune_common::toolchain::tool_version(&path);
+            let version = igel_common::toolchain::tool_version(&path);
             out.push_str(&version);
             out.push('\n');
         }
@@ -483,7 +483,7 @@ pub fn native_tools_identity() -> &'static str {
 /// `/usr/bin/cc` is a shim: fingerprint the real `clang` and SDK (without starting `xcrun`).
 fn apple_developer_identity(developer_dir: &Path, sdkroot: Option<&Path>) -> String {
     let canonical =
-        |p: &Path| rune_common::fsutil::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+        |p: &Path| igel_common::fsutil::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
     let mut out = format!("DEVELOPER_DIR={}\n", canonical(developer_dir).display());
     for clang in [
         "usr/bin/clang",
@@ -493,7 +493,7 @@ fn apple_developer_identity(developer_dir: &Path, sdkroot: Option<&Path>) -> Str
         if path.is_file() {
             out.push_str(&format!(
                 "clang={}\n",
-                rune_common::toolchain::program_fingerprint(&path)
+                igel_common::toolchain::program_fingerprint(&path)
             ));
         }
     }
@@ -509,7 +509,7 @@ fn apple_developer_identity(developer_dir: &Path, sdkroot: Option<&Path>) -> Str
         out.push_str(&format!(
             "sdk={}|{}\n",
             canonical(sdk).display(),
-            rune_common::toolchain::program_fingerprint(&settings)
+            igel_common::toolchain::program_fingerprint(&settings)
         ));
     }
     out
@@ -548,7 +548,7 @@ mod tests {
              # env-dep:X=1\n",
         )
         .unwrap();
-        let record = ReadRecord::from_dep_info(&d, &p("/w"), &p("/w/pkg"), &p("/w/.rune/target"));
+        let record = ReadRecord::from_dep_info(&d, &p("/w"), &p("/w/pkg"), &p("/w/.igel/target"));
         assert_eq!(
             record.files,
             [
@@ -676,17 +676,17 @@ mod tests {
     #[test]
     fn the_key_follows_the_values_of_declared_environment_variables() {
         let inputs = DeclaredInputs {
-            env: vec!["RUNE_TEST_INPUT_VAR".into()],
+            env: vec!["IGEL_TEST_INPUT_VAR".into()],
             ..Default::default()
         };
         // SAFETY-free: the variable name is unique to this test.
-        unsafe { std::env::remove_var("RUNE_TEST_INPUT_VAR") };
+        unsafe { std::env::remove_var("IGEL_TEST_INPUT_VAR") };
         let unset = effective_key("k", Some(&inputs), false);
-        unsafe { std::env::set_var("RUNE_TEST_INPUT_VAR", "one") };
+        unsafe { std::env::set_var("IGEL_TEST_INPUT_VAR", "one") };
         let one = effective_key("k", Some(&inputs), false);
-        unsafe { std::env::set_var("RUNE_TEST_INPUT_VAR", "two") };
+        unsafe { std::env::set_var("IGEL_TEST_INPUT_VAR", "two") };
         let two = effective_key("k", Some(&inputs), false);
-        unsafe { std::env::remove_var("RUNE_TEST_INPUT_VAR") };
+        unsafe { std::env::remove_var("IGEL_TEST_INPUT_VAR") };
         assert_ne!(unset, one);
         assert_ne!(one, two);
         assert_eq!(unset, effective_key("k", Some(&inputs), false));
@@ -745,7 +745,7 @@ mod tests {
     }
 
     #[test]
-    fn env_reads_come_from_dep_info_minus_what_rune_provides() {
+    fn env_reads_come_from_dep_info_minus_what_igel_provides() {
         let dir = tempfile::tempdir().unwrap();
         let d = dir.path().join("x.d");
         std::fs::write(

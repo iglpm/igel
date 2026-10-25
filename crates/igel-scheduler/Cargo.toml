@@ -1,5 +1,5 @@
 [package]
-name = "rune-scheduler"
+name = "igel-scheduler"
 description = "Parallel build task scheduler with DAG-based execution and rmeta pipelining"
 version.workspace = true
 edition.workspace = true
@@ -8,11 +8,11 @@ rust-version.workspace = true
 
 [dependencies]
 jobserver.workspace = true
-rune-common.workspace = true
-rune-graph.workspace = true
-rune-fingerprint.workspace = true
-rune-compiler.workspace = true
-rune-cas.workspace = true
+igel-common.workspace = true
+igel-graph.workspace = true
+igel-fingerprint.workspace = true
+igel-compiler.workspace = true
+igel-cas.workspace = true
 tracing.workspace = true
 crossbeam-channel.workspace = true
 indicatif.workspace = true

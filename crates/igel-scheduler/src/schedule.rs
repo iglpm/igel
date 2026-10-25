@@ -316,7 +316,7 @@ pub fn write_html(path: &Path, steps: &HashMap<StepId, Step>, report: &ScheduleR
     let html = format!(
         r#"<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Rune build timings</title>
+<title>Igel build timings</title>
 <style>
 :root {{ --bg:#fbfaf7; --fg:#1d1b18; --muted:#6b665e; --line:#e3ded5; --lib:#6b8fd6; --bin:#d98b3a; --test:#5aa36b; --pm:#a07ad6; --bs:#c9b458; --chain:#d0342c; }}
 @media (prefers-color-scheme: dark) {{ :root {{ --bg:#16150f; --fg:#ece8df; --muted:#a39e94; --line:#34312a; }} }}

@@ -1,6 +1,6 @@
-use rune_common::BuildScriptOutput;
-use rune_common::CompilationUnit;
-use rune_graph::NodeId;
+use igel_common::BuildScriptOutput;
+use igel_common::CompilationUnit;
+use igel_graph::NodeId;
 use std::path::PathBuf;
 use std::time::Duration;
 

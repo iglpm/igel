@@ -1,6 +1,6 @@
 use crate::PipelineEvent;
+use igel_graph::NodeId;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
-use rune_graph::NodeId;
 use std::time::Duration;
 
 /// Single-line build progress, cut to the terminal width, with active crates oldest first.

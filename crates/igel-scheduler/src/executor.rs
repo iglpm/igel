@@ -2,19 +2,19 @@ use crate::inputs::{self, DeclaredInputs, effective_key};
 use crate::pipeline::PipelineEvent;
 use crate::schedule::{Gate, ScheduleReport, Step, StepId};
 use crossbeam_channel::{Receiver, Sender, unbounded};
-use rayon::prelude::*;
-use rune_cas::CasStore;
-use rune_cas::store::Content;
-use rune_common::toolchain::{self, TargetInfo, Toolchain};
-use rune_common::{
-    BuildScriptOutput, CompilationUnit, CrateSource, CrateType, LinkArgScope, Profile, RuneConfig,
-    RuneError, RuneResult, TargetKind,
+use igel_cas::CasStore;
+use igel_cas::store::Content;
+use igel_common::toolchain::{self, TargetInfo, Toolchain};
+use igel_common::{
+    BuildScriptOutput, CompilationUnit, CrateSource, CrateType, IgelConfig, IgelError, IgelResult,
+    LinkArgScope, Profile, TargetKind,
 };
-use rune_compiler::{
+use igel_compiler::{
     BuildScriptRunner, CompilationResult, RustcCommandBuilder, RustcInvoker,
     build_script::BuildScriptEnv,
 };
-use rune_graph::{BuildGraph, NodeId, compute_critical_paths_pipelined};
+use igel_graph::{BuildGraph, NodeId, compute_critical_paths_pipelined};
+use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -67,12 +67,12 @@ enum WorkerMsg {
     ScriptPhaseDone {
         node_id: NodeId,
         duration: Duration,
-        lock: Option<rune_common::fsutil::FileLock>,
+        lock: Option<igel_common::fsutil::FileLock>,
         lock_waited: bool,
     },
     LockAcquired {
         node_id: NodeId,
-        lock: rune_common::fsutil::FileLock,
+        lock: igel_common::fsutil::FileLock,
     },
     /// An executable is compiled and waits, without a job slot, until every rlib it links exists;
     /// a message on `resume` lets it link.
@@ -93,12 +93,12 @@ fn links_late(unit: &CompilationUnit) -> bool {
 }
 
 fn frontend_threads(
-    setting: rune_common::settings::FrontendThreads,
+    setting: igel_common::settings::FrontendThreads,
     cpus: usize,
     busy: usize,
     waiting: usize,
 ) -> Option<usize> {
-    use rune_common::settings::FrontendThreads;
+    use igel_common::settings::FrontendThreads;
     let n = match setting {
         FrontendThreads::Off => return None,
         FrontendThreads::Fixed(n) => n,
@@ -134,7 +134,7 @@ struct ScriptStamp {
 
 impl ScriptStamp {
     fn hash(p: &Path) -> String {
-        rune_common::hash::xxhash3_file(p)
+        igel_common::hash::xxhash3_file(p)
             .map(|h| format!("{h:016x}"))
             .unwrap_or_default()
     }
@@ -261,14 +261,14 @@ fn link_gates(
 }
 
 fn unit_lock_path(
-    config: &RuneConfig,
+    config: &IgelConfig,
     profile: &Profile,
     graph: &BuildGraph,
     id: NodeId,
 ) -> PathBuf {
     config
         .profile_target_dir(profile.output_dir_name())
-        .join(".rune-locks")
+        .join(".igel-locks")
         .join(script_key(&graph.node(id).unit))
 }
 
@@ -281,7 +281,7 @@ pub enum ExternMode {
 /// Parallel build executor: keys every unit up front, restores cache hits in parallel, then schedules the
 /// rest by critical path with `.rmeta` pipelining.
 pub struct BuildExecutor {
-    config: RuneConfig,
+    config: IgelConfig,
     profile: Profile,
     cas: Option<CasStore>,
     event_tx: Sender<PipelineEvent>,
@@ -293,23 +293,23 @@ pub struct BuildExecutor {
     /// Shared with every `rustc` and build script so all codegen threads draw from one token pool.
     jobserver: Option<jobserver::Client>,
     tokens: Option<crate::tokens::JobTokens>,
-    frontend_threads: rune_common::settings::FrontendThreads,
+    frontend_threads: igel_common::settings::FrontendThreads,
     /// rustc-runified can compile executables before their dependencies' rlibs exist.
     link_late: bool,
     cpus: usize,
-    memory: fn() -> Option<rune_common::sysinfo::Memory>,
+    memory: fn() -> Option<igel_common::sysinfo::Memory>,
     sandbox: Option<std::sync::Arc<SandboxPolicy>>,
     extra_costs: HashMap<NodeId, f64>,
 }
 
 #[derive(Debug, Clone)]
 pub struct SandboxPolicy {
-    pub sandbox: rune_common::sandbox::Sandbox,
+    pub sandbox: igel_common::sandbox::Sandbox,
     pub network: HashSet<String>,
 }
 
 impl BuildExecutor {
-    pub fn new(config: RuneConfig, profile: Profile, max_jobs: usize) -> Self {
+    pub fn new(config: IgelConfig, profile: Profile, max_jobs: usize) -> Self {
         let (event_tx, event_rx) = unbounded();
         let jobserver = jobserver::Client::new(max_jobs.max(1)).ok();
         let tokens = jobserver.clone().map(crate::tokens::JobTokens::new);
@@ -332,7 +332,7 @@ impl BuildExecutor {
                 .is_some_and(|d| d.supports("no-link") && d.supports("link-only")),
             sandbox: None,
             cpus: std::thread::available_parallelism().map_or(1, |n| n.get()),
-            memory: rune_common::sysinfo::memory,
+            memory: igel_common::sysinfo::memory,
             extra_costs: HashMap::new(),
         }
     }
@@ -344,7 +344,7 @@ impl BuildExecutor {
 
     pub fn with_memory_probe(
         mut self,
-        probe: fn() -> Option<rune_common::sysinfo::Memory>,
+        probe: fn() -> Option<igel_common::sysinfo::Memory>,
     ) -> Self {
         self.memory = probe;
         self
@@ -355,7 +355,7 @@ impl BuildExecutor {
         self
     }
 
-    pub fn with_frontend_threads(mut self, t: rune_common::settings::FrontendThreads) -> Self {
+    pub fn with_frontend_threads(mut self, t: igel_common::settings::FrontendThreads) -> Self {
         self.frontend_threads = t;
         self
     }
@@ -401,7 +401,7 @@ impl BuildExecutor {
         out_dir_for(&self.config, &self.profile, unit)
     }
 
-    pub fn execute(&self, graph: &BuildGraph) -> RuneResult<BuildResult> {
+    pub fn execute(&self, graph: &BuildGraph) -> IgelResult<BuildResult> {
         let result = self.execute_graph(graph);
         if result.is_err() {
             let _ = self.event_tx.send(PipelineEvent::AllComplete {
@@ -414,18 +414,18 @@ impl BuildExecutor {
         result
     }
 
-    fn execute_graph(&self, graph: &BuildGraph) -> RuneResult<BuildResult> {
+    fn execute_graph(&self, graph: &BuildGraph) -> IgelResult<BuildResult> {
         let start_time = Instant::now();
         let profile_dir_name = self.profile.output_dir_name();
         self.config
             .ensure_dirs(profile_dir_name)
-            .map_err(RuneError::Io)?;
+            .map_err(IgelError::Io)?;
 
         let topo = graph.topological_sort()?;
 
         let source_cache_path = self.config.fingerprint_dir.join("source-cache.json");
         let mut source_cache =
-            rune_fingerprint::FingerprintCache::load(&source_cache_path).unwrap_or_default();
+            igel_fingerprint::FingerprintCache::load(&source_cache_path).unwrap_or_default();
         let timings_path = self.config.fingerprint_dir.join("timings.json");
         let global_timings_path = self.config.cas_dir.join("timings.json");
         let mut timings = Timings::load(&timings_path, &global_timings_path);
@@ -436,10 +436,10 @@ impl BuildExecutor {
         let now = || start_time.elapsed().as_secs_f64();
 
         // 1. Cache keys, dependencies first. The stored key also covers the current values of declared inputs.
-        let keys_timer = rune_common::timing::phase("cache keys");
+        let keys_timer = igel_common::timing::phase("cache keys");
         let mut unit_base_keys: HashMap<NodeId, String> = HashMap::with_capacity(topo.len());
         let mut unit_cas_keys: HashMap<NodeId, String> = HashMap::with_capacity(topo.len());
-        // `rune check` reuses a build's stored result only if the unit's whole dependency closure is substituted:
+        // `igl check` reuses a build's stored result only if the unit's whole dependency closure is substituted:
         // rustc gives the two `.rmeta` flavours different crate hashes, so they must never mix in one chain.
         let substitute = self.cas.is_some() && !self.force_rebuild;
         let mut full_keys: HashMap<NodeId, String> = HashMap::new();
@@ -487,8 +487,8 @@ impl BuildExecutor {
 
         // 2. Restore every cache hit in parallel.
         if let Some(cas) = self.cas.as_ref().filter(|_| !self.force_rebuild) {
-            let _timer = rune_common::timing::phase("cas restore");
-            let restore = |&id: &NodeId| -> Option<(NodeId, rune_cas::store::Linked)> {
+            let _timer = igel_common::timing::phase("cas restore");
+            let restore = |&id: &NodeId| -> Option<(NodeId, igel_cas::store::Linked)> {
                 let unit = &graph.node(id).unit;
                 let key = &unit_cas_keys[&id];
                 if unit.build_script.is_some()
@@ -506,10 +506,10 @@ impl BuildExecutor {
                 {
                     return None;
                 }
-                // Another `rune` may be compiling a unit with the same outputs right now; leave it to the scheduler.
+                // Another `igl` may be compiling a unit with the same outputs right now; leave it to the scheduler.
                 let path = unit_lock_path(&self.config, &self.profile, graph, id);
-                let rune_common::fsutil::TryLock::Locked(_lock) =
-                    rune_common::fsutil::FileLock::try_exclusive(&path)
+                let igel_common::fsutil::TryLock::Locked(_lock) =
+                    igel_common::fsutil::FileLock::try_exclusive(&path)
                 else {
                     return None;
                 };
@@ -526,7 +526,7 @@ impl BuildExecutor {
                     .ok()?;
                 (!linked.files.is_empty()).then_some((id, linked))
             };
-            let mut restored: HashMap<NodeId, rune_cas::store::Linked> = if topo.len() < 48 {
+            let mut restored: HashMap<NodeId, igel_cas::store::Linked> = if topo.len() < 48 {
                 topo.iter().filter_map(restore).collect()
             } else {
                 topo.par_iter().filter_map(restore).collect()
@@ -621,7 +621,7 @@ impl BuildExecutor {
 
         // 3. Critical-path priorities over the remaining work (measured times, else size estimates).
         let weights = {
-            let _timer = rune_common::timing::phase("critical path");
+            let _timer = igel_common::timing::phase("critical path");
             timings.measure_sources(
                 topo.iter()
                     .filter(|id| !completed.contains(id))
@@ -714,7 +714,7 @@ impl BuildExecutor {
         let mut awaiting_link: HashMap<NodeId, Sender<()>> = HashMap::new();
         let mut compiled_at: HashMap<NodeId, f64> = HashMap::new();
         // Held from the script step through compilation so no other process reruns the script under a compiler.
-        let mut held_locks: HashMap<NodeId, (rune_common::fsutil::FileLock, bool)> = HashMap::new();
+        let mut held_locks: HashMap<NodeId, (igel_common::fsutil::FileLock, bool)> = HashMap::new();
         let mut lock_waiting: HashSet<NodeId> = HashSet::new();
         let mut job_threads: Vec<std::thread::JoinHandle<()>> = Vec::new();
         let mut memory_held = Duration::ZERO;
@@ -830,14 +830,14 @@ impl BuildExecutor {
                         Some(held) => held,
                         None => {
                             let path = unit_lock_path(&self.config, &self.profile, graph, node_id);
-                            match rune_common::fsutil::FileLock::try_exclusive(&path) {
-                                rune_common::fsutil::TryLock::Locked(lock) => (lock, false),
-                                rune_common::fsutil::TryLock::Busy => {
+                            match igel_common::fsutil::FileLock::try_exclusive(&path) {
+                                igel_common::fsutil::TryLock::Locked(lock) => (lock, false),
+                                igel_common::fsutil::TryLock::Busy => {
                                     lock_waiting.insert(node_id);
                                     let tx = worker_tx.clone();
                                     std::thread::spawn(move || {
                                         let (lock, _) =
-                                            rune_common::fsutil::FileLock::exclusive(&path);
+                                            igel_common::fsutil::FileLock::exclusive(&path);
                                         let _ = tx.send(WorkerMsg::LockAcquired { node_id, lock });
                                     });
                                     continue;
@@ -899,9 +899,10 @@ impl BuildExecutor {
                     }
                     // Critical path prioritization: allocates dedicated job tokens to scripts
                     // and boosts frontend threads on critical compiles when parallel frontend is enabled.
-                    let experiment = std::env::var("RUNE_EXPERIMENT_CRITICAL")
+                    let experiment = std::env::var("IGEL_EXPERIMENT_CRITICAL")
                         .unwrap_or_else(|_| "tokens".into());
-                    let has = |f: &str| experiment == "all" || experiment.split(',').any(|x| x == f);
+                    let has =
+                        |f: &str| experiment == "all" || experiment.split(',').any(|x| x == f);
                     let critical = on_critical_path(&weights, &completed, node_id);
                     let boost = critical
                         && if script_only {
@@ -925,7 +926,8 @@ impl BuildExecutor {
                             self.frontend_threads_for(in_flight.len(), ready_count - index - 1);
                         if boost
                             && (job.frontend_threads.is_some()
-                                || self.frontend_threads == rune_common::settings::FrontendThreads::Auto)
+                                || self.frontend_threads
+                                    == igel_common::settings::FrontendThreads::Auto)
                         {
                             job.frontend_threads = Some(self.cpus.min(8));
                         }
@@ -1153,7 +1155,7 @@ impl BuildExecutor {
                                 .as_ref()
                                 .is_some_and(|d| d.supports("early-metadata"))
                         {
-                            rune_common::runified::metadata_never_completes(rmeta);
+                            igel_common::runified::metadata_never_completes(rmeta);
                         }
                     }
                 }
@@ -1182,14 +1184,14 @@ impl BuildExecutor {
         timings.save(&timings_path, &global_timings_path);
         let schedule =
             (!steps.is_empty()).then(|| ScheduleReport::analyze(&steps, self.cpus, self.max_jobs));
-        if let (true, Some(report)) = (rune_common::timing::enabled(), &schedule) {
+        if let (true, Some(report)) = (igel_common::timing::enabled(), &schedule) {
             let trace_path = self.config.fingerprint_dir.join("trace.json");
             crate::schedule::write_chrome_trace(&trace_path, &steps);
             let html_path = self
                 .config
-                .rune_dir
+                .igel_dir
                 .join("timings")
-                .join("rune-timing.html");
+                .join("igel-timing.html");
             crate::schedule::write_html(&html_path, &steps, report);
             eprint!("  [timing] {}", report.describe_chain());
             eprintln!(
@@ -1231,7 +1233,7 @@ impl BuildExecutor {
         graph: &BuildGraph,
         id: NodeId,
         keys: &HashMap<NodeId, String>,
-        source_cache: &mut rune_fingerprint::FingerprintCache,
+        source_cache: &mut igel_fingerprint::FingerprintCache,
         as_full_build: bool,
     ) -> (String, String) {
         let node = graph.node(id);
@@ -1269,7 +1271,7 @@ impl BuildExecutor {
         graph: &BuildGraph,
         id: NodeId,
         keys: &HashMap<NodeId, String>,
-        source_cache: &mut rune_fingerprint::FingerprintCache,
+        source_cache: &mut igel_fingerprint::FingerprintCache,
         as_full_build: bool,
     ) -> Option<Option<String>> {
         let node = graph.node(id);
@@ -1314,7 +1316,7 @@ impl BuildExecutor {
         id: NodeId,
         unit: &CompilationUnit,
         keys: &HashMap<NodeId, String>,
-        source_cache: &mut rune_fingerprint::FingerprintCache,
+        source_cache: &mut igel_fingerprint::FingerprintCache,
     ) -> Option<(inputs::ReadRecord, Option<String>)> {
         let as_full_build = unit.check_only != graph.node(id).unit.check_only;
         let script = self.read_mode(graph, id, keys, source_cache, as_full_build)?;
@@ -1328,7 +1330,7 @@ impl BuildExecutor {
         graph: &BuildGraph,
         id: NodeId,
         keys: &HashMap<NodeId, String>,
-        source_cache: &mut rune_fingerprint::FingerprintCache,
+        source_cache: &mut igel_fingerprint::FingerprintCache,
     ) -> UnitIdentity {
         let unit = &graph.node(id).unit;
         let dep_keys = dep_keys_of(graph, id, keys);
@@ -1362,11 +1364,11 @@ impl BuildExecutor {
     pub fn current_identities(
         &self,
         graph: &BuildGraph,
-    ) -> RuneResult<Vec<(NodeId, String, UnitIdentity)>> {
+    ) -> IgelResult<Vec<(NodeId, String, UnitIdentity)>> {
         let topo = graph.topological_sort()?;
         let cache_path = self.config.fingerprint_dir.join("source-cache.json");
         let mut source_cache =
-            rune_fingerprint::FingerprintCache::load(&cache_path).unwrap_or_default();
+            igel_fingerprint::FingerprintCache::load(&cache_path).unwrap_or_default();
         let mut keys = HashMap::new();
         let mut out = Vec::new();
         for id in topo {
@@ -1381,11 +1383,11 @@ impl BuildExecutor {
         Ok(out)
     }
 
-    pub fn store_keys(&self, graph: &BuildGraph) -> RuneResult<Vec<String>> {
+    pub fn store_keys(&self, graph: &BuildGraph) -> IgelResult<Vec<String>> {
         let topo = graph.topological_sort()?;
         let cache_path = self.config.fingerprint_dir.join("source-cache.json");
         let mut source_cache =
-            rune_fingerprint::FingerprintCache::load(&cache_path).unwrap_or_default();
+            igel_fingerprint::FingerprintCache::load(&cache_path).unwrap_or_default();
         let mut keys: HashMap<NodeId, String> = HashMap::new();
         let mut script_outputs: HashMap<String, BuildScriptOutput> = HashMap::new();
         let mut out = Vec::new();
@@ -1441,7 +1443,7 @@ impl BuildExecutor {
         id: NodeId,
         keys: &HashMap<NodeId, String>,
         dep_metadata: &[(String, String, String)],
-        source_cache: &mut rune_fingerprint::FingerprintCache,
+        source_cache: &mut igel_fingerprint::FingerprintCache,
     ) -> (String, String, String) {
         let unit = &graph.node(id).unit;
         self.script_keys_of(graph, id, unit, keys, dep_metadata, source_cache)
@@ -1454,7 +1456,7 @@ impl BuildExecutor {
         unit: &CompilationUnit,
         keys: &HashMap<NodeId, String>,
         dep_metadata: &[(String, String, String)],
-        source_cache: &mut rune_fingerprint::FingerprintCache,
+        source_cache: &mut igel_fingerprint::FingerprintCache,
     ) -> (String, String, String) {
         let node = graph.node(id);
         let build_dep_keys: Vec<(String, String)> = node
@@ -1481,7 +1483,7 @@ impl BuildExecutor {
             source_cache,
         );
         let package_hash = if unit.crate_id.source == CrateSource::Local {
-            rune_fingerprint::hasher::compute_package_hash(&unit.manifest_dir, source_cache)
+            igel_fingerprint::hasher::compute_package_hash(&unit.manifest_dir, source_cache)
                 .unwrap_or_default()
         } else {
             String::new()
@@ -1507,7 +1509,7 @@ impl BuildExecutor {
         topo: &[NodeId],
         built: impl Fn(NodeId) -> bool,
         keys: &HashMap<NodeId, String>,
-        source_cache: &mut rune_fingerprint::FingerprintCache,
+        source_cache: &mut igel_fingerprint::FingerprintCache,
     ) {
         let mut all = load_identities(&self.config.fingerprint_dir);
         let before = all.clone();
@@ -1532,7 +1534,7 @@ impl BuildExecutor {
             && let Ok(text) = serde_json::to_string(&all)
         {
             let path = self.config.fingerprint_dir.join("identities.json");
-            let _ = rune_common::fsutil::write_atomic(&path, text.as_bytes());
+            let _ = igel_common::fsutil::write_atomic(&path, text.as_bytes());
         }
     }
 }
@@ -1749,7 +1751,7 @@ struct UnitJob {
     dep_keys: Vec<(String, String)>,
     build_output: Option<BuildScriptOutput>,
     dep_link_search: Vec<(Option<String>, PathBuf)>,
-    config: RuneConfig,
+    config: IgelConfig,
     profile: Profile,
     cas: Option<CasStore>,
     toolchain: &'static Toolchain,
@@ -1764,7 +1766,7 @@ struct UnitJob {
     tokens: Option<crate::tokens::JobTokens>,
     sandbox: Option<std::sync::Arc<SandboxPolicy>>,
     script_only: bool,
-    lock: Option<rune_common::fsutil::FileLock>,
+    lock: Option<igel_common::fsutil::FileLock>,
     lock_waited: bool,
     frontend_threads: Option<usize>,
     /// On the critical path: a jobserver of its own with this many tokens, so what the step runs
@@ -1785,6 +1787,18 @@ struct UnitJob {
 impl UnitJob {
     fn compiler_command(&self, member: bool) -> std::process::Command {
         let cmd = self.toolchain.rustc_command(member);
+        match &self.sandbox {
+            Some(p) => p.sandbox.wrap(&cmd, &[&self.config.target_dir], false),
+            None => cmd,
+        }
+    }
+
+    fn host_compiler_command(&self, member: bool) -> std::process::Command {
+        let cmd = if self.toolchain.hyprc {
+            self.toolchain.host_rustc_command(member)
+        } else {
+            self.toolchain.rustc_command(member)
+        };
         match &self.sandbox {
             Some(p) => p.sandbox.wrap(&cmd, &[&self.config.target_dir], false),
             None => cmd,
@@ -1812,7 +1826,7 @@ impl UnitJob {
         let unit = &self.unit;
         let has_script = unit.build_script.is_some();
         let mut base = self.base_key.clone();
-        let mut files = rune_fingerprint::FingerprintCache::new();
+        let mut files = igel_fingerprint::FingerprintCache::new();
         if let Some(script) = &self.read_script
             && let Some(read) = read_record_key(unit, &mut files)
             && let Some(record) = cas.get_value::<inputs::ReadRecord>(&format!("{read}-read"))
@@ -1827,7 +1841,7 @@ impl UnitJob {
         }
         let recorded: Option<DeclaredInputs> = cas.get_value(&format!("{base}-inputs"));
         let key = effective_key(&base, recorded.as_ref(), has_script);
-        let fits = |m: &rune_cas::store::ArtifactManifest| {
+        let fits = |m: &igel_cas::store::ArtifactManifest| {
             self.compiled_against
                 .as_ref()
                 .is_some_and(|deps| m.matches_dependencies(deps))
@@ -1845,7 +1859,7 @@ impl UnitJob {
             return false;
         }
         let out_dir = out_dir_for(&self.config, &self.profile, unit);
-        let Ok(rune_cas::store::Linked {
+        let Ok(igel_cas::store::Linked {
             files: linked,
             manifest,
         }) = cas.link_entry(&key, &out_dir)
@@ -1964,7 +1978,7 @@ impl UnitJob {
         let read_key = self
             .read_script
             .as_ref()
-            .and_then(|_| read_record_key(unit, &mut rune_fingerprint::FingerprintCache::new()));
+            .and_then(|_| read_record_key(unit, &mut igel_fingerprint::FingerprintCache::new()));
         let mut read_record: Option<inputs::ReadRecord> = None;
         let bump = |base_key: &str, declared: &DeclaredInputs, store_key: &mut String| {
             let key = effective_key(base_key, Some(declared), has_script);
@@ -2016,7 +2030,7 @@ impl UnitJob {
                 target: target_info.name.clone(),
                 host: tc.host.clone(),
                 opt_level: eff.opt_level.as_str().to_string(),
-                debug: eff.debuginfo != rune_common::DebugInfo::None,
+                debug: eff.debuginfo != igel_common::DebugInfo::None,
                 debug_assertions: eff.debug_assertions,
                 profile: if profile.is_release() {
                     "release"
@@ -2043,6 +2057,7 @@ impl UnitJob {
                 links: unit.links.clone(),
                 rustflags: unit.ext.script_rustflags.clone(),
                 config_env: self.config_env.clone(),
+                hyprc: tc.hyprc,
             };
             let compile_env = BuildScriptEnv {
                 linker: unit.ext.script_linker.as_ref().map(PathBuf::from),
@@ -2055,7 +2070,7 @@ impl UnitJob {
                 .as_ref()
                 .map(|p| {
                     let p = Profile {
-                        panic: rune_common::PanicStrategy::Unwind,
+                        panic: igel_common::PanicStrategy::Unwind,
                         ..p.clone()
                     };
                     with_profile_flags(
@@ -2080,13 +2095,13 @@ impl UnitJob {
                     js.configure(cmd);
                 }
                 if let Some(n) = self.nice {
-                    rune_common::sysinfo::lower_priority_of(cmd, n);
+                    igel_common::sysinfo::lower_priority_of(cmd, n);
                 }
             };
             let script_bin_dir =
                 config.build_script_bin_dir_by_key(profile.output_dir_name(), &script_key(unit));
             // A stamp beside the compiled script: rerunning a script doesn't recompile it.
-            let stamp_path = script_bin_dir.join(".rune-stamp");
+            let stamp_path = script_bin_dir.join(".igel-stamp");
             let reusable = self
                 .script_base
                 .as_ref()
@@ -2109,7 +2124,7 @@ impl UnitJob {
                 }
                 None => {
                     let compiled = BuildScriptRunner::compile_reporting(
-                        self.compiler_command(unit.ext.member),
+                        self.host_compiler_command(unit.ext.member),
                         &build_rs,
                         &script_bin_dir,
                         &deps_dir,
@@ -2123,7 +2138,7 @@ impl UnitJob {
                             inputs::dep_info_sources(&script_bin_dir.join("build_script_build.d"));
                         let stamp = ScriptStamp::new(base, &script_sources, printed);
                         if let Ok(text) = serde_json::to_string(&stamp) {
-                            let _ = rune_common::fsutil::write_atomic(&stamp_path, text.as_bytes());
+                            let _ = igel_common::fsutil::write_atomic(&stamp_path, text.as_bytes());
                         }
                     }
                     compiled
@@ -2142,7 +2157,7 @@ impl UnitJob {
                             js.configure(cmd);
                         }
                         if let Some(n) = self.nice {
-                            rune_common::sysinfo::lower_priority_of(cmd, n);
+                            igel_common::sysinfo::lower_priority_of(cmd, n);
                         }
                     };
                     // Registry/git packages are immutable and shared: their scripts may only write to `OUT_DIR`.
@@ -2311,14 +2326,19 @@ impl UnitJob {
         if self.link_late {
             cmd_builder = cmd_builder.extra_flags(vec!["--runified=no-link".into()]);
         }
-        let mut cmd = cmd_builder.build_with_command(self.compiler_command(unit.ext.member));
+        let compiler_base = if unit.crate_type == CrateType::ProcMacro {
+            self.host_compiler_command(unit.ext.member)
+        } else {
+            self.compiler_command(unit.ext.member)
+        };
+        let mut cmd = cmd_builder.build_with_command(compiler_base);
         // Alive until the compiler exits.
         let own = self.own_tokens.and_then(|n| jobserver::Client::new(n).ok());
         if let Some(js) = own.as_ref().or(self.jobserver.as_ref()) {
             js.configure(&mut cmd);
         }
         if let Some(n) = self.nice {
-            rune_common::sysinfo::lower_priority_of(&mut cmd, n);
+            igel_common::sysinfo::lower_priority_of(&mut cmd, n);
         }
         debug!("Running {:?}", cmd);
 
@@ -2345,7 +2365,7 @@ impl UnitJob {
                 if read_key.is_some() {
                     let record = inputs::ReadRecord::from_dep_info(
                         &artifact.artifact,
-                        rune_common::fsutil::simplified(&self.config.project_root),
+                        igel_common::fsutil::simplified(&self.config.project_root),
                         &unit.manifest_dir,
                         &self.config.target_dir,
                     );
@@ -2354,7 +2374,7 @@ impl UnitJob {
                         unit,
                         profile,
                         &self.dep_keys,
-                        &mut rune_fingerprint::FingerprintCache::new(),
+                        &mut igel_fingerprint::FingerprintCache::new(),
                         Some((&record, script.as_deref())),
                     );
                     read_record = Some(record);
@@ -2364,7 +2384,7 @@ impl UnitJob {
                     }
                 }
                 let reads = inputs::env_reads_from_dep_info(&artifact.artifact, &provided);
-                let manifest = rune_common::manifest_file::manifest_in(&unit.manifest_dir);
+                let manifest = igel_common::manifest_file::manifest_in(&unit.manifest_dir);
                 let read_manifest = inputs::reads_manifest(
                     &artifact.artifact,
                     &manifest,
@@ -2390,7 +2410,7 @@ impl UnitJob {
                 sent_metadata = true;
                 // A non-reproducible compiler output: nothing compiled against it may be stored.
                 own_content =
-                    rune_cas::store::content_of_files(std::slice::from_ref(&artifact.artifact));
+                    igel_cas::store::content_of_files(std::slice::from_ref(&artifact.artifact));
                 let diverged = match (&self.cas, &own_content, &self.compiled_against) {
                     (Some(cas), Some(own), Some(deps)) if self.publish => {
                         cas.manifest(&store_key).is_some_and(|m| {
@@ -2451,7 +2471,7 @@ impl UnitJob {
                         }
                         Ok(l) => {
                             let err_msg = render_compile_error(&l);
-                            let diagnostics = rune_compiler::diagnostic_lines(&l.stderr_raw);
+                            let diagnostics = igel_compiler::diagnostic_lines(&l.stderr_raw);
                             self.fail_with(err_msg.clone(), err_msg, diagnostics);
                             return;
                         }
@@ -2473,7 +2493,7 @@ impl UnitJob {
                     String::new()
                 };
                 let diagnostics: Vec<String> = if unit.crate_id.source == CrateSource::Local {
-                    rune_compiler::diagnostic_lines(&comp_res.stderr_raw)
+                    igel_compiler::diagnostic_lines(&comp_res.stderr_raw)
                 } else {
                     Vec::new()
                 };
@@ -2481,7 +2501,7 @@ impl UnitJob {
                     comp_res.artifacts.into_iter().map(|a| a.artifact).collect();
                 uplift_artifacts(config, profile, unit, &artifacts);
                 if own_content.is_none() {
-                    own_content = rune_cas::store::content_of_files(&artifacts);
+                    own_content = igel_cas::store::content_of_files(&artifacts);
                 }
 
                 let _ = self.event_tx.send(PipelineEvent::BuildFinished {
@@ -2509,7 +2529,7 @@ impl UnitJob {
                             &unit.crate_id.name,
                             &unit.crate_id.version.to_string(),
                             &artifacts,
-                            &rune_cas::store::PutOptions {
+                            &igel_cas::store::PutOptions {
                                 adopt: true,
                                 compiled_against: deps.clone(),
                                 replace_stale: true,
@@ -2553,7 +2573,7 @@ impl UnitJob {
             }
             Ok(comp_res) => {
                 let err_msg = render_compile_error(&comp_res);
-                let diagnostics = rune_compiler::diagnostic_lines(&comp_res.stderr_raw);
+                let diagnostics = igel_compiler::diagnostic_lines(&comp_res.stderr_raw);
                 self.fail_with(err_msg.clone(), err_msg, diagnostics);
             }
             Err(e) => self.fail(e.to_string(), e.to_string()),
@@ -2571,7 +2591,7 @@ fn with_hint(message: String) -> String {
 /// Fingerprint of files below `dir` (path, size, mtime). Directory mtimes are ignored: tools create and
 /// remove scratch directories in the package root.
 fn tree_stamp(dir: &Path) -> u64 {
-    let mut hb = rune_common::hash::HashBuilder::new();
+    let mut hb = igel_common::hash::HashBuilder::new();
     for entry in walkdir::WalkDir::new(dir)
         .sort_by_file_name()
         .into_iter()
@@ -2591,7 +2611,7 @@ fn tree_stamp(dir: &Path) -> u64 {
             .unwrap_or(0);
         hb.update(&mtime.to_le_bytes());
     }
-    rune_common::hash::xxhash3(hb.finish_blake3().as_bytes())
+    igel_common::hash::xxhash3(hb.finish_blake3().as_bytes())
 }
 
 pub fn script_key(unit: &CompilationUnit) -> String {
@@ -2601,18 +2621,18 @@ pub fn script_key(unit: &CompilationUnit) -> String {
 fn pinned_script_key(key: &str, out_dir: &Path, manifest_dir: &Path) -> String {
     let at = format!(
         "{}\0{}",
-        rune_common::fsutil::simplified(out_dir).display(),
-        rune_common::fsutil::simplified(manifest_dir).display()
+        igel_common::fsutil::simplified(out_dir).display(),
+        igel_common::fsutil::simplified(manifest_dir).display()
     );
-    format!("{key}-at-{}", rune_common::hash::xxhash3_hex(at.as_bytes()))
+    format!("{key}-at-{}", igel_common::hash::xxhash3_hex(at.as_bytes()))
 }
 
 /// Whether a script's result names this project's directories in a way that cannot be relocated.
 fn names_project(output: &BuildScriptOutput, out_dir: &Path, manifest_dir: &Path) -> bool {
     let build_dir = out_dir.parent().and_then(Path::parent).unwrap_or(out_dir);
     let dirs = [
-        rune_common::fsutil::simplified(build_dir),
-        rune_common::fsutil::simplified(manifest_dir),
+        igel_common::fsutil::simplified(build_dir),
+        igel_common::fsutil::simplified(manifest_dir),
     ];
     if output.names_any(&dirs) {
         return true;
@@ -2634,7 +2654,7 @@ fn names_project(output: &BuildScriptOutput, out_dir: &Path, manifest_dir: &Path
     files.iter().any(|f| {
         std::fs::read(f).is_ok_and(|bytes| {
             let text = String::from_utf8_lossy(&bytes);
-            dirs.iter().any(|d| rune_common::text_names_dir(&text, d))
+            dirs.iter().any(|d| igel_common::text_names_dir(&text, d))
         })
     })
 }
@@ -2650,8 +2670,8 @@ fn store_script_output(
 ) {
     let mut portable = output.clone();
     portable.normalize(
-        rune_common::fsutil::simplified(out_dir),
-        rune_common::fsutil::simplified(manifest_dir),
+        igel_common::fsutil::simplified(out_dir),
+        igel_common::fsutil::simplified(manifest_dir),
     );
     let key = if names_project(&portable, out_dir, manifest_dir) {
         pinned_script_key(key, out_dir, manifest_dir)
@@ -2679,8 +2699,8 @@ fn stored_script_output(
             return None;
         }
         output.relocate(
-            rune_common::fsutil::simplified(out_dir),
-            rune_common::fsutil::simplified(manifest_dir),
+            igel_common::fsutil::simplified(out_dir),
+            igel_common::fsutil::simplified(manifest_dir),
         );
         Some((key, output))
     })
@@ -2699,7 +2719,7 @@ fn restore_script_output(
 }
 
 /// `deps/`, or `examples/` for examples, as in Cargo.
-pub fn out_dir_for(config: &RuneConfig, profile: &Profile, unit: &CompilationUnit) -> PathBuf {
+pub fn out_dir_for(config: &IgelConfig, profile: &Profile, unit: &CompilationUnit) -> PathBuf {
     match (unit.crate_type, unit.kind) {
         (CrateType::Bin, TargetKind::Example) if !unit.check_only && !unit.harness => {
             bin_dir_for(config, profile, unit)
@@ -2708,7 +2728,7 @@ pub fn out_dir_for(config: &RuneConfig, profile: &Profile, unit: &CompilationUni
     }
 }
 
-pub fn bin_dir_for(config: &RuneConfig, profile: &Profile, unit: &CompilationUnit) -> PathBuf {
+pub fn bin_dir_for(config: &IgelConfig, profile: &Profile, unit: &CompilationUnit) -> PathBuf {
     let dir = profile.output_dir_name();
     let base = match &unit.target {
         Some(t) => {
@@ -2754,7 +2774,7 @@ fn extern_dependencies(graph: &BuildGraph, node_id: NodeId) -> impl Iterator<Ite
         })
 }
 
-/// By file name: `rune check` puts a full build's `.rmeta` where its own would go.
+/// By file name: `igl check` puts a full build's `.rmeta` where its own would go.
 fn compiled_against(
     graph: &BuildGraph,
     node_id: NodeId,
@@ -2848,7 +2868,7 @@ fn remove_stale_outputs(out_dir: &Path, unit: &CompilationUnit) {
 
 /// Cargo's friendly names in the profile directory, as hard links to the real files in `deps/`.
 fn uplift_artifacts(
-    config: &RuneConfig,
+    config: &IgelConfig,
     profile: &Profile,
     unit: &CompilationUnit,
     artifacts: &[PathBuf],
@@ -2899,14 +2919,14 @@ fn link_or_copy_replace(src: &Path, dest: &Path) {
             return;
         }
     }
-    let _ = rune_common::fsutil::replace_with_link(src, dest);
+    let _ = igel_common::fsutil::replace_with_link(src, dest);
 }
 
 const METADATA_FRACTION: f64 = 0.4;
 
 const DEFAULT_COMPILER_MEMORY: u64 = 256 << 20;
 
-/// Part of every unit's key: how Rune runs the compiler (2: non-project crates compile in their package root).
+/// Part of every unit's key: how Igel runs the compiler (2: non-project crates compile in their package root).
 const INVOCATION: &str = "\0invocation=2";
 
 /// Compile times for critical-path weighting: measured (this project, then machine-wide), else estimated
@@ -3068,7 +3088,7 @@ fn rust_source_bytes(dir: &Path) -> u64 {
             if ft.is_dir() {
                 if !matches!(
                     name.as_ref(),
-                    "target" | ".git" | ".rune" | ".cargo" | "node_modules" | "tests" | "benches"
+                    "target" | ".git" | ".igel" | ".cargo" | "node_modules" | "tests" | "benches"
                 ) {
                     stack.push(entry.path());
                 }
@@ -3131,13 +3151,13 @@ pub fn with_cargo_env(
         .env("CARGO_PKG_VERSION", &pkg_version)
         .env(
             "CARGO_MANIFEST_DIR",
-            &rune_common::fsutil::simplified(&unit.manifest_dir)
+            &igel_common::fsutil::simplified(&unit.manifest_dir)
                 .display()
                 .to_string(),
         )
         .env(
             "CARGO_MANIFEST_PATH",
-            &rune_common::fsutil::simplified(&rune_common::manifest_file::manifest_in(
+            &igel_common::fsutil::simplified(&igel_common::manifest_file::manifest_in(
                 &unit.manifest_dir,
             ))
             .display()
@@ -3191,7 +3211,7 @@ pub fn with_profile_flags(
     links_final_artifact: bool,
 ) -> RustcCommandBuilder {
     // Only spell out settings that differ from rustc's defaults for this opt-level.
-    let opt0 = profile.opt_level == rune_common::OptLevel::O0;
+    let opt0 = profile.opt_level == igel_common::OptLevel::O0;
     if !opt0 {
         builder = builder.opt_level(profile.opt_level.as_str());
     }
@@ -3216,7 +3236,7 @@ pub fn with_profile_flags(
             builder = builder.codegen_flag("embed-bitcode=no");
         }
     }
-    if profile.panic != rune_common::PanicStrategy::Unwind {
+    if profile.panic != igel_common::PanicStrategy::Unwind {
         builder = builder.panic(profile.panic.as_str());
     }
     if let Some(cgu) = profile.codegen_units {
@@ -3244,7 +3264,7 @@ fn compiled_for(unit: &CompilationUnit) -> &str {
 }
 
 /// `--remap-path-prefix` for `trim-paths`. Not part of the key.
-fn trim_path_flags(unit: &CompilationUnit, config: &RuneConfig) -> Vec<String> {
+fn trim_path_flags(unit: &CompilationUnit, config: &IgelConfig) -> Vec<String> {
     let with_slash = |p: &Path| {
         let mut s = p.to_string_lossy().into_owned();
         if !s.ends_with(std::path::MAIN_SEPARATOR) {
@@ -3268,7 +3288,7 @@ fn trim_path_flags(unit: &CompilationUnit, config: &RuneConfig) -> Vec<String> {
 pub fn build_rustc_command(
     unit: &CompilationUnit,
     profile: &Profile,
-    config: &RuneConfig,
+    config: &IgelConfig,
     extern_deps: &[(String, PathBuf)],
     build_output: Option<&BuildScriptOutput>,
     color: bool,
@@ -3276,15 +3296,15 @@ pub fn build_rustc_command(
     let eff = unit.effective_profile(profile);
     // Project crates compile from the project root with relative paths; others from their own package root.
     // rustc hashes its working directory into the crate's identity, so this must be stable.
-    let unit_source_root = rune_common::fsutil::simplified(&unit.source_root);
-    let config_project_root = rune_common::fsutil::simplified(&config.project_root);
+    let unit_source_root = igel_common::fsutil::simplified(&unit.source_root);
+    let config_project_root = igel_common::fsutil::simplified(&config.project_root);
     let (source, cwd) = match unit_source_root.strip_prefix(config_project_root) {
         Ok(rel) if unit.crate_id.source == CrateSource::Local && !rel.as_os_str().is_empty() => {
             (rel.to_path_buf(), config_project_root.to_path_buf())
         }
         _ => (
             unit.source_root.clone(),
-            rune_common::fsutil::simplified(&unit.manifest_dir).to_path_buf(),
+            igel_common::fsutil::simplified(&unit.manifest_dir).to_path_buf(),
         ),
     };
     // Platform separators, as Cargo passes it.
@@ -3312,11 +3332,11 @@ pub fn build_rustc_command(
     };
     // Test harnesses and proc-macros need unwinding: they ignore `panic = "abort"`, as in Cargo.
     let unwinding;
-    let eff = if eff.panic != rune_common::PanicStrategy::Unwind
+    let eff = if eff.panic != igel_common::PanicStrategy::Unwind
         && (unit.harness || unit.crate_type == CrateType::ProcMacro)
     {
         unwinding = Profile {
-            panic: rune_common::PanicStrategy::Unwind,
+            panic: igel_common::PanicStrategy::Unwind,
             ..eff.clone()
         };
         &unwinding
@@ -3343,9 +3363,13 @@ pub fn build_rustc_command(
     // Proc-macros are linked too: shared libraries rustc loads, linked by the host's linker.
     let links = links_final_artifact || unit.crate_type == CrateType::ProcMacro;
     if let (Some(linker), true) = (&unit.ext.linker, links) {
-        let (exe, env) = rune_common::linker::for_rustc(linker);
+        let (exe, env) = igel_common::linker::for_rustc(linker);
         builder = builder.linker(&exe.to_string_lossy());
-        if let Some(flavor) = rune_common::linker::rustc_flavor(linker, compiled_for(unit)) {
+        if let Some(flavor) = igel_common::linker::rustc_flavor(
+            linker,
+            compiled_for(unit),
+            &igel_common::toolchain::global().host,
+        ) {
             builder = builder.extra_flags(vec!["-C".into(), format!("linker-flavor={flavor}")]);
         }
         for (k, v) in env {
@@ -3382,7 +3406,7 @@ pub fn build_rustc_command(
     let profile_dir_name = profile.output_dir_name();
     builder = builder.out_dir(&out_dir_for(config, profile, unit));
 
-    // `rune check` skips codegen except for proc-macros, which must be loadable.
+    // `igl check` skips codegen except for proc-macros, which must be loadable.
     if unit.check_only && unit.crate_type != CrateType::ProcMacro {
         builder = builder.emit(&["dep-info", "metadata"]);
     } else if unit.crate_type == CrateType::Bin || unit.harness {
@@ -3497,7 +3521,7 @@ pub fn compute_unit_cas_key(
     unit: &CompilationUnit,
     profile: &Profile,
     dep_keys: &[(String, String)],
-    source_cache: &mut rune_fingerprint::FingerprintCache,
+    source_cache: &mut igel_fingerprint::FingerprintCache,
 ) -> String {
     identity_with(
         unit,
@@ -3519,8 +3543,8 @@ pub struct UnitIdentity {
 }
 
 struct KeyRecorder {
-    key: rune_common::hash::HashBuilder,
-    parts: Option<std::collections::BTreeMap<String, rune_common::hash::HashBuilder>>,
+    key: igel_common::hash::HashBuilder,
+    parts: Option<std::collections::BTreeMap<String, igel_common::hash::HashBuilder>>,
 }
 
 impl KeyRecorder {
@@ -3530,7 +3554,7 @@ impl KeyRecorder {
         match parts.get_mut(part) {
             Some(hasher) => hasher.update(bytes),
             None => {
-                let mut hasher = rune_common::hash::HashBuilder::new();
+                let mut hasher = igel_common::hash::HashBuilder::new();
                 hasher.update(bytes);
                 parts.insert(part.to_string(), hasher);
             }
@@ -3542,7 +3566,7 @@ pub fn compute_unit_identity(
     unit: &CompilationUnit,
     profile: &Profile,
     dep_keys: &[(String, String)],
-    source_cache: &mut rune_fingerprint::FingerprintCache,
+    source_cache: &mut igel_fingerprint::FingerprintCache,
 ) -> UnitIdentity {
     identity_with(
         unit,
@@ -3558,7 +3582,7 @@ pub fn compute_unit_identity_from(
     unit: &CompilationUnit,
     profile: &Profile,
     dep_keys: &[(String, String)],
-    source_cache: &mut rune_fingerprint::FingerprintCache,
+    source_cache: &mut igel_fingerprint::FingerprintCache,
     read: Option<(&inputs::ReadRecord, Option<&str>)>,
 ) -> UnitIdentity {
     let sources = match read {
@@ -3572,7 +3596,7 @@ pub fn compute_unit_key_from(
     unit: &CompilationUnit,
     profile: &Profile,
     dep_keys: &[(String, String)],
-    source_cache: &mut rune_fingerprint::FingerprintCache,
+    source_cache: &mut igel_fingerprint::FingerprintCache,
     read: Option<(&inputs::ReadRecord, Option<&str>)>,
 ) -> String {
     let sources = match read {
@@ -3585,13 +3609,13 @@ pub fn compute_unit_key_from(
 /// Keyed by configuration and root file contents; a stale record only costs a miss.
 pub fn read_record_key(
     unit: &CompilationUnit,
-    source_cache: &mut rune_fingerprint::FingerprintCache,
+    source_cache: &mut igel_fingerprint::FingerprintCache,
 ) -> Option<String> {
     if unit.crate_id.source != CrateSource::Local {
         return None;
     }
-    let root = rune_fingerprint::hasher::file_hash(&unit.source_root, source_cache)?;
-    let mut hb = rune_common::hash::HashBuilder::new();
+    let root = igel_fingerprint::hasher::file_hash(&unit.source_root, source_cache)?;
+    let mut hb = igel_common::hash::HashBuilder::new();
     hb.update(b"read-record\0");
     hb.update(unit.metadata_hash().as_bytes());
     hb.update(b"\0");
@@ -3617,14 +3641,14 @@ pub fn compute_script_base(
     profile: &Profile,
     build_dep_keys: &[(String, String)],
     dep_metadata: &[(String, String, String)],
-    source_cache: &mut rune_fingerprint::FingerprintCache,
+    source_cache: &mut igel_fingerprint::FingerprintCache,
 ) -> String {
     let mut deps: Vec<(String, String)> = build_dep_keys.to_vec();
     for (links, k, v) in dep_metadata {
         deps.push((format!("dep-metadata:{links}:{k}"), v.clone()));
     }
     let identity = identity_with(unit, profile, &deps, source_cache, Sources::None, false);
-    let mut hb = rune_common::hash::HashBuilder::new();
+    let mut hb = igel_common::hash::HashBuilder::new();
     hb.update(b"build-script-result\0");
     hb.update(identity.key.as_bytes());
     if let Some(script) = &unit.build_script {
@@ -3641,12 +3665,12 @@ fn identity_with(
     unit: &CompilationUnit,
     profile: &Profile,
     dep_keys: &[(String, String)],
-    source_cache: &mut rune_fingerprint::FingerprintCache,
+    source_cache: &mut igel_fingerprint::FingerprintCache,
     sources: Sources,
     with_parts: bool,
 ) -> UnitIdentity {
     let mut hb = KeyRecorder {
-        key: rune_common::hash::HashBuilder::new(),
+        key: igel_common::hash::HashBuilder::new(),
         parts: with_parts.then(Default::default),
     };
     const UNIT: &str = "unit (features, crate type, edition, target)";
@@ -3745,7 +3769,7 @@ fn identity_with(
             }
             hb.update("sources", b"read\0");
             for (name, path) in record.paths(&unit.manifest_dir) {
-                let hash = rune_fingerprint::hasher::file_hash(&path, source_cache)
+                let hash = igel_fingerprint::hasher::file_hash(&path, source_cache)
                     .map_or_else(|| "missing".to_string(), |h| format!("{h:016x}"));
                 hb.update("sources", name.as_bytes());
                 hb.update("sources", b"=");
@@ -3757,7 +3781,7 @@ fn identity_with(
             }
         } else {
             let package_hash =
-                rune_fingerprint::hasher::compute_package_hash(&unit.manifest_dir, source_cache)
+                igel_fingerprint::hasher::compute_package_hash(&unit.manifest_dir, source_cache)
                     .unwrap_or_default();
             hb.update("sources", package_hash.as_bytes());
             if with_parts {
@@ -3772,7 +3796,7 @@ fn identity_with(
         .flatten()
         .filter(|p| !p.starts_with(&unit.manifest_dir))
         {
-            if let Ok(h) = rune_common::hash::xxhash3_file(outside) {
+            if let Ok(h) = igel_common::hash::xxhash3_file(outside) {
                 hb.update("sources outside the package", &h.to_le_bytes());
             }
         }
@@ -3838,7 +3862,7 @@ pub fn load_identities(fingerprint_dir: &Path) -> HashMap<String, UnitIdentity> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rune_common::{CrateId, Edition};
+    use igel_common::{CrateId, Edition};
 
     fn unit(name: &str, source: CrateSource, dir: &Path) -> CompilationUnit {
         CompilationUnit {
@@ -3898,7 +3922,7 @@ mod tests {
     }
 
     fn key(u: &CompilationUnit, p: &Profile) -> String {
-        compute_unit_cas_key(u, p, &[], &mut rune_fingerprint::FingerprintCache::new())
+        compute_unit_cas_key(u, p, &[], &mut igel_fingerprint::FingerprintCache::new())
     }
 
     #[test]
@@ -3936,13 +3960,13 @@ mod tests {
             u.target_name = name.into();
             graph.add_node(u);
         }
-        fn short() -> Option<rune_common::sysinfo::Memory> {
-            Some(rune_common::sysinfo::Memory {
+        fn short() -> Option<igel_common::sysinfo::Memory> {
+            Some(igel_common::sysinfo::Memory {
                 total: 8 << 30,
                 available: 100 << 20,
             })
         }
-        let config = RuneConfig::new(dir.path().join("project"));
+        let config = IgelConfig::new(dir.path().join("project"));
         let result = BuildExecutor::new(config, Profile::dev(), 4)
             .with_memory_probe(short)
             .execute(&graph)
@@ -3971,13 +3995,13 @@ mod tests {
             u.target_name = name.into();
             graph.add_node(u);
         }
-        fn roomy() -> Option<rune_common::sysinfo::Memory> {
-            Some(rune_common::sysinfo::Memory {
+        fn roomy() -> Option<igel_common::sysinfo::Memory> {
+            Some(igel_common::sysinfo::Memory {
                 total: 8 << 30,
                 available: 3 << 30,
             })
         }
-        let config = RuneConfig::new(dir.path().join("project"));
+        let config = IgelConfig::new(dir.path().join("project"));
         let first = BuildExecutor::new(config.clone(), Profile::dev(), 4)
             .with_memory_probe(roomy)
             .execute(&graph)
@@ -4023,7 +4047,7 @@ mod tests {
 
     #[test]
     fn auto_frontend_threads_use_only_idle_cores() {
-        use rune_common::settings::FrontendThreads::*;
+        use igel_common::settings::FrontendThreads::*;
         assert_eq!(frontend_threads(Auto, 10, 10, 0), None);
         assert_eq!(frontend_threads(Auto, 10, 4, 6), None);
         assert_eq!(frontend_threads(Auto, 10, 1, 0), Some(8));
@@ -4047,7 +4071,10 @@ mod tests {
         assert!(!on_critical_path(&weights, &completed, NodeId(3)));
         completed.extend([NodeId(1), NodeId(2)]);
         assert!(on_critical_path(&weights, &completed, NodeId(3)));
-        assert!(!on_critical_path(&weights, &completed, NodeId(9)), "unknown");
+        assert!(
+            !on_critical_path(&weights, &completed, NodeId(9)),
+            "unknown"
+        );
     }
 
     #[test]
@@ -4055,7 +4082,7 @@ mod tests {
         let u = unit("serde", registry(), Path::new("/x"));
         let base = key(&u, &Profile::release());
         let mut lto = Profile::release();
-        lto.lto = rune_common::LtoMode::Fat;
+        lto.lto = igel_common::LtoMode::Fat;
         assert_ne!(base, key(&u, &lto), "LTO must change the key");
         let mut cgu = Profile::release();
         cgu.codegen_units = Some(1);
@@ -4067,7 +4094,7 @@ mod tests {
     fn keys_depend_on_dependency_keys_but_not_their_order() {
         let u = unit("serde", registry(), Path::new("/x"));
         let p = Profile::dev();
-        let mut cache = rune_fingerprint::FingerprintCache::new();
+        let mut cache = igel_fingerprint::FingerprintCache::new();
         let a = ("a".to_string(), "k1".to_string());
         let b = ("b".to_string(), "k2".to_string());
         let k1 = compute_unit_cas_key(&u, &p, &[a.clone(), b.clone()], &mut cache);
@@ -4080,10 +4107,10 @@ mod tests {
     #[test]
     fn profile_flags_cover_the_whole_profile() {
         let mut p = Profile::release();
-        p.lto = rune_common::LtoMode::Thin;
+        p.lto = igel_common::LtoMode::Thin;
         p.codegen_units = Some(1);
         p.strip = Some("symbols".into());
-        p.panic = rune_common::PanicStrategy::Abort;
+        p.panic = igel_common::PanicStrategy::Abort;
         let cmd = with_profile_flags(
             RustcCommandBuilder::new("x.rs".into()),
             &p,
