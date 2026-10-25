@@ -1,6 +1,6 @@
 <div align="center">
-<h1>
 <img src="./assets/logo.png" height="80" align="center" alt="Igel logo">
+<h1>
 Igel
 </h1>
 
