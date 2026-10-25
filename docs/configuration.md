@@ -1,36 +1,36 @@
 # Configuration Reference
 
-Rune provides flexible configuration options that can be scoped to individual repositories or applied globally across your machine.
+Igel provides flexible configuration options that can be scoped to individual repositories or applied globally across your machine.
 
-Project configuration lives in `Rune.toml` at the root of your workspace (Cargo ignores this file). Global settings reside in `~/.rune/config.toml`.
+Project configuration lives in `Igel.toml` at the root of your workspace (Cargo ignores this file). Global settings reside in `~/.igel/config.toml`.
 
 ## Configuration Precedence
 
 Settings are resolved in the following order of precedence (highest to lowest):
 
 1. Command-line flags (e.g. `--release`, `--jobs 8`)
-2. Environment variables (`RUNE_*`)
-3. Project configuration (`./Rune.toml`)
-4. Global user configuration (`~/.rune/config.toml`)
+2. Environment variables (`IGEL_*`)
+3. Project configuration (`./Igel.toml`)
+4. Global user configuration (`~/.igel/config.toml`)
 5. Built-in defaults
 
 ## Managing Settings with the CLI
 
-Use `rune config` to view and modify settings without editing TOML files by hand:
+Use `igl config` to view and modify settings without editing TOML files by hand:
 
 ```bash
 # View active settings with their origin source
-rune config list --show-origin
+igl config list --show-origin
 
 # Configure settings for the current project
-rune config set build.release-rebuild-all true
+igl config set build.release-rebuild-all true
 
 # Configure settings globally across all projects
-rune config set build.linker hyprlnk --global
+igl config set build.linker hyprlnk --global
 
 # Inspect or remove a specific setting
-rune config get build.compiler
-rune config unset build.release-rebuild-all
+igl config get build.compiler
+igl config unset build.release-rebuild-all
 ```
 
 ## Available Configuration Keys
@@ -49,16 +49,16 @@ rune config unset build.release-rebuild-all
 | `build.sandbox-network` | none | Comma-separated list of package names permitted to access the network during sandboxed builds. |
 | `build.low-priority` | `false` | Runs compilation jobs at a lower process scheduling priority (`nice`), keeping your desktop responsive during heavy background builds. |
 | `build.release-rebuild-all`| `false` | When `false`, release builds reuse existing CAS artifacts. When `true`, all crates are recompiled unconditionally for release profiles. |
-| `build.target-dir` | `.rune/target` | Output directory for build artifacts and intermediate files. |
+| `build.target-dir` | `.igel/target` | Output directory for build artifacts and intermediate files. |
 
 ### Cache Store Settings (`[cas]`)
 
 | Key | Default | Description |
 | :--- | :--- | :--- |
 | `cas.enabled` | `true` | Enables or disables content-addressable caching. |
-| `cas.dir` | `~/.rune/cas` | Filesystem path for the local content-addressable artifact store. |
+| `cas.dir` | `~/.igel/cas` | Filesystem path for the local content-addressable artifact store. |
 | `cas.remote` | none | Remote cache target. Can be a shared filesystem path or one or more comma-separated Cairn cache server URLs (e.g. `http://cairn.internal:7070`). |
-| `cas.remote-token` | none | Bearer authentication token for Cairn cache servers. (Prefer setting via `RUNE_CAS_REMOTE_TOKEN` to avoid committing credentials). |
+| `cas.remote-token` | none | Bearer authentication token for Cairn cache servers. (Prefer setting via `IGEL_CAS_REMOTE_TOKEN` to avoid committing credentials). |
 | `cas.remote-replicas` | `1` | Number of replicas to maintain across multiple Cairn cache servers for high availability. |
 | `cas.remote-write` | `true` | Allows publishing new artifacts to the remote store. Set to `false` on developer laptops for read-only remote cache access. |
 | `cas.max-size` | `auto` | Maximum disk storage for the local CAS (`10GB`, `500MB`). `auto` allocates 10% of available disk space (between 5 and 50 GiB). |
@@ -77,17 +77,17 @@ rune config unset build.release-rebuild-all
 
 | Key | Default | Description |
 | :--- | :--- | :--- |
-| `test.cache` | `false` | Caches successful test outcomes based on code, fixtures, and environment variables. (Equivalent to `rune test --cached`). |
+| `test.cache` | `false` | Caches successful test outcomes based on code, fixtures, and environment variables. (Equivalent to `igl test --cached`). |
 | `test.jobs` | `1` | Maximum number of test binaries running concurrently. Defaults to `1` to prevent port and database collisions across test suites. |
 | `test.timeout` | `0` | Maximum execution time per test binary (e.g. `90s`, `10m`). Automatically terminates and reports hanging tests. |
 | `test.schedule` | `binaries` | Test scheduling strategy. `tests` splits individual test cases into parallel batches across all CPU cores (nextest-style). |
-| `test.doctests` | `true` | Automatically includes documentation tests during `rune test`. |
+| `test.doctests` | `true` | Automatically includes documentation tests during `igl test`. |
 
 ### Cross-Compilation (`[cross]`)
 
 | Key | Default | Description |
 | :--- | :--- | :--- |
-| `cross.default-target` | none | The target `rune cross` and `--cross` build for when none is given. Plain `rune build` is unaffected. |
+| `cross.default-target` | none | The target `igl cross` and `--cross` build for when none is given. Plain `igl build` is unaffected. |
 | `cross.engine` | `auto` | Where cross builds run: `auto` (here when this machine can build the target, else in a container), `direct` or `container`. |
 | `cross.daemon` | `true` | Keep a warm container per project and target, which builds start in at once. |
 | `cross.idle-timeout` | `15m` | How long a warm container waits for the next build before it stops (`0`: until stopped). |
@@ -105,11 +105,11 @@ Per-target settings (`pre-build`, `env`, `image`, `dockerfile`, `volumes`, `runn
 
 ## Environment Variables
 
-Every configuration key can be set using environment variables prefixed with `RUNE_`. Convert periods and hyphens to underscores in uppercase:
+Every configuration key can be set using environment variables prefixed with `IGEL_`. Convert periods and hyphens to underscores in uppercase:
 
-- `build.jobs` → `RUNE_BUILD_JOBS=12`
-- `build.compiler` → `RUNE_BUILD_COMPILER=auto`
-- `cas.remote` → `RUNE_CAS_REMOTE=http://cairn:7070`
-- `cas.remote-token` → `RUNE_CAS_REMOTE_TOKEN=secret-token`
+- `build.jobs` → `IGEL_BUILD_JOBS=12`
+- `build.compiler` → `IGEL_BUILD_COMPILER=auto`
+- `cas.remote` → `IGEL_CAS_REMOTE=http://cairn:7070`
+- `cas.remote-token` → `IGEL_CAS_REMOTE_TOKEN=secret-token`
 
-Setting `RUNE_HOME` shifts all global Rune data (binaries, store, registry indexes, settings) to a custom directory, making it easy to create isolated environments for testing and containers.
+Setting `IGEL_HOME` shifts all global Igel data (binaries, store, registry indexes, settings) to a custom directory, making it easy to create isolated environments for testing and containers.

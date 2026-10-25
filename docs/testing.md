@@ -1,10 +1,10 @@
 # Testing & Code Coverage
 
-Testing in Rune is built directly into the core build scheduler. Instead of waiting for every library, executable, and benchmark in the workspace to finish compiling before launching your test suite, Rune runs tests the moment the first test binary links.
+Testing in Igel is built directly into the core build scheduler. Instead of waiting for every library, executable, and benchmark in the workspace to finish compiling before launching your test suite, Igel runs tests the moment the first test binary links.
 
 ## Pipelined Test Execution
 
-When you run `rune test`, testing runs concurrently with ongoing compilations:
+When you run `igl test`, testing runs concurrently with ongoing compilations:
 
 ```text
 ▸ ok app (unit tests: lib) · 41 passed · 0.12s
@@ -17,9 +17,9 @@ The terminal display reports completed suites, total passed tests, and active te
 
 ### Key Architectural Behaviors
 
-- **Isolated Binary Execution**: By default, test binaries execute sequentially (`test.jobs = 1`) while the build continues in parallel. Because tests in separate binaries often share resources like network ports, temporary files, or databases, sequential execution eliminates flaky concurrency failures. If your test binaries are fully isolated, run them concurrently with `rune test --test-jobs 4`.
-- **Intelligent Prioritization**: Rune tracks historical test run durations across runs. Binaries that historically take the longest to finish are scheduled and compiled first, minimizing total wall-clock time.
-- **Process Cleanup**: If a test spawns background worker processes or mock servers and fails to terminate them, Rune guarantees they will not hang the test runner when the parent binary exits.
+- **Isolated Binary Execution**: By default, test binaries execute sequentially (`test.jobs = 1`) while the build continues in parallel. Because tests in separate binaries often share resources like network ports, temporary files, or databases, sequential execution eliminates flaky concurrency failures. If your test binaries are fully isolated, run them concurrently with `igl test --test-jobs 4`.
+- **Intelligent Prioritization**: Igel tracks historical test run durations across runs. Binaries that historically take the longest to finish are scheduled and compiled first, minimizing total wall-clock time.
+- **Process Cleanup**: If a test spawns background worker processes or mock servers and fails to terminate them, Igel guarantees they will not hang the test runner when the parent binary exits.
 - **Strict Timeouts**: Stop hanging tests from blocking CI runners. Pass `--timeout 10m` (or configure `test.timeout = "10m"`) to terminate runs that exceed your threshold and report which individual tests stalled:
 
 ```text
@@ -32,32 +32,32 @@ stalled test: upload_resumes_after_disconnect
 
 ```bash
 # Basic Execution
-rune test                           # Run unit, integration, and doc tests
-rune test parse -- --nocapture      # Filter test names and pass args to test binaries
-rune test --no-fail-fast            # Execute all test binaries even after failures
-rune bench                          # Run benchmarks
+igl test                           # Run unit, integration, and doc tests
+igl test parse -- --nocapture      # Filter test names and pass args to test binaries
+igl test --no-fail-fast            # Execute all test binaries even after failures
+igl bench                          # Run benchmarks
 
 # Targeted Workflows
-rune test --failed                  # Re-run only the tests that failed previously
-rune test --retries 2               # Automatically retry failures and report flaky tests
-rune test --schedule tests          # Distribute tests across all cores (nextest-style)
-rune test --cached                  # Skip test binaries whose inputs haven't changed
-rune test --junit report.xml        # Export JUnit XML test report for CI
+igl test --failed                  # Re-run only the tests that failed previously
+igl test --retries 2               # Automatically retry failures and report flaky tests
+igl test --schedule tests          # Distribute tests across all cores (nextest-style)
+igl test --cached                  # Skip test binaries whose inputs haven't changed
+igl test --junit report.xml        # Export JUnit XML test report for CI
 ```
 
-## Fast Failure Iteration: `rune test --failed`
+## Fast Failure Iteration: `igl test --failed`
 
 Fixing broken tests shouldn't require re-running your entire test suite.
 
-Rune persists the exact set of failing test names per project and profile:
-- Running `rune test --failed` compiles and executes only the binaries containing failing tests, running only those specific test names.
-- When an individual test passes, Rune clears it from the failure cache. Repeating `rune test --failed` progressively narrows execution until the entire suite is green.
-- Combine with filters (`rune test --failed parse`) to target specific subsets of broken tests.
+Igel persists the exact set of failing test names per project and profile:
+- Running `igl test --failed` compiles and executes only the binaries containing failing tests, running only those specific test names.
+- When an individual test passes, Igel clears it from the failure cache. Repeating `igl test --failed` progressively narrows execution until the entire suite is green.
+- Combine with filters (`igl test --failed parse`) to target specific subsets of broken tests.
 
 ## Flaky Test Detection: `--retries`
 
 Flaky tests degrade CI reliability. The `--retries N` flag automatically re-runs failing tests by exact name up to `N` times:
-- If a test passes on a subsequent attempt, Rune marks it as **flaky** in the terminal summary and JUnit XML report without failing the CI pipeline.
+- If a test passes on a subsequent attempt, Igel marks it as **flaky** in the terminal summary and JUnit XML report without failing the CI pipeline.
 - Tests that consistently fail across all attempts are marked as failed, halting the build.
 
 ## Instant Cached Test Runs: `--cached`
@@ -65,12 +65,12 @@ Flaky tests degrade CI reliability. The `--retries N` flag automatically re-runs
 When code and test inputs haven't changed, re-running hundreds of unit tests wastes time:
 
 ```bash
-rune test --cached
+igl test --cached
 ```
 
-Rune hashes the test binary executable, package fixture files, command-line arguments, and relevant environment variables (`RUST_*`, `CARGO_*`, `RUNE_*`). If all inputs match a previous successful run, Rune skips execution and reports cached results instantly.
+Igel hashes the test binary executable, package fixture files, command-line arguments, and relevant environment variables (`RUST_*`, `CARGO_*`, `IGEL_*`). If all inputs match a previous successful run, Igel skips execution and reports cached results instantly.
 
-On Rune's own 285 tests, running `rune test --cached` drops execution time from **8.0s down to 0.26s**. Failed tests and documentation tests are never cached.
+On Igel's own 285 tests, running `igl test --cached` drops execution time from **8.0s down to 0.26s**. Failed tests and documentation tests are never cached.
 
 > **Caution**: Enable test caching only for hermetic tests. Tests that depend on external live databases, external HTTP services, or system clocks should run without caching.
 
@@ -78,11 +78,11 @@ On Rune's own 285 tests, running `rune test --cached` drops execution time from 
 
 For large integration test suites dominated by a single heavy binary, enable `--schedule tests` (or `test.schedule = "tests"`). 
 
-Rune queries the binary's test list and partitions tests into parallel batches distributed across every available core — similar to `cargo-nextest`. This cuts wall-clock time dramatically on multi-core systems.
+Igel queries the binary's test list and partitions tests into parallel batches distributed across every available core — similar to `cargo-nextest`. This cuts wall-clock time dramatically on multi-core systems.
 
-## Native Code Coverage: `rune coverage`
+## Native Code Coverage: `igl coverage`
 
-Rune includes built-in source-based code coverage powered by LLVM profiling:
+Igel includes built-in source-based code coverage powered by LLVM profiling:
 
 ```text
 file                       lines             functions               regions
@@ -96,13 +96,13 @@ Generate comprehensive coverage reports without installing external tools:
 
 ```bash
 # Terminal summary with missing line annotations
-rune coverage --show-missing-lines
+igl coverage --show-missing-lines
 
 # Export in standard formats for CI services
-rune coverage --lcov -o lcov.info
-rune coverage --cobertura -o coverage.xml
-rune coverage --html -o coverage_html/
-rune coverage --fail-under 80       # Enforce minimum coverage threshold
+igl coverage --lcov -o lcov.info
+igl coverage --cobertura -o coverage.xml
+igl coverage --html -o coverage_html/
+igl coverage --fail-under 80       # Enforce minimum coverage threshold
 ```
 
-Coverage builds are isolated inside `.rune/target/coverage/build`, preventing instrumented binaries from invalidating your normal development cache.
+Coverage builds are isolated inside `.igel/target/coverage/build`, preventing instrumented binaries from invalidating your normal development cache.
