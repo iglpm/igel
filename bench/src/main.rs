@@ -1,4 +1,4 @@
-//! `rune-bench`: measures Rune against Cargo (`rune-bench run|report|compare|list`).
+//! `igel-bench`: measures Igel against Cargo (`igel-bench run|report|compare|list`).
 
 mod measure;
 mod report;
@@ -16,9 +16,9 @@ use std::time::Duration;
 
 #[derive(Parser)]
 #[command(
-    name = "rune-bench",
+    name = "igel-bench",
     version,
-    about = "Benchmarks Rune against Cargo on generated and real projects"
+    about = "Benchmarks Igel against Cargo on generated and real projects"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -40,7 +40,7 @@ enum Command {
         before: PathBuf,
         after: PathBuf,
         /// Which tool's numbers to compare
-        #[arg(long, default_value = "rune")]
+        #[arg(long, default_value = "igl")]
         tool: String,
         /// Slowdown (in percent) beyond the runs' own noise that counts as a
         /// regression
@@ -74,7 +74,7 @@ struct RunArgs {
     /// Only these workloads (repeatable): tiny, medium, large
     #[arg(long = "workload", value_name = "NAME")]
     workloads: Vec<String>,
-    /// Only these scenarios (repeatable; see `rune-bench list`)
+    /// Only these scenarios (repeatable; see `igel-bench list`)
     #[arg(long = "scenario", value_name = "ID")]
     scenarios: Vec<String>,
     /// Benchmark a real project (copied first; registry dependencies need
@@ -93,9 +93,9 @@ struct RunArgs {
     /// (default: the first of `tests/*.rs`)
     #[arg(long, value_name = "FILE")]
     edit_test: Option<PathBuf>,
-    /// The rune binary (default: `rune` on PATH, else ./target/release/rune)
+    /// The igl binary (default: `igl` on PATH, else ./target/release/igl)
     #[arg(long)]
-    rune: Option<PathBuf>,
+    igl: Option<PathBuf>,
     /// The cargo binary (default: `cargo` on PATH)
     #[arg(long)]
     cargo: Option<PathBuf>,
@@ -111,7 +111,7 @@ struct RunArgs {
     /// Give up on one command after this many seconds
     #[arg(long, default_value_t = 3600)]
     timeout: u64,
-    /// Where results go (default: ./rune-bench-results/<date-time>)
+    /// Where results go (default: ./igel-bench-results/<date-time>)
     #[arg(long)]
     out: Option<PathBuf>,
     /// Keep the workloads' copies and build output afterwards
@@ -200,15 +200,15 @@ fn list() {
 
 fn run(a: RunArgs) -> Result<()> {
     let full = a.suite == Suite::Full;
-    let rune_bin = a.rune.clone().or_else(|| {
-        tool::which("rune").or_else(|| {
-            let local = PathBuf::from("target/release/rune");
+    let igel_bin = a.igl.clone().or_else(|| {
+        tool::which("igl").or_else(|| {
+            let local = PathBuf::from("target/release/igl");
             local.is_file().then_some(local)
         })
     });
-    let rune = tool::Tool::find("rune", rune_bin.as_deref())?;
+    let igl = tool::Tool::find("igl", igel_bin.as_deref())?;
     let cargo = tool::Tool::find("cargo", a.cargo.as_deref())?;
-    let tools = vec![rune, cargo];
+    let tools = vec![igl, cargo];
 
     let mut workloads: Vec<workload::Workload> = Vec::new();
     if let Some(p) = &a.project {
@@ -233,14 +233,14 @@ fn run(a: RunArgs) -> Result<()> {
     }
     for name in &a.workloads {
         if !workload::builtin().iter().any(|w| &w.name == name) {
-            bail!("unknown workload `{name}` (see `rune-bench list`)");
+            bail!("unknown workload `{name}` (see `igel-bench list`)");
         }
     }
 
     let all = scenario::all();
     for id in &a.scenarios {
         if !all.iter().any(|s| s.id == id) {
-            bail!("unknown scenario `{id}` (see `rune-bench list`)");
+            bail!("unknown scenario `{id}` (see `igel-bench list`)");
         }
     }
     let scenarios: Vec<&scenario::Scenario> = all
@@ -257,7 +257,7 @@ fn run(a: RunArgs) -> Result<()> {
     let out = a
         .out
         .clone()
-        .unwrap_or_else(|| PathBuf::from("rune-bench-results").join(timestamp()));
+        .unwrap_or_else(|| PathBuf::from("igel-bench-results").join(timestamp()));
     std::fs::create_dir_all(&out)?;
     let need: u64 = workloads
         .iter()
@@ -300,7 +300,7 @@ fn run(a: RunArgs) -> Result<()> {
         ),
         measurements: Vec::new(),
     };
-    eprintln!("rune-bench: {} vs {}", tools[0].version, tools[1].version);
+    eprintln!("igel-bench: {} vs {}", tools[0].version, tools[1].version);
     eprintln!(
         "  {} workload(s) × {} scenario(s); results in {}",
         workloads.len(),

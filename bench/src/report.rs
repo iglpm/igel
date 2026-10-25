@@ -26,11 +26,11 @@ fn spread(m: &Measurement) -> String {
     format!("±{:.0} %", m.summary.cv() * 100.0)
 }
 
-fn verdict(rune: &Measurement, cargo: &Measurement) -> Option<(f64, String)> {
-    let c = stats::compare(&rune.summary, &cargo.summary)?;
-    let text = if c.within_noise && rune.unit != "bytes" {
+fn verdict(igl: &Measurement, cargo: &Measurement) -> Option<(f64, String)> {
+    let c = stats::compare(&igl.summary, &cargo.summary)?;
+    let text = if c.within_noise && igl.unit != "bytes" {
         "about the same (within noise)".to_string()
-    } else if rune.unit == "bytes" {
+    } else if igl.unit == "bytes" {
         if c.speedup >= 1.0 {
             format!("{:.1}× less disk", c.speedup)
         } else {
@@ -56,7 +56,7 @@ fn pairs(results: &Results) -> Vec<(&Measurement, &Measurement, f64, String)> {
     for w in results.workloads() {
         for m in results.scenarios(&w) {
             if let (Some(r), Some(c)) = (
-                results.find(&w, &m.scenario, "rune"),
+                results.find(&w, &m.scenario, "igl"),
                 results.find(&w, &m.scenario, "cargo"),
             ) && let Some((s, text)) = verdict(r, c)
             {
@@ -81,11 +81,11 @@ pub fn terminal(results: &Results) -> String {
         let _ = writeln!(out, "\n{w}");
         let _ = writeln!(
             out,
-            "  {:<width$} {:>12} {:>12}   rune vs cargo",
-            "scenario", "rune", "cargo"
+            "  {:<width$} {:>12} {:>12}   igl vs cargo",
+            "scenario", "igl", "cargo"
         );
         for m in results.scenarios(&w) {
-            let r = results.find(&w, &m.scenario, "rune");
+            let r = results.find(&w, &m.scenario, "igl");
             let c = results.find(&w, &m.scenario, "cargo");
             let v = match (r, c) {
                 (Some(r), Some(c)) => verdict(r, c).map(|(_, t)| t).unwrap_or_default(),
@@ -105,7 +105,7 @@ pub fn terminal(results: &Results) -> String {
     if let Some(g) = geomean(&speedups) {
         let _ = writeln!(
             out,
-            "\nOverall (geometric mean of the time measurements): Rune is {}.",
+            "\nOverall (geometric mean of the time measurements): Igel is {}.",
             stats::describe(g)
         );
     }
@@ -113,7 +113,7 @@ pub fn terminal(results: &Results) -> String {
 }
 
 pub fn markdown(results: &Results) -> String {
-    let mut out = String::from("# Rune vs Cargo\n\n");
+    let mut out = String::from("# Igel vs Cargo\n\n");
     out.push_str(&environment_lines(results).join("\n"));
     out.push_str("\n\n");
     let all = pairs(results);
@@ -121,7 +121,7 @@ pub fn markdown(results: &Results) -> String {
     if let Some(g) = geomean(&speedups) {
         let _ = writeln!(
             out,
-            "**Overall:** across the {} time measurements, Rune is **{}** (geometric mean).\n",
+            "**Overall:** across the {} time measurements, Igel is **{}** (geometric mean).\n",
             speedups.iter().filter(|(_, m)| m.unit == "s").count(),
             stats::describe(g)
         );
@@ -136,11 +136,11 @@ pub fn markdown(results: &Results) -> String {
             .unwrap_or_default();
         let _ = writeln!(out, "## {w}\n\n{about}\n");
         out.push_str(
-            "| Scenario | Rune | Cargo | Rune vs Cargo | CPU time (Rune / Cargo) | Peak memory (Rune / Cargo) |\n",
+            "| Scenario | Igel | Cargo | Igel vs Cargo | CPU time (Igel / Cargo) | Peak memory (Igel / Cargo) |\n",
         );
         out.push_str("| --- | ---: | ---: | --- | ---: | ---: |\n");
         for m in results.scenarios(&w) {
-            let r = results.find(&w, &m.scenario, "rune");
+            let r = results.find(&w, &m.scenario, "igl");
             let c = results.find(&w, &m.scenario, "cargo");
             let v = match (r, c) {
                 (Some(r), Some(c)) => verdict(r, c).map(|(_, t)| t).unwrap_or_default(),
@@ -218,7 +218,7 @@ fn environment_lines(results: &Results) -> Vec<String> {
         m.runs_light,
         m.commit
             .as_ref()
-            .map(|c| format!(", Rune at `{c}`"))
+            .map(|c| format!(", Igel at `{c}`"))
             .unwrap_or_default()
     ));
     lines
@@ -251,7 +251,7 @@ fn bars(r: Option<&Measurement>, c: Option<&Measurement>) -> String {
     let label = |m: Option<&Measurement>| m.map(value).unwrap_or_default();
     format!(
         "<svg viewBox=\"0 0 470 36\" width=\"470\" height=\"36\" role=\"img\">{}{}</svg>",
-        bar(rv, 2, "rune", format!("rune {}", label(r))),
+        bar(rv, 2, "igl", format!("igl {}", label(r))),
         bar(cv, 20, "cargo", format!("cargo {}", label(c)))
     )
 }
@@ -263,7 +263,7 @@ pub fn html(results: &Results) -> String {
     if let Some(g) = geomean(&speedups) {
         let _ = write!(
             body,
-            "<p class=\"headline\">Across {} time measurements, Rune is <strong>{}</strong> than Cargo \
+            "<p class=\"headline\">Across {} time measurements, Igel is <strong>{}</strong> than Cargo \
              (geometric mean).</p>",
             speedups.iter().filter(|(_, m)| m.unit == "s").count(),
             esc(&stats::describe(g))
@@ -309,13 +309,13 @@ pub fn html(results: &Results) -> String {
         let _ = write!(
             body,
             "<section><h2>{}</h2><p class=\"muted\">{}</p><table><thead><tr><th>Scenario</th>\
-             <th>Median time (rune vs cargo)</th><th>Rune vs Cargo</th><th>CPU</th><th>Peak memory</th>\
+             <th>Median time (igl vs cargo)</th><th>Igel vs Cargo</th><th>CPU</th><th>Peak memory</th>\
              </tr></thead><tbody>",
             esc(&w),
             esc(&about)
         );
         for m in results.scenarios(&w) {
-            let r = results.find(&w, &m.scenario, "rune");
+            let r = results.find(&w, &m.scenario, "igl");
             let c = results.find(&w, &m.scenario, "cargo");
             let (class, v) = match (r, c) {
                 (Some(r), Some(c)) => match verdict(r, c) {
@@ -366,10 +366,10 @@ pub fn html(results: &Results) -> String {
     format!(
         r#"<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Rune vs Cargo</title>
+<title>Igel vs Cargo</title>
 <style>
-:root {{ --bg:#fbfaff; --fg:#1c1830; --muted:#6b6585; --line:#e4e0f0; --rune:#7c4dff; --cargo:#d9822b; --good:#16794a; --bad:#b4232f; --tile:#f1edff; }}
-@media (prefers-color-scheme: dark) {{ :root {{ --bg:#14121c; --fg:#ece9f6; --muted:#9a94b4; --line:#2c2840; --rune:#a68bff; --cargo:#f0a35a; --good:#4cc38a; --bad:#ff6b76; --tile:#1f1b2e; }} }}
+:root {{ --bg:#fbfaff; --fg:#1c1830; --muted:#6b6585; --line:#e4e0f0; --igl:#7c4dff; --cargo:#d9822b; --good:#16794a; --bad:#b4232f; --tile:#f1edff; }}
+@media (prefers-color-scheme: dark) {{ :root {{ --bg:#14121c; --fg:#ece9f6; --muted:#9a94b4; --line:#2c2840; --igl:#a68bff; --cargo:#f0a35a; --good:#4cc38a; --bad:#ff6b76; --tile:#1f1b2e; }} }}
 body {{ margin:0; background:var(--bg); color:var(--fg); font:15px/1.5 system-ui, -apple-system, Segoe UI, sans-serif; }}
 main {{ max-width:1100px; margin:0 auto; padding:24px 16px 64px; }}
 h1 {{ font-size:28px; margin:0 0 4px; }} h2 {{ margin:36px 0 2px; }}
@@ -383,15 +383,15 @@ th, td {{ text-align:left; padding:8px 6px; border-bottom:1px solid var(--line);
 th {{ font-size:13px; color:var(--muted); font-weight:500; }}
 .sc {{ font-weight:600; }}
 .good {{ color:var(--good); font-weight:600; }} .bad {{ color:var(--bad); font-weight:600; }}
-svg {{ max-width:100%; height:auto; }} svg .rune {{ fill:var(--rune); }} svg .cargo {{ fill:var(--cargo); }}
+svg {{ max-width:100%; height:auto; }} svg .igl {{ fill:var(--igl); }} svg .cargo {{ fill:var(--cargo); }}
 svg .lbl {{ fill:var(--fg); font-size:11px; }}
 .table-wrap {{ overflow-x:auto; }}
 ul.env {{ padding-left:18px; color:var(--muted); font-size:13px; }}
 </style></head><body><main>
-<h1>Rune vs Cargo</h1>
+<h1>Igel vs Cargo</h1>
 <ul class="env">{env}</ul>
 {body}
-<p class="muted small">Times are medians; each tool builds its own copy of a workload, runs alternate between the tools, CPU time adds up every process a command waited for, peak memory is the largest single process. Generated by <code>rune-bench</code>.</p>
+<p class="muted small">Times are medians; each tool builds its own copy of a workload, runs alternate between the tools, CPU time adds up every process a command waited for, peak memory is the largest single process. Generated by <code>igel-bench</code>.</p>
 </main></body></html>
 "#
     )
@@ -400,7 +400,7 @@ ul.env {{ padding-left:18px; color:var(--muted); font-size:13px; }}
 pub fn compare(old: &Results, new: &Results, tool: &str, threshold: f64) -> (String, usize) {
     let mut out = String::new();
     let mut regressions = 0;
-    let control_tool = if tool == "cargo" { "rune" } else { "cargo" };
+    let control_tool = if tool == "cargo" { "igl" } else { "cargo" };
     let _ = writeln!(
         out,
         "  {:<12} {:<18} {:>12} {:>12} {:>9} {:>10}",
@@ -511,7 +511,7 @@ mod tests {
     #[test]
     fn reports_name_the_faster_tool() {
         let r = results(vec![
-            m("w", "noop", "rune", &[0.05, 0.05]),
+            m("w", "noop", "igl", &[0.05, 0.05]),
             m("w", "noop", "cargo", &[0.2, 0.2]),
         ]);
         let t = terminal(&r);
@@ -524,32 +524,32 @@ mod tests {
 
     #[test]
     fn a_clear_slowdown_is_a_regression_and_noise_is_not() {
-        let old = results(vec![m("w", "noop", "rune", &[1.0, 1.0, 1.0])]);
-        let slower = results(vec![m("w", "noop", "rune", &[1.3, 1.3, 1.3])]);
-        let (_, n) = compare(&old, &slower, "rune", 0.10);
+        let old = results(vec![m("w", "noop", "igl", &[1.0, 1.0, 1.0])]);
+        let slower = results(vec![m("w", "noop", "igl", &[1.3, 1.3, 1.3])]);
+        let (_, n) = compare(&old, &slower, "igl", 0.10);
         assert_eq!(n, 1);
-        let noisy_old = results(vec![m("w", "noop", "rune", &[0.7, 1.0, 1.3])]);
-        let (_, n) = compare(&noisy_old, &slower, "rune", 0.10);
+        let noisy_old = results(vec![m("w", "noop", "igl", &[0.7, 1.0, 1.3])]);
+        let (_, n) = compare(&noisy_old, &slower, "igl", 0.10);
         assert_eq!(n, 0, "within the old run's own spread");
-        let overlapping = results(vec![m("w", "noop", "rune", &[1.05, 1.3, 1.31])]);
-        let (_, n) = compare(&old, &overlapping, "rune", 0.10);
+        let overlapping = results(vec![m("w", "noop", "igl", &[1.05, 1.3, 1.31])]);
+        let (_, n) = compare(&old, &overlapping, "igl", 0.10);
         assert_eq!(n, 1, "{:?}", Summary::of(&[1.05, 1.3, 1.31]));
-        let old_spread = results(vec![m("w", "noop", "rune", &[0.9, 1.0, 1.1])]);
-        let (_, n) = compare(&old_spread, &overlapping, "rune", 0.10);
+        let old_spread = results(vec![m("w", "noop", "igl", &[0.9, 1.0, 1.1])]);
+        let (_, n) = compare(&old_spread, &overlapping, "igl", 0.10);
         assert_eq!(n, 0, "the runs overlap");
     }
 
     #[test]
     fn a_machine_that_got_slower_for_both_tools_is_not_a_regression() {
         let old = results(vec![
-            m("w", "build", "rune", &[1.0, 1.0, 1.0]),
+            m("w", "build", "igl", &[1.0, 1.0, 1.0]),
             m("w", "build", "cargo", &[2.0, 2.0, 2.0]),
         ]);
         let busier = results(vec![
-            m("w", "build", "rune", &[1.3, 1.3, 1.3]),
+            m("w", "build", "igl", &[1.3, 1.3, 1.3]),
             m("w", "build", "cargo", &[2.6, 2.6, 2.6]),
         ]);
-        let (text, n) = compare(&old, &busier, "rune", 0.10);
+        let (text, n) = compare(&old, &busier, "igl", 0.10);
         assert_eq!(n, 0, "{text}");
         assert!(
             text.contains("+30.0 %") && text.contains("+0.0 %"),

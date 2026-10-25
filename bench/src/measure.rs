@@ -47,7 +47,7 @@ fn tempfile_path() -> std::path::PathBuf {
     use std::sync::atomic::{AtomicUsize, Ordering};
     static N: AtomicUsize = AtomicUsize::new(0);
     std::env::temp_dir().join(format!(
-        "rune-bench-{}-{}.log",
+        "igel-bench-{}-{}.log",
         std::process::id(),
         N.fetch_add(1, Ordering::Relaxed)
     ))
@@ -207,7 +207,7 @@ mod tests {
 
     #[test]
     fn hard_links_count_once() {
-        let dir = std::env::temp_dir().join(format!("rune-bench-size-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("igel-bench-size-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("a"), vec![0u8; 1000]).unwrap();

@@ -203,8 +203,8 @@ fn print_line(results: &Results, workload: &str, s: &Scenario) {
         Some(_) => "—".to_string(),
         None => "".to_string(),
     };
-    let (rune, cargo) = (get("rune"), get("cargo"));
-    let verdict = match (rune, cargo) {
+    let (igl, cargo) = (get("igl"), get("cargo"));
+    let verdict = match (igl, cargo) {
         (Some(r), Some(c)) => match stats::compare(&r.summary, &c.summary) {
             Some(cmp) if r.unit == "bytes" => {
                 format!("{:.1}× the disk", 1.0 / cmp.speedup)
@@ -216,12 +216,12 @@ fn print_line(results: &Results, workload: &str, s: &Scenario) {
         _ => String::new(),
     };
     eprintln!(
-        "  ✓ {:<16} rune {:>11}   cargo {:>11}   {verdict}",
+        "  ✓ {:<16} igl {:>11}   cargo {:>11}   {verdict}",
         s.id,
-        show(rune),
+        show(igl),
         show(cargo)
     );
-    for m in [rune, cargo].into_iter().flatten() {
+    for m in [igl, cargo].into_iter().flatten() {
         if let Some(note) = &m.note
             && (m.summary.n == 0 || m.failures > 0)
         {

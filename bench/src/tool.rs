@@ -57,8 +57,8 @@ impl Tool {
         })
     }
 
-    pub fn is_rune(&self) -> bool {
-        self.name == "rune"
+    pub fn is_igel(&self) -> bool {
+        self.name == "igl"
     }
 
     pub fn command(&self, ctx: &Ctx, args: &[&str]) -> Command {
@@ -68,22 +68,22 @@ impl Tool {
             c.env_remove(var);
         }
         for (k, _) in std::env::vars_os() {
-            if k.to_string_lossy().starts_with("RUNE_") {
+            if k.to_string_lossy().starts_with("IGEL_") {
                 c.env_remove(k);
             }
         }
         c.env("NO_COLOR", "1")
             .env("CARGO_TERM_COLOR", "never")
             .env("CARGO_TERM_PROGRESS_WHEN", "never");
-        if self.is_rune() {
-            c.env("RUNE_HOME", &ctx.home);
+        if self.is_igel() {
+            c.env("IGEL_HOME", &ctx.home);
         }
         c
     }
 
     pub fn output_dir(&self, ctx: &Ctx) -> PathBuf {
-        if self.is_rune() {
-            ctx.dir.join(".rune")
+        if self.is_igel() {
+            ctx.dir.join(".igel")
         } else {
             ctx.dir.join("target")
         }
@@ -95,7 +95,7 @@ impl Tool {
 
     pub fn remove_caches(&self, ctx: &Ctx) -> Result<()> {
         self.remove_output(ctx)?;
-        if self.is_rune() {
+        if self.is_igel() {
             remove(&ctx.home.join("cas"))?;
         }
         Ok(())
@@ -104,7 +104,7 @@ impl Tool {
     pub fn disk_use(&self, ctx: &Ctx) -> (u64, u64) {
         let out_dir = self.output_dir(ctx);
         let out = crate::measure::dir_size(&out_dir);
-        let total = if self.is_rune() {
+        let total = if self.is_igel() {
             crate::measure::dirs_size(&[&out_dir, &ctx.home.join("cas")])
         } else {
             out

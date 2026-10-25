@@ -55,17 +55,17 @@ pub struct Comparison {
     pub within_noise: bool,
 }
 
-pub fn compare(rune: &Summary, cargo: &Summary) -> Option<Comparison> {
-    if rune.n == 0 || cargo.n == 0 || rune.median <= 0.0 {
+pub fn compare(igl: &Summary, cargo: &Summary) -> Option<Comparison> {
+    if igl.n == 0 || cargo.n == 0 || igl.median <= 0.0 {
         return None;
     }
-    let speedup = cargo.median / rune.median;
-    let decisive = rune.max < cargo.min || cargo.max < rune.min;
-    let spread = rune.cv().max(cargo.cv());
+    let speedup = cargo.median / igl.median;
+    let decisive = igl.max < cargo.min || cargo.max < igl.min;
+    let spread = igl.cv().max(cargo.cv());
     Some(Comparison {
         speedup,
         decisive,
-        within_noise: !decisive && rune.n > 1 && cargo.n > 1 && (speedup.ln().abs() <= spread),
+        within_noise: !decisive && igl.n > 1 && cargo.n > 1 && (speedup.ln().abs() <= spread),
     })
 }
 
@@ -121,9 +121,9 @@ mod tests {
 
     #[test]
     fn comparisons_read_naturally() {
-        let rune = Summary::of(&[1.0, 1.1]);
+        let igl = Summary::of(&[1.0, 1.1]);
         let cargo = Summary::of(&[3.0, 3.3]);
-        let c = compare(&rune, &cargo).unwrap();
+        let c = compare(&igl, &cargo).unwrap();
         assert!(c.decisive && !c.within_noise);
         assert_eq!(describe(c.speedup), "3.0× faster");
         let a = Summary::of(&[1.0, 1.4, 0.8]);

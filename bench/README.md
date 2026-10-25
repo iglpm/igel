@@ -1,6 +1,6 @@
-# `rune-bench`: Build System Benchmarking Suite
+# `igel-bench`: Build System Benchmarking Suite
 
-`rune-bench` is an automated, rigorous benchmarking framework designed to compare Rune and Cargo across everyday developer workflows: cold builds, no-op checks, incremental code edits, branch switching, test execution, and project graph queries.
+`igel-bench` is an automated, rigorous benchmarking framework designed to compare Igel and Cargo across everyday developer workflows: cold builds, no-op checks, incremental code edits, branch switching, test execution, and project graph queries.
 
 ## Quickstart
 
@@ -8,24 +8,24 @@ Build the benchmark runner and launch a benchmark suite:
 
 ```bash
 # Build release binaries
-cargo build --release -p rune-cli -p rune-bench
+cargo build --release -p igel-cli -p igel-bench
 
 # Run quick benchmark suite (~10 minutes: tiny and medium workloads)
-./target/release/rune-bench run
+./target/release/igel-bench run
 
 # Run full comprehensive suite (includes large workloads and release profiles)
-./target/release/rune-bench run --suite full
+./target/release/igel-bench run --suite full
 
 # Benchmark your own codebase
-./target/release/rune-bench run --project ~/src/my-service --edit-core crates/core/src/lib.rs
+./target/release/igel-bench run --project ~/src/my-service --edit-core crates/core/src/lib.rs
 
 # List all available workloads and scenarios
-./target/release/rune-bench list
+./target/release/igel-bench list
 ```
 
 ## Generated Reports
 
-Benchmark results are saved automatically to `./rune-bench-results/<timestamp>/`:
+Benchmark results are saved automatically to `./igel-bench-results/<timestamp>/`:
 - `results.json`: Full machine-readable dataset containing raw metrics for every run.
 - `report.md`: GitHub-flavored Markdown summary tables and speedup factors.
 - `report.html`: Interactive HTML report with charts, peak memory plots, and CPU consumption graphs.
@@ -49,7 +49,7 @@ Every scenario executes identical commands for both tools from identical initial
 
 ## Standard Workloads
 
-`rune-bench` generates deterministic, standalone synthetic workspaces requiring zero network access:
+`igel-bench` generates deterministic, standalone synthetic workspaces requiring zero network access:
 
 - `tiny`: 2 crates (a library and binary application) measuring pure tool overhead.
 - `medium`: 25 crates in 4 hierarchical layers, typical of mid-sized microservices.
@@ -61,11 +61,11 @@ You can benchmark any real-world repository using `--project DIR`. The runner cr
 
 Benchmarking compilers reliably requires eliminating external system noise:
 
-- **Interleaved Execution**: Runs alternate strictly between tools (`rune`, `cargo`, `cargo`, `rune`...) to prevent thermal throttling or background system load from skewing comparisons.
+- **Interleaved Execution**: Runs alternate strictly between tools (`igl`, `cargo`, `cargo`, `igl`...) to prevent thermal throttling or background system load from skewing comparisons.
 - **Process Isolation**: Each tool operates within its own directory copy and isolated cache environments.
 - **Warm-Up Cycles**: Inexpensive scenarios run unrecorded warm-up iterations to prime OS disk caches.
 - **Precise Telemetry**: Measures wall-clock time, user+system CPU time across child processes via `wait4`, and peak resident memory (RSS).
-- **Environment Sanitization**: Strips caller environment overrides (`CARGO_TARGET_DIR`, `RUSTFLAGS`, `RUSTC_WRAPPER`, `RUNE_*`) to guarantee parity.
+- **Environment Sanitization**: Strips caller environment overrides (`CARGO_TARGET_DIR`, `RUSTFLAGS`, `RUSTC_WRAPPER`, `IGEL_*`) to guarantee parity.
 
 ## Detecting Performance Regressions in CI
 
@@ -73,13 +73,13 @@ Use `compare` to enforce performance budgets:
 
 ```bash
 # Benchmark baseline commit
-rune-bench run --out /tmp/bench-base
+igel-bench run --out /tmp/bench-base
 
 # Benchmark candidate commit
-rune-bench run --out /tmp/bench-candidate
+igel-bench run --out /tmp/bench-candidate
 
 # Compare with automated statistical significance threshold
-rune-bench compare /tmp/bench-base/results.json /tmp/bench-candidate/results.json --threshold 10
+igel-bench compare /tmp/bench-base/results.json /tmp/bench-candidate/results.json --threshold 10
 ```
 
-`rune-bench compare` checks for statistically significant regressions against Cargo as an internal control. If candidate performance degrades beyond the noise margin across all runs, the command exits with code 1, making it a reliable automated CI gate.
+`igel-bench compare` checks for statistically significant regressions against Cargo as an internal control. If candidate performance degrades beyond the noise margin across all runs, the command exits with code 1, making it a reliable automated CI gate.

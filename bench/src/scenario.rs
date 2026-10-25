@@ -153,7 +153,7 @@ pub fn all() -> Vec<Scenario> {
             id: "disk",
             category: "Disk",
             title: "disk used by a dev build",
-            about: "Build output in the project after a cold build (Rune: plus its shared store).",
+            about: "Build output in the project after a cold build (Igel: plus its shared store).",
             kind: Kind::Disk,
             heavy: true,
             full_only: false,
@@ -365,7 +365,7 @@ pub fn all() -> Vec<Scenario> {
             args: &["generate-lockfile"],
             prepare: nothing,
             before: |ctx, _, _| {
-                for f in ["Cargo.lock", "Rune.lock.bin"] {
+                for f in ["Cargo.lock", "Igel.lock.bin"] {
                     let _ = std::fs::remove_file(ctx.dir.join(f));
                 }
                 Ok(())

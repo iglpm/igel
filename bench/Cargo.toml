@@ -1,6 +1,6 @@
 [package]
-name = "rune-bench"
-description = "Benchmarks Rune against Cargo: builds, rebuilds, caches, tests and inspection commands on generated and real projects"
+name = "igel-bench"
+description = "Benchmarks Igel against Cargo: builds, rebuilds, caches, tests and inspection commands on generated and real projects"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,7 +8,7 @@ license.workspace = true
 publish = false
 
 [[bin]]
-name = "rune-bench"
+name = "igel-bench"
 path = "src/main.rs"
 
 [dependencies]
