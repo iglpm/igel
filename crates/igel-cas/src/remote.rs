@@ -63,7 +63,7 @@ fn begin_atomic(dst: &Path) -> io::Result<(PathBuf, fs::File)> {
 fn finish_atomic(tmp: &Path, dst: &Path, exec: bool) -> io::Result<()> {
     let result = (|| {
         set_read_only(tmp, exec)?;
-        rune_common::fsutil::rename_over(tmp, dst)
+        igel_common::fsutil::rename_over(tmp, dst)
     })();
     if result.is_err() {
         let _ = fs::remove_file(tmp);
@@ -218,7 +218,7 @@ impl HttpTransport {
             .clamp(2, 8);
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(workers)
-            .thread_name("rune-shared-store")
+            .thread_name("igel-shared-store")
             .enable_all()
             .build()
             .map_err(|e| e.to_string())?;
@@ -227,7 +227,7 @@ impl HttpTransport {
             .timeout(Duration::from_secs(300))
             .tcp_nodelay(true)
             .pool_max_idle_per_host(32);
-        let http = rune_common::net::global();
+        let http = igel_common::net::global();
         for (path, pem) in http.ca_bundles() {
             if let Ok(certs) = pem.map_err(|e| e.to_string()).and_then(|pem| {
                 reqwest::Certificate::from_pem_bundle(&pem).map_err(|e| e.to_string())
@@ -305,7 +305,7 @@ impl HttpTransport {
         {
             tracing::warn!(
                 "the shared store {} refused this machine's credentials ({status}); \
-                 set cas.remote-token (or RUNE_CAS_REMOTE_TOKEN)",
+                 set cas.remote-token (or IGEL_CAS_REMOTE_TOKEN)",
                 self.endpoints[i].base
             );
         }

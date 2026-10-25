@@ -168,7 +168,7 @@ fn make_read_only(path: &Path) {
 /// (another file system, or another mount of it, as with a container's bind mounts). Without
 /// the second, every build there would copy and hash each artifact again.
 fn already_linked(src: &Path, dest: &Path) -> bool {
-    hard_linked(src, dest) || rune_common::fsutil::is_copy_of(src, dest)
+    hard_linked(src, dest) || igel_common::fsutil::is_copy_of(src, dest)
 }
 
 fn hard_linked(src: &Path, dest: &Path) -> bool {
@@ -313,7 +313,7 @@ impl CasStore {
                 return None;
             }
             make_read_only(&tmp);
-            rune_common::fsutil::rename_over(&tmp, &dest).ok()?;
+            igel_common::fsutil::rename_over(&tmp, &dest).ok()?;
         }
         manifest.compressed = false;
         manifest.stored_size = None;
@@ -592,7 +592,7 @@ impl CasStore {
             if already_linked(&src, &dest) {
                 continue;
             }
-            rune_common::fsutil::replace_with_link(&src, &dest)?;
+            igel_common::fsutil::replace_with_link(&src, &dest)?;
         }
         Ok(true)
     }
@@ -630,7 +630,7 @@ impl CasStore {
                 continue;
             }
 
-            rune_common::fsutil::replace_with_link(&src, &dest)?;
+            igel_common::fsutil::replace_with_link(&src, &dest)?;
             if hard_linked(&src, &dest) {
                 linked_files.push(dest);
                 continue;

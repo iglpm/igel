@@ -1,4 +1,4 @@
-//! `rune cas export`/`import`: store entries as a tar archive. Imports are untrusted: only
+//! `igl cas export`/`import`: store entries as a tar archive. Imports are untrusted: only
 //! `objects/<xx>/<key>/…` paths, every artifact checked against its hash, existing entries kept.
 
 use crate::store::{CasStore, hash_file};

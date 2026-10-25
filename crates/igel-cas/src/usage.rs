@@ -1,4 +1,4 @@
-//! Where the store's disk space goes: `rune cas du`.
+//! Where the store's disk space goes: `igl cas du`.
 
 use crate::store::{ArtifactManifest, CasStore};
 use std::collections::HashMap;

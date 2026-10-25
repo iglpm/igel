@@ -1,13 +1,13 @@
 [package]
-name = "rune-cas"
-description = "Content-addressable artifact store for the Rune build system"
+name = "igel-cas"
+description = "Content-addressable artifact store for the Igel build system"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-rune-common.workspace = true
+igel-common.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 serde = { workspace = true }
