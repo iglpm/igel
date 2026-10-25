@@ -1,6 +1,8 @@
 <div align="center">
-
-# Igel
+<h1>
+<img src="./assets/logo.png" height="80" align="center" alt="Igel logo">
+Igel
+</h1>
 
 **Rust builds that never do the same work twice.**
 
@@ -12,6 +14,8 @@ curl -fsSL https://runepm.com/install.sh | sh
 ```
 
 </div>
+
+---
 
 Igel compiles your existing Rust projects directly with `rustc` while persisting every compiled crate into a shared, content-addressable store. Whether you switch branches, pull an older commit, spin up a secondary worktree, or spin up a fresh CI agent, artifacts built anywhere on your system are restored in milliseconds instead of compiled from scratch.
 
