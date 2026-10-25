@@ -48,21 +48,21 @@ pub fn find_enclosing_workspace(
     manifest: &crate::Manifest,
 ) -> Option<(PathBuf, WorkspaceManifest)> {
     let load = |root: &Path| -> Option<WorkspaceManifest> {
-        crate::Manifest::from_path(&rune_common::manifest_file::manifest_in(root))
+        crate::Manifest::from_path(&igel_common::manifest_file::manifest_in(root))
             .ok()
             .and_then(|m| m.workspace)
     };
     if let Some(explicit) = manifest.package.as_ref().and_then(|p| p.workspace.as_ref()) {
-        let root = rune_common::fsutil::canonicalize(dir.join(explicit)).ok()?;
+        let root = igel_common::fsutil::canonicalize(dir.join(explicit)).ok()?;
         return load(&root).map(|w| (root, w));
     }
     if let Some(ws) = &manifest.workspace {
         return Some((dir.to_path_buf(), ws.clone()));
     }
     let mut cur = dir.parent()?.to_path_buf();
-    let dir_canon = rune_common::fsutil::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+    let dir_canon = igel_common::fsutil::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
     loop {
-        if rune_common::manifest_file::has_manifest(&cur)
+        if igel_common::manifest_file::has_manifest(&cur)
             && let Some(ws) = load(&cur)
         {
             let is_member = ws
@@ -70,7 +70,7 @@ pub fn find_enclosing_workspace(
                 .unwrap_or_default()
                 .iter()
                 .any(|d| {
-                    rune_common::fsutil::canonicalize(d).unwrap_or_else(|_| d.clone()) == dir_canon
+                    igel_common::fsutil::canonicalize(d).unwrap_or_else(|_| d.clone()) == dir_canon
                 });
             if is_member {
                 return Some((cur, ws));
@@ -108,7 +108,7 @@ impl WorkspaceManifest {
             // A plain path: `glob` would stat every directory from the root down to it.
             if !pattern.contains(['*', '?', '[']) {
                 let path: PathBuf = root.join(pattern).components().collect();
-                if rune_common::manifest_file::has_manifest(&path) && !excluded.contains(&path) {
+                if igel_common::manifest_file::has_manifest(&path) && !excluded.contains(&path) {
                     paths.push(path);
                 }
                 continue;
@@ -117,7 +117,7 @@ impl WorkspaceManifest {
             for entry in glob(&full_pattern)? {
                 match entry {
                     Ok(path) => {
-                        if rune_common::manifest_file::has_manifest(&path)
+                        if igel_common::manifest_file::has_manifest(&path)
                             && !excluded.contains(&path)
                         {
                             paths.push(path);

@@ -1,6 +1,6 @@
 //! Resolution of `[profile.*]` tables into concrete [`Profile`]s, as in Cargo.
 
-use rune_common::{DebugInfo, LtoMode, OptLevel, PanicStrategy, Profile};
+use igel_common::{DebugInfo, LtoMode, OptLevel, PanicStrategy, Profile};
 use std::collections::HashMap;
 
 use crate::cargo_toml::ProfileOverride;

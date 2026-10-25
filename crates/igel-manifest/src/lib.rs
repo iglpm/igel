@@ -1,4 +1,4 @@
-//! Cargo.toml and Rune.toml manifest parsing.
+//! Cargo.toml and Igel.toml manifest parsing.
 
 pub mod cargo_toml;
 pub mod dependency;

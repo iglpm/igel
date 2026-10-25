@@ -66,7 +66,7 @@ impl PackageManifest {
             .unwrap_or_else(|| "2015".to_string())
     }
 
-    pub fn meta_in(&self, ws: Option<&WorkspaceManifest>) -> rune_common::PackageMeta {
+    pub fn meta_in(&self, ws: Option<&WorkspaceManifest>) -> igel_common::PackageMeta {
         let wsp = ws.and_then(|w| w.package.as_ref());
         let text = |key: &str, from_ws: Option<&String>| -> String {
             match self.extra.get(key) {
@@ -115,7 +115,7 @@ impl PackageManifest {
             }
             _ => String::new(),
         };
-        rune_common::PackageMeta {
+        igel_common::PackageMeta {
             name: self.name.clone(),
             authors,
             description,
@@ -367,9 +367,9 @@ impl Manifest {
         };
         let raw: RawManifest = if path
             .file_name()
-            .is_some_and(|n| n == rune_common::manifest_file::RUNE_TOML)
+            .is_some_and(|n| n == igel_common::manifest_file::IGEL_TOML)
         {
-            // In a `Rune.toml`, `[test]` is a settings table while `[[test]]` is the list of test targets.
+            // In a `Igel.toml`, `[test]` is a settings table while `[[test]]` is the list of test targets.
             let mut table: toml::Table = content.parse().map_err(parse_err)?;
             if table.get("test").is_some_and(|v| v.is_table()) {
                 table.remove("test");
@@ -898,7 +898,7 @@ mod tests {
     }
 
     #[test]
-    fn a_rune_toml_manifest_carries_settings_tables_beside_its_package() {
+    fn a_igel_toml_manifest_carries_settings_tables_beside_its_package() {
         let toml = r#"
             [package]
             name = "demo"
@@ -908,7 +908,7 @@ mod tests {
             [dependencies]
             serde = "1"
 
-            # Rune settings, in the same file:
+            # Igel settings, in the same file:
             [build]
             jobs = 4
             [cas]
@@ -916,15 +916,15 @@ mod tests {
             [test]
             doctests = false
         "#;
-        let m = Manifest::from_str(toml, Path::new("Rune.toml")).unwrap();
+        let m = Manifest::from_str(toml, Path::new("Igel.toml")).unwrap();
         assert_eq!(m.package.unwrap().name, "demo");
         assert!(m.dependencies.values().any(|d| d.name == "serde"));
     }
 
     #[test]
-    fn a_rune_toml_with_test_targets_keeps_them() {
+    fn a_igel_toml_with_test_targets_keeps_them() {
         let toml = "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n\n[[test]]\nname = \"integration\"\npath = \"tests/it.rs\"\n";
-        let m = Manifest::from_str(toml, Path::new("Rune.toml")).unwrap();
+        let m = Manifest::from_str(toml, Path::new("Igel.toml")).unwrap();
         assert_eq!(m.test.len(), 1);
         assert_eq!(m.test[0].name.as_deref(), Some("integration"));
     }
