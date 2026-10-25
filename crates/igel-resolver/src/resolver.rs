@@ -1,7 +1,7 @@
 use cfg_expr::expr::TargetMatcher;
-use rune_manifest::dependency::{DependencyKind, DependencySpec};
-use rune_registry::source::{CRATES_IO, IndexClient};
-use rune_registry::{CrateIndex, IndexRecord};
+use igel_manifest::dependency::{DependencyKind, DependencySpec};
+use igel_registry::source::{CRATES_IO, IndexClient};
+use igel_registry::{CrateIndex, IndexRecord};
 use semver::{Version, VersionReq};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -21,11 +21,11 @@ pub enum ResolverError {
     )]
     LockedVersionNotCached { name: String, version: String },
     #[error(transparent)]
-    Registry(#[from] rune_registry::index::IndexError),
+    Registry(#[from] igel_registry::index::IndexError),
     #[error("Manifest parse error: {0}")]
     Manifest(String),
     #[error("Git dependency error: {0}")]
-    Git(#[from] rune_registry::git::GitError),
+    Git(#[from] igel_registry::git::GitError),
 }
 
 pub type Result<T> = std::result::Result<T, ResolverError>;
@@ -63,7 +63,7 @@ pub enum PackageSource {
 
 impl PackageSource {
     pub fn crates_io() -> Self {
-        Self::Registry(rune_common::CRATES_IO_INDEX.to_string())
+        Self::Registry(igel_common::CRATES_IO_INDEX.to_string())
     }
 
     pub fn is_registry(&self) -> bool {
@@ -72,7 +72,7 @@ impl PackageSource {
 
     pub fn lock_source(&self) -> Option<String> {
         match self {
-            Self::Registry(index) => Some(if index == rune_common::CRATES_IO_INDEX {
+            Self::Registry(index) => Some(if index == igel_common::CRATES_IO_INDEX {
                 // Cargo's canonical spelling of crates.io.
                 "registry+https://github.com/rust-lang/crates.io-index".to_string()
             } else {
@@ -319,7 +319,7 @@ impl DependencyResolver {
         if by_registry.is_empty() {
             return;
         }
-        let _timer = rune_common::timing::phase("index prefetch");
+        let _timer = igel_common::timing::phase("index prefetch");
         let refresh = self.refresh;
         for (registry, mut names) in by_registry {
             names.sort();
@@ -347,7 +347,7 @@ impl DependencyResolver {
         if self.offline || seeds.is_empty() {
             return;
         }
-        let _timer = rune_common::timing::phase("index prefetch");
+        let _timer = igel_common::timing::phase("index prefetch");
         let mut registries: Vec<String> = seeds.iter().map(|(r, ..)| r.clone()).collect();
         registries.sort();
         registries.dedup();
@@ -477,7 +477,7 @@ impl DependencyResolver {
         project_root: &Path,
         root_dependencies: &[(String, DependencySpec)],
         existing_lock: Option<&Lockfile>,
-        workspace: Option<&rune_manifest::workspace::WorkspaceManifest>,
+        workspace: Option<&igel_manifest::workspace::WorkspaceManifest>,
     ) -> Result<ResolvedGraph> {
         // Cargo allows one version per compatible range. Conflicts are settled by preference or backtracking
         // and the walk re-run; almost every graph needs one round.
@@ -512,7 +512,7 @@ impl DependencyResolver {
             if conflicts.is_empty() {
                 return Ok(graph);
             }
-            let _timer = rune_common::timing::phase("version unification");
+            let _timer = igel_common::timing::phase("version unification");
             let mut progressed = false;
             for (registry, name, versions) in conflicts {
                 progressed |= self.settle(&registry, &name, &versions, &edges, &graph);
@@ -535,7 +535,7 @@ impl DependencyResolver {
     }
 
     fn solve_whole(&mut self, graph: &ResolvedGraph, edges: &[Edge]) -> bool {
-        let _timer = rune_common::timing::phase("version solving");
+        let _timer = igel_common::timing::phase("version solving");
         let requirements: Vec<crate::solver::Requirement<'_>> = edges
             .iter()
             .map(|e| crate::solver::Requirement {
@@ -704,7 +704,7 @@ impl DependencyResolver {
         project_root: &Path,
         root_dependencies: &[(String, DependencySpec)],
         existing_lock: Option<&Lockfile>,
-        workspace: Option<&rune_manifest::workspace::WorkspaceManifest>,
+        workspace: Option<&igel_manifest::workspace::WorkspaceManifest>,
     ) -> Result<(ResolvedGraph, Vec<Edge>)> {
         let mut hints = std::mem::take(&mut self.hints);
         if let Some(lock) = existing_lock {
@@ -723,7 +723,7 @@ impl DependencyResolver {
                     continue;
                 }
                 if let Ok(registry) =
-                    rune_registry::source::defs().index_for_name(spec.registry.as_deref())
+                    igel_registry::source::defs().index_for_name(spec.registry.as_deref())
                 {
                     seeds.push((
                         registry,
@@ -749,7 +749,7 @@ impl DependencyResolver {
                 .clone()
                 .unwrap_or_else(|| VersionReq::from_str("*").unwrap());
             let local_dir = spec.path.as_ref().map(|p| project_root.join(p));
-            let registry = rune_registry::source::defs()
+            let registry = igel_registry::source::defs()
                 .index_for_name(spec.registry.as_deref())
                 .map_err(ResolverError::Registry)?;
             queue.push_back((
@@ -815,7 +815,7 @@ impl DependencyResolver {
                 }
             }
 
-            let activation_timer = rune_common::timing::phase("optional-dep activation");
+            let activation_timer = igel_common::timing::phase("optional-dep activation");
             let more = activate_newly_enabled_optional_deps(
                 &resolved_packages,
                 &mut feature_resolver,
@@ -827,7 +827,7 @@ impl DependencyResolver {
             }
         }
 
-        let _timer = rune_common::timing::phase("feature unification");
+        let _timer = igel_common::timing::phase("feature unification");
         let feature_results = feature_resolver.resolve();
 
         let mut edges = Vec::new();
@@ -836,7 +836,7 @@ impl DependencyResolver {
                 continue;
             }
             let Ok(registry) =
-                rune_registry::source::defs().index_for_name(spec.registry.as_deref())
+                igel_registry::source::defs().index_for_name(spec.registry.as_deref())
             else {
                 continue;
             };
@@ -1030,7 +1030,7 @@ fn compatible_duplicates(graph: &ResolvedGraph) -> Vec<(String, String, Vec<Vers
 
 fn registry_of_lock_source(source: &str) -> Option<String> {
     if source == "registry+https://github.com/rust-lang/crates.io-index" {
-        Some(rune_common::CRATES_IO_INDEX.to_string())
+        Some(igel_common::CRATES_IO_INDEX.to_string())
     } else if source.starts_with("sparse+") || source.starts_with("registry+") {
         Some(source.to_string())
     } else {
@@ -1051,15 +1051,15 @@ fn resolve_one_queue_item(
     queue: &mut VecDeque<QueueItem>,
     visited: &mut HashSet<(String, String)>,
     project_root: &Path,
-    workspace: Option<&rune_manifest::workspace::WorkspaceManifest>,
+    workspace: Option<&igel_manifest::workspace::WorkspaceManifest>,
     existing_lock: Option<&Lockfile>,
     resolver: &mut DependencyResolver,
 ) -> Result<()> {
     if let Some(dir) = local_dir {
-        let manifest_path = rune_common::manifest_file::manifest_in(&dir);
-        if let Ok(manifest) = rune_manifest::Manifest::from_path(&manifest_path) {
-            let canon = rune_common::fsutil::canonicalize(&dir).unwrap_or_else(|_| dir.clone());
-            let enclosing = rune_manifest::find_enclosing_workspace(&canon, &manifest);
+        let manifest_path = igel_common::manifest_file::manifest_in(&dir);
+        if let Ok(manifest) = igel_manifest::Manifest::from_path(&manifest_path) {
+            let canon = igel_common::fsutil::canonicalize(&dir).unwrap_or_else(|_| dir.clone());
+            let enclosing = igel_manifest::find_enclosing_workspace(&canon, &manifest);
             let ws_ref = enclosing.as_ref().map(|(_, w)| w).or(workspace);
             let ws_root: PathBuf = enclosing
                 .as_ref()
@@ -1096,7 +1096,7 @@ fn resolve_one_queue_item(
                 let mut member_deps: Vec<_> = manifest.dependencies.values().collect();
                 member_deps.sort_by(|a, b| (&a.name, a.kind as u8).cmp(&(&b.name, b.kind as u8)));
                 for dep_spec in member_deps {
-                    let spec = rune_manifest::effective_spec(dep_spec, &canon, &ws_root, ws_ref);
+                    let spec = igel_manifest::effective_spec(dep_spec, &canon, &ws_root, ws_ref);
                     let dep_req = spec
                         .version
                         .clone()
@@ -1106,7 +1106,7 @@ fn resolve_one_queue_item(
                         .package
                         .clone()
                         .unwrap_or_else(|| dep_spec.name.clone());
-                    let child_registry = rune_registry::source::defs()
+                    let child_registry = igel_registry::source::defs()
                         .index_for_name(spec.registry.as_deref())
                         .map_err(ResolverError::Registry)?;
                     let child_local_dir = if let Some(p) = &spec.path {
@@ -1148,8 +1148,8 @@ fn resolve_one_queue_item(
                     }
                 }
 
-                let source = match rune_registry::git::locate_dir(&canon)
-                    .or_else(|| rune_registry::git::locate_dir(&dir))
+                let source = match igel_registry::git::locate_dir(&canon)
+                    .or_else(|| igel_registry::git::locate_dir(&dir))
                 {
                     Some(co) => PackageSource::Git {
                         url: co.url.clone(),
@@ -1300,7 +1300,7 @@ fn resolve_one_queue_item(
             let mature = |rec: &&IndexRecord| {
                 rec.pubtime
                     .as_deref()
-                    .and_then(rune_common::time::parse_rfc3339)
+                    .and_then(igel_common::time::parse_rfc3339)
                     .is_none_or(|t| t <= cutoff)
             };
             if matches.iter().any(mature) {
@@ -1318,7 +1318,7 @@ fn resolve_one_queue_item(
             matches.iter().copied().find(|rec| {
                 rec.rust_version
                     .as_deref()
-                    .and_then(rune_common::toolchain::parse_rust_version)
+                    .and_then(igel_common::toolchain::parse_rust_version)
                     .is_none_or(|need| need <= *m)
             })
         });
@@ -1456,13 +1456,13 @@ fn normalize_registry(url: &str) -> String {
 }
 
 fn git_package_dir(spec: &DependencySpec, url: &str, package: &str) -> Result<PathBuf> {
-    let reference = rune_registry::git::GitRef::from_spec(
+    let reference = igel_registry::git::GitRef::from_spec(
         spec.branch.as_deref(),
         spec.tag.as_deref(),
         spec.rev.as_deref(),
     );
-    let checkout = rune_registry::git::checkout(url, &reference)?;
-    Ok(rune_registry::git::find_package(&checkout, package)?)
+    let checkout = igel_registry::git::checkout(url, &reference)?;
+    Ok(igel_registry::git::find_package(&checkout, package)?)
 }
 
 /// Only the declared alias counts (`bytes_05 = { package = "bytes" }` is not `bytes`).
@@ -1578,7 +1578,7 @@ pub fn matches_target(target_str: Option<&str>, target_triple: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rune_registry::IndexDependency;
+    use igel_registry::IndexDependency;
 
     fn dep(name: &str, req: &str, optional: bool, kind: Option<&str>) -> IndexDependency {
         IndexDependency {

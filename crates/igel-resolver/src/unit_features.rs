@@ -1,7 +1,7 @@
 //! Per-build feature resolution following Cargo's feature resolver: per selection, separate host/target
 //! features (resolver 2+), platform-gated dependencies, dev features only for dev targets.
 
-use rune_manifest::dependency::DependencyKind;
+use igel_manifest::dependency::DependencyKind;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 
 #[derive(Debug, Clone)]

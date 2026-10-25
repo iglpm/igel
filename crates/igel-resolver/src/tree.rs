@@ -1,8 +1,8 @@
-//! `rune tree` and `rune why`.
+//! `igl tree` and `igl why`.
 
 use crate::resolver::{ResolvedDependencyRef, ResolvedGraph, ResolvedPackage};
 use colored::*;
-use rune_manifest::dependency::DependencyKind;
+use igel_manifest::dependency::DependencyKind;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

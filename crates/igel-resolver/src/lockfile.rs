@@ -5,9 +5,9 @@ use std::path::Path;
 use thiserror::Error;
 use tracing::debug;
 
-const BINARY_LOCK_MAGIC: &[u8; 9] = b"RUNELOCK\x02";
+const BINARY_LOCK_MAGIC: &[u8; 9] = b"IGELLOCK\x02";
 /// Magic, fingerprint, lock in one file, so a lockfile is never paired with another resolution's fingerprint.
-const BINARY_LOCK_MAGIC_V3: &[u8; 9] = b"RUNELOCK\x03";
+const BINARY_LOCK_MAGIC_V3: &[u8; 9] = b"IGELLOCK\x03";
 
 #[derive(Debug, Error)]
 pub enum LockfileError {
@@ -182,7 +182,7 @@ pub struct LockfileManager;
 
 impl LockfileManager {
     pub fn load_fast(project_root: &Path) -> Option<Lockfile> {
-        let binary = Self::read_binary(&project_root.join("Rune.lock.bin")).ok();
+        let binary = Self::read_binary(&project_root.join("Igel.lock.bin")).ok();
         let cargo = Self::read_cargo(&project_root.join("Cargo.lock")).ok();
         match (binary, cargo) {
             // `Cargo.lock` is the source of truth; the binary lockfile is only used while it agrees.
@@ -193,7 +193,7 @@ impl LockfileManager {
     }
 
     pub fn load_binary(project_root: &Path) -> Option<Lockfile> {
-        Self::read_binary(&project_root.join("Rune.lock.bin")).ok()
+        Self::read_binary(&project_root.join("Igel.lock.bin")).ok()
     }
 
     pub fn read_binary(path: &Path) -> Result<Lockfile> {
@@ -279,7 +279,7 @@ impl LockfileManager {
         Ok(())
     }
 
-    /// Writes `Rune.lock.bin` only: `Cargo.lock` is written solely by `rune lockfile export --format cargo`.
+    /// Writes `Igel.lock.bin` only: `Cargo.lock` is written solely by `igl lockfile export --format cargo`.
     pub fn sync_all(project_root: &Path, lock: &Lockfile) -> Result<()> {
         Self::sync_all_with_fingerprint(project_root, lock, None)
     }
@@ -289,9 +289,9 @@ impl LockfileManager {
         lock: &Lockfile,
         fingerprint: Option<&str>,
     ) -> Result<()> {
-        let bin_path = project_root.join("Rune.lock.bin");
+        let bin_path = project_root.join("Igel.lock.bin");
         Self::write_binary_with_fingerprint(lock, &bin_path, fingerprint)?;
-        debug!("Wrote Rune.lock.bin at {}", project_root.display());
+        debug!("Wrote Igel.lock.bin at {}", project_root.display());
         Ok(())
     }
 }
@@ -304,7 +304,7 @@ mod tests {
     #[test]
     fn test_binary_lockfile_roundtrip() {
         let dir = tempdir().unwrap();
-        let bin_path = dir.path().join("Rune.lock.bin");
+        let bin_path = dir.path().join("Igel.lock.bin");
 
         let mut lock = Lockfile::new();
         lock.add_or_replace(LockPackage {

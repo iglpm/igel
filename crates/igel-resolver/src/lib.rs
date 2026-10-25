@@ -1,4 +1,4 @@
-//! Dependency resolution, feature unification, lockfiles, `rune tree`/`rune why`.
+//! Dependency resolution, feature unification, lockfiles, `igl tree`/`igl why`.
 
 pub mod features;
 pub mod lockfile;

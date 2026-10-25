@@ -1,8 +1,8 @@
 //! `[patch]` and `[replace]`: substituting a dependency's source everywhere in the graph, when the
 //! patched version satisfies the requirement. Configuration patches win over the manifest's.
 
-use rune_manifest::dependency::DependencySpec;
-use rune_manifest::{Manifest, WorkspaceManifest};
+use igel_manifest::dependency::DependencySpec;
+use igel_manifest::{Manifest, WorkspaceManifest};
 use semver::{Version, VersionReq};
 use std::path::{Path, PathBuf};
 
@@ -147,20 +147,20 @@ impl PatchEntry {
         let dir = if let Some(p) = &self.spec.path {
             p.clone()
         } else if let Some(url) = &self.spec.git {
-            let reference = rune_registry::git::GitRef::from_spec(
+            let reference = igel_registry::git::GitRef::from_spec(
                 self.spec.branch.as_deref(),
                 self.spec.tag.as_deref(),
                 self.spec.rev.as_deref(),
             );
-            let co = rune_registry::git::checkout(url, &reference).map_err(|e| e.to_string())?;
-            rune_registry::git::find_package(&co, &self.name).map_err(|e| e.to_string())?
+            let co = igel_registry::git::checkout(url, &reference).map_err(|e| e.to_string())?;
+            igel_registry::git::find_package(&co, &self.name).map_err(|e| e.to_string())?
         } else {
             return Ok(None);
         };
-        let manifest = Manifest::from_path(&rune_common::manifest_file::manifest_in(&dir))
+        let manifest = Manifest::from_path(&igel_common::manifest_file::manifest_in(&dir))
             .map_err(|e| format!("patch `{}`: {e}", self.name))?;
-        let canon = rune_common::fsutil::canonicalize(&dir).unwrap_or_else(|_| dir.clone());
-        let enclosing = rune_manifest::find_enclosing_workspace(&canon, &manifest);
+        let canon = igel_common::fsutil::canonicalize(&dir).unwrap_or_else(|_| dir.clone());
+        let enclosing = igel_manifest::find_enclosing_workspace(&canon, &manifest);
         let ws: Option<&WorkspaceManifest> = enclosing.as_ref().map(|(_, w)| w);
         let version = manifest
             .package
