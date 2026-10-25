@@ -1,0 +1,1183 @@
+//! `new`, `init`, `clean`, `fmt`, `config`, `cas`, `lockfile`.
+
+use anyhow::{Context, Result, bail};
+use colored::Colorize;
+use igel_cas::CasStore;
+use igel_cas::gc::{GcConfig, run_gc};
+use igel_common::settings::{
+    self, KEYS, Origin, Scope, Settings, config_path, key_def, parse_size,
+};
+use igel_common::{Edition, IgelConfig};
+use igel_resolver::lockfile::LockfileManager;
+use std::collections::HashMap;
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use crate::args::*;
+use crate::ui;
+use crate::workspace::{Workspace, find_project_root};
+
+const RUST_KEYWORDS: &[&str] = &[
+    "as", "break", "const", "continue", "crate", "else", "enum", "extern", "false", "fn", "for",
+    "if", "impl", "in", "let", "loop", "match", "mod", "move", "mut", "pub", "ref", "return",
+    "self", "Self", "static", "struct", "super", "trait", "true", "type", "unsafe", "use", "where",
+    "while", "async", "await", "dyn", "abstract", "become", "box", "do", "final", "macro",
+    "override", "priv", "typeof", "unsized", "virtual", "yield", "try", "gen",
+];
+
+pub fn validate_package_name(name: &str) -> Result<()> {
+    if name.is_empty() {
+        bail!("package name cannot be empty");
+    }
+    let mut chars = name.chars();
+    let first = chars.next().unwrap();
+    if !(first.is_alphabetic() || first == '_') {
+        bail!(
+            "invalid character `{first}` in package name: `{name}`, the first character must be a Unicode XID start character or `_`"
+        );
+    }
+    if let Some(bad) = chars.find(|c| !(c.is_alphanumeric() || *c == '_' || *c == '-')) {
+        bail!(
+            "invalid character `{bad}` in package name: `{name}`, characters must be Unicode XID characters, `-`, or `_`"
+        );
+    }
+    if RUST_KEYWORDS.contains(&name.replace('-', "_").as_str()) {
+        bail!("the name `{name}` cannot be used as a package name, it is a Rust keyword");
+    }
+    let normalized = name.replace('-', "_");
+    if ["alloc", "core", "proc_macro", "std", "test"].contains(&normalized.as_str()) {
+        bail!(
+            "the name `{name}` cannot be used as a package name, it conflicts with Rust's \
+             built-in {normalized} library (`--name` picks another name for this directory)"
+        );
+    }
+    Ok(())
+}
+
+fn scaffold(
+    dir: &Path,
+    name: &str,
+    lib: bool,
+    edition: &str,
+    gitignore: bool,
+    manifest_file: &str,
+) -> Result<()> {
+    validate_package_name(name)?;
+    if let Some(existing) = igel_common::manifest_file::find_manifest(dir) {
+        bail!(
+            "`{}` already exists in `{}`",
+            existing
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("a manifest"),
+            dir.display()
+        );
+    }
+    let _: Edition = edition.parse().map_err(|e: String| anyhow::anyhow!(e))?;
+    fs::create_dir_all(dir.join("src"))?;
+
+    let manifest = format!(
+        "[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"{edition}\"\n\n[dependencies]\n"
+    );
+    let manifest_path = dir.join(manifest_file);
+    let content = match fs::read_to_string(&manifest_path) {
+        Ok(existing) if !existing.trim().is_empty() => format!("{manifest}\n{existing}"),
+        _ => manifest,
+    };
+    fs::write(&manifest_path, content)?;
+
+    let source = if lib {
+        dir.join("src/lib.rs")
+    } else {
+        dir.join("src/main.rs")
+    };
+    if !source.exists() {
+        fs::write(
+            &source,
+            if lib {
+                "pub fn add(left: u64, right: u64) -> u64 {\n    left + right\n}\n\n\
+                 #[cfg(test)]\nmod tests {\n    use super::*;\n\n    #[test]\n    fn it_works() {\n        \
+                 assert_eq!(add(2, 2), 4);\n    }\n}\n"
+            } else {
+                "fn main() {\n    println!(\"Hello, world!\");\n}\n"
+            },
+        )?;
+    }
+
+    if gitignore {
+        let path = dir.join(".gitignore");
+        if !path.exists() {
+            fs::write(path, "/target\n/.igel\nIgel.lock.bin\n")?;
+        }
+        if !dir.join(".git").exists() && !inside_git_repo(dir) {
+            let _ = std::process::Command::new("git")
+                .arg("init")
+                .arg("--quiet")
+                .arg(dir)
+                .status();
+        }
+    }
+    ui::action(
+        "created",
+        format!(
+            "{} `{name}` package",
+            if lib {
+                "library"
+            } else {
+                "binary (application)"
+            }
+        ),
+    );
+    Ok(())
+}
+
+fn inside_git_repo(dir: &Path) -> bool {
+    let mut cur = igel_common::fsutil::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+    loop {
+        if cur.join(".git").exists() {
+            return true;
+        }
+        if !cur.pop() {
+            return false;
+        }
+    }
+}
+
+pub fn new(args: NewArgs) -> Result<()> {
+    if args.path.exists() {
+        bail!(
+            "destination `{}` already exists (use `igl init` to initialize it)",
+            args.path.display()
+        );
+    }
+    let name = match &args.name {
+        Some(n) => n.clone(),
+        None => args
+            .path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(str::to_string)
+            .context("cannot infer a package name from the path; pass --name")?,
+    };
+    scaffold(
+        &args.path,
+        &name,
+        args.lib,
+        &args.edition,
+        !args.no_gitignore,
+        manifest_file_for(&args.manifest),
+    )
+}
+
+fn manifest_file_for(choice: &str) -> &'static str {
+    if choice == "igl" {
+        igel_common::manifest_file::IGEL_TOML
+    } else {
+        igel_common::manifest_file::CARGO_TOML
+    }
+}
+
+pub fn init(args: InitArgs) -> Result<()> {
+    fs::create_dir_all(&args.path)?;
+    let abs = igel_common::fsutil::canonicalize(&args.path)?;
+    let name = match &args.name {
+        Some(n) => n.clone(),
+        None => abs
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(str::to_string)
+            .context("cannot infer a package name; pass --name")?,
+    };
+    let lib = args.lib
+        || (!args.bin && abs.join("src/lib.rs").exists() && !abs.join("src/main.rs").exists());
+    scaffold(
+        &abs,
+        &name,
+        lib,
+        &args.edition,
+        !args.no_gitignore,
+        manifest_file_for(&args.manifest),
+    )
+}
+
+pub fn clean(args: CleanArgs) -> Result<()> {
+    let root = find_project_root(args.manifest.manifest_path.as_deref());
+    let mut config = match &root {
+        Some(r) => {
+            let settings = Settings::load(Some(r))?;
+            IgelConfig::new(r).with_settings(settings)
+        }
+        None => bail!(
+            "could not find `Cargo.toml` or `Igel.toml` in the current directory or any parent"
+        ),
+    };
+    if let Some(dir) = &args.target_dir {
+        config.target_dir = dir.clone();
+    }
+
+    let target = if args.release {
+        config.target_dir.join("release")
+    } else if let Some(profile) = &args.profile {
+        config.target_dir.join(match profile.as_str() {
+            "dev" | "test" => "debug",
+            "bench" => "release",
+            other => other,
+        })
+    } else {
+        config.target_dir.clone()
+    };
+
+    if target.exists() {
+        let (files, size) = walkdir::WalkDir::new(&target)
+            .into_iter()
+            .flatten()
+            .filter(|e| e.file_type().is_file())
+            .filter_map(|e| e.metadata().ok())
+            .fold((0usize, 0u64), |(n, b), m| (n + 1, b + m.len()));
+        fs::remove_dir_all(&target)
+            .with_context(|| format!("failed to remove {}", target.display()))?;
+        ui::action(
+            "cleaned",
+            format!(
+                "{} {}",
+                ui::rel(&target),
+                format!("({}, {})", ui::plural(files, "file"), ui::bytes(size)).dimmed()
+            ),
+        );
+    } else {
+        ui::summary("nothing to clean");
+    }
+    Ok(())
+}
+
+/// `igl fmt`: rustfmt on each crate's entry points (it follows `mod`s), grouped by edition.
+pub fn fmt(mut args: FmtArgs) -> Result<()> {
+    if let Some(i) = args.rustfmt_args.iter().position(|a| a == "--check") {
+        args.rustfmt_args.remove(i);
+        args.check = true;
+    }
+    let ws = Workspace::load(args.manifest.manifest_path.as_deref())?;
+    let selected = ws.select(&args.package, args.workspace, &[])?;
+
+    let mut by_edition: HashMap<Edition, Vec<PathBuf>> = HashMap::new();
+    for &mi in &selected {
+        let m = &ws.members[mi];
+        let entries = by_edition.entry(m.edition).or_default();
+        if let Some(lib) = &m.manifest.lib {
+            entries.push(
+                m.dir
+                    .join(lib.path.as_deref().unwrap_or(Path::new("src/lib.rs"))),
+            );
+        }
+        for t in m
+            .manifest
+            .bin
+            .iter()
+            .chain(&m.manifest.example)
+            .chain(&m.manifest.test)
+            .chain(&m.manifest.bench)
+        {
+            if let Some(p) = &t.path {
+                entries.push(m.dir.join(p));
+            }
+        }
+    }
+
+    let mut total = 0;
+    for entries in by_edition.values_mut() {
+        entries.retain(|p| p.exists());
+        entries.sort();
+        entries.dedup();
+        total += entries.len();
+    }
+    if total == 0 {
+        ui::warn("no local crate source found to format");
+        return Ok(());
+    }
+
+    ui::action(
+        if args.check { "checking" } else { "formatting" },
+        format!("{} target{}", total, if total == 1 { "" } else { "s" }),
+    );
+
+    let rustfmt = std::env::var_os("RUSTFMT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("rustfmt"));
+
+    let mut needs_formatting = false;
+    let mut groups: Vec<_> = by_edition
+        .into_iter()
+        .filter(|(_, v)| !v.is_empty())
+        .collect();
+    groups.sort_by_key(|(e, _)| e.as_str());
+    for (edition, entries) in groups {
+        let mut cmd = std::process::Command::new(&rustfmt);
+        cmd.arg("--edition").arg(edition.as_str());
+        if args.check {
+            cmd.arg("--check");
+        }
+        cmd.args(&args.rustfmt_args);
+        cmd.args(&entries);
+        let status = cmd.status().with_context(|| {
+            format!(
+                "failed to run `{}` — install it with `rustup component add rustfmt`",
+                rustfmt.display()
+            )
+        })?;
+        if !status.success() {
+            if args.check {
+                needs_formatting = true;
+            } else {
+                bail!("rustfmt exited with an error");
+            }
+        }
+    }
+    if needs_formatting {
+        bail!("some files are not formatted (run `igl fmt` to fix)");
+    }
+    ui::summary(if args.check {
+        "formatting OK".to_string()
+    } else {
+        "formatted".to_string()
+    });
+    Ok(())
+}
+
+fn config_scope(
+    global: bool,
+    project: bool,
+    root: &Option<PathBuf>,
+    for_write: bool,
+) -> Result<Scope> {
+    match (global, project) {
+        (true, _) => Ok(Scope::Global),
+        (_, true) => {
+            if root.is_none() {
+                bail!("`--project` needs to be run inside a Cargo project");
+            }
+            Ok(Scope::Project)
+        }
+        _ if for_write && root.is_some() => Ok(Scope::Project),
+        _ => Ok(Scope::Global),
+    }
+}
+
+pub fn config(cmd: ConfigCommands) -> Result<()> {
+    let root = find_project_root(None);
+    let settings = Settings::load(root.as_deref())?;
+
+    match cmd {
+        ConfigCommands::List {
+            global,
+            project,
+            show_origin,
+        } => {
+            if global || project {
+                let scope = config_scope(global, project, &root, false)?;
+                let path = config_path(scope, root.as_deref()).context("no such settings file")?;
+                let mut any = false;
+                for def in KEYS {
+                    if let Some(v) = settings::read_from_file(&path, def.name)? {
+                        println!("{} = {}", def.name, v);
+                        any = true;
+                    }
+                }
+                if !any {
+                    ui::detail(format!("no settings in {}", path.display()));
+                }
+                return Ok(());
+            }
+            let rows = settings.effective();
+            let width = rows.iter().map(|(d, ..)| d.name.len()).max().unwrap_or(0);
+            let text_width = crate::ui::term_width().clamp(40, 100) - 4;
+            let mut page = crate::pager::Page::new("igl config list");
+            page.line(format!(
+                "{}  {}",
+                crate::ui::brand("settings"),
+                "values you set are highlighted · change one with `igl config set <key> <value>`"
+                    .dimmed()
+            ));
+            let mut section = "";
+            for (def, value, origin) in rows {
+                let this = def.name.split('.').next().unwrap_or("");
+                if this != section {
+                    section = this;
+                    page.blank();
+                }
+                let set = origin != Origin::Default;
+                let value = if set {
+                    crate::ui::brand(&value)
+                } else {
+                    value.clone()
+                };
+                let mut line = format!("{:<width$}  {value}", def.name.bold());
+                if show_origin || set {
+                    line.push_str(&format!("  {}", format!("# {origin}").dimmed()));
+                }
+                page.line(line);
+                for l in crate::ui::wrap(def.description, text_width) {
+                    page.line(format!("    {}", l.dimmed()));
+                }
+            }
+            page.show();
+        }
+        ConfigCommands::Get {
+            key,
+            global,
+            project,
+        } => {
+            let def = key_def(&key)
+                .ok_or_else(|| settings::SettingsError::UnknownKey { key: key.clone() })?;
+            if global || project {
+                let scope = config_scope(global, project, &root, false)?;
+                let path = config_path(scope, root.as_deref()).context("no such settings file")?;
+                match settings::read_from_file(&path, &key)? {
+                    Some(v) => println!("{v}"),
+                    None => bail!("`{key}` is not set in {}", path.display()),
+                }
+            } else {
+                let value = settings
+                    .get(&key)
+                    .map(|(v, _)| v.to_string())
+                    .unwrap_or_else(|| def.default.to_string());
+                println!("{value}");
+            }
+        }
+        ConfigCommands::Set {
+            key,
+            value,
+            global,
+            project,
+        } => {
+            let scope = config_scope(global, project, &root, true)?;
+            let path =
+                config_path(scope, root.as_deref()).context("no settings file for this scope")?;
+            let stored = settings::set_in_file(&path, &key, &value)?;
+            ui::action(
+                "set",
+                format!(
+                    "{} = {} ({}: {})",
+                    key.bold(),
+                    stored,
+                    if scope == Scope::Global {
+                        "global"
+                    } else {
+                        "project"
+                    },
+                    path.display()
+                ),
+            );
+            let effective = Settings::load(root.as_deref())?;
+            if let Some((v, origin)) = effective.get(&key)
+                && *v != stored
+            {
+                ui::warn(format!("the effective value is still {v}, from {origin}"));
+            }
+            if scope == Scope::Global
+                && root.is_some()
+                && let Some(proj) = root.as_ref().map(|r| r.join(settings::PROJECT_FILE))
+                && settings::read_from_file(&proj, &key)
+                    .ok()
+                    .flatten()
+                    .is_some()
+            {
+                ui::warn(format!(
+                    "this project's {} overrides the global value",
+                    settings::PROJECT_FILE
+                ));
+            }
+        }
+        ConfigCommands::Unset {
+            key,
+            global,
+            project,
+        } => {
+            let scope = config_scope(global, project, &root, true)?;
+            let path =
+                config_path(scope, root.as_deref()).context("no settings file for this scope")?;
+            if settings::unset_in_file(&path, &key)? {
+                ui::action("unset", format!("{} in {}", key.bold(), path.display()));
+            } else {
+                ui::warn(format!("`{key}` was not set in {}", path.display()));
+            }
+        }
+        ConfigCommands::Path => {
+            println!("global:  {}", settings::global_config_path().display());
+            match &root {
+                Some(r) => println!("project: {}", r.join(settings::PROJECT_FILE).display()),
+                None => println!("project: (not inside a Cargo project)"),
+            }
+        }
+    }
+    Ok(())
+}
+
+pub fn cas(cmd: CasCommands) -> Result<()> {
+    let root = find_project_root(None);
+    let settings = Settings::load(root.as_deref())?;
+    let config =
+        IgelConfig::new(root.clone().unwrap_or_else(|| PathBuf::from("."))).with_settings(settings);
+    let cas = CasStore::new(config.cas_dir.clone())?;
+
+    match cmd {
+        CasCommands::Import { path } => {
+            let stats = cas
+                .import_bundle(&path)
+                .with_context(|| format!("cannot import {}", path.display()))?;
+            ui::summary(format!(
+                "imported {} entries ({}){}",
+                stats.entries,
+                format_size_human(stats.bytes),
+                if stats.skipped > 0 {
+                    format!(" · {} already present or damaged", stats.skipped)
+                } else {
+                    String::new()
+                }
+            ));
+        }
+        CasCommands::Export(_) => unreachable!("handled by cmd_build::cas_export"),
+        CasCommands::Pin(_) => unreachable!("handled by cmd_build::cas_pin"),
+        CasCommands::Unpin => {
+            let root = crate::workspace::find_project_root(None)
+                .context("could not find `Cargo.toml` in this directory or any parent")?;
+            if igel_cas::pins::unpin(&cas, &root) {
+                ui::summary(format!("unpinned {}", root.display()));
+            } else {
+                ui::detail(format!("{} was not pinned", root.display()));
+            }
+        }
+        CasCommands::Pins => {
+            let pins = igel_cas::pins::list(&cas);
+            if pins.is_empty() {
+                ui::detail("no workspace is pinned (`igl cas pin` pins the current one)");
+            }
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            for p in pins {
+                let present = p.keys.iter().filter(|k| cas.contains(k)).count();
+                ui::out(format!(
+                    "  {}  {}",
+                    p.project.display(),
+                    format!(
+                        "{present} entries, pinned {}",
+                        format_idle(now.saturating_sub(p.pinned_at))
+                    )
+                    .dimmed()
+                ));
+            }
+        }
+        CasCommands::Stats => {
+            let stats = cas.stats().unwrap_or_default();
+            let total = stats.hits + stats.misses;
+            let hit_rate = if total > 0 {
+                (stats.hits as f64 / total as f64) * 100.0
+            } else {
+                0.0
+            };
+            ui::heading("build cache");
+            let mut rows = vec![
+                ("location", config.cas_dir.display().to_string()),
+                ("entries", stats.total_entries.to_string()),
+                ("size", format_size_human(stats.total_size_bytes)),
+                (
+                    "hit rate",
+                    if total > 0 {
+                        format!(
+                            "{hit_rate:.1}%  {}",
+                            format!("({} reused, {} compiled)", stats.hits, stats.misses).dimmed()
+                        )
+                    } else {
+                        "no builds recorded yet".dimmed().to_string()
+                    },
+                ),
+            ];
+            if let Some(max) = config.settings.cas_max_size_for(&config.cas_dir) {
+                rows.push(("max size", format_size_human(max)));
+            }
+            if let Some(age) = config.settings.cas_max_age() {
+                rows.push((
+                    "cleanup",
+                    format!("entries unused for {} days are removed", age / 86_400),
+                ));
+            }
+            if let Some(idle) = config.settings.cas_compress_after() {
+                rows.push((
+                    "compression",
+                    format!(
+                        "entries unused for {} are compressed",
+                        format_idle_threshold(idle)
+                    ),
+                ));
+            }
+            let pins = igel_cas::pins::list(&cas);
+            if !pins.is_empty() {
+                rows.push(("pinned", ui::plural(pins.len(), "workspace")));
+            }
+            for l in ui::kv_lines(&rows, 2) {
+                ui::out(l);
+            }
+        }
+        CasCommands::Du(args) => {
+            let u = igel_cas::usage::usage(&cas);
+            ui::heading("build cache usage");
+            for l in ui::kv_lines(
+                &[
+                    ("location", config.cas_dir.display().to_string()),
+                    ("entries", u.entries.to_string()),
+                    ("size", format_size_human(u.bytes)),
+                ],
+                2,
+            ) {
+                ui::out(l);
+            }
+            if u.packages.is_empty() {
+                return Ok(());
+            }
+            println!();
+            println!(
+                "  {:<32} {:>8} {:>10}  last used",
+                "package", "entries", "size"
+            );
+            for p in u.packages.iter().take(args.top) {
+                println!(
+                    "  {:<32} {:>8} {:>10}  {}",
+                    p.name,
+                    p.entries,
+                    format_size_human(p.bytes),
+                    format_idle(p.idle_secs)
+                );
+            }
+            if u.packages.len() > args.top {
+                let rest: u64 = u.packages[args.top..].iter().map(|p| p.bytes).sum();
+                println!(
+                    "  … {} more packages, {}",
+                    u.packages.len() - args.top,
+                    format_size_human(rest)
+                );
+            }
+            println!();
+            for b in &u.idle {
+                if b.entries > 0 {
+                    println!(
+                        "  {:>10} unused for {:<8} ({} entries)",
+                        format_size_human(b.bytes),
+                        format_idle_threshold(b.min_idle_secs),
+                        b.entries
+                    );
+                }
+            }
+            if let Some(b) = u.idle.iter().rev().find(|b| b.entries > 0) {
+                ui::detail(format!(
+                    "free it with: igl cas gc --max-age {}",
+                    b.min_idle_secs
+                ));
+            }
+        }
+        CasCommands::Gc(args) => {
+            if std::env::var_os("IGEL_BACKGROUND").is_some() {
+                igel_common::sysinfo::lower_priority();
+            }
+            let max_size = match &args.max_size {
+                Some(s) => Some(parse_size(s).with_context(|| format!("invalid size `{s}`"))?),
+                None => config.settings.cas_max_size_for(&config.cas_dir),
+            };
+            if max_size.is_none() && args.max_age.is_none() && args.compress_idle.is_none() {
+                bail!(
+                    "nothing to do: pass --max-size / --max-age, or set `cas.max-size` with `igl config set`"
+                );
+            }
+            let report = run_gc(
+                &cas,
+                &GcConfig {
+                    max_size_bytes: max_size,
+                    max_age_secs: args.max_age,
+                    compress_idle_secs: args.compress_idle,
+                },
+            )
+            .map_err(|e| anyhow::anyhow!("CAS GC failed: {e}"))?;
+            ui::action(
+                "collected",
+                format!(
+                    "{} entries, {} freed",
+                    report.entries_removed,
+                    format_size_human(report.bytes_freed)
+                ),
+            );
+            if report.entries_compressed > 0 {
+                ui::action(
+                    "compressed",
+                    format!(
+                        "{} idle entries, {} saved",
+                        report.entries_compressed,
+                        format_size_human(report.bytes_compressed_away)
+                    ),
+                );
+            }
+            ui::detail(format!(
+                "{} entries remaining, {}",
+                report.entries_remaining,
+                format_size_human(report.bytes_remaining)
+            ));
+            if report.entries_pinned > 0 {
+                ui::detail(format!(
+                    "{} entries kept for pinned workspaces",
+                    report.entries_pinned
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn format_size_human(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut v = bytes as f64;
+    let mut i = 0;
+    while v >= 1024.0 && i < UNITS.len() - 1 {
+        v /= 1024.0;
+        i += 1;
+    }
+    if i == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{v:.2} {}", UNITS[i])
+    }
+}
+
+pub fn lockfile(cmd: LockfileCommands) -> Result<()> {
+    let root = find_project_root(None).context(
+        "could not find `Cargo.toml` or `Igel.toml` in the current directory or any parent",
+    )?;
+    match cmd {
+        LockfileCommands::Export { format, output } => {
+            let lock = LockfileManager::load_fast(&root).context("No lockfile found to export")?;
+            let text = match format.as_str() {
+                "json" => serde_json::to_string_pretty(&lock)?,
+                _ => toml::to_string_pretty(&lock)?,
+            };
+            match output {
+                Some(p) if p.as_os_str() != "-" => {
+                    if format == "cargo" {
+                        LockfileManager::write_cargo(&lock, &p)?;
+                    } else {
+                        fs::write(&p, text)?;
+                    }
+                    ui::action("exported", p.display());
+                }
+                _ => println!("{text}"),
+            }
+        }
+        LockfileCommands::Migrate => {
+            let cargo_path = root.join("Cargo.lock");
+            let lock = LockfileManager::read_cargo(&cargo_path)
+                .context("Failed to read Cargo.lock for migration")?;
+            let bin_path = root.join("Igel.lock.bin");
+            LockfileManager::write_binary(&lock, &bin_path)?;
+            ui::action(
+                "migrated",
+                format!(
+                    "Cargo.lock to Igel.lock.bin ({} packages)",
+                    lock.packages.len()
+                ),
+            );
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn package_name_validation() {
+        assert!(validate_package_name("my-crate").is_ok());
+        assert!(validate_package_name("my_crate2").is_ok());
+        assert!(validate_package_name("").is_err());
+        assert!(validate_package_name("1abc").is_err());
+        assert!(validate_package_name("has space").is_err());
+        assert!(validate_package_name("fn").is_err());
+        assert!(validate_package_name("self").is_err());
+    }
+
+    #[test]
+    fn scaffold_creates_a_buildable_layout() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("demo");
+        scaffold(&p, "demo", true, "2021", false, "Cargo.toml").unwrap();
+        assert!(p.join("Cargo.toml").is_file());
+        assert!(
+            fs::read_to_string(p.join("src/lib.rs"))
+                .unwrap()
+                .contains("#[test]")
+        );
+        assert!(scaffold(&p, "demo", true, "2021", false, "Cargo.toml").is_err());
+    }
+
+    #[test]
+    fn human_sizes() {
+        assert_eq!(format_size_human(512), "512 B");
+        assert_eq!(format_size_human(2048), "2.00 KiB");
+    }
+}
+
+fn format_idle(secs: u64) -> String {
+    match secs {
+        0..=59 => "just now".to_string(),
+        60..=3_599 => format!("{} min ago", secs / 60),
+        3_600..=86_399 => format!("{} h ago", secs / 3_600),
+        _ => format!("{} days ago", secs / 86_400),
+    }
+}
+
+fn format_idle_threshold(secs: u64) -> String {
+    match secs {
+        0..=3_599 => format!("{} min", secs / 60),
+        3_600..=86_399 => format!("{} h", secs / 3_600),
+        86_400 => "1 day".to_string(),
+        _ => format!("{} days", secs / 86_400),
+    }
+}
+
+#[cfg(test)]
+mod du_format_tests {
+    use super::*;
+
+    #[test]
+    fn idle_times_read_naturally() {
+        assert_eq!(format_idle(5), "just now");
+        assert_eq!(format_idle(600), "10 min ago");
+        assert_eq!(format_idle(7_200), "2 h ago");
+        assert_eq!(format_idle(3 * 86_400), "3 days ago");
+        assert_eq!(format_idle_threshold(86_400), "1 day");
+        assert_eq!(format_idle_threshold(30 * 86_400), "30 days");
+    }
+}
+
+pub fn doctor() -> Result<()> {
+    use crate::doctor::{Environment, Level, diagnose, fs_type_of};
+
+    let root = find_project_root(None);
+    let settings = Settings::load(root.as_deref())?;
+    let config =
+        IgelConfig::new(root.clone().unwrap_or_else(|| PathBuf::from("."))).with_settings(settings);
+
+    let vv =
+        std::process::Command::new(std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into()))
+            .arg("-vV")
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned());
+    let field = |name: &str| {
+        vv.as_deref()?
+            .lines()
+            .find_map(|l| l.strip_prefix(name))
+            .map(|v| v.trim().to_string())
+    };
+    let host = field("host:");
+
+    let ws = crate::workspace::Workspace::load(None).ok();
+    let mut rustflags = crate::session::rustflags_from_env_public();
+    let mut configured_linker = None;
+    let mut dev_debug_full_explicit = false;
+    if let Some(ws) = &ws {
+        rustflags.extend(
+            ws.cargo_config
+                .string_list(&["build", "rustflags"])
+                .unwrap_or_default(),
+        );
+        if let Some(h) = &host {
+            configured_linker = ws.cargo_config.string(&["target", h, "linker"]);
+            rustflags.extend(
+                ws.cargo_config
+                    .string_list(&["target", h, "rustflags"])
+                    .unwrap_or_default(),
+            );
+        }
+        dev_debug_full_explicit = ws
+            .root_manifest
+            .profile
+            .get("dev")
+            .and_then(|t| t.debug.as_ref())
+            .is_some_and(|d| {
+                matches!(d, toml::Value::Boolean(true) | toml::Value::Integer(2))
+                    || d.as_str() == Some("full")
+            });
+    }
+
+    let cas = CasStore::new(config.cas_dir.clone())?;
+    let usage = igel_cas::usage::usage(&cas);
+    let idle_30d = usage
+        .idle
+        .iter()
+        .find(|b| b.min_idle_secs == 30 * 86_400)
+        .map_or(0, |b| b.bytes);
+    let home = config
+        .cas_dir
+        .parent()
+        .unwrap_or(&config.cas_dir)
+        .to_path_buf();
+    let mounts = std::fs::read_to_string("/proc/mounts").unwrap_or_default();
+
+    let env = Environment {
+        rustc_release: field("release:"),
+        host,
+        on_path: Box::new(which_on_path),
+        rustflags,
+        configured_linker,
+        igel_linker: config.settings.linker(),
+        runified: igel_common::toolchain::global()
+            .clone()
+            .with_compiler(
+                config
+                    .settings
+                    .compiler()
+                    .unwrap_or(igel_common::runified::Choice::Auto),
+            )
+            .ok()
+            .and_then(|t| t.runified)
+            .map(|d| d.version),
+        // `<release>-<hash>-<host>/rustc-runified`, one per toolchain build.
+        runified_installed_for: std::fs::read_dir(
+            igel_common::settings::igel_home().join("runified"),
+        )
+        .map(|dir| {
+            let mut releases: Vec<String> = dir
+                .flatten()
+                .filter(|e| {
+                    e.path()
+                        .join(format!("rustc-runified{}", std::env::consts::EXE_SUFFIX))
+                        .is_file()
+                })
+                .filter_map(|e| Some(e.file_name().to_str()?.split('-').next()?.to_string()))
+                .collect();
+            releases.sort();
+            releases.dedup();
+            releases
+        })
+        .unwrap_or_default(),
+        dev_debug_full_explicit,
+        full_dependency_debuginfo: config.settings.dependency_debuginfo(),
+        home: home.display().to_string(),
+        home_fs: fs_type_of(&home, &mounts),
+        cas_bytes: usage.bytes,
+        cas_idle_bytes: idle_30d,
+        jobs: config.jobs,
+        cpus: std::thread::available_parallelism().map_or(1, |n| n.get()),
+        rustc_wrapper: std::env::var("RUSTC_WRAPPER")
+            .ok()
+            .filter(|w| !w.is_empty()),
+        shadowed_cargo_toml: ws.as_ref().is_some_and(|ws| {
+            use igel_common::manifest_file::{
+                CARGO_TOML, IGEL_TOML, find_manifest, text_is_manifest,
+            };
+            let root = ws.root();
+            find_manifest(root).is_some_and(|m| m.file_name().is_some_and(|n| n == IGEL_TOML))
+                && std::fs::read_to_string(root.join(CARGO_TOML))
+                    .is_ok_and(|t| text_is_manifest(&t))
+        }),
+        disk_free: {
+            let mut v = Vec::new();
+            if let Some(free) = igel_common::sysinfo::disk_available(&config.cas_dir) {
+                v.push(("the store".to_string(), free));
+            }
+            if root.is_some()
+                && let Some(free) = igel_common::sysinfo::disk_available(&config.target_dir)
+                && igel_common::sysinfo::disk_size(&config.target_dir)
+                    != igel_common::sysinfo::disk_size(&config.cas_dir)
+            {
+                v.push(("this project's build output".to_string(), free));
+            }
+            v
+        },
+        memory_total: igel_common::sysinfo::memory().map(|m| m.total),
+    };
+
+    let findings = diagnose(&env);
+    let warnings = findings.iter().filter(|f| f.level == Level::Warn).count();
+    for f in &findings {
+        match f.level {
+            Level::Ok => println!("  {} {}", "✓".green().bold(), f.title),
+            Level::Note => println!("  {} {}", "·".dimmed(), f.title),
+            Level::Warn => println!("  {} {}", "!".yellow().bold(), f.title.bold()),
+        }
+        if f.level != Level::Ok
+            && let Some(d) = &f.detail
+        {
+            println!("      {d}");
+        }
+        if let Some(fix) = &f.fix {
+            for (i, line) in fix.lines().enumerate() {
+                println!("      {}{line}", if i == 0 { "fix: " } else { "     " });
+            }
+        }
+    }
+    println!();
+    if warnings == 0 {
+        ui::summary("nothing to fix");
+    } else {
+        ui::summary(format!("{warnings} thing(s) worth fixing"));
+    }
+    Ok(())
+}
+
+fn which_on_path(tool: &str) -> bool {
+    std::env::var_os("PATH").is_some_and(|paths| {
+        std::env::split_paths(&paths).any(|dir| {
+            let p = dir.join(tool);
+            p.is_file()
+        })
+    })
+}
+
+pub fn affected(args: crate::args::AffectedArgs) -> Result<()> {
+    let ws = crate::workspace::Workspace::load(args.manifest_path.as_deref())?;
+    let root = ws.config.project_root.clone();
+
+    let git = |extra: &[&str]| -> Result<Vec<PathBuf>> {
+        let out = std::process::Command::new("git")
+            .args(extra)
+            .current_dir(&root)
+            .output()
+            .context("failed to run `git` (needed by `igl affected`)")?;
+        if !out.status.success() {
+            let err = String::from_utf8_lossy(&out.stderr);
+            if err.contains("not a git repository") {
+                bail!(
+                    "`igl affected` compares git revisions, and this project is not in a git repository"
+                );
+            }
+            if err.contains("unknown revision") || err.contains("bad revision") {
+                bail!(
+                    "git knows no revision to compare with here (a repository without commits, \
+                     or a shallow clone missing the base): commit first, or pass --base <rev>"
+                );
+            }
+            bail!(
+                "`git {}` failed: {}",
+                extra.join(" "),
+                err.lines().next().unwrap_or("").trim()
+            );
+        }
+        Ok(String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(PathBuf::from)
+            .collect())
+    };
+    let mut changed = git(&["diff", "--name-only", "--relative", &args.since])?;
+    changed.extend(git(&["ls-files", "--others", "--exclude-standard"])?);
+
+    let pkgs: Vec<crate::affected::Pkg> = ws
+        .members
+        .iter()
+        .map(|m| crate::affected::Pkg {
+            name: m.name.clone(),
+            dir: m.dir.clone(),
+            deps: m
+                .manifest
+                .dependencies
+                .values()
+                .map(|d| d.spec.package.clone().unwrap_or_else(|| d.name.clone()))
+                .collect(),
+        })
+        .collect();
+    let mut names = crate::affected::affected(&pkgs, &root, &changed);
+    if let Some(spec) = &args.partition {
+        let (n, m) = crate::affected::parse_partition(spec)
+            .with_context(|| format!("`--partition {spec}`: expected N/M with 1 ≤ N ≤ M"))?;
+        names = crate::affected::partition(&names, n, m);
+    }
+
+    match args.format.as_str() {
+        "json" => println!("{}", serde_json::to_string(&names)?),
+        "args" => println!(
+            "{}",
+            names
+                .iter()
+                .map(|n| format!("-p {n}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        ),
+        _ => names.iter().for_each(|n| println!("{n}")),
+    }
+    Ok(())
+}
+
+pub fn script(args: crate::args::ScriptArgs) -> Result<()> {
+    let file = igel_common::fsutil::canonicalize(&args.file)
+        .with_context(|| format!("cannot read script `{}`", args.file.display()))?;
+    let text = std::fs::read_to_string(&file)
+        .with_context(|| format!("cannot read script `{}`", file.display()))?;
+    let parsed =
+        crate::script::parse(&text).map_err(|e| anyhow::anyhow!("{}: {e}", file.display()))?;
+    let manifest = crate::script::manifest(&file, &parsed.manifest)
+        .map_err(|e| anyhow::anyhow!("{}: {e}", file.display()))?;
+
+    let mut h = igel_common::hash::HashBuilder::new();
+    h.update(file.to_string_lossy().as_bytes());
+    let id: String = h.finish_blake3().chars().take(12).collect();
+    let dir = igel_common::settings::igel_home()
+        .join("scripts")
+        .join(format!("{}-{id}", crate::script::package_name(&file)));
+    std::fs::create_dir_all(dir.join("src"))?;
+    write_if_changed(&dir.join("Cargo.toml"), &manifest)?;
+    write_if_changed(&dir.join("src/main.rs"), &parsed.source)?;
+
+    let mut cmd = std::process::Command::new(std::env::current_exe()?);
+    cmd.arg("run")
+        .arg("--quiet")
+        .arg("--manifest-path")
+        .arg(dir.join("Cargo.toml"));
+    if args.release {
+        cmd.arg("--release");
+    }
+    if args.offline {
+        cmd.arg("--offline");
+    }
+    cmd.arg("--").args(&args.args);
+    let status = cmd.status().context("failed to start the script")?;
+    std::process::exit(status.code().unwrap_or(1));
+}
+
+fn write_if_changed(path: &Path, content: &str) -> Result<()> {
+    if std::fs::read_to_string(path).is_ok_and(|old| old == content) {
+        return Ok(());
+    }
+    std::fs::write(path, content).with_context(|| format!("cannot write {}", path.display()))
+}
+
+pub fn version(verbose: bool) -> Result<()> {
+    println!("igl {}", env!("IGEL_VERSION"));
+    if !verbose {
+        return Ok(());
+    }
+    let tc = igel_common::toolchain::global();
+    let mut rows = vec![
+        ("release", env!("CARGO_PKG_VERSION").to_string()),
+        ("commit-hash", env!("IGEL_COMMIT_HASH").to_string()),
+        ("commit-date", env!("IGEL_COMMIT_DATE").to_string()),
+        ("host", env!("IGEL_BUILD_TARGET").to_string()),
+        (
+            "os",
+            format!("{} {}", std::env::consts::OS, std::env::consts::ARCH),
+        ),
+        ("rustc", format!("{} ({})", tc.version, tc.host)),
+    ];
+    rows.retain(|(_, v)| !v.is_empty());
+    let width = rows.iter().map(|(k, _)| k.len()).max().unwrap_or(0);
+    for (k, v) in rows {
+        println!("{k:<width$}  {v}");
+    }
+    Ok(())
+}
+
+pub fn completions(shell: clap_complete::Shell) -> Result<()> {
+    use clap::CommandFactory;
+    let mut cmd = crate::args::Cli::command();
+    clap_complete::generate(shell, &mut cmd, "igl", &mut std::io::stdout());
+    Ok(())
+}

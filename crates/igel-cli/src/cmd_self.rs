@@ -1,0 +1,458 @@
+//! `igl self update` and `igl self uninstall`.
+
+use crate::args::{SelfUninstallArgs, SelfUpdateArgs};
+use crate::ui;
+use anyhow::{Context, Result, bail};
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
+
+pub fn update(args: SelfUpdateArgs) -> Result<()> {
+    let target = current_target()?;
+    let current_version = env!("CARGO_PKG_VERSION");
+    let current_exe = match args.to {
+        Some(to) => to,
+        None => std::env::current_exe()
+            .ok()
+            .and_then(|p| igel_common::fsutil::canonicalize(&p).ok())
+            .unwrap_or_else(|| std::env::current_exe().unwrap()),
+    };
+
+    let repo = args
+        .repo
+        .as_deref()
+        .or(option_env!("IGEL_REPOSITORY"))
+        .unwrap_or("runepm/igel");
+
+    let client = igel_registry::http::client(
+        reqwest::blocking::Client::builder()
+            .user_agent(format!("igl/{current_version}"))
+            .connect_timeout(std::time::Duration::from_secs(15))
+            .timeout(std::time::Duration::from_secs(600)),
+    );
+
+    let download_base_env = std::env::var("IGEL_DOWNLOAD_BASE").ok();
+
+    let (target_tag, base_url) = if let Some(base) = download_base_env {
+        let tag = args.version.unwrap_or_else(|| "latest".to_string());
+        (tag, base.trim_end_matches('/').to_string())
+    } else if let Some(ver) = args.version {
+        let tag = release_tag(&ver);
+        let base = if tag == "latest" {
+            format!("https://github.com/{repo}/releases/latest/download")
+        } else {
+            format!("https://github.com/{repo}/releases/download/{tag}")
+        };
+        (tag, base)
+    } else {
+        ui::action("checking", format!("latest release from {repo}"));
+        let (tag, base) = resolve_latest_release(&client, repo)?;
+        (tag, base)
+    };
+
+    let clean_tag = target_tag.trim_start_matches('v');
+    if let Ok(target_semver) = semver::Version::parse(clean_tag)
+        && let Ok(curr_semver) = semver::Version::parse(current_version)
+        && target_semver <= curr_semver
+        && !args.force
+    {
+        if args.check {
+            ui::action("ok", format!("igl is up to date (v{current_version})"));
+        } else {
+            ui::action(
+                "ok",
+                format!("igl is already up to date (v{current_version})"),
+            );
+        }
+        return Ok(());
+    }
+
+    if args.check {
+        ui::action(
+            "update",
+            format!("a newer release is available: {target_tag} (current: v{current_version})"),
+        );
+        ui::hint("run `igl self update` to install it");
+        return Ok(());
+    }
+
+    let archive_name = format!("igel-{target}.tar.gz");
+    let archive_url = format!("{base_url}/{archive_name}");
+    let sha256_url = format!("{base_url}/{archive_name}.sha256");
+
+    ui::action("downloading", format!("Igel {target_tag} ({target})"));
+
+    let sha256_resp = client
+        .get(&sha256_url)
+        .send()
+        .with_context(|| format!("failed to request checksum from {sha256_url}"))?;
+    if !sha256_resp.status().is_success() {
+        bail!(
+            "failed to download checksum: HTTP {} from {}",
+            sha256_resp.status(),
+            sha256_url
+        );
+    }
+    let sha256_text = sha256_resp
+        .text()
+        .context("failed to read checksum response")?;
+    let expected_hash = sha256_text
+        .split_whitespace()
+        .next()
+        .context("invalid checksum file format")?
+        .to_lowercase();
+
+    let mut archive_temp = tempfile::Builder::new()
+        .prefix("igel-archive-")
+        .suffix(".tar.gz")
+        .tempfile()
+        .context("failed to create temporary archive file")?;
+
+    let mut archive_resp = client
+        .get(&archive_url)
+        .send()
+        .with_context(|| format!("failed to request archive from {archive_url}"))?;
+    if !archive_resp.status().is_success() {
+        bail!(
+            "failed to download archive: HTTP {} from {}",
+            archive_resp.status(),
+            archive_url
+        );
+    }
+
+    let mut buffer = [0u8; 65536];
+    loop {
+        let n = archive_resp
+            .read(&mut buffer)
+            .context("failed to read archive stream")?;
+        if n == 0 {
+            break;
+        }
+        archive_temp
+            .write_all(&buffer[..n])
+            .context("failed to write archive data")?;
+    }
+    archive_temp
+        .flush()
+        .context("failed to flush archive data")?;
+
+    let actual_hash = igel_registry::download::sha256_file(archive_temp.path())
+        .context("failed to compute archive checksum")?
+        .to_lowercase();
+
+    if expected_hash != actual_hash {
+        bail!("checksum mismatch: expected {expected_hash}, got {actual_hash}");
+    }
+    ui::action("verifying", "checksum matches");
+
+    let extract_dir = tempfile::Builder::new()
+        .prefix("igel-extract-")
+        .tempdir()
+        .context("failed to create temporary extraction directory")?;
+
+    let tar_gz = std::fs::File::open(archive_temp.path())
+        .context("failed to open downloaded archive for extraction")?;
+    let gz = flate2::read::GzDecoder::new(tar_gz);
+    let mut archive = tar::Archive::new(gz);
+    archive
+        .unpack(extract_dir.path())
+        .context("failed to unpack release archive")?;
+
+    let bin_name = if cfg!(windows) { "igl.exe" } else { "igl" };
+    let expected_bin = extract_dir
+        .path()
+        .join(format!("igel-{target}"))
+        .join(bin_name);
+
+    let new_bin = if expected_bin.exists() {
+        expected_bin
+    } else {
+        find_file_recursively(extract_dir.path(), bin_name)
+            .with_context(|| format!("could not find `{bin_name}` in extracted archive"))?
+    };
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&new_bin, std::fs::Permissions::from_mode(0o755))
+            .context("failed to set executable permissions on unpacked binary")?;
+    }
+
+    replace_executable(&new_bin, &current_exe)?;
+
+    ui::action(
+        "updated",
+        format!(
+            "Igel v{current_version} -> {target_tag} ({})",
+            current_exe.display()
+        ),
+    );
+
+    Ok(())
+}
+
+pub fn uninstall(args: SelfUninstallArgs) -> Result<()> {
+    let current_exe = std::env::current_exe()
+        .ok()
+        .and_then(|p| igel_common::fsutil::canonicalize(&p).ok())
+        .unwrap_or_else(|| std::env::current_exe().unwrap());
+
+    if !args.yes {
+        print!(
+            "Are you sure you want to uninstall Igel from {}? [y/N] ",
+            current_exe.display()
+        );
+        std::io::stdout().flush().ok();
+        let mut input = String::new();
+        std::io::stdin().read_line(&mut input).ok();
+        let trimmed = input.trim().to_lowercase();
+        if trimmed != "y" && trimmed != "yes" {
+            ui::action("cancelled", "uninstallation aborted");
+            return Ok(());
+        }
+    }
+
+    if current_exe.exists() {
+        std::fs::remove_file(&current_exe)
+            .with_context(|| format!("failed to remove binary `{}`", current_exe.display()))?;
+        ui::action("removed", current_exe.display());
+    }
+
+    let igel_home = igel_common::settings::igel_home();
+    if args.purge {
+        if igel_home.exists() && !looks_like_igel_home(&igel_home) {
+            bail!(
+                "not removing `{}`: it does not look like Igel's own directory \
+                 (check IGEL_HOME); remove what you want gone by hand",
+                igel_home.display()
+            );
+        }
+        if igel_home.exists() {
+            std::fs::remove_dir_all(&igel_home).with_context(|| {
+                format!(
+                    "failed to remove configuration directory `{}`",
+                    igel_home.display()
+                )
+            })?;
+            ui::action(
+                "removed",
+                format!("{} (cache and configuration)", igel_home.display()),
+            );
+        }
+    } else {
+        ui::action(
+            "kept",
+            format!(
+                "the store, caches and settings in {} (`--purge` removes them)",
+                igel_home.display()
+            ),
+        );
+    }
+
+    ui::action("uninstalled", "Igel has been removed from your system");
+    Ok(())
+}
+
+/// Only a directory Igel made, never home or a file system root, whatever `IGEL_HOME` says.
+fn looks_like_igel_home(dir: &Path) -> bool {
+    let canonical = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+    if canonical.parent().is_none() {
+        return false;
+    }
+    if let Some(home) = home::home_dir()
+        && canonical == home.canonicalize().unwrap_or(home)
+    {
+        return false;
+    }
+    [
+        "cas",
+        "registry",
+        "cache",
+        "config.toml",
+        "bin",
+        "git",
+        "advisory-db",
+    ]
+    .iter()
+    .any(|entry| canonical.join(entry).exists())
+}
+
+fn resolve_latest_release(
+    client: &reqwest::blocking::Client,
+    repo: &str,
+) -> Result<(String, String)> {
+    let api_url = format!("https://api.github.com/repos/{repo}/releases/latest");
+    if let Ok(resp) = client
+        .get(&api_url)
+        .header(reqwest::header::ACCEPT, "application/vnd.github.v3+json")
+        .send()
+        && resp.status().is_success()
+        && let Ok(json) = resp.json::<serde_json::Value>()
+        && let Some(tag) = json.get("tag_name").and_then(|v| v.as_str())
+    {
+        let base = format!("https://github.com/{repo}/releases/download/{tag}");
+        return Ok((tag.to_string(), base));
+    }
+
+    let redirect_url = format!("https://github.com/{repo}/releases/latest");
+    if let Ok(resp) = client.get(&redirect_url).send() {
+        let final_url = resp.url().as_str();
+        if let Some(pos) = final_url.rfind("/tag/") {
+            let tag = &final_url[pos + 5..];
+            let tag = tag.trim_end_matches('/');
+            if !tag.is_empty() {
+                let base = format!("https://github.com/{repo}/releases/download/{tag}");
+                return Ok((tag.to_string(), base));
+            }
+        }
+    }
+
+    let base = format!("https://github.com/{repo}/releases/latest/download");
+    Ok(("latest".to_string(), base))
+}
+
+fn release_tag(version: &str) -> String {
+    if version == "latest" {
+        return version.to_string();
+    }
+    let bare = version.trim_start_matches('v');
+    let parts = bare.split('.').count();
+    let full = if parts == 2 && !bare.contains('-') {
+        format!("{bare}.0")
+    } else {
+        bare.to_string()
+    };
+    format!("v{full}")
+}
+
+fn current_target() -> Result<String> {
+    let build_target = env!("IGEL_BUILD_TARGET");
+    if !build_target.is_empty() {
+        return Ok(build_target.to_string());
+    }
+
+    let arch = match std::env::consts::ARCH {
+        "x86_64" => "x86_64",
+        "aarch64" => "aarch64",
+        other => bail!("unsupported architecture: {other}"),
+    };
+
+    let os = match std::env::consts::OS {
+        "macos" => "apple-darwin",
+        "linux" => "unknown-linux-gnu",
+        "windows" => "pc-windows-msvc",
+        other => bail!("unsupported operating system: {other}"),
+    };
+
+    Ok(format!("{arch}-{os}"))
+}
+
+fn find_file_recursively(dir: &Path, file_name: &str) -> Option<PathBuf> {
+    for entry in walkdir::WalkDir::new(dir)
+        .into_iter()
+        .filter_map(|e| e.ok())
+    {
+        if entry.file_name() == file_name && entry.file_type().is_file() {
+            return Some(entry.into_path());
+        }
+    }
+    None
+}
+
+fn replace_executable(src: &Path, dst: &Path) -> Result<()> {
+    let parent = dst
+        .parent()
+        .context("destination executable has no parent directory")?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let staging = parent.join(format!(".igel-update-{}.tmp", std::process::id()));
+        std::fs::copy(src, &staging).with_context(|| {
+            format!(
+                "cannot copy new binary to staging path `{}`",
+                staging.display()
+            )
+        })?;
+
+        std::fs::set_permissions(&staging, std::fs::Permissions::from_mode(0o755)).ok();
+
+        if let Err(e) = std::fs::rename(&staging, dst) {
+            let _ = std::fs::remove_file(&staging);
+            if e.kind() == std::io::ErrorKind::PermissionDenied {
+                bail!(
+                    "permission denied updating `{}`: you may need to run `sudo igl self update`",
+                    dst.display()
+                );
+            }
+            return Err(e).with_context(|| format!("failed to replace `{}`", dst.display()));
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        let pid = std::process::id();
+        let backup = parent.join(format!(".igel-old-{pid}.exe"));
+        let staging = parent.join(format!(".igel-new-{pid}.exe"));
+
+        std::fs::copy(src, &staging).with_context(|| {
+            format!(
+                "cannot copy new binary to staging path `{}`",
+                staging.display()
+            )
+        })?;
+
+        if dst.exists() {
+            std::fs::rename(dst, &backup).with_context(|| {
+                format!(
+                    "cannot rename active executable `{}` to backup `{}`",
+                    dst.display(),
+                    backup.display()
+                )
+            })?;
+        }
+
+        if let Err(e) = std::fs::rename(&staging, dst) {
+            if backup.exists() {
+                let _ = std::fs::rename(&backup, dst);
+            }
+            let _ = std::fs::remove_file(&staging);
+            return Err(e)
+                .with_context(|| format!("failed to install new binary to `{}`", dst.display()));
+        }
+
+        let _ = std::fs::remove_file(&backup);
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        std::fs::copy(src, dst)
+            .with_context(|| format!("cannot copy new binary to `{}`", dst.display()))?;
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn short_versions_name_full_release_tags() {
+        assert_eq!(release_tag("2027.1"), "v2027.1.0");
+        assert_eq!(release_tag("2027.1.2"), "v2027.1.2");
+        assert_eq!(release_tag("v2027.0.0"), "v2027.0.0");
+        assert_eq!(release_tag("latest"), "latest");
+    }
+
+    #[test]
+    fn purge_only_deletes_a_directory_igel_made() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!looks_like_igel_home(dir.path()), "an empty directory");
+        std::fs::create_dir(dir.path().join("cas")).unwrap();
+        assert!(looks_like_igel_home(dir.path()));
+        assert!(!looks_like_igel_home(Path::new("/")));
+        if let Some(home) = home::home_dir() {
+            assert!(!looks_like_igel_home(&home), "the home directory");
+        }
+    }
+}

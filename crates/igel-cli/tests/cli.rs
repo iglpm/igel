@@ -1,0 +1,6770 @@
+//! End-to-end tests of the real `igl` binary on throwaway projects, each with its own `IGEL_HOME`.
+
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output};
+
+fn igel_command() -> Command {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_igl"));
+    for (key, _) in std::env::vars_os() {
+        let key = key.to_string_lossy();
+        if key.starts_with("IGEL_")
+            || matches!(
+                &*key,
+                "RUSTFLAGS"
+                    | "CARGO_ENCODED_RUSTFLAGS"
+                    | "RUSTDOCFLAGS"
+                    | "RUSTC"
+                    | "RUSTC_WRAPPER"
+                    | "CARGO_TARGET_DIR"
+                    | "CARGO_BUILD_TARGET"
+            )
+        {
+            cmd.env_remove(&*key);
+        }
+    }
+    cmd
+}
+
+struct Project {
+    dir: tempfile::TempDir,
+    home_dir: tempfile::TempDir,
+}
+
+fn compiler_probes() -> Option<&'static [u8]> {
+    static PROBES: std::sync::OnceLock<Option<Vec<u8>>> = std::sync::OnceLock::new();
+    PROBES
+        .get_or_init(|| {
+            let home = tempfile::tempdir().ok()?;
+            let project = tempfile::tempdir().ok()?;
+            std::fs::write(
+                project.path().join("Cargo.toml"),
+                "[package]\nname = \"probe\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+            )
+            .ok()?;
+            std::fs::create_dir_all(project.path().join("src")).ok()?;
+            std::fs::write(project.path().join("src/lib.rs"), "").ok()?;
+            igel_command()
+                .arg("check")
+                .current_dir(project.path())
+                .env("IGEL_HOME", home.path())
+                .output()
+                .ok()?;
+            std::fs::read(home.path().join("cache/toolchains.json")).ok()
+        })
+        .as_deref()
+}
+
+impl Project {
+    fn new() -> Self {
+        let home_dir = tempfile::tempdir().unwrap();
+        if let Some(probes) = compiler_probes() {
+            let cache = home_dir.path().join("cache");
+            std::fs::create_dir_all(&cache).unwrap();
+            std::fs::write(cache.join("toolchains.json"), probes).unwrap();
+        }
+        Self {
+            dir: tempfile::tempdir().unwrap(),
+            home_dir,
+        }
+    }
+
+    fn path(&self) -> &Path {
+        self.dir.path()
+    }
+
+    fn home(&self) -> PathBuf {
+        self.home_dir.path().to_path_buf()
+    }
+
+    fn write(&self, rel: &str, content: &str) -> &Self {
+        let p = self.path().join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, content).unwrap();
+        self
+    }
+
+    fn read(&self, rel: &str) -> String {
+        std::fs::read_to_string(self.path().join(rel)).unwrap()
+    }
+
+    fn igel_in(&self, cwd: &Path, args: &[&str]) -> Output {
+        igel_command()
+            .args(args)
+            .current_dir(cwd)
+            .env("IGEL_HOME", self.home())
+            .env("NO_COLOR", "1")
+            .output()
+            .unwrap()
+    }
+
+    fn igl(&self, args: &[&str]) -> Output {
+        self.igel_in(self.path(), args)
+    }
+
+    fn ok(&self, args: &[&str]) -> String {
+        let out = self.igl(args);
+        let text = text(&out);
+        assert!(
+            out.status.success(),
+            "`igl {}` failed:\n{text}",
+            args.join(" ")
+        );
+        text
+    }
+}
+
+fn native(path: &str) -> String {
+    path.replace('/', std::path::MAIN_SEPARATOR_STR)
+}
+
+fn exe(name: &str) -> String {
+    format!("{name}{}", std::env::consts::EXE_SUFFIX)
+}
+
+fn text(out: &Output) -> String {
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    )
+}
+
+const LIB_MANIFEST: &str = "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n";
+
+fn lib_project() -> Project {
+    let p = Project::new();
+    p.write("Cargo.toml", LIB_MANIFEST);
+    p.write(
+        "src/lib.rs",
+        "pub fn add(a: u32, b: u32) -> u32 { a + b }\n\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn adds() { assert_eq!(super::add(1, 2), 3); }\n}\n",
+    );
+    p
+}
+
+#[test]
+fn toml_1_1_manifests_with_multiline_inline_tables_and_trailing_commas_build() {
+    let p = Project::new();
+    p.write(
+        "Cargo.toml",
+        r#"
+[package]
+name = "demo"
+version = "0.1.0"
+edition = "2021"
+authors = [
+    "Someone <s@example.com>",
+]
+
+[features]
+default = [
+    "extra",
+]
+extra = []
+
+[dependencies]
+helper = {
+    path = "helper",
+    # comment inside a multi-line inline table
+    features = [
+        "x",
+    ],
+}
+"#,
+    );
+    p.write("helper/Cargo.toml", "[package]\nname = \"helper\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[features]\nx = []\n");
+    p.write(
+        "helper/src/lib.rs",
+        "pub fn h() -> u32 { if cfg!(feature = \"x\") { 7 } else { 0 } }\n",
+    );
+    p.write("src/lib.rs", "pub fn v() -> u32 { helper::h() }\n#[cfg(test)]\nmod t { #[test] fn feature_flows_to_the_dependency() { assert_eq!(super::v(), 7); } }\n");
+    let out = p.ok(&["build"]);
+    assert!(out.contains("compiled"), "{out}");
+    p.ok(&["test"]);
+}
+
+#[test]
+fn second_build_is_fully_cached_and_edits_recompile_only_what_changed() {
+    let p = lib_project();
+    assert!(p.ok(&["build"]).contains("1 compiled"));
+    assert!(p.ok(&["build"]).contains("0 compiled · 1 cached"));
+
+    p.write(
+        "src/lib.rs",
+        "pub fn add(a: u32, b: u32) -> u32 { a + b + 0 }\n",
+    );
+    assert!(p.ok(&["build"]).contains("1 compiled"));
+
+    p.write("src/lib.rs", "pub fn add(a: u32, b: u32) -> u32 { a + b }\n\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn adds() { assert_eq!(super::add(1, 2), 3); }\n}\n");
+    assert!(p.ok(&["build"]).contains("0 compiled · 1 cached"));
+}
+
+#[test]
+fn only_files_a_crate_read_rebuild_it() {
+    let p = Project::new();
+    p.write(
+        "Cargo.toml",
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\
+         [dependencies]\nbase = { path = \"base\" }\n[workspace]\n",
+    );
+    p.write("src/lib.rs", "pub fn v() -> &'static str { base::DATA }\n");
+    p.write(
+        "base/Cargo.toml",
+        "[package]\nname = \"base\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    p.write(
+        "base/src/lib.rs",
+        "mod m;\npub use m::f;\npub const DATA: &str = include_str!(\"../data.txt\");\n\
+         pub const SHARED: &str = include_str!(\"../../shared.txt\");\n",
+    );
+    p.write("base/src/m.rs", "pub fn f() {}\n");
+    p.write("base/data.txt", "one");
+    p.write("shared.txt", "s1");
+    let out = p.ok(&["build"]);
+    assert!(out.contains("2 compiled"), "{out}");
+
+    p.write("base/NOTES.md", "notes");
+    p.write("base/build.log", "log");
+    p.write("base/tests/it.rs", "#[test]\nfn t() {}\n");
+    p.write("README.md", "readme");
+    let out = p.ok(&["build"]);
+    assert!(out.contains("0 compiled · 2 cached"), "{out}");
+
+    p.write("base/data.txt", "two");
+    assert!(p.ok(&["build"]).contains("2 compiled"));
+    p.write("shared.txt", "s2");
+    assert!(p.ok(&["build"]).contains("2 compiled"));
+    p.write("base/src/m.rs", "pub fn f() { }\n");
+    assert!(p.ok(&["build"]).contains("2 compiled"));
+    assert!(p.ok(&["build"]).contains("0 compiled · 2 cached"));
+
+    std::fs::remove_dir_all(p.path().join(".igel")).unwrap();
+    let out = p.ok(&["build"]);
+    assert!(out.contains("0 compiled · 2 cached"), "{out}");
+}
+
+#[test]
+fn binaries_compile_in_deps_and_only_their_names_appear_in_the_profile_dir() {
+    let p = Project::new();
+    p.write("Cargo.toml", LIB_MANIFEST);
+    p.write("src/main.rs", "fn main() { println!(\"hi\"); }\n");
+    p.ok(&["build"]);
+    let debug = p.path().join(".igel/target/debug");
+    let run = Command::new(debug.join(exe("demo"))).output().unwrap();
+    assert_eq!(String::from_utf8_lossy(&run.stdout), "hi\n");
+    let files: Vec<String> = std::fs::read_dir(&debug)
+        .unwrap()
+        .flatten()
+        .filter(|e| e.file_type().unwrap().is_file())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(files, [exe("demo")], "{files:?}");
+    let json = p.ok(&["build", "--message-format", "json"]);
+    let exe = json
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .find_map(|v| v["executable"].as_str().map(str::to_string))
+        .expect("an executable in the JSON output");
+    assert!(
+        Path::new(&exe).ends_with(Path::new(".igel/target/debug").join(self::exe("demo"))),
+        "{exe}"
+    );
+    std::fs::remove_dir_all(p.path().join(".igel/target")).unwrap();
+    assert!(p.ok(&["build"]).contains("0 compiled"));
+    assert!(debug.join(self::exe("demo")).is_file());
+}
+
+#[cfg(unix)]
+fn native_dylib_workspace() -> Project {
+    let p = Project::new();
+    p.write(
+        "Cargo.toml",
+        "[workspace]\nmembers = [\"natsys\", \"mid\", \"app\"]\nresolver = \"2\"\n",
+    );
+    p.write(
+        "natsys/Cargo.toml",
+        "[package]\nname = \"natsys\"\nversion = \"0.1.0\"\nedition = \"2021\"\nlinks = \"nat\"\n",
+    );
+    p.write("natsys/nat.c", "int nat_answer(void) { return 42; }\n");
+    p.write(
+        "natsys/build.rs",
+        r#"fn main() {
+    let out = std::env::var("OUT_DIR").unwrap();
+    let mac = std::env::var("CARGO_CFG_TARGET_OS").unwrap() == "macos";
+    let lib = format!("{out}/libnat.{}", if mac { "dylib" } else { "so" });
+    let mut cc = std::process::Command::new(std::env::var("CC").unwrap_or("cc".into()));
+    cc.args(["-shared", "-fPIC", "nat.c", "-o", &lib]);
+    if mac {
+        // Found through the loader's search path at run time, not by path.
+        cc.args(["-install_name", "libnat.dylib"]);
+    }
+    assert!(cc.status().unwrap().success());
+    println!("cargo::rerun-if-changed=nat.c");
+    println!("cargo::rustc-link-search=native={out}");
+    println!("cargo::rustc-link-lib=dylib=nat");
+}
+"#,
+    );
+    p.write(
+        "natsys/src/lib.rs",
+        "unsafe extern \"C\" { fn nat_answer() -> i32; }\npub fn answer() -> i32 { unsafe { nat_answer() } }\n",
+    );
+    p.write(
+        "mid/Cargo.toml",
+        "[package]\nname = \"mid\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[dependencies]\nnatsys = { path = \"../natsys\" }\n",
+    );
+    p.write(
+        "mid/src/lib.rs",
+        "pub fn doubled() -> i32 { natsys::answer() * 2 }\n",
+    );
+    p.write(
+        "app/Cargo.toml",
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[dependencies]\nmid = { path = \"../mid\" }\n",
+    );
+    p.write(
+        "app/src/main.rs",
+        "fn main() { println!(\"native says {}\", mid::doubled()); }\n#[test]\nfn links() { assert_eq!(mid::doubled(), 84); }\n",
+    );
+    p
+}
+
+#[cfg(unix)]
+#[test]
+fn native_libraries_of_dependencies_link_and_load_two_levels_up() {
+    let p = native_dylib_workspace();
+    let out = p.ok(&["run", "-p", "app"]);
+    assert!(out.contains("native says 84"), "{out}");
+    let out = p.ok(&["test", "-p", "app"]);
+    assert!(out.contains("1 passed"), "{out}");
+    std::fs::remove_dir_all(p.path().join(".igel/target")).unwrap();
+    let out = p.ok(&["run", "-p", "app"]);
+    assert!(
+        out.contains("0 compiled") && out.contains("native says 84"),
+        "{out}"
+    );
+}
+
+#[test]
+fn library_outputs_get_cargos_names_in_the_profile_directory() {
+    let p = lib_project();
+    p.write(
+        "Cargo.toml",
+        &format!("{LIB_MANIFEST}[lib]\ncrate-type = [\"cdylib\", \"staticlib\", \"rlib\"]\n"),
+    );
+    p.ok(&["build"]);
+    let debug = p.path().join(".igel/target/debug");
+    let dylib = if cfg!(target_os = "macos") {
+        "libdemo.dylib"
+    } else if cfg!(windows) {
+        "demo.dll"
+    } else {
+        "libdemo.so"
+    };
+    let staticlib = if cfg!(windows) {
+        "demo.lib"
+    } else {
+        "libdemo.a"
+    };
+    for name in [dylib, staticlib, "libdemo.rlib"] {
+        assert!(debug.join(name).is_file(), "missing {name}");
+    }
+}
+
+#[test]
+fn doctests_see_the_build_scripts_out_dir_and_cfgs() {
+    let p = Project::new();
+    p.write(
+        "Cargo.toml",
+        "[package]\nname = \"gen\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    p.write(
+        "build.rs",
+        r#"fn main() {
+    let out = std::env::var("OUT_DIR").unwrap();
+    std::fs::write(format!("{out}/gen.rs"), "pub const GEN: u32 = 5;").unwrap();
+    println!("cargo::rustc-check-cfg=cfg(gen_ok)");
+    println!("cargo::rustc-cfg=gen_ok");
+}
+"#,
+    );
+    p.write(
+        "src/lib.rs",
+        r#"include!(concat!(env!("OUT_DIR"), "/gen.rs"));
+
+/// ```
+/// assert_eq!(gen::GEN, 5);
+/// ```
+pub fn uses_generated() {}
+
+/// Only documented, and tested, when the build script's cfg is on.
+/// ```
+/// assert!(gen::only_with_cfg());
+/// ```
+#[cfg(gen_ok)]
+pub fn only_with_cfg() -> bool {
+    true
+}
+"#,
+    );
+    let out = p.ok(&["test", "--doc"]);
+    assert!(out.contains("2 passed"), "{out}");
+}
+
+#[cfg(unix)]
+#[test]
+fn config_aliases_and_external_subcommands_work_like_cargos() {
+    let p = Project::new();
+    p.write("Cargo.toml", LIB_MANIFEST);
+    p.write(
+        "src/main.rs",
+        "fn main() { println!(\"args: {:?}\", std::env::args().skip(1).collect::<Vec<_>>()); }\n",
+    );
+    p.write(
+        ".cargo/config.toml",
+        "[alias]\ngreet = \"run -q --\"\nloud = [\"greet\", \"LOUD\"]\n",
+    );
+    assert!(p.ok(&["greet", "hi"]).contains("args: [\"hi\"]"));
+    assert!(p.ok(&["loud", "x"]).contains("args: [\"LOUD\", \"x\"]"));
+
+    let bin = tempfile::tempdir().unwrap();
+    let plugin = bin.path().join("cargo-hello");
+    std::fs::write(
+        &plugin,
+        "#!/bin/sh\necho \"plugin got: $*\"\n[ -n \"$CARGO\" ] && echo \"CARGO is set\"\n",
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&plugin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let path = format!(
+        "{}:{}",
+        bin.path().display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let out = igel_command()
+        .args(["hello", "--flag", "x"])
+        .current_dir(p.path())
+        .env("IGEL_HOME", p.home())
+        .env("PATH", path)
+        .output()
+        .unwrap();
+    let out = text(&out);
+    assert!(out.contains("plugin got: hello --flag x"), "{out}");
+    assert!(out.contains("CARGO is set"), "{out}");
+
+    let out = p.igl(&["definitely-not-a-command"]);
+    assert!(!out.status.success());
+}
+
+#[test]
+fn cleaning_the_target_dir_restores_from_the_cas() {
+    let p = lib_project();
+    p.ok(&["build"]);
+    p.ok(&["clean"]);
+    assert!(!p.path().join(".igel/target").exists());
+    assert!(p.ok(&["build"]).contains("0 compiled · 1 cached"));
+}
+
+#[test]
+fn release_rebuild_all_is_off_by_default_and_controlled_by_config() {
+    let p = lib_project();
+    p.ok(&["build", "--release"]);
+
+    p.ok(&["clean"]);
+    let out = p.ok(&["build", "--release"]);
+    assert!(out.contains("0 compiled · 1 cached"), "{out}");
+    assert!(!out.contains("rebuilt all"), "{out}");
+
+    p.ok(&["config", "set", "build.release-rebuild-all", "true"]);
+    assert!(p.read("Igel.toml").contains("release-rebuild-all = true"));
+    p.ok(&["clean"]);
+    let out = p.ok(&["build", "--release"]);
+    assert!(out.contains("1 compiled · 0 cached"), "{out}");
+    assert!(out.contains("rebuilt all"), "{out}");
+
+    p.ok(&["build"]);
+    p.ok(&["clean"]);
+    assert!(p.ok(&["build"]).contains("0 compiled · 1 cached"));
+
+    p.ok(&["clean"]);
+    assert!(
+        p.ok(&["build", "--release", "--rebuild-all=false"])
+            .contains("0 compiled · 1 cached")
+    );
+    p.ok(&["config", "unset", "build.release-rebuild-all"]);
+    p.ok(&["clean"]);
+    assert!(
+        p.ok(&["build", "--release", "--rebuild-all"])
+            .contains("1 compiled")
+    );
+}
+
+#[test]
+fn global_config_applies_to_every_project_and_project_overrides_it() {
+    let p = lib_project();
+    p.ok(&[
+        "config",
+        "set",
+        "build.release-rebuild-all",
+        "true",
+        "--global",
+    ]);
+    assert!(
+        p.ok(&["config", "get", "build.release-rebuild-all"])
+            .trim()
+            .ends_with("true")
+    );
+    p.ok(&["build", "--release"]);
+    p.ok(&["clean"]);
+    assert!(p.ok(&["build", "--release"]).contains("rebuilt all"));
+
+    p.ok(&[
+        "config",
+        "set",
+        "build.release-rebuild-all",
+        "false",
+        "--project",
+    ]);
+    p.ok(&["clean"]);
+    assert!(!p.ok(&["build", "--release"]).contains("rebuilt all"));
+
+    let listing = p.ok(&["config", "list", "--show-origin"]);
+    assert!(
+        listing.contains("build.release-rebuild-all") && listing.contains("project"),
+        "{listing}"
+    );
+}
+
+#[test]
+fn config_rejects_unknown_keys_and_bad_values() {
+    let p = lib_project();
+    let out = p.igl(&["config", "set", "build.nope", "1"]);
+    assert!(!out.status.success());
+    assert!(text(&out).contains("unknown setting"), "{}", text(&out));
+
+    let out = p.igl(&["config", "set", "build.release-rebuild-all", "maybe"]);
+    assert!(!out.status.success());
+    assert!(text(&out).contains("boolean"), "{}", text(&out));
+    assert!(
+        !p.path().join("Igel.toml").exists(),
+        "a rejected value must not create the file"
+    );
+}
+
+#[test]
+fn igel_toml_never_invalidates_the_build_cache() {
+    let p = lib_project();
+    p.ok(&["build"]);
+    p.ok(&["config", "set", "build.jobs", "2"]);
+    assert!(
+        p.ok(&["build"]).contains("0 compiled"),
+        "settings edits must not rebuild"
+    );
+}
+
+#[test]
+fn default_features_apply_to_local_crates_and_flags_change_them() {
+    let p = Project::new();
+    p.write(
+        "Cargo.toml",
+        "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[features]\ndefault = [\"on\"]\non = []\nopt = []\n",
+    );
+    p.write(
+        "src/lib.rs",
+        "pub fn f() -> (bool, bool) { (cfg!(feature = \"on\"), cfg!(feature = \"opt\")) }\n#[cfg(test)]\nmod t {\n#[test] fn flags() { let (on, opt) = super::f(); assert!(on); assert!(!opt); }\n}\n",
+    );
+    p.ok(&["test"]);
+
+    let out = p.igl(&["test", "--no-default-features"]);
+    assert!(!out.status.success(), "{}", text(&out));
+
+    p.write(
+        "src/lib.rs",
+        "pub fn f() -> (bool, bool) { (cfg!(feature = \"on\"), cfg!(feature = \"opt\")) }\n#[cfg(test)]\nmod t {\n#[test] fn flags() { let (on, opt) = super::f(); assert!(on && opt); }\n}\n",
+    );
+    p.ok(&["test", "--features", "opt"]);
+    let bad = p.igl(&["build", "--features", "nonexistent"]);
+    assert!(!bad.status.success());
+    assert!(
+        text(&bad).contains("does not contain the feature"),
+        "{}",
+        text(&bad)
+    );
+}
+
+fn workspace() -> Project {
+    let p = Project::new();
+    p.write(
+        "Cargo.toml",
+        "[workspace]\nmembers = [\"crates/*\"]\nresolver = \"2\"\n",
+    );
+    p.write(
+        "crates/good/Cargo.toml",
+        "[package]\nname = \"good\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    p.write("crates/good/src/lib.rs", "pub fn g() -> u8 { 1 }\n");
+    p.write(
+        "crates/bad/Cargo.toml",
+        "[package]\nname = \"bad\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    p.write("crates/bad/src/lib.rs", "this does not compile\n");
+    p
+}
+
+#[test]
+fn check_after_build_reuses_the_build_and_still_checks_edits() {
+    let p = Project::new();
+    p.write(
+        "Cargo.toml",
+        "[workspace]\nmembers = [\"base\", \"mid\", \"app\"]\nresolver = \"2\"\n",
+    );
+    let pkg = |name: &str, deps: &str| {
+        format!(
+            "[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[dependencies]\n{deps}"
+        )
+    };
+    p.write("base/Cargo.toml", &pkg("base", ""));
+    p.write(
+        "base/build.rs",
+        "fn main() { let out = std::env::var(\"OUT_DIR\").unwrap(); std::fs::write(format!(\"{out}/n.rs\"), \"pub const N: u32 = 7;\").unwrap(); }\n",
+    );
+    p.write(
+        "base/src/lib.rs",
+        "include!(concat!(env!(\"OUT_DIR\"), \"/n.rs\"));\n",
+    );
+    p.write(
+        "mid/Cargo.toml",
+        &pkg("mid", "base = { path = \"../base\" }\n"),
+    );
+    p.write("mid/src/lib.rs", "pub fn m() -> u32 { base::N * 2 }\n");
+    p.write(
+        "app/Cargo.toml",
+        &pkg(
+            "app",
+            "base = { path = \"../base\" }\nmid = { path = \"../mid\" }\n",
+        ),
+    );
+    let main = "fn main() { let unused = 1; println!(\"{}\", mid::m() + base::N); }\n";
+    p.write("app/src/main.rs", main);
+
+    p.ok(&["build"]);
+    let out = p.ok(&["check"]);
+    assert!(out.contains("0 compiled"), "{out}");
+    assert!(out.contains("unused"), "{out}");
+
+    p.write("mid/src/lib.rs", "pub fn m() -> u32 { base::N * 3 }\n");
+    let out = p.ok(&["check"]);
+    assert!(out.contains("2 compiled"), "{out}");
+    p.write("app/src/main.rs", "fn main() { let x: u32 = \"no\"; }\n");
+    let out = p.igl(&["check"]);
+    assert!(!out.status.success(), "{}", text(&out));
+    assert!(text(&out).contains("mismatched types"), "{}", text(&out));
+
+    p.write("app/src/main.rs", main);
+    p.ok(&["build"]);
+    let out = p.ok(&["check"]);
+    assert!(out.contains("0 compiled"), "{out}");
+}
+
+#[test]
+fn package_selection_builds_only_what_was_asked_for() {
+    let p = workspace();
+    p.ok(&["build", "-p", "good"]);
+
+    assert!(!p.igl(&["build"]).status.success());
+    assert!(!p.igl(&["build", "--workspace"]).status.success());
+    p.ok(&["build", "--workspace", "--exclude", "bad"]);
+
+    let out = p.igel_in(&p.path().join("crates/good"), &["build"]);
+    assert!(out.status.success(), "{}", text(&out));
+
+    let unknown = p.igl(&["build", "-p", "nope"]);
+    assert!(!unknown.status.success());
+    assert!(
+        text(&unknown).contains("did not match any packages"),
+        "{}",
+        text(&unknown)
+    );
+}
+
+#[test]
+fn failing_tests_exit_101_and_show_the_failure() {
+    let p = lib_project();
+    p.write(
+        "src/lib.rs",
+        "#[cfg(test)]\nmod tests {\n    #[test]\n    fn passes() {}\n    #[test]\n    fn breaks() { assert_eq!(1, 2, \"custom-message-xyz\"); }\n}\n",
+    );
+    let out = p.igl(&["test"]);
+    assert_eq!(out.status.code(), Some(101), "{}", text(&out));
+    let t = text(&out);
+    assert!(
+        t.contains("breaks") && t.contains("custom-message-xyz"),
+        "{t}"
+    );
+    assert!(t.contains("FAILED"), "{t}");
+
+    let out = p.igl(&["test", "passes"]);
+    assert!(out.status.success(), "{}", text(&out));
+
+    let out = p.igl(&["test", "--", "--list"]);
+    assert!(text(&out).contains("passes: test"), "{}", text(&out));
+}
+
+#[test]
+fn compile_errors_in_tests_are_reported_with_a_nonzero_exit() {
+    let p = lib_project();
+    p.write(
+        "src/lib.rs",
+        "#[cfg(test)]\nmod tests { #[test] fn t() { let x: u32 = \"no\"; } }\n",
+    );
+    let out = p.igl(&["test"]);
+    assert!(!out.status.success());
+    assert!(text(&out).contains("mismatched types"), "{}", text(&out));
+}
+
+#[test]
+fn integration_tests_and_binaries_are_built_and_run() {
+    let p = Project::new();
+    p.write(
+        "Cargo.toml",
+        "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    p.write("src/lib.rs", "pub fn answer() -> u32 { 42 }\n");
+    p.write(
+        "src/main.rs",
+        "fn main() { println!(\"answer={}\", demo::answer()); }\n",
+    );
+    p.write(
+        "tests/it.rs",
+        "#[test]\nfn lib_is_linked() { assert_eq!(demo::answer(), 42); }\n\n#[test]\nfn binary_is_built_first() {\n    let exe = env!(\"CARGO_BIN_EXE_demo\");\n    let out = std::process::Command::new(exe).output().unwrap();\n    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), \"answer=42\");\n}\n",
+    );
+    let out = p.ok(&["test"]);
+    assert!(
+        out.contains("test it"),
+        "the integration test should be listed: {out}"
+    );
+
+    let run = p.ok(&["run"]);
+    assert!(run.contains("answer=42"), "{run}");
+    let with_args = {
+        p.write("src/main.rs", "fn main() { println!(\"args={:?}\", std::env::args().skip(1).collect::<Vec<_>>()); }\n");
+        p.ok(&["run", "--", "a", "--flag"])
+    };
+    assert!(with_args.contains("[\"a\", \"--flag\"]"), "{with_args}");
+}
+
+#[test]
+fn doctests_run_and_failures_are_reported() {
+    let p = lib_project();
+    p.write("src/lib.rs", "/// ```\n/// assert_eq!(demo::add(1, 1), 2);\n/// ```\npub fn add(a: u32, b: u32) -> u32 { a + b }\n");
+    let out = p.ok(&["test"]);
+    assert!(
+        out.contains("doc-tests") && out.contains("1 passed"),
+        "{out}"
+    );
+
+    p.write("src/lib.rs", "/// ```\n/// assert_eq!(demo::add(1, 1), 3);\n/// ```\npub fn add(a: u32, b: u32) -> u32 { a + b }\n");
+    assert_eq!(p.igl(&["test"]).status.code(), Some(101));
+    p.ok(&["test", "--no-doc"]);
+    p.ok(&["config", "set", "test.doctests", "false"]);
+    p.ok(&["test"]);
+}
+
+#[test]
+fn dev_dependencies_are_used_by_tests_but_not_built_by_build() {
+    let p = Project::new();
+    p.write(
+        "Cargo.toml",
+        "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[dev-dependencies]\nhelper = { path = \"helper\" }\n",
+    );
+    p.write(
+        "helper/Cargo.toml",
+        "[package]\nname = \"helper\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    p.write("helper/src/lib.rs", "pub fn h() -> u32 { 5 }\n");
+    p.write("src/lib.rs", "pub fn f() -> u32 { 1 }\n#[cfg(test)]\nmod t { #[test] fn uses_dev_dep() { assert_eq!(helper::h(), 5); } }\n");
+    assert!(
+        p.ok(&["build"]).contains("1 compiled"),
+        "dev-dependencies stay out of `build`"
+    );
+    p.ok(&["test"]);
+}
+
+#[test]
+fn lints_tables_are_enforced() {
+    let p = lib_project();
+    p.write(
+        "Cargo.toml",
+        &format!("{LIB_MANIFEST}\n[lints.rust]\nunsafe_code = \"forbid\"\n"),
+    );
+    p.write(
+        "src/lib.rs",
+        "pub fn f() -> u8 { unsafe { std::mem::zeroed() } }\n",
+    );
+    let out = p.igl(&["build"]);
+    assert!(
+        !out.status.success(),
+        "unsafe code must be rejected: {}",
+        text(&out)
+    );
+    assert!(text(&out).contains("unsafe"), "{}", text(&out));
+}
+
+#[test]
+fn compiler_warnings_are_shown_and_replayed_from_the_cache() {
+    let p = lib_project();
+    p.write("src/lib.rs", "pub fn f() { let unused = 1; }\n");
+    assert!(p.ok(&["build"]).contains("unused variable"));
+    let again = p.ok(&["build"]);
+    assert!(
+        again.contains("unused variable") && again.contains("0 compiled"),
+        "{again}"
+    );
+    assert!(!p.ok(&["build", "--quiet"]).contains("compiled"));
+}
+
+#[test]
+fn renamed_and_custom_named_libraries_link() {
+    let p = Project::new();
+    p.write(
+        "Cargo.toml",
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[dependencies]\nfoo-pkg = { path = \"foo\" }\nrenamed = { path = \"bar\", package = \"bar-pkg\" }\n",
+    );
+    p.write("foo/Cargo.toml", "[package]\nname = \"foo-pkg\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[lib]\nname = \"custom_foo\"\n");
+    p.write("foo/src/lib.rs", "pub fn f() -> u8 { 1 }\n");
+    p.write(
+        "bar/Cargo.toml",
+        "[package]\nname = \"bar-pkg\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    p.write("bar/src/lib.rs", "pub fn b() -> u8 { 2 }\n");
+    p.write(
+        "src/main.rs",
+        "fn main() { println!(\"{}\", custom_foo::f() + renamed::b()); }\n",
+    );
+    assert!(p.ok(&["run"]).contains('3'));
+}
+
+#[test]
+fn custom_profiles_get_their_own_output_directory() {
+    let p = lib_project();
+    p.write(
+        "Cargo.toml",
+        &format!("{LIB_MANIFEST}\n[profile.release]\nlto = true\n[profile.fast]\ninherits = \"release\"\nopt-level = 1\n"),
+    );
+    p.ok(&["build", "--profile", "fast"]);
+    assert!(p.path().join(".igel/target/fast/deps").is_dir());
+    assert!(!p.path().join(".igel/target/release").exists());
+    p.ok(&["build", "--release"]);
+    assert!(p.path().join(".igel/target/release/deps").is_dir());
+
+    let bad = p.igl(&["build", "--profile", "nonexistent"]);
+    assert!(!bad.status.success());
+    assert!(text(&bad).contains("inherits"), "{}", text(&bad));
+}
+
+#[test]
+fn new_and_init_scaffold_projects_that_build_and_test() {
+    let p = Project::new();
+    p.ok(&["new", "mylib", "--lib"]);
+    let lib = p.path().join("mylib");
+    assert!(lib.join("Cargo.toml").is_file() && lib.join("src/lib.rs").is_file());
+    let out = p.igel_in(&lib, &["test"]);
+    assert!(out.status.success(), "{}", text(&out));
+
+    p.ok(&["new", "myapp"]);
+    let run = p.igel_in(&p.path().join("myapp"), &["run"]);
+    assert!(text(&run).contains("Hello, world!"), "{}", text(&run));
+
+    assert!(!p.igl(&["new", "myapp"]).status.success());
+    assert!(!p.igl(&["new", "fn"]).status.success());
+    std::fs::create_dir_all(p.path().join("existing")).unwrap();
+    p.ok(&["init", "existing", "--lib"]);
+    assert!(p.path().join("existing/Cargo.toml").is_file());
+    assert!(!p.igl(&["init", "existing"]).status.success());
+}
+
+#[test]
+fn examples_can_be_built_and_run() {
+    let p = lib_project();
+    p.write(
+        "examples/hello.rs",
+        "fn main() { println!(\"from example: {}\", demo::add(2, 2)); }\n",
+    );
+    let out = p.ok(&["run", "--example", "hello"]);
+    assert!(out.contains("from example: 4"), "{out}");
+    p.ok(&["build", "--examples"]);
+    assert!(!p.igl(&["run", "--example", "missing"]).status.success());
+}
+
+#[test]
+fn locate_project_and_metadata_describe_the_workspace() {
+    let p = workspace();
+    let loc = p.ok(&["locate-project"]);
+    assert!(loc.contains("Cargo.toml"), "{loc}");
+    let meta = p.ok(&["metadata", "--no-deps", "--offline"]);
+    let v: serde_json::Value = serde_json::from_str(meta.trim()).unwrap();
+    let names: Vec<_> = v["packages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["bad", "good"]);
+    assert_eq!(v["version"], 1);
+}
+
+#[test]
+fn locked_fails_when_the_lockfile_would_change_and_offline_needs_a_cache() {
+    let p = lib_project();
+    p.write(
+        "Cargo.toml",
+        &format!("{LIB_MANIFEST}\n[dependencies]\nserde = \"1\"\n"),
+    );
+    let out = p.igl(&["build", "--offline"]);
+    assert!(!out.status.success());
+    assert!(
+        text(&out).to_lowercase().contains("offline"),
+        "{}",
+        text(&out)
+    );
+}
+
+#[test]
+fn an_unreachable_git_dependency_fails_loudly_instead_of_resolving_to_the_wrong_crate() {
+    let p = lib_project();
+    p.write(
+        "Cargo.toml",
+        &format!("{LIB_MANIFEST}\n[dependencies]\nserde = {{ git = \"https://example.invalid/serde\" }}\n"),
+    );
+    let out = p.igl(&["build"]);
+    assert!(!out.status.success());
+    let t = text(&out);
+    assert!(
+        t.contains("git dependency `serde`") && t.contains("example.invalid"),
+        "{t}"
+    );
+}
+
+#[test]
+fn editing_manifests_preserves_multiline_tables_and_comments() {
+    let p = Project::new();
+    p.write(
+        "Cargo.toml",
+        r#"# top comment
+[package]
+name = "demo"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+keep = {
+    path = "keep",
+    features = [
+        "x",
+    ],   # trailing comma and comment
+}
+drop-me = { path = "drop" }
+"#,
+    );
+    for name in ["keep", "drop"] {
+        p.write(
+            &format!("{name}/Cargo.toml"),
+            &format!("[package]\nname = \"{}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[features]\nx = []\n", if name == "drop" { "drop-me" } else { name }),
+        );
+        p.write(&format!("{name}/src/lib.rs"), "");
+    }
+    p.write("src/lib.rs", "");
+
+    p.ok(&["remove", "drop-me", "--offline"]);
+    let manifest = p.read("Cargo.toml");
+    assert!(!manifest.contains("drop-me"), "{manifest}");
+    assert!(manifest.contains("# top comment"), "{manifest}");
+    assert!(
+        manifest.contains("features = [\n        \"x\",\n    ],   # trailing comma and comment"),
+        "untouched entries must keep their exact formatting:\n{manifest}"
+    );
+    p.ok(&["build", "--offline"]);
+
+    let out = p.ok(&["remove", "nope", "--offline"]);
+    assert!(out.contains("not found"), "{out}");
+}
+
+fn host_triple() -> String {
+    let out = Command::new("rustc").arg("-vV").output().unwrap();
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .find_map(|l| l.strip_prefix("host: "))
+        .unwrap()
+        .to_string()
+}
+
+fn build_script_project() -> Project {
+    let p = Project::new();
+    p.write(
+        "Cargo.toml",
+        r#"[package]
+name = "demo"
+version = "1.2.3-beta.1"
+edition = "2021"
+authors = ["Ada <ada@example.com>", "Bob"]
+description = "a demo"
+build = "build.rs"
+"#,
+    );
+    p.write(
+        "build.rs",
+        r#"use std::io::Write;
+fn main() {
+    let out = std::path::PathBuf::from(std::env::var("OUT_DIR").unwrap());
+    let mut f = std::fs::File::create(out.join("generated.rs")).unwrap();
+    writeln!(
+        f,
+        "pub const FACTS: &str = {:?};",
+        format!(
+            "os={} authors={} desc={} pre={} debug={} profile={} target={}",
+            std::env::var("CARGO_CFG_TARGET_OS").unwrap(),
+            std::env::var("CARGO_PKG_AUTHORS").unwrap(),
+            std::env::var("CARGO_PKG_DESCRIPTION").unwrap(),
+            std::env::var("CARGO_PKG_VERSION_PRE").unwrap(),
+            std::env::var("DEBUG").unwrap(),
+            std::env::var("PROFILE").unwrap(),
+            std::env::var("TARGET").unwrap(),
+        )
+    )
+    .unwrap();
+    println!("cargo::rustc-cfg=from_script");
+    println!("cargo::rustc-check-cfg=cfg(from_script)");
+    println!("cargo::rustc-env=SCRIPT_VAR=ok");
+    println!("cargo::rerun-if-changed=build.rs");
+}
+"#,
+    );
+    p.write(
+        "src/lib.rs",
+        r#"include!(concat!(env!("OUT_DIR"), "/generated.rs"));
+pub fn script_cfg() -> bool { cfg!(from_script) }
+"#,
+    );
+    p.write(
+        "src/main.rs",
+        r#"// The binary shares the library's build script run: same OUT_DIR, same cfgs.
+mod generated { include!(concat!(env!("OUT_DIR"), "/generated.rs")); }
+fn main() {
+    println!("lib: {}", demo::FACTS);
+    println!("bin: {}", generated::FACTS);
+    println!("cfg={} env={}", cfg!(from_script), env!("SCRIPT_VAR"));
+}
+"#,
+    );
+    p
+}
+
+#[test]
+fn build_scripts_see_the_target_and_package_metadata_and_share_out_dir() {
+    let p = build_script_project();
+    let out = p.ok(&["run"]);
+    let host = host_triple();
+    let os = if cfg!(target_os = "linux") {
+        "linux"
+    } else {
+        std::env::consts::OS
+    };
+    let expected = format!(
+        "os={os} authors=Ada <ada@example.com>:Bob desc=a demo pre=beta.1 debug=true profile=debug target={host}"
+    );
+    assert!(out.contains(&format!("lib: {expected}")), "{out}");
+    assert!(out.contains(&format!("bin: {expected}")), "{out}");
+    assert!(out.contains("cfg=true env=ok"), "{out}");
+}
+
+#[test]
+fn projects_with_build_scripts_are_fully_cached_after_the_first_build() {
+    let p = build_script_project();
+    p.ok(&["build"]);
+    let again = p.ok(&["build"]);
+    assert!(again.contains("0 compiled"), "{again}");
+    std::fs::remove_dir_all(p.path().join(".igel/target")).unwrap();
+    let restored = p.ok(&["run"]);
+    assert!(restored.contains("0 compiled"), "{restored}");
+    assert!(restored.contains("cfg=true env=ok"), "{restored}");
+}
+
+#[test]
+fn cross_builds_use_a_target_directory_and_host_scripts() {
+    let p = build_script_project();
+    let host = host_triple();
+    let out = p.ok(&["build", "--target", &host]);
+    assert!(out.contains("compiled"), "{out}");
+    let bin = p
+        .path()
+        .join(".igel/target")
+        .join(&host)
+        .join("debug")
+        .join(exe("demo"));
+    assert!(bin.is_file(), "expected {}", bin.display());
+    let run = Command::new(&bin).output().unwrap();
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(stdout.contains(&format!("target={host}")), "{stdout}");
+}
+
+fn split_feature_project() -> Project {
+    let p = Project::new();
+    p.write(
+        "Cargo.toml",
+        r#"[package]
+name = "app"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+shared = { path = "shared" }
+
+[build-dependencies]
+shared = { path = "shared", features = ["extra"] }
+"#,
+    );
+    p.write(
+        "shared/Cargo.toml",
+        "[package]\nname = \"shared\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[features]\nextra = []\n",
+    );
+    p.write(
+        "shared/src/lib.rs",
+        "pub fn has_extra() -> bool { cfg!(feature = \"extra\") }\n",
+    );
+    p.write(
+        "build.rs",
+        "fn main() { println!(\"cargo::rustc-env=BUILD_SAW_EXTRA={}\", shared::has_extra()); }\n",
+    );
+    p.write(
+        "src/main.rs",
+        "fn main() { println!(\"build={} runtime={}\", env!(\"BUILD_SAW_EXTRA\"), shared::has_extra()); }\n",
+    );
+    p
+}
+
+#[test]
+fn build_dependencies_get_their_own_features_and_are_not_linked_into_the_crate() {
+    let p = split_feature_project();
+    let out = p.ok(&["run"]);
+    assert!(out.contains("build=true runtime=false"), "{out}");
+    let host = host_triple();
+    let out = p.ok(&["build", "--target", &host]);
+    assert!(out.contains("compiled"), "{out}");
+    let run = Command::new(
+        p.path()
+            .join(".igel/target")
+            .join(&host)
+            .join("debug")
+            .join("app"),
+    )
+    .output()
+    .unwrap();
+    assert!(
+        String::from_utf8_lossy(&run.stdout).contains("build=true runtime=false"),
+        "{}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+
+    let q = Project::new();
+    q.write(
+        "Cargo.toml",
+        "[package]\nname = \"q\"\nversion = \"0.1.0\"\nedition = \"2021\"\nbuild = \"build.rs\"\n[build-dependencies]\nshared = { path = \"shared\" }\n",
+    );
+    q.write(
+        "shared/Cargo.toml",
+        "[package]\nname = \"shared\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    q.write("shared/src/lib.rs", "pub fn f() {}\n");
+    q.write("build.rs", "fn main() { shared::f(); }\n");
+    q.write("src/main.rs", "fn main() { shared::f(); }\n");
+    let out = q.igl(&["build"]);
+    assert!(
+        !out.status.success(),
+        "build-dependencies leaked into the crate"
+    );
+}
+
+#[test]
+fn proc_macros_build_for_the_host_in_native_and_cross_builds() {
+    let p = Project::new();
+    p.write(
+        "Cargo.toml",
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[dependencies]\nanswer = { path = \"answer\" }\n",
+    );
+    p.write(
+        "answer/Cargo.toml",
+        "[package]\nname = \"answer\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[lib]\nproc-macro = true\n",
+    );
+    p.write(
+        "answer/src/lib.rs",
+        "extern crate proc_macro;\n#[proc_macro]\npub fn answer(_: proc_macro::TokenStream) -> proc_macro::TokenStream { \"42u32\".parse().unwrap() }\n",
+    );
+    p.write(
+        "src/main.rs",
+        "fn main() { println!(\"answer={}\", answer::answer!()); }\n",
+    );
+    assert!(p.ok(&["run"]).contains("answer=42"));
+    let host = host_triple();
+    p.ok(&["build", "--target", &host]);
+    let run = Command::new(
+        p.path()
+            .join(".igel/target")
+            .join(&host)
+            .join("debug")
+            .join("app"),
+    )
+    .output()
+    .unwrap();
+    assert!(String::from_utf8_lossy(&run.stdout).contains("answer=42"));
+}
+
+#[test]
+fn features_only_count_for_the_selected_packages() {
+    let p = Project::new();
+    p.write(
+        "Cargo.toml",
+        "[workspace]\nmembers = [\"a\", \"b\", \"shared\"]\nresolver = \"2\"\n",
+    );
+    p.write(
+        "shared/Cargo.toml",
+        "[package]\nname = \"shared\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[features]\nx = []\n",
+    );
+    p.write(
+        "shared/src/lib.rs",
+        "pub fn has_x() -> bool { cfg!(feature = \"x\") }\n",
+    );
+    p.write(
+        "a/Cargo.toml",
+        "[package]\nname = \"a\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[dependencies]\nshared = { path = \"../shared\", features = [\"x\"] }\n",
+    );
+    p.write(
+        "a/src/main.rs",
+        "fn main() { println!(\"a sees x={}\", shared::has_x()); }\n",
+    );
+    p.write(
+        "b/Cargo.toml",
+        "[package]\nname = \"b\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[dependencies]\nshared = { path = \"../shared\" }\n",
+    );
+    p.write(
+        "b/src/main.rs",
+        "fn main() { println!(\"b sees x={}\", shared::has_x()); }\n",
+    );
+
+    assert!(p.ok(&["run", "-p", "b"]).contains("b sees x=false"));
+    p.ok(&["build", "-p", "a", "-p", "b"]);
+    let b = Command::new(p.path().join(".igel/target/debug/b"))
+        .output()
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&b.stdout).contains("b sees x=true"),
+        "{}",
+        String::from_utf8_lossy(&b.stdout)
+    );
+}
+
+#[test]
+fn library_crate_types_produce_every_requested_artifact() {
+    let p = lib_project();
+    p.write(
+        "Cargo.toml",
+        &format!("{LIB_MANIFEST}[lib]\ncrate-type = [\"cdylib\", \"staticlib\", \"rlib\"]\n"),
+    );
+    p.ok(&["build"]);
+    let deps = p.path().join(".igel/target/debug/deps");
+    let names: Vec<String> = std::fs::read_dir(&deps)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    let has = |prefix: &str, suffix: &str| {
+        names.iter().any(|n| {
+            n.starts_with(&format!("{prefix}demo-"))
+                && n.ends_with(suffix)
+                && !n.ends_with(".dll.lib")
+        })
+    };
+    assert!(has("lib", ".rlib"), "{names:?}");
+    let (static_prefix, static_suffix) = if cfg!(target_env = "msvc") {
+        ("", ".lib")
+    } else {
+        ("lib", ".a")
+    };
+    assert!(has(static_prefix, static_suffix), "{names:?}");
+    assert!(
+        has(std::env::consts::DLL_PREFIX, std::env::consts::DLL_SUFFIX),
+        "{names:?}"
+    );
+}
+
+#[test]
+fn package_profile_overrides_change_how_a_dependency_is_compiled() {
+    let make = |override_table: &str| {
+        let p = Project::new();
+        p.write(
+            "Cargo.toml",
+            &format!(
+                "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[dependencies]\nhelper = {{ path = \"helper\" }}\n{override_table}"
+            ),
+        );
+        p.write(
+            "helper/Cargo.toml",
+            "[package]\nname = \"helper\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        );
+        p.write(
+            "helper/src/lib.rs",
+            "pub fn add(a: u8, b: u8) -> u8 { a + b }\n",
+        );
+        p.write(
+            "src/main.rs",
+            "fn main() { let n = std::env::args().count() as u8; println!(\"sum={}\", helper::add(254 + n, 1)); }\n",
+        );
+        p
+    };
+    let strict = make("");
+    let out = strict.igl(&["run"]);
+    assert!(!out.status.success(), "{}", text(&out));
+    let loose = make("[profile.dev.package.helper]\noverflow-checks = false\n");
+    assert!(loose.ok(&["run"]).contains("sum=0"));
+}
+
+#[cfg(unix)]
+#[test]
+fn rustc_wrappers_are_used_and_never_share_artifacts_with_unwrapped_builds() {
+    use std::os::unix::fs::PermissionsExt;
+    let p = lib_project();
+    let scratch = tempfile::tempdir().unwrap();
+    let log = scratch.path().join("wrapper.log");
+    let script = scratch.path().join("wrap.sh");
+    std::fs::write(
+        &script,
+        format!("#!/bin/sh\necho called >> {}\nexec \"$@\"\n", log.display()),
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let plain = p.ok(&["build"]);
+    assert!(plain.contains("1 compiled"), "{plain}");
+    assert!(!log.exists());
+
+    let run = |p: &Project| {
+        let out = igel_command()
+            .args(["build"])
+            .current_dir(p.path())
+            .env("IGEL_HOME", p.home())
+            .env("NO_COLOR", "1")
+            .env("RUSTC_WRAPPER", &script)
+            .env_remove("RUSTFLAGS")
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{}", text(&out));
+        text(&out)
+    };
+    let wrapped = run(&p);
+    assert!(
+        wrapped.contains("1 compiled"),
+        "wrapper must not reuse the plain build: {wrapped}"
+    );
+    assert!(log.exists(), "the wrapper was never invoked");
+    let calls = std::fs::read_to_string(&log).unwrap().lines().count();
+    let again = run(&p);
+    assert!(
+        again.contains("0 compiled") && again.contains("1 cached"),
+        "{again}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&log).unwrap().lines().count(),
+        calls
+    );
+}
+
+#[test]
+fn cargo_config_env_rustflags_and_target_tables_apply() {
+    let p = Project::new();
+    let host = host_triple();
+    p.write(
+        "Cargo.toml",
+        "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    p.write(
+        ".cargo/config.toml",
+        &format!(
+            "[env]\nGREETING = \"hello from config\"\n\n[build]\nrustflags = [\"--cfg\", \"from_build_flags\"]\n\n[target.{host}]\nrustflags = [\"--cfg\", \"from_target_flags\"]\n"
+        ),
+    );
+    p.write(
+        "src/main.rs",
+        "fn main() {\n    println!(\"{} build={} target={}\", env!(\"GREETING\"), cfg!(from_build_flags), cfg!(from_target_flags));\n}\n",
+    );
+    let out = p.ok(&["run"]);
+    assert!(
+        out.contains("hello from config build=false target=true"),
+        "{out}"
+    );
+}
+
+#[test]
+fn rust_version_is_enforced_unless_ignored() {
+    let p = lib_project();
+    p.write(
+        "Cargo.toml",
+        &format!("{LIB_MANIFEST}rust-version = \"1.999\"\n"),
+    );
+    let out = p.igl(&["build"]);
+    assert!(!out.status.success());
+    let t = text(&out);
+    assert!(t.contains("requires rustc 1.999"), "{t}");
+    assert!(
+        p.ok(&["build", "--ignore-rust-version"])
+            .contains("compiled")
+    );
+}
+
+#[test]
+fn packages_linking_the_same_native_library_conflict() {
+    let p = Project::new();
+    let member = |name: &str| {
+        (
+            format!("{name}/Cargo.toml"),
+            format!(
+                "[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\nlinks = \"samelib\"\nbuild = \"build.rs\"\n"
+            ),
+        )
+    };
+    p.write(
+        "Cargo.toml",
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[dependencies]\none = { path = \"one\" }\ntwo = { path = \"two\" }\n",
+    );
+    for name in ["one", "two"] {
+        let (path, manifest) = member(name);
+        p.write(&path, &manifest);
+        p.write(&format!("{name}/build.rs"), "fn main() {}\n");
+        p.write(&format!("{name}/src/lib.rs"), "");
+    }
+    p.write("src/main.rs", "fn main() {}\n");
+    let out = p.igl(&["build"]);
+    assert!(!out.status.success());
+    assert!(
+        text(&out).contains("native library `samelib`"),
+        "{}",
+        text(&out)
+    );
+}
+
+#[test]
+fn a_failing_build_script_shows_its_stderr_and_error_directive() {
+    let p = lib_project();
+    p.write(
+        "Cargo.toml",
+        &format!("{LIB_MANIFEST}build = \"build.rs\"\n"),
+    );
+    p.write(
+        "build.rs",
+        "fn main() { eprintln!(\"custom diagnostic text\"); println!(\"cargo::error=configuration is wrong\"); }\n",
+    );
+    let out = p.igl(&["build"]);
+    assert!(!out.status.success());
+    let t = text(&out);
+    assert!(t.contains("configuration is wrong"), "{t}");
+}
+
+fn git(dir: &Path, args: &[&str]) -> String {
+    let out = Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_AUTHOR_NAME", "t")
+        .env("GIT_AUTHOR_EMAIL", "t@example.com")
+        .env("GIT_COMMITTER_NAME", "t")
+        .env("GIT_COMMITTER_EMAIL", "t@example.com")
+        .env("GIT_CONFIG_COUNT", "1")
+        .env("GIT_CONFIG_KEY_0", "protocol.file.allow")
+        .env("GIT_CONFIG_VALUE_0", "always")
+        .output()
+        .expect("git is required for these tests");
+    assert!(
+        out.status.success(),
+        "git {} failed: {}",
+        args.join(" "),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+fn upstream(version_text: &str) -> tempfile::TempDir {
+    let repo = tempfile::tempdir().unwrap();
+    let d = repo.path();
+    git(d, &["init", "--quiet", "--initial-branch=main"]);
+    std::fs::create_dir_all(d.join("src")).unwrap();
+    std::fs::write(
+        d.join("Cargo.toml"),
+        "[package]\nname = \"gitdep\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        d.join("src/lib.rs"),
+        format!("pub fn version() -> &'static str {{ {version_text:?} }}\n"),
+    )
+    .unwrap();
+    git(d, &["add", "-A"]);
+    git(d, &["commit", "--quiet", "-m", "first"]);
+    repo
+}
+
+fn commit_version(repo: &Path, text: &str, message: &str) -> String {
+    std::fs::write(
+        repo.join("src/lib.rs"),
+        format!("pub fn version() -> &'static str {{ {text:?} }}\n"),
+    )
+    .unwrap();
+    git(repo, &["add", "-A"]);
+    git(repo, &["commit", "--quiet", "-m", message]);
+    git(repo, &["rev-parse", "HEAD"])
+}
+
+fn git_app(dep: &str) -> Project {
+    let p = Project::new();
+    p.write(
+        "Cargo.toml",
+        &format!(
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[dependencies]\ngitdep = {dep}\n"
+        ),
+    );
+    p.write(
+        "src/main.rs",
+        "fn main() { println!(\"gitdep says {}\", gitdep::version()); }\n",
+    );
+    p
+}
+
+fn url(repo: &Path) -> String {
+    igel_common::fsutil::file_url(repo)
+}
+
+#[test]
+fn git_dependencies_build_lock_the_exact_commit_and_move_only_on_update() {
+    let repo = upstream("v1");
+    let first = git(repo.path(), &["rev-parse", "HEAD"]);
+    let p = git_app(&format!("{{ git = {:?} }}", url(repo.path())));
+
+    assert!(p.ok(&["run"]).contains("gitdep says v1"));
+
+    let lock = p.read("Cargo.lock");
+    assert!(
+        lock.contains(&format!("git+{}#{first}", url(repo.path()))),
+        "{lock}"
+    );
+
+    let again = p.ok(&["build"]);
+    assert!(again.contains("0 compiled"), "{again}");
+
+    let second = commit_version(repo.path(), "v2", "second");
+    assert_ne!(first, second);
+    assert!(p.ok(&["run"]).contains("gitdep says v1"));
+
+    p.ok(&["update"]);
+    let run = p.ok(&["run"]);
+    assert!(run.contains("gitdep says v2"), "{run}");
+    assert!(
+        p.read("Cargo.lock").contains(&format!("#{second}")),
+        "{}",
+        p.read("Cargo.lock")
+    );
+}
+
+#[test]
+fn git_dependencies_can_be_pinned_by_tag_branch_and_rev_and_the_key_follows_the_commit() {
+    let repo = upstream("v1");
+    git(repo.path(), &["tag", "release-1"]);
+    let first = git(repo.path(), &["rev-parse", "HEAD"]);
+    git(repo.path(), &["checkout", "--quiet", "-b", "next"]);
+    commit_version(repo.path(), "next-work", "on next");
+    git(repo.path(), &["checkout", "--quiet", "main"]);
+    let u = url(repo.path());
+
+    let by_tag = git_app(&format!("{{ git = {u:?}, tag = \"release-1\" }}"));
+    assert!(by_tag.ok(&["run"]).contains("gitdep says v1"));
+    assert!(by_tag.read("Cargo.lock").contains("?tag=release-1#"));
+
+    let by_branch = git_app(&format!("{{ git = {u:?}, branch = \"next\" }}"));
+    assert!(by_branch.ok(&["run"]).contains("gitdep says next-work"));
+    assert!(by_branch.read("Cargo.lock").contains("?branch=next#"));
+
+    let by_rev = git_app(&format!("{{ git = {u:?}, rev = {first:?} }}"));
+    assert!(by_rev.ok(&["run"]).contains("gitdep says v1"));
+
+    let missing = git_app(&format!("{{ git = {u:?}, branch = \"nope\" }}"));
+    let out = missing.igl(&["build"]);
+    assert!(!out.status.success());
+    assert!(text(&out).contains("branch `nope`"), "{}", text(&out));
+}
+
+#[test]
+fn git_repositories_with_their_own_workspace_inherit_from_it() {
+    let repo = tempfile::tempdir().unwrap();
+    let d = repo.path();
+    git(d, &["init", "--quiet", "--initial-branch=main"]);
+    let w = |rel: &str, text: &str| {
+        let p = d.join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, text).unwrap();
+    };
+    w(
+        "Cargo.toml",
+        "[workspace]\nmembers = [\"crates/*\"]\nresolver = \"2\"\n[workspace.package]\nversion = \"2.5.0\"\nedition = \"2021\"\n[workspace.dependencies]\ncore-part = { path = \"crates/core-part\" }\n",
+    );
+    w(
+        "crates/core-part/Cargo.toml",
+        "[package]\nname = \"core-part\"\nversion.workspace = true\nedition.workspace = true\n",
+    );
+    w(
+        "crates/core-part/src/lib.rs",
+        "pub fn base() -> u32 { 40 }\n",
+    );
+    w(
+        "crates/wrapper/Cargo.toml",
+        "[package]\nname = \"wrapper\"\nversion.workspace = true\nedition.workspace = true\n[dependencies]\ncore-part.workspace = true\n",
+    );
+    w(
+        "crates/wrapper/src/lib.rs",
+        "pub fn answer() -> u32 { core_part::base() + 2 }\n",
+    );
+    git(d, &["add", "-A"]);
+    git(d, &["commit", "--quiet", "-m", "workspace"]);
+
+    let p = Project::new();
+    p.write(
+        "Cargo.toml",
+        &format!(
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[dependencies]\nwrapper = {{ git = {:?} }}\n",
+            url(d)
+        ),
+    );
+    p.write(
+        "src/main.rs",
+        "fn main() { println!(\"answer={}\", wrapper::answer()); }\n",
+    );
+    let out = p.ok(&["run"]);
+    assert!(out.contains("answer=42"), "{out}");
+    assert!(
+        p.read("Cargo.lock")
+            .contains("name = \"wrapper\"\nversion = \"2.5.0\"")
+    );
+}
+
+#[test]
+fn git_submodules_are_checked_out_and_part_of_the_source() {
+    let sub = tempfile::tempdir().unwrap();
+    git(sub.path(), &["init", "--quiet", "--initial-branch=main"]);
+    std::fs::write(sub.path().join("data.txt"), "from the submodule").unwrap();
+    git(sub.path(), &["add", "-A"]);
+    git(sub.path(), &["commit", "--quiet", "-m", "sub"]);
+
+    let repo = upstream("v1");
+    git(
+        repo.path(),
+        &[
+            "submodule",
+            "add",
+            "--quiet",
+            &url(sub.path()),
+            "vendor-data",
+        ],
+    );
+    std::fs::write(
+        repo.path().join("src/lib.rs"),
+        "pub fn version() -> &'static str { include_str!(\"../vendor-data/data.txt\") }\n",
+    )
+    .unwrap();
+    git(repo.path(), &["add", "-A"]);
+    git(
+        repo.path(),
+        &["commit", "--quiet", "-m", "use the submodule"],
+    );
+
+    let p = git_app(&format!("{{ git = {:?} }}", url(repo.path())));
+    let out = igel_command()
+        .args(["run"])
+        .current_dir(p.path())
+        .env("IGEL_HOME", p.home())
+        .env("NO_COLOR", "1")
+        .env("GIT_CONFIG_COUNT", "1")
+        .env("GIT_CONFIG_KEY_0", "protocol.file.allow")
+        .env("GIT_CONFIG_VALUE_0", "always")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(
+        text(&out).contains("gitdep says from the submodule"),
+        "{}",
+        text(&out)
+    );
+}
+
+fn patch_project(patch_section: &str) -> Project {
+    let p = Project::new();
+    p.write(
+        "Cargo.toml",
+        &format!(
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[dependencies]\nfoo = \"1.0\"\nmid = {{ path = \"mid\" }}\n{patch_section}"
+        ),
+    );
+    p.write(
+        "mid/Cargo.toml",
+        "[package]\nname = \"mid\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[dependencies]\nfoo = \"1\"\n",
+    );
+    p.write(
+        "mid/src/lib.rs",
+        "pub fn via_mid() -> &'static str { foo::says() }\n",
+    );
+    p.write(
+        "foo-fork/Cargo.toml",
+        "[package]\nname = \"foo\"\nversion = \"1.5.0\"\nedition = \"2021\"\n",
+    );
+    p.write(
+        "foo-fork/src/lib.rs",
+        "pub fn says() -> &'static str { \"the fork\" }\n",
+    );
+    p.write(
+        "src/main.rs",
+        "fn main() { println!(\"direct={} via_mid={}\", foo::says(), mid::via_mid()); }\n",
+    );
+    p
+}
+
+#[test]
+fn patches_replace_a_dependency_for_every_dependent() {
+    let p = patch_project(
+        "[patch.crates-io]\nfoo = { path = \"foo-fork\" }\nnobody-uses-this = { path = \"foo-fork\" }\n",
+    );
+    let out = p.ok(&["run"]);
+    assert!(out.contains("direct=the fork via_mid=the fork"), "{out}");
+    assert!(
+        out.contains("patch `nobody-uses-this`") && out.contains("was not used"),
+        "{out}"
+    );
+    assert!(!out.contains("patch `foo`"), "{out}");
+    let lock = p.read("Cargo.lock");
+    assert!(
+        lock.contains("name = \"foo\"\nversion = \"1.5.0\"\n"),
+        "{lock}"
+    );
+    assert!(!lock.contains("crates.io-index"), "{lock}");
+
+    p.write(
+        "foo-fork/src/lib.rs",
+        "pub fn says() -> &'static str { \"the edited fork\" }\n",
+    );
+    let out = p.ok(&["run"]);
+    assert!(
+        out.contains("direct=the edited fork via_mid=the edited fork"),
+        "{out}"
+    );
+}
+
+#[test]
+fn replace_and_configuration_patches_work_too() {
+    let p = patch_project("[replace]\n\"foo:1.5.0\" = { path = \"foo-fork\" }\n");
+    p.write(
+        "Cargo.toml",
+        &p.read("Cargo.toml")
+            .replace("foo = \"1.0\"", "foo = \"=1.5.0\""),
+    );
+    p.write(
+        "mid/Cargo.toml",
+        &p.read("mid/Cargo.toml")
+            .replace("foo = \"1\"", "foo = \"=1.5.0\""),
+    );
+    assert!(p.ok(&["run"]).contains("direct=the fork"));
+
+    let q = patch_project("");
+    q.write(
+        ".cargo/config.toml",
+        "[patch.crates-io]\nfoo = { path = \"foo-fork\" }\n",
+    );
+    assert!(q.ok(&["run"]).contains("via_mid=the fork"));
+}
+
+fn make_crate(name: &str, version: &str, lib_rs: &str) -> (Vec<u8>, String) {
+    make_crate_with(name, version, &[("src/lib.rs", lib_rs)])
+}
+
+fn make_crate_with(name: &str, version: &str, files: &[(&str, &str)]) -> (Vec<u8>, String) {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join(format!("{name}-{version}"));
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(
+        root.join("Cargo.toml"),
+        format!("[package]\nname = \"{name}\"\nversion = \"{version}\"\nedition = \"2021\"\n"),
+    )
+    .unwrap();
+    for (path, content) in files {
+        let path = root.join(path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, content).unwrap();
+    }
+    let mut bytes = Vec::new();
+    {
+        let gz = flate2::write::GzEncoder::new(&mut bytes, flate2::Compression::default());
+        let mut archive = tar::Builder::new(gz);
+        archive
+            .append_dir_all(format!("{name}-{version}"), &root)
+            .unwrap();
+        archive.into_inner().unwrap().finish().unwrap();
+    }
+    let out = tmp.path().join("out.crate");
+    std::fs::write(&out, &bytes).unwrap();
+    let sum = igel_registry::download::sha256_file(&out).unwrap();
+    (bytes, sum)
+}
+
+fn registry_app(dep: &str) -> Project {
+    let p = Project::new();
+    p.write(
+        "Cargo.toml",
+        &format!(
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[dependencies]\nfoo = {dep}\n"
+        ),
+    );
+    p.write(
+        "src/main.rs",
+        "fn main() { println!(\"foo says {}\", foo::says()); }\n",
+    );
+    p
+}
+
+const FOO_LIB: &str = "pub fn says() -> &'static str { \"hello from the registry\" }\n";
+
+#[test]
+fn a_local_registry_replaces_crates_io_but_the_lockfile_keeps_the_identity() {
+    let reg = tempfile::tempdir().unwrap();
+    let (bytes, sum) = make_crate("foo", "1.0.0", FOO_LIB);
+    std::fs::write(reg.path().join("foo-1.0.0.crate"), bytes).unwrap();
+    std::fs::create_dir_all(reg.path().join("index/3/f")).unwrap();
+    std::fs::write(
+        reg.path().join("index/3/f/foo"),
+        format!("{{\"name\":\"foo\",\"vers\":\"1.0.0\",\"deps\":[],\"cksum\":\"{sum}\",\"features\":{{}},\"yanked\":false}}\n"),
+    )
+    .unwrap();
+
+    let p = registry_app("\"1\"");
+    p.write(
+        ".cargo/config.toml",
+        &format!(
+            "[source.crates-io]\nreplace-with = \"local\"\n[source.local]\nlocal-registry = {:?}\n",
+            reg.path()
+        ),
+    );
+    let out = p.ok(&["run"]);
+    assert!(out.contains("foo says hello from the registry"), "{out}");
+    let lock = p.read("Cargo.lock");
+    assert!(
+        lock.contains("registry+https://github.com/rust-lang/crates.io-index"),
+        "{lock}"
+    );
+    assert!(lock.contains(&format!("checksum = \"{sum}\"")), "{lock}");
+}
+
+type RegistryCrate<'a> = (&'a str, &'a str, &'a [(&'a str, &'a str)]);
+
+fn local_registry(crates: &[RegistryCrate]) -> tempfile::TempDir {
+    let reg = tempfile::tempdir().unwrap();
+    let mut index: std::collections::BTreeMap<String, String> = Default::default();
+    for (name, version, deps) in crates {
+        let (bytes, sum) = make_crate(name, version, "pub fn f() {}\n");
+        std::fs::write(reg.path().join(format!("{name}-{version}.crate")), bytes).unwrap();
+        let deps: Vec<String> = deps
+            .iter()
+            .map(|(d, req)| format!(
+                "{{\"name\":\"{d}\",\"req\":\"{req}\",\"features\":[],\"optional\":false,\"default_features\":true,\"target\":null,\"kind\":\"normal\"}}"
+            ))
+            .collect();
+        index.entry(name.to_string()).or_default().push_str(&format!(
+            "{{\"name\":\"{name}\",\"vers\":\"{version}\",\"deps\":[{}],\"cksum\":\"{sum}\",\"features\":{{}},\"yanked\":false}}\n",
+            deps.join(",")
+        ));
+    }
+    write_index(reg.path(), &index);
+    reg
+}
+
+fn write_index(reg: &Path, index: &std::collections::BTreeMap<String, String>) {
+    for (name, lines) in index {
+        let dir = match name.len() {
+            1 => reg.join("index/1"),
+            2 => reg.join("index/2"),
+            3 => reg.join("index/3").join(&name[..1]),
+            _ => reg.join("index").join(&name[..2]).join(&name[2..4]),
+        };
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(name), lines).unwrap();
+    }
+}
+
+fn index_dep(alias: &str, package: Option<&str>, req: &str, optional: bool) -> String {
+    let package = package.map_or(String::new(), |p| format!("\"package\":\"{p}\","));
+    format!(
+        "{{\"name\":\"{alias}\",{package}\"req\":\"{req}\",\"features\":[],\"optional\":{optional},\"default_features\":true,\"target\":null,\"kind\":\"normal\"}}"
+    )
+}
+
+#[test]
+fn an_optional_dependency_nothing_switches_on_may_be_missing_from_the_lockfile() {
+    let reg = tempfile::tempdir().unwrap();
+    let mut index: std::collections::BTreeMap<String, String> = Default::default();
+    let mut publish = |name: &str, version: &str, extra: &str, deps: &str, features: &str, lib| {
+        let manifest = format!(
+            "[package]\nname = \"{name}\"\nversion = \"{version}\"\nedition = \"2021\"\n{extra}"
+        );
+        let (bytes, sum) = make_crate_with(
+            name,
+            version,
+            &[("Cargo.toml", manifest.as_str()), ("src/lib.rs", lib)],
+        );
+        std::fs::write(reg.path().join(format!("{name}-{version}.crate")), bytes).unwrap();
+        index.entry(name.to_string()).or_default().push_str(&format!(
+            "{{\"name\":\"{name}\",\"vers\":\"{version}\",\"deps\":[{deps}],\"cksum\":\"{sum}\",\"features\":{features},\"yanked\":false}}\n"
+        ));
+    };
+    publish("fh", "1.0.0", "", "", "{}", "pub fn v() -> u32 { 1 }\n");
+    publish("fh", "2.0.0", "", "", "{}", "pub fn v() -> u32 { 2 }\n");
+    for (version, major) in [("1.0.0", "1"), ("2.0.0", "2")] {
+        publish(
+            "hb",
+            version,
+            &format!(
+                "[dependencies]\nfh = {{ version = \"{major}\", optional = true }}\n[features]\ndefault = [\"fh\"]\n"
+            ),
+            &index_dep("fh", None, &format!("^{major}"), true),
+            "{\"default\":[\"fh\"]}",
+            "pub fn v() -> u32 { if cfg!(feature = \"fh\") { 10 } else { 0 } }\n#[cfg(feature = \"fh\")]\npub use fh;\n",
+        );
+    }
+    let hb2 = index_dep("hb", None, "^2", false)
+        .replace("\"default_features\":true", "\"default_features\":false");
+    publish(
+        "im",
+        "1.0.0",
+        "[dependencies]\nhb = { version = \"2\", default-features = false }\n",
+        &hb2,
+        "{}",
+        "pub fn v() -> u32 { hb::v() }\n",
+    );
+    publish("by", "0.5.6", "", "", "{}", "pub fn v() -> u32 { 5 }\n");
+    publish("by", "1.0.0", "", "", "{}", "pub fn v() -> u32 { 100 }\n");
+    publish(
+        "cb",
+        "4.0.0",
+        "[dependencies]\nby = { version = \"1\", optional = true }\n\
+         by05 = { package = \"by\", version = \"0.5\", optional = true }\n\
+         [features]\ndefault = [\"std\"]\nstd = [\"by\"]\nold = [\"by05\"]\n",
+        &format!(
+            "{},{}",
+            index_dep("by", None, "^1", true),
+            index_dep("by05", Some("by"), "^0.5", true)
+        ),
+        "{\"default\":[\"std\"],\"std\":[\"by\"],\"old\":[\"by05\"]}",
+        "#[cfg(feature = \"std\")]\npub use by;\n",
+    );
+    write_index(reg.path(), &index);
+
+    let p = app_with(&reg, "hb = \"1\"\nim = \"1\"\ncb = \"4\"\n");
+    p.write(
+        "src/main.rs",
+        "fn main() { println!(\"{} {} {} {}\", hb::v(), hb::fh::v(), im::v(), cb::by::v()); }\n",
+    );
+    let out = p.ok(&["run"]);
+    assert!(out.contains("10 1 0 100"), "{out}");
+    assert_eq!(
+        locked(&p),
+        [
+            "app 0.1.0",
+            "by 1.0.0",
+            "cb 4.0.0",
+            "fh 1.0.0",
+            "hb 1.0.0",
+            "hb 2.0.0",
+            "im 1.0.0"
+        ]
+    );
+    let again = p.ok(&["build"]);
+    assert!(again.contains("0 compiled"), "{again}");
+    assert!(
+        !again.contains("resolved"),
+        "nothing to resolve again: {again}"
+    );
+}
+
+fn app_with(reg: &tempfile::TempDir, deps: &str) -> Project {
+    let p = Project::new();
+    p.write(
+        "Cargo.toml",
+        &format!("[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[dependencies]\n{deps}"),
+    );
+    p.write("src/main.rs", "fn main() {}\n");
+    p.write(
+        ".cargo/config.toml",
+        &format!(
+            "[source.crates-io]\nreplace-with = \"local\"\n[source.local]\nlocal-registry = {:?}\n",
+            reg.path()
+        ),
+    );
+    p
+}
+
+fn locked(p: &Project) -> Vec<String> {
+    let lock: toml::Table = p.read("Cargo.lock").parse().unwrap();
+    let mut out: Vec<String> = lock["package"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|pkg| {
+            format!(
+                "{} {}",
+                pkg["name"].as_str().unwrap(),
+                pkg["version"].as_str().unwrap()
+            )
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+#[test]
+fn one_version_per_compatible_range_like_cargo() {
+    let reg = local_registry(&[
+        ("a", "1.0.0", &[]),
+        ("a", "1.1.0", &[]),
+        ("b", "1.0.0", &[("a", "=1.0.0")]),
+    ]);
+    let p = app_with(&reg, "a = \"1.0\"\nb = \"1\"\n");
+    p.ok(&["build"]);
+    assert_eq!(locked(&p), ["a 1.0.0", "app 0.1.0", "b 1.0.0"]);
+}
+
+#[test]
+fn resolution_backtracks_to_an_older_release_that_fits() {
+    let reg = local_registry(&[
+        ("a", "1.0.0", &[]),
+        ("a", "1.1.0", &[]),
+        ("b", "1.0.0", &[("a", "^1.0")]),
+        ("b", "2.0.0", &[("a", "^1.1")]),
+    ]);
+    let p = app_with(&reg, "a = \"=1.0.0\"\nb = \"*\"\n");
+    p.ok(&["build"]);
+    assert_eq!(locked(&p), ["a 1.0.0", "app 0.1.0", "b 1.0.0"]);
+}
+
+#[test]
+fn resolution_backtracks_several_crates_when_one_is_not_enough() {
+    let reg = local_registry(&[
+        ("a", "1.0.0", &[]),
+        ("a", "1.1.0", &[]),
+        ("b", "1.0.0", &[("a", "^1.0")]),
+        ("b", "2.0.0", &[("a", "^1.1")]),
+        ("c", "1.0.0", &[("a", "^1.0")]),
+        ("c", "2.0.0", &[("a", "^1.1")]),
+    ]);
+    let p = app_with(&reg, "a = \"=1.0.0\"\nb = \"*\"\nc = \"*\"\n");
+    p.ok(&["build"]);
+    assert_eq!(locked(&p), ["a 1.0.0", "app 0.1.0", "b 1.0.0", "c 1.0.0"]);
+}
+
+#[test]
+fn update_precise_and_dry_run_move_one_package_like_cargo() {
+    let reg = local_registry(&[
+        ("foo", "1.0.0", &[]),
+        ("foo", "1.1.0", &[]),
+        ("foo", "1.2.0", &[]),
+    ]);
+    let p = app_with(&reg, "foo = \"1\"\n");
+    p.ok(&["build"]);
+    assert_eq!(locked(&p), ["app 0.1.0", "foo 1.2.0"]);
+
+    let out = p.ok(&["update", "-p", "foo", "--precise", "1.0.0", "--dry-run"]);
+    assert!(out.contains("foo v1.2.0 -> v1.0.0"), "{out}");
+    assert_eq!(locked(&p), ["app 0.1.0", "foo 1.2.0"]);
+
+    p.ok(&["update", "-p", "foo", "--precise", "1.0.0"]);
+    assert_eq!(locked(&p), ["app 0.1.0", "foo 1.0.0"]);
+    assert!(p.ok(&["build"]).contains("compiled"));
+    assert_eq!(locked(&p), ["app 0.1.0", "foo 1.0.0"]);
+
+    let out = p.igl(&["update", "foo", "--precise", "2.0.0"]);
+    assert!(!out.status.success());
+    assert!(
+        text(&out).contains("cannot update `foo` to 2.0.0"),
+        "{}",
+        text(&out)
+    );
+    assert_eq!(locked(&p), ["app 0.1.0", "foo 1.0.0"]);
+
+    p.ok(&["update", "foo"]);
+    assert_eq!(locked(&p), ["app 0.1.0", "foo 1.2.0"]);
+}
+
+#[test]
+fn add_lists_the_features_it_turns_on_like_cargo() {
+    let reg = local_registry(&[("foo", "1.0.0", &[])]);
+    let optional = |name: &str| {
+        format!(
+            "{{\"name\":\"{name}\",\"req\":\"1\",\"features\":[],\"optional\":true,\"default_features\":true,\"target\":null,\"kind\":\"normal\"}}"
+        )
+    };
+    let file = reg.path().join("index/3/f/foo");
+    let record = std::fs::read_to_string(&file)
+        .unwrap()
+        .replace(
+            "\"deps\":[]",
+            &format!("\"deps\":[{},{}]", optional("foo_derive"), optional("bar")),
+        )
+        .replace(
+            "\"features\":{}",
+            "\"features\":{\"default\":[\"std\"],\"std\":[],\"derive\":[\"dep:foo_derive\"],\"extra\":[\"bar\"]},\"rust_version\":\"1.70\",\"pubtime\":\"2026-01-02T03:04:05Z\"",
+        );
+    std::fs::write(&file, record).unwrap();
+    let p = app_with(&reg, "");
+    let out = p.ok(&["add", "foo", "-F", "extra", "--dry-run"]);
+    let listed: Vec<&str> = out
+        .lines()
+        .map(str::trim)
+        .filter(|l| l.starts_with("+ ") || l.starts_with("- "))
+        .collect();
+    assert_eq!(listed, ["+ bar", "+ extra", "+ std", "- derive"], "{out}");
+    assert!(
+        out.contains("needs Rust 1.70, published 2026-01-02"),
+        "{out}"
+    );
+    let quiet = p.ok(&["add", "foo", "--no-default-features", "--dry-run"]);
+    assert!(quiet.contains("- std"), "{quiet}");
+}
+
+#[test]
+fn add_supports_renames_platforms_workspace_deps_and_replaced_sources() {
+    let reg = local_registry(&[("foo", "1.0.0", &[]), ("foo", "1.4.2", &[])]);
+    let p = app_with(&reg, "");
+    p.ok(&["add", "foo", "--rename", "bar", "--target", "cfg(unix)"]);
+    let manifest = p.read("Cargo.toml");
+    assert!(
+        manifest.contains("[target.'cfg(unix)'.dependencies]")
+            && manifest.contains("bar = { version = \"1.4.2\", package = \"foo\" }"),
+        "{manifest}"
+    );
+    let out = p.ok(&["add", "foo@1.0", "--dev", "--dry-run"]);
+    assert!(out.contains("would add"), "{out}");
+    assert_eq!(p.read("Cargo.toml"), manifest);
+
+    let w = Project::new();
+    w.write(
+        "Cargo.toml",
+        "[workspace]\nmembers = [\"m\"]\n\n[workspace.dependencies]\nfoo = \"1.0.0\"\n",
+    );
+    w.write(
+        "m/Cargo.toml",
+        "[package]\nname = \"m\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    w.write("m/src/lib.rs", "");
+    w.write(".cargo/config.toml", &p.read(".cargo/config.toml"));
+    w.ok(&["add", "foo", "-p", "m"]);
+    assert!(
+        w.read("m/Cargo.toml")
+            .contains("foo = { workspace = true }")
+    );
+}
+
+#[test]
+fn clippy_lints_members_while_build_scripts_see_the_real_rustc() {
+    if Command::new("clippy-driver")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        eprintln!("clippy-driver not installed; skipping");
+        return;
+    }
+    let p = Project::new();
+    p.write("Cargo.toml", LIB_MANIFEST);
+    p.write(
+        "build.rs",
+        r#"fn main() {
+    let rustc = std::env::var("RUSTC").unwrap();
+    let out = std::process::Command::new(rustc).arg("--version").output().unwrap();
+    let v = String::from_utf8(out.stdout).unwrap();
+    assert!(v.starts_with("rustc "), "RUSTC is not rustc: {v}");
+}
+"#,
+    );
+    p.write(
+        "src/main.rs",
+        "fn five() -> i32 { return 5; }\nfn main() { println!(\"{}\", five()); }\n",
+    );
+    let out = p.ok(&["clippy"]);
+    assert!(
+        out.contains("needless_return") || out.contains("unneeded `return`"),
+        "{out}"
+    );
+    let out = p.igl(&["clippy", "--", "-D", "warnings"]);
+    assert!(!out.status.success(), "{}", text(&out));
+}
+
+#[test]
+fn trim_paths_keeps_this_machines_paths_out_of_the_binary() {
+    let p = Project::new();
+    p.write(
+        "Cargo.toml",
+        &format!("{LIB_MANIFEST}\n[profile.release]\ntrim-paths = true\n"),
+    );
+    p.write("src/main.rs", "fn main() { panic!(\"where am I\"); }\n");
+    p.ok(&["build", "--release"]);
+    let exe = p.path().join(".igel/target/release").join(exe("demo"));
+    let run = Command::new(&exe).output().unwrap();
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert!(stderr.contains(&native("src/main.rs:1")), "{stderr}");
+    let root = igel_common::fsutil::canonicalize(p.path()).unwrap();
+    assert!(!stderr.contains(root.to_str().unwrap()), "{stderr}");
+    let bytes = std::fs::read(&exe).unwrap();
+    for path in [root.to_str().unwrap(), p.home().to_str().unwrap()] {
+        assert!(
+            !bytes.windows(path.len()).any(|w| w == path.as_bytes()),
+            "the binary still names {path}"
+        );
+    }
+
+    p.write("Cargo.toml", LIB_MANIFEST);
+    p.ok(&["build", "--release"]);
+    let run = Command::new(&exe).output().unwrap();
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert!(stderr.contains(&native("src/main.rs:1")), "{stderr}");
+    assert!(!stderr.contains(root.to_str().unwrap()), "{stderr}");
+}
+
+#[test]
+fn compiler_messages_name_workspace_files_relative_to_the_root() {
+    let p = Project::new();
+    p.write(
+        "Cargo.toml",
+        "[workspace]\nresolver = \"2\"\nmembers = [\"app\"]\n",
+    );
+    p.write(
+        "app/Cargo.toml",
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    p.write("app/src/main.rs", "fn main() { let x: u32 = \"no\"; }\n");
+    let out = p.igl(&["build"]);
+    assert!(!out.status.success());
+    let text = text(&out);
+    assert!(text.contains(&native("--> app/src/main.rs:1:26")), "{text}");
+    let root = igel_common::fsutil::canonicalize(p.path()).unwrap();
+    assert!(!text.contains(root.to_str().unwrap()), "{text}");
+    let verdict = text.find("could not compile app v0.1.0").expect(&text);
+    assert!(verdict > text.find("mismatched types").unwrap(), "{text}");
+    assert_eq!(text.matches("could not compile").count(), 1, "{text}");
+
+    p.write(
+        "app/src/main.rs",
+        "#![warn(unused_parens)]\nfn main() { let x = (1); let _ = x; }\n",
+    );
+    p.ok(&["fix", "--allow-no-vcs"]);
+    assert!(
+        p.read("app/src/main.rs").contains("let x = 1;"),
+        "{}",
+        p.read("app/src/main.rs")
+    );
+}
+
+#[test]
+fn explain_says_what_changed_since_the_last_build() {
+    let p = Project::new();
+    p.write(
+        "Cargo.toml",
+        "[workspace]\nmembers = [\"core\", \"app\"]\nresolver = \"2\"\n",
+    );
+    p.write(
+        "core/Cargo.toml",
+        "[package]\nname = \"core\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    p.write("core/src/lib.rs", "pub fn f() -> u8 { 1 }\n");
+    p.write(
+        "app/Cargo.toml",
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[dependencies]\ncore = { path = \"../core\" }\n",
+    );
+    p.write("app/src/main.rs", "fn main() { core::f(); }\n");
+    p.ok(&["build"]);
+    assert!(p.ok(&["explain"]).contains("nothing would be compiled"));
+
+    p.write("core/src/lib.rs", "pub fn f() -> u8 { 2 }\n");
+    p.write("core/src/extra.rs", "\n");
+    let out = p.ok(&["explain"]);
+    assert!(
+        out.contains("sources changed: src/extra.rs (added), src/lib.rs (modified)"),
+        "{out}"
+    );
+    assert!(out.contains("a dependency changed: core"), "{out}");
+    assert!(out.contains("2 of 2 units would be compiled"), "{out}");
+
+    p.ok(&["build"]);
+    assert!(p.ok(&["explain"]).contains("nothing would be compiled"));
+}
+
+#[test]
+fn fmt_check_after_the_separator_works_as_in_ci() {
+    let p = Project::new();
+    p.write("Cargo.toml", LIB_MANIFEST);
+    p.write("src/main.rs", "fn main(){let x=1;println!(\"{}\",x);}\n");
+    let out = p.igl(&["fmt", "--all", "--", "--check"]);
+    assert!(!out.status.success(), "{}", text(&out));
+    assert!(
+        p.read("src/main.rs").starts_with("fn main(){"),
+        "--check must not write"
+    );
+    p.ok(&["fmt"]);
+    p.ok(&["fmt", "--all", "--", "--check"]);
+}
+
+#[test]
+fn install_from_a_registry_lists_upgrades_and_uninstalls_like_cargo() {
+    let reg = tempfile::tempdir().unwrap();
+    let mut index = String::new();
+    for version in ["1.0.0", "1.1.0"] {
+        let main = format!("fn main() {{ println!(\"tool {version}\"); }}\n");
+        let (bytes, sum) = make_crate_with("tool", version, &[("src/main.rs", &main)]);
+        std::fs::write(reg.path().join(format!("tool-{version}.crate")), bytes).unwrap();
+        index.push_str(&format!(
+            "{{\"name\":\"tool\",\"vers\":\"{version}\",\"deps\":[],\"cksum\":\"{sum}\",\"features\":{{}},\"yanked\":false}}\n"
+        ));
+    }
+    std::fs::create_dir_all(reg.path().join("index/to/ol")).unwrap();
+    std::fs::write(reg.path().join("index/to/ol/tool"), index).unwrap();
+
+    let p = Project::new();
+    p.write(
+        ".cargo/config.toml",
+        &format!(
+            "[source.crates-io]\nreplace-with = \"local\"\n[source.local]\nlocal-registry = {:?}\n",
+            reg.path()
+        ),
+    );
+    let root = p.path().join("installed");
+    let root_arg = root.to_str().unwrap();
+    let run_tool = || {
+        let out = Command::new(root.join("bin/tool")).output().unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+
+    p.ok(&["install", "tool@1.0.0", "--root", root_arg]);
+    assert_eq!(run_tool(), "tool 1.0.0");
+    let list = p.ok(&["install", "--list", "--root", root_arg]);
+    assert!(list.contains("tool v1.0.0:\n    tool"), "{list}");
+    let tracking = std::fs::read_to_string(root.join(".crates.toml")).unwrap();
+    assert!(
+        tracking.contains(
+            "\"tool 1.0.0 (registry+https://github.com/rust-lang/crates.io-index)\" = [\"tool\"]"
+        ),
+        "{tracking}"
+    );
+    assert!(root.join(".crates2.json").is_file());
+
+    let again = p.ok(&["install", "tool@1.0.0", "--root", root_arg]);
+    assert!(again.contains("already installed"), "{again}");
+    p.ok(&["install", "tool", "--root", root_arg]);
+    assert_eq!(run_tool(), "tool 1.1.0");
+    let tracking = std::fs::read_to_string(root.join(".crates.toml")).unwrap();
+    assert!(
+        tracking.contains("tool 1.1.0") && !tracking.contains("tool 1.0.0"),
+        "{tracking}"
+    );
+
+    p.ok(&["uninstall", "tool", "--root", root_arg]);
+    assert!(!root.join("bin/tool").exists());
+    let out = p.igl(&["uninstall", "tool", "--root", root_arg]);
+    assert!(!out.status.success());
+    assert!(text(&out).contains("not installed"), "{}", text(&out));
+    let scratch = p.home().join("install");
+    assert!(
+        !scratch.exists() || std::fs::read_dir(&scratch).unwrap().next().is_none(),
+        "scratch builds were not cleaned up"
+    );
+}
+
+#[test]
+fn a_cargo_lock_changed_outside_igel_is_respected_not_reverted() {
+    let reg = tempfile::tempdir().unwrap();
+    let mut index = String::new();
+    let mut sums = Vec::new();
+    for (version, says) in [("1.0.0", "one-oh"), ("1.1.0", "one-one")] {
+        let lib = format!("pub fn says() -> &'static str {{ \"{says}\" }}\n");
+        let (bytes, sum) = make_crate("foo", version, &lib);
+        std::fs::write(reg.path().join(format!("foo-{version}.crate")), bytes).unwrap();
+        index.push_str(&format!(
+            "{{\"name\":\"foo\",\"vers\":\"{version}\",\"deps\":[],\"cksum\":\"{sum}\",\"features\":{{}},\"yanked\":false}}\n"
+        ));
+        sums.push(sum);
+    }
+    std::fs::create_dir_all(reg.path().join("index/3/f")).unwrap();
+    std::fs::write(reg.path().join("index/3/f/foo"), index).unwrap();
+
+    let p = registry_app("\"1\"");
+    p.write(
+        ".cargo/config.toml",
+        &format!(
+            "[source.crates-io]\nreplace-with = \"local\"\n[source.local]\nlocal-registry = {:?}\n",
+            reg.path()
+        ),
+    );
+    assert!(p.ok(&["run"]).contains("foo says one-one"));
+
+    let older = p
+        .read("Cargo.lock")
+        .replace("version = \"1.1.0\"", "version = \"1.0.0\"")
+        .replace(&sums[1], &sums[0]);
+    p.write("Cargo.lock", &older);
+    let out = p.ok(&["run"]);
+    assert!(out.contains("foo says one-oh"), "{out}");
+    assert_eq!(p.read("Cargo.lock"), older);
+    p.ok(&["fetch"]);
+    assert!(p.ok(&["tree"]).contains("foo v1.0.0"));
+    assert_eq!(p.read("Cargo.lock"), older);
+}
+
+#[test]
+fn vendored_directories_replace_crates_io_for_offline_builds() {
+    let (_, sum) = make_crate("foo", "1.0.0", FOO_LIB);
+    let p = registry_app("\"1\"");
+    p.write(
+        "vendor/foo-1.0.0/Cargo.toml",
+        "[package]\nname = \"foo\"\nversion = \"1.0.0\"\nedition = \"2021\"\n",
+    );
+    p.write("vendor/foo-1.0.0/src/lib.rs", FOO_LIB);
+    p.write(
+        "vendor/foo-1.0.0/.cargo-checksum.json",
+        &format!("{{\"package\":\"{sum}\",\"files\":{{}}}}"),
+    );
+    p.write(
+        ".cargo/config.toml",
+        "[source.crates-io]\nreplace-with = \"vendored\"\n[source.vendored]\ndirectory = \"vendor\"\n",
+    );
+    let out = p.ok(&["run", "--offline"]);
+    assert!(out.contains("foo says hello from the registry"), "{out}");
+    assert!(
+        p.read("Cargo.lock")
+            .contains(&format!("checksum = \"{sum}\""))
+    );
+}
+
+fn serve_registry(token: &'static str, crate_bytes: Vec<u8>, index_line: String) -> u16 {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let crate_bytes = crate_bytes.clone();
+            let index_line = index_line.clone();
+            std::thread::spawn(move || {
+                let mut stream = stream;
+                let mut head = Vec::new();
+                let mut byte = [0u8; 1];
+                while !head.ends_with(b"\r\n\r\n") {
+                    match stream.read(&mut byte) {
+                        Ok(1) => head.push(byte[0]),
+                        _ => return,
+                    }
+                }
+                let head = String::from_utf8_lossy(&head).into_owned();
+                let path = head
+                    .lines()
+                    .next()
+                    .and_then(|l| l.split_whitespace().nth(1))
+                    .unwrap_or("/")
+                    .to_string();
+                let authorized = head.lines().any(|l| {
+                    l.to_ascii_lowercase()
+                        .strip_prefix("authorization:")
+                        .is_some_and(|v| v.trim() == token.to_ascii_lowercase())
+                });
+                let (status, body): (&str, Vec<u8>) = if !authorized {
+                    ("401 Unauthorized", b"auth required".to_vec())
+                } else if path == "/config.json" {
+                    (
+                        "200 OK",
+                        format!("{{\"dl\":\"http://127.0.0.1:{port}/dl\",\"api\":\"http://127.0.0.1:{port}\",\"auth-required\":true}}")
+                            .into_bytes(),
+                    )
+                } else if path == "/3/f/foo" {
+                    ("200 OK", index_line.into_bytes())
+                } else if path == "/dl/foo/1.0.0/download" {
+                    ("200 OK", crate_bytes)
+                } else {
+                    ("404 Not Found", Vec::new())
+                };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.write_all(&body);
+                let _ = stream.flush();
+                let _ = stream.shutdown(std::net::Shutdown::Both);
+            });
+        }
+    });
+    port
+}
+
+#[derive(Default)]
+struct MockRegistry {
+    crates: std::collections::HashMap<(String, String), Vec<u8>>,
+    index: std::collections::BTreeMap<String, Vec<serde_json::Value>>,
+}
+
+fn serve_publishing_registry(
+    token: &'static str,
+) -> (u16, std::sync::Arc<std::sync::Mutex<MockRegistry>>) {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    let state = std::sync::Arc::new(std::sync::Mutex::new(MockRegistry::default()));
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let shared = state.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let state = shared.clone();
+            std::thread::spawn(move || {
+                let mut stream = stream;
+                let mut head = Vec::new();
+                let mut byte = [0u8; 1];
+                while !head.ends_with(b"\r\n\r\n") {
+                    match stream.read(&mut byte) {
+                        Ok(1) => head.push(byte[0]),
+                        _ => return,
+                    }
+                }
+                let head = String::from_utf8_lossy(&head).into_owned();
+                let mut first = head.lines().next().unwrap_or("").split_whitespace();
+                let method = first.next().unwrap_or("").to_string();
+                let target = first.next().unwrap_or("/").to_string();
+                let header = |name: &str| {
+                    head.lines().find_map(|l| {
+                        let (k, v) = l.split_once(':')?;
+                        k.eq_ignore_ascii_case(name).then(|| v.trim().to_string())
+                    })
+                };
+                let len: usize = header("content-length")
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0);
+                let mut body = vec![0u8; len];
+                if stream.read_exact(&mut body).is_err() {
+                    return;
+                }
+                let authorized = header("authorization").as_deref() == Some(token);
+                let (path, query) = target.split_once('?').unwrap_or((&target, ""));
+                let segs: Vec<&str> = path.trim_matches('/').split('/').collect();
+                let json = |v: serde_json::Value| ("200 OK", v.to_string().into_bytes());
+                let mut st = state.lock().unwrap();
+                let (status, out): (&str, Vec<u8>) = match (method.as_str(), segs.as_slice()) {
+                    ("GET", ["config.json"]) => json(serde_json::json!({
+                        "dl": format!("http://127.0.0.1:{port}/dl"),
+                        "api": format!("http://127.0.0.1:{port}"),
+                    })),
+                    ("GET", ["dl", name, version, "download"]) => {
+                        match st.crates.get(&(name.to_string(), version.to_string())) {
+                            Some(b) => ("200 OK", b.clone()),
+                            None => ("404 Not Found", Vec::new()),
+                        }
+                    }
+                    ("PUT", ["api", "v1", "crates", "new"]) if authorized => {
+                        let n = u32::from_le_bytes(body[0..4].try_into().unwrap()) as usize;
+                        let meta: serde_json::Value =
+                            serde_json::from_slice(&body[4..4 + n]).unwrap();
+                        let c = u32::from_le_bytes(body[4 + n..8 + n].try_into().unwrap()) as usize;
+                        let bytes = body[8 + n..8 + n + c].to_vec();
+                        let tmp = tempfile::NamedTempFile::new().unwrap();
+                        std::fs::write(tmp.path(), &bytes).unwrap();
+                        let sum = igel_registry::download::sha256_file(tmp.path()).unwrap();
+                        let name = meta["name"].as_str().unwrap().to_string();
+                        let vers = meta["vers"].as_str().unwrap().to_string();
+                        let deps: Vec<serde_json::Value> = meta["deps"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .map(|d| {
+                                let alias = d["explicit_name_in_toml"].as_str();
+                                serde_json::json!({
+                                    "name": alias.unwrap_or(d["name"].as_str().unwrap()),
+                                    "package": alias.map(|_| d["name"].clone()),
+                                    "req": d["version_req"],
+                                    "features": d["features"],
+                                    "optional": d["optional"],
+                                    "default_features": d["default_features"],
+                                    "target": d["target"],
+                                    "kind": d["kind"],
+                                    "registry": d["registry"],
+                                })
+                            })
+                            .collect();
+                        st.index
+                            .entry(name.clone())
+                            .or_default()
+                            .push(serde_json::json!({
+                                "name": name, "vers": vers, "deps": deps, "cksum": sum,
+                                "features": meta["features"], "yanked": false,
+                            }));
+                        st.crates.insert((name, vers), bytes);
+                        json(
+                            serde_json::json!({"warnings": {"invalid_categories": [], "invalid_badges": [], "other": []}}),
+                        )
+                    }
+                    ("DELETE" | "PUT", ["api", "v1", "crates", name, version, action])
+                        if authorized && (*action == "yank" || *action == "unyank") =>
+                    {
+                        for line in st.index.get_mut(*name).into_iter().flatten() {
+                            if line["vers"] == *version {
+                                line["yanked"] = serde_json::json!(*action == "yank");
+                            }
+                        }
+                        json(serde_json::json!({"ok": true}))
+                    }
+                    ("GET", ["api", "v1", "crates", _, "owners"]) if authorized => {
+                        json(serde_json::json!({"users": [{"login": "ada", "name": "Ada"}]}))
+                    }
+                    ("GET", ["api", "v1", "crates"]) => {
+                        let q = query
+                            .split('&')
+                            .find_map(|kv| kv.strip_prefix("q="))
+                            .unwrap_or("");
+                        let hits: Vec<serde_json::Value> = st
+                            .index
+                            .iter()
+                            .filter(|(n, _)| n.contains(q))
+                            .map(|(n, lines)| {
+                                serde_json::json!({
+                                    "name": n,
+                                    "max_version": lines.last().unwrap()["vers"],
+                                    "description": "mock crate",
+                                })
+                            })
+                            .collect();
+                        json(serde_json::json!({"crates": hits, "meta": {"total": hits.len()}}))
+                    }
+                    ("GET", [.., name]) if st.index.contains_key(*name) => {
+                        let text: String =
+                            st.index[*name].iter().map(|l| format!("{l}\n")).collect();
+                        ("200 OK", text.into_bytes())
+                    }
+                    ("PUT" | "DELETE", ["api", ..]) => (
+                        "403 Forbidden",
+                        br#"{"errors":[{"detail":"must be logged in"}]}"#.to_vec(),
+                    ),
+                    _ => ("404 Not Found", Vec::new()),
+                };
+                drop(st);
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    out.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.write_all(&out);
+                let _ = stream.flush();
+            });
+        }
+    });
+    (port, state)
+}
+
+#[test]
+fn a_locked_release_newer_than_the_cached_index_is_fetched_not_downgraded() {
+    let (port, state) = serve_publishing_registry("unused");
+    let add = |version: &str| -> String {
+        let (bytes, sum) = make_crate("stale", version, "pub fn v() {}\n");
+        let mut st = state.lock().unwrap();
+        st.index
+            .entry("stale".into())
+            .or_default()
+            .push(serde_json::json!({
+                "name": "stale", "vers": version, "deps": [], "cksum": sum,
+                "features": {}, "yanked": false,
+            }));
+        st.crates.insert(("stale".into(), version.into()), bytes);
+        sum
+    };
+    let old_sum = add("1.0.0");
+    let p = Project::new();
+    p.write(
+        "Cargo.toml",
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\
+         [dependencies]\nstale = { version = \"1\", registry = \"mock\" }\n",
+    );
+    p.write("src/main.rs", "fn main() {}\n");
+    p.write(
+        ".cargo/config.toml",
+        &format!("[registries.mock]\nindex = \"sparse+http://127.0.0.1:{port}/\"\n"),
+    );
+    p.ok(&["build"]);
+    assert!(p.read("Cargo.lock").contains("version = \"1.0.0\""));
+
+    let new_sum = add("1.0.1");
+    let lock = p
+        .read("Cargo.lock")
+        .replace("version = \"1.0.0\"", "version = \"1.0.1\"")
+        .replace(&old_sum, &new_sum);
+    p.write("Cargo.lock", &lock);
+    p.ok(&["build"]);
+    let lock = p.read("Cargo.lock");
+    assert!(lock.contains("version = \"1.0.1\""), "{lock}");
+
+    let new_sum = add("1.0.2");
+    p.write(
+        "Cargo.lock",
+        &lock
+            .replace("version = \"1.0.1\"", "version = \"1.0.2\"")
+            .replace(&old_sum, &new_sum),
+    );
+    let out = p.igl(&["build", "--offline"]);
+    assert!(!out.status.success());
+    assert!(text(&out).contains("without `--offline`"), "{}", text(&out));
+}
+
+#[test]
+fn packages_are_published_installed_yanked_and_owned_through_a_registry_api() {
+    let (port, state) = serve_publishing_registry("tok-123");
+    let p = Project::new();
+    p.write(
+        "Cargo.toml",
+        "[workspace]\nmembers = [\"lib\", \"app\"]\nresolver = \"2\"\n\n[workspace.package]\nversion = \"0.3.0\"\nedition = \"2021\"\nlicense = \"MIT\"\n",
+    );
+    p.write(
+        "lib/Cargo.toml",
+        "[package]\nname = \"mocklib\"\nversion.workspace = true\nedition.workspace = true\nlicense.workspace = true\ndescription = \"lib\"\n",
+    );
+    p.write("lib/src/lib.rs", "pub fn answer() -> u32 { 42 }\n");
+    p.write(
+        "app/Cargo.toml",
+        "[package]\nname = \"mockapp\"\nversion.workspace = true\nedition.workspace = true\nlicense.workspace = true\ndescription = \"app\"\n\n[dependencies]\nmocklib = { path = \"../lib\", version = \"0.3.0\", registry = \"mock\" }\n",
+    );
+    p.write(
+        "app/src/main.rs",
+        "fn main() { println!(\"published answer {}\", mocklib::answer()); }\n",
+    );
+    p.write(".gitignore", ".igel\n");
+    p.write(
+        ".cargo/config.toml",
+        &format!("[registries.mock]\nindex = \"sparse+http://127.0.0.1:{port}/\"\n"),
+    );
+    let git = |args: &[&str]| {
+        assert!(
+            Command::new("git")
+                .args(args)
+                .current_dir(p.path())
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .status()
+                .unwrap()
+                .success()
+        )
+    };
+    git(&["init", "-q"]);
+    git(&["add", "-A"]);
+    git(&["commit", "-qm", "init"]);
+
+    let cargo_home = tempfile::tempdir().unwrap();
+    let igl = |args: &[&str]| {
+        igel_command()
+            .args(args)
+            .current_dir(p.path())
+            .env("IGEL_HOME", p.home())
+            .env("CARGO_HOME", cargo_home.path())
+            .env("NO_COLOR", "1")
+            .output()
+            .unwrap()
+    };
+    let ok = |args: &[&str]| {
+        let out = igl(args);
+        assert!(
+            out.status.success(),
+            "`igl {}` failed:\n{}",
+            args.join(" "),
+            text(&out)
+        );
+        text(&out)
+    };
+
+    let out = igl(&[
+        "publish",
+        "-p",
+        "mocklib",
+        "--registry",
+        "mock",
+        "--no-verify",
+    ]);
+    assert!(!out.status.success());
+    assert!(
+        text(&out).contains("igl login --registry mock"),
+        "{}",
+        text(&out)
+    );
+
+    ok(&["login", "--registry", "mock", "tok-123"]);
+    let creds = std::fs::read_to_string(cargo_home.path().join("credentials.toml")).unwrap();
+    assert!(
+        creds.contains("[registries.mock]") && creds.contains("tok-123"),
+        "{creds}"
+    );
+
+    let out = ok(&["publish", "-p", "mocklib", "--registry", "mock"]);
+    assert!(out.contains("uploaded mocklib v0.3.0"), "{out}");
+    ok(&["publish", "-p", "mockapp", "--registry", "mock"]);
+    {
+        let st = state.lock().unwrap();
+        let app = &st.index["mockapp"][0];
+        assert_eq!(app["deps"][0]["name"], "mocklib");
+        assert_eq!(app["deps"][0]["req"], "^0.3.0");
+        assert!(app["deps"][0]["registry"].is_null(), "{app}");
+        let bytes = st.crates[&("mockapp".to_string(), "0.3.0".to_string())].clone();
+        let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(&bytes[..]));
+        let manifest = archive
+            .entries()
+            .unwrap()
+            .flatten()
+            .find(|e| e.path().unwrap() == Path::new("mockapp-0.3.0/Cargo.toml"))
+            .map(|mut e| {
+                let mut text = String::new();
+                std::io::Read::read_to_string(&mut e, &mut text).unwrap();
+                text
+            })
+            .expect("the package has a manifest");
+        assert!(!manifest.contains("path ="), "{manifest}");
+        assert!(manifest.contains("version = \"0.3.0\""), "{manifest}");
+    }
+
+    let root = p.path().join("bin-root");
+    ok(&[
+        "install",
+        "mockapp",
+        "--registry",
+        "mock",
+        "--root",
+        root.to_str().unwrap(),
+    ]);
+    let run = Command::new(root.join("bin/mockapp")).output().unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout),
+        "published answer 42\n"
+    );
+
+    let found = ok(&["search", "mock", "--registry", "mock"]);
+    assert!(found.contains("mocklib = \"0.3.0\""), "{found}");
+    assert!(ok(&["owner", "--list", "mocklib", "--registry", "mock"]).contains("ada (Ada)"));
+    ok(&["yank", "mocklib@0.3.0", "--registry", "mock"]);
+    assert_eq!(state.lock().unwrap().index["mocklib"][0]["yanked"], true);
+    ok(&["yank", "mocklib@0.3.0", "--undo", "--registry", "mock"]);
+    assert_eq!(state.lock().unwrap().index["mocklib"][0]["yanked"], false);
+
+    ok(&["logout", "--registry", "mock"]);
+    let creds = std::fs::read_to_string(cargo_home.path().join("credentials.toml")).unwrap();
+    assert!(!creds.contains("tok-123"), "{creds}");
+}
+
+#[cfg(unix)]
+#[test]
+fn registry_tokens_come_from_external_credential_providers() {
+    let (port, state) = serve_publishing_registry("tok-from-provider");
+    state
+        .lock()
+        .unwrap()
+        .index
+        .entry("foo".into())
+        .or_default()
+        .push(serde_json::json!({"name": "foo", "vers": "1.0.0", "deps": [], "cksum": "00", "features": {}, "yanked": false}));
+    let p = Project::new();
+    p.write(
+        "provider.sh",
+        "#!/bin/sh\necho '{\"v\":[1]}'\nread req\necho '{\"Ok\":{\"kind\":\"get\",\"token\":\"tok-from-provider\",\"cache\":\"session\",\"operation_independent\":true}}'\n",
+    );
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(
+        p.path().join("provider.sh"),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    p.write(
+        ".cargo/config.toml",
+        &format!(
+            "[registries.mock]\nindex = \"sparse+http://127.0.0.1:{port}/\"\ncredential-provider = {:?}\n",
+            p.path().join("provider.sh").display().to_string()
+        ),
+    );
+    let cargo_home = tempfile::tempdir().unwrap();
+    let out = igel_command()
+        .args(["yank", "foo@1.0.0", "--registry", "mock"])
+        .current_dir(p.path())
+        .env("IGEL_HOME", p.home())
+        .env("CARGO_HOME", cargo_home.path())
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", text(&out));
+    assert_eq!(state.lock().unwrap().index["foo"][0]["yanked"], true);
+}
+
+#[test]
+fn git_based_registry_indexes_resolve_download_and_lock_like_cargo() {
+    let (port, state) = serve_publishing_registry("unused");
+    let (bytes, sum) = make_crate("foo", "1.0.0", FOO_LIB);
+    state
+        .lock()
+        .unwrap()
+        .crates
+        .insert(("foo".into(), "1.0.0".into()), bytes);
+    let index = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(index.path().join("3/f")).unwrap();
+    std::fs::write(
+        index.path().join("3/f/foo"),
+        format!("{{\"name\":\"foo\",\"vers\":\"1.0.0\",\"deps\":[],\"cksum\":\"{sum}\",\"features\":{{}},\"yanked\":false}}\n"),
+    )
+    .unwrap();
+    std::fs::write(
+        index.path().join("config.json"),
+        format!("{{\"dl\":\"http://127.0.0.1:{port}/dl\"}}"),
+    )
+    .unwrap();
+    for args in [
+        &["init", "-q"][..],
+        &["add", "-A"],
+        &["commit", "-qm", "index"],
+    ] {
+        assert!(
+            Command::new("git")
+                .args(args)
+                .current_dir(index.path())
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+    let url = igel_common::fsutil::file_url(index.path());
+    let p = registry_app("{ version = \"1\", registry = \"corp\" }");
+    p.write(
+        ".cargo/config.toml",
+        &format!("[registries.corp]\nindex = \"{url}\"\n"),
+    );
+    let out = p.ok(&["run"]);
+    assert!(out.contains("foo says hello from the registry"), "{out}");
+    let lock = p.read("Cargo.lock");
+    assert!(
+        lock.contains(&format!("source = \"registry+{url}\"")),
+        "{lock}"
+    );
+    assert!(lock.contains(&format!("checksum = \"{sum}\"")), "{lock}");
+    std::fs::remove_dir_all(p.path().join(".igel")).unwrap();
+    assert!(p.ok(&["run", "--offline"]).contains("foo says"));
+}
+
+#[test]
+fn authenticated_alternative_registries_resolve_download_and_are_part_of_the_identity() {
+    let (bytes, sum) = make_crate("foo", "1.0.0", FOO_LIB);
+    let line = format!(
+        "{{\"name\":\"foo\",\"vers\":\"1.0.0\",\"deps\":[],\"cksum\":\"{sum}\",\"features\":{{}},\"yanked\":false}}\n"
+    );
+    let port = serve_registry("secret-token", bytes, line);
+    let index = format!("sparse+http://127.0.0.1:{port}/");
+
+    let p = registry_app("{ version = \"1\", registry = \"corp\" }");
+    p.write(
+        ".cargo/config.toml",
+        &format!("[registries.corp]\nindex = {index:?}\n"),
+    );
+
+    let out = p.igl(&["build"]);
+    assert!(!out.status.success());
+    assert!(
+        text(&out).contains("requires authentication"),
+        "{}",
+        text(&out)
+    );
+
+    let with_token = igel_command()
+        .args(["run"])
+        .current_dir(p.path())
+        .env("IGEL_HOME", p.home())
+        .env("NO_COLOR", "1")
+        .env("CARGO_REGISTRIES_CORP_TOKEN", "secret-token")
+        .output()
+        .unwrap();
+    assert!(with_token.status.success(), "{}", text(&with_token));
+    assert!(
+        text(&with_token).contains("foo says hello from the registry"),
+        "{}",
+        text(&with_token)
+    );
+
+    let lock = p.read("Cargo.lock");
+    assert!(lock.contains(&format!("source = \"{index}\"")), "{lock}");
+    assert!(!lock.contains("crates.io-index"), "{lock}");
+}
+
+#[test]
+fn an_undefined_registry_is_an_error_not_a_fallback_to_crates_io() {
+    let p = registry_app("{ version = \"1\", registry = \"nowhere\" }");
+    let out = p.igl(&["build"]);
+    assert!(!out.status.success());
+    assert!(
+        text(&out).contains("registry `nowhere` is not defined"),
+        "{}",
+        text(&out)
+    );
+}
+
+fn run_with_env(p: &Project, var: &str, value: Option<&str>) -> String {
+    let mut cmd = igel_command();
+    cmd.args(["run"])
+        .current_dir(p.path())
+        .env("IGEL_HOME", p.home())
+        .env("NO_COLOR", "1")
+        .env_remove(var);
+    if let Some(v) = value {
+        cmd.env(var, v);
+    }
+    let out = cmd.output().unwrap();
+    assert!(out.status.success(), "{}", text(&out));
+    text(&out)
+}
+
+#[test]
+fn option_env_reads_are_part_of_the_cache_key() {
+    let p = Project::new();
+    p.write(
+        "Cargo.toml",
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    p.write(
+        "src/main.rs",
+        "fn main() { println!(\"tag={}\", option_env!(\"IGEL_TEST_BUILD_TAG\").unwrap_or(\"none\")); }\n",
+    );
+    let a = run_with_env(&p, "IGEL_TEST_BUILD_TAG", Some("a"));
+    assert!(a.contains("tag=a") && a.contains("1 compiled"), "{a}");
+    let b = run_with_env(&p, "IGEL_TEST_BUILD_TAG", Some("b"));
+    assert!(
+        b.contains("tag=b") && b.contains("1 compiled"),
+        "stale artifact reused: {b}"
+    );
+    let unset = run_with_env(&p, "IGEL_TEST_BUILD_TAG", None);
+    assert!(unset.contains("tag=none"), "{unset}");
+    let a_again = run_with_env(&p, "IGEL_TEST_BUILD_TAG", Some("a"));
+    assert!(
+        a_again.contains("tag=a") && a_again.contains("0 compiled"),
+        "{a_again}"
+    );
+}
+
+#[test]
+fn build_script_rerun_if_env_changed_and_external_files_invalidate_the_cache() {
+    let outside = tempfile::tempdir().unwrap();
+    let header = outside.path().join("config.h");
+    std::fs::write(&header, "first").unwrap();
+
+    let p = Project::new();
+    p.write(
+        "Cargo.toml",
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\nbuild = \"build.rs\"\n",
+    );
+    p.write(
+        "build.rs",
+        &format!(
+            r#"fn main() {{
+    println!("cargo::rerun-if-env-changed=IGEL_TEST_SCRIPT_VAR");
+    println!("cargo::rerun-if-changed={{}}", {:?});
+    let var = std::env::var("IGEL_TEST_SCRIPT_VAR").unwrap_or_default();
+    let header = std::fs::read_to_string({:?}).unwrap();
+    println!("cargo::rustc-env=SEEN={{}}/{{}}", var, header);
+}}
+"#,
+            header.display(),
+            header.display()
+        ),
+    );
+    p.write(
+        "src/main.rs",
+        "fn main() { println!(\"seen={}\", env!(\"SEEN\")); }\n",
+    );
+
+    let first = run_with_env(&p, "IGEL_TEST_SCRIPT_VAR", Some("1"));
+    assert!(first.contains("seen=1/first"), "{first}");
+    let second = run_with_env(&p, "IGEL_TEST_SCRIPT_VAR", Some("2"));
+    assert!(
+        second.contains("seen=2/first"),
+        "stale build-script result: {second}"
+    );
+    let third = run_with_env(&p, "IGEL_TEST_SCRIPT_VAR", Some("1"));
+    assert!(
+        third.contains("seen=1/first") && third.contains("0 compiled"),
+        "{third}"
+    );
+    std::fs::write(&header, "second").unwrap();
+    let fourth = run_with_env(&p, "IGEL_TEST_SCRIPT_VAR", Some("1"));
+    assert!(
+        fourth.contains("seen=1/second"),
+        "stale build-script result: {fourth}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn target_runners_wrap_cross_runs() {
+    use std::os::unix::fs::PermissionsExt;
+    let p = lib_project();
+    let host = host_triple();
+    let scratch = tempfile::tempdir().unwrap();
+    let log = scratch.path().join("runner.log");
+    let runner = scratch.path().join("runner.sh");
+    std::fs::write(
+        &runner,
+        format!(
+            "#!/bin/sh\necho \"ran: $(basename \"$1\")\" >> {}\nexec \"$@\"\n",
+            log.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&runner, std::fs::Permissions::from_mode(0o755)).unwrap();
+    p.write(
+        "Cargo.toml",
+        &format!("{LIB_MANIFEST}\n[[bin]]\nname = \"demo-bin\"\npath = \"src/main.rs\"\n"),
+    );
+    p.write(
+        "src/main.rs",
+        "fn main() { println!(\"hello from the binary\"); }\n",
+    );
+    p.write(
+        ".cargo/config.toml",
+        &format!(
+            "[target.{host}]\nrunner = {:?}\n",
+            runner.display().to_string()
+        ),
+    );
+
+    let out = p.ok(&["run"]);
+    assert!(
+        out.contains("hello from the binary") && !log.exists(),
+        "{out}"
+    );
+    let out = p.ok(&["run", "--target", &host]);
+    assert!(out.contains("hello from the binary"), "{out}");
+    assert!(
+        std::fs::read_to_string(&log)
+            .unwrap()
+            .contains("ran: demo-bin"),
+        "the runner was not used"
+    );
+}
+
+#[test]
+fn documentation_is_regenerated_only_when_its_identity_changes() {
+    let p = lib_project();
+    p.write(
+        "src/lib.rs",
+        "/// Adds two numbers.\npub fn add(a: u32, b: u32) -> u32 { a + b }\n",
+    );
+    let first = p.ok(&["doc", "--no-deps"]);
+    assert!(
+        first.contains("documenting demo") && !first.contains("up to date"),
+        "{first}"
+    );
+    assert!(p.path().join(".igel/target/doc/demo/index.html").is_file());
+
+    let second = p.ok(&["doc", "--no-deps"]);
+    assert!(second.contains("up to date"), "{second}");
+
+    p.write(
+        "src/lib.rs",
+        "/// Adds two numbers, differently.\npub fn add(a: u32, b: u32) -> u32 { b + a }\n",
+    );
+    let third = p.ok(&["doc", "--no-deps"]);
+    assert!(
+        third.contains("documenting demo") && !third.contains("up to date"),
+        "{third}"
+    );
+}
+
+#[test]
+fn editing_an_unrelated_manifest_section_does_not_rebuild_the_package() {
+    let p = lib_project();
+    p.ok(&["build"]);
+    p.write(
+        "Cargo.toml",
+        &format!("# an edit that changes nothing\n{LIB_MANIFEST}\n[dev-dependencies]\nhelper = {{ path = \"helper\" }}\n"),
+    );
+    p.write(
+        "helper/Cargo.toml",
+        "[package]\nname = \"helper\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    p.write("helper/src/lib.rs", "");
+    let again = p.ok(&["build"]);
+    assert!(
+        again.contains("0 compiled"),
+        "the library was rebuilt for a manifest-only edit: {again}"
+    );
+}
+
+#[test]
+fn manifest_edits_that_change_the_compilation_still_rebuild() {
+    let p = lib_project();
+    p.ok(&["build"]);
+    p.write(
+        "src/lib.rs",
+        "#[cfg(feature = \"extra\")]\npub fn extra() {}\npub fn add(a: u32, b: u32) -> u32 { a + b }\n",
+    );
+    p.ok(&["build"]);
+    p.write(
+        "Cargo.toml",
+        &format!("{LIB_MANIFEST}[features]\ndefault = [\"extra\"]\nextra = []\n"),
+    );
+    let out = p.ok(&["build"]);
+    assert!(
+        out.contains("1 compiled"),
+        "a changed feature set must rebuild: {out}"
+    );
+}
+
+#[test]
+fn a_crate_that_includes_its_own_manifest_notices_when_it_changes() {
+    let p = Project::new();
+    p.write(
+        "Cargo.toml",
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\ndescription = \"first\"\n",
+    );
+    p.write(
+        "src/main.rs",
+        "fn main() { println!(\"manifest says: {}\", include_str!(\"../Cargo.toml\").lines().find(|l| l.starts_with(\"description\")).unwrap()); }\n",
+    );
+    assert!(p.ok(&["run"]).contains("description = \"first\""));
+    p.write(
+        "Cargo.toml",
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\ndescription = \"second\"\n",
+    );
+    let out = p.ok(&["run"]);
+    assert!(
+        out.contains("description = \"second\""),
+        "stale binary: {out}"
+    );
+}
+
+#[test]
+fn a_build_script_may_not_modify_an_immutable_package_source() {
+    let repo = upstream("v1");
+    let d = repo.path();
+    std::fs::write(
+        d.join("Cargo.toml"),
+        "[package]\nname = \"gitdep\"\nversion = \"0.1.0\"\nedition = \"2021\"\nbuild = \"build.rs\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        d.join("build.rs"),
+        "fn main() { std::fs::write(\"stray-output.txt\", \"oops\").unwrap(); }\n",
+    )
+    .unwrap();
+    git(d, &["add", "-A"]);
+    git(d, &["commit", "--quiet", "-m", "misbehaving script"]);
+    let p = git_app(&format!("{{ git = {:?} }}", url(d)));
+    let out = p.igl(&["build"]);
+    assert!(!out.status.success(), "{}", text(&out));
+    let t = text(&out);
+    assert!(
+        t.contains("modified its own source directory") && t.contains("OUT_DIR"),
+        "{t}"
+    );
+}
+
+fn chain_project(len: usize) -> Project {
+    let p = Project::new();
+    let members: Vec<String> = (0..len).map(|i| format!("\"c{i}\"")).collect();
+    p.write(
+        "Cargo.toml",
+        &format!(
+            "[workspace]\nresolver = \"2\"\nmembers = [\"app\", {}]\n",
+            members.join(", ")
+        ),
+    );
+    for i in 0..len {
+        let dep = if i == 0 {
+            String::new()
+        } else {
+            format!("c{} = {{ path = \"../c{}\" }}\n", i - 1, i - 1)
+        };
+        p.write(
+            &format!("c{i}/Cargo.toml"),
+            &format!(
+                "[package]\nname = \"c{i}\"\nversion = \"0.1.0\"\nedition = \"2021\"\nbuild = \"build.rs\"\n\n[dependencies]\n{dep}"
+            ),
+        );
+        p.write(
+            &format!("c{i}/build.rs"),
+            "fn main() {\n    let out = std::env::var(\"OUT_DIR\").unwrap();\n    std::fs::write(format!(\"{out}/gen.rs\"), \"pub const GEN: u32 = 7;\").unwrap();\n}\n",
+        );
+        let call = if i == 0 {
+            "0".to_string()
+        } else {
+            format!("c{}::value()", i - 1)
+        };
+        p.write(
+            &format!("c{i}/src/lib.rs"),
+            &format!(
+                "include!(concat!(env!(\"OUT_DIR\"), \"/gen.rs\"));\npub fn value() -> u32 {{ {call} + GEN }}\n"
+            ),
+        );
+    }
+    p.write(
+        "app/Cargo.toml",
+        &format!(
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\nc{} = {{ path = \"../c{}\" }}\n",
+            len - 1,
+            len - 1
+        ),
+    );
+    p.write(
+        "app/src/main.rs",
+        &format!(
+            "fn main() {{ println!(\"value={{}}\", c{}::value()); }}\n",
+            len - 1
+        ),
+    );
+    p
+}
+
+#[test]
+fn concurrent_builds_of_one_project_all_succeed_and_share_the_work() {
+    let p = chain_project(8);
+    let outputs: Vec<Output> = std::thread::scope(|s| {
+        let handles: Vec<_> = (0..6).map(|_| s.spawn(|| p.igl(&["build"]))).collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    for (i, out) in outputs.iter().enumerate() {
+        assert!(
+            out.status.success(),
+            "concurrent build #{i} failed:\n{}",
+            text(out)
+        );
+    }
+    let ran = p.ok(&["run", "-p", "app"]);
+    assert!(ran.contains("value=56"), "{ran}");
+    assert!(p.ok(&["build"]).contains("0 compiled"));
+}
+
+#[test]
+fn concurrent_check_and_build_do_not_break_each_other() {
+    let p = chain_project(6);
+    let outputs: Vec<(&str, Output)> = std::thread::scope(|s| {
+        let p = &p;
+        let handles: Vec<_> = ["check", "build", "check", "build"]
+            .into_iter()
+            .map(|cmd| (cmd, s.spawn(move || p.igl(&[cmd]))))
+            .collect();
+        handles
+            .into_iter()
+            .map(|(cmd, h)| (cmd, h.join().unwrap()))
+            .collect()
+    });
+    for (cmd, out) in &outputs {
+        assert!(
+            out.status.success(),
+            "concurrent `{cmd}` failed:\n{}",
+            text(out)
+        );
+    }
+    assert!(p.ok(&["run", "-p", "app"]).contains("value=42"));
+}
+
+#[test]
+fn deps_only_builds_dependencies_and_leaves_the_workspace_alone() {
+    let (_, sum) = make_crate("foo", "1.0.0", FOO_LIB);
+    let p = registry_app("\"1\"");
+    p.write(
+        "vendor/foo-1.0.0/Cargo.toml",
+        "[package]\nname = \"foo\"\nversion = \"1.0.0\"\nedition = \"2021\"\n",
+    );
+    p.write("vendor/foo-1.0.0/src/lib.rs", FOO_LIB);
+    p.write(
+        "vendor/foo-1.0.0/.cargo-checksum.json",
+        &format!("{{\"package\":\"{sum}\",\"files\":{{}}}}"),
+    );
+    p.write(
+        ".cargo/config.toml",
+        "[source.crates-io]\nreplace-with = \"vendored\"\n[source.vendored]\ndirectory = \"vendor\"\n",
+    );
+
+    let out = p.ok(&["build", "--deps-only", "--offline"]);
+    assert!(out.contains("1 compiled"), "only `foo` builds: {out}");
+    assert!(!p.path().join(".igel/target/debug/app").exists());
+
+    let out = p.ok(&["build", "--offline"]);
+    assert!(
+        out.contains("1 compiled") && out.contains("1 cached"),
+        "{out}"
+    );
+    assert!(p.ok(&["run", "--offline"]).contains("foo says hello"));
+}
+
+fn json_lines(out: &Output) -> Vec<serde_json::Value> {
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap_or_else(|e| panic!("not JSON: {l:?} ({e})")))
+        .collect()
+}
+
+#[test]
+fn test_no_run_json_names_every_test_executable_like_cargo() {
+    let p = lib_project();
+    p.write("tests/it.rs", "#[test] fn it() {}\n");
+    let out = p.igl(&[
+        "test",
+        "--no-run",
+        "--message-format",
+        "json-render-diagnostics",
+    ]);
+    assert!(out.status.success(), "{}", text(&out));
+    let tests: Vec<(String, String)> = json_lines(&out)
+        .iter()
+        .filter(|l| l["reason"] == "compiler-artifact" && l["profile"]["test"] == true)
+        .map(|l| {
+            (
+                l["target"]["kind"][0].as_str().unwrap().to_string(),
+                l["executable"].as_str().unwrap_or_default().to_string(),
+            )
+        })
+        .collect();
+    let kinds: Vec<&str> = tests.iter().map(|(k, _)| k.as_str()).collect();
+    assert!(
+        kinds.contains(&"lib") && kinds.contains(&"test"),
+        "{tests:?}"
+    );
+    for (kind, exe) in &tests {
+        assert!(!exe.is_empty(), "{kind} test has no executable: {tests:?}");
+        let run = Command::new(exe).output().unwrap();
+        assert!(run.status.success() && String::from_utf8_lossy(&run.stdout).contains("1 passed"));
+    }
+}
+
+#[test]
+fn message_format_json_reports_diagnostics_artifacts_and_the_end_of_the_build() {
+    let p = Project::new();
+    p.write("Cargo.toml", LIB_MANIFEST);
+    p.write("src/lib.rs", "pub fn f() { let unused = 1; }\n");
+
+    for (round, expect_fresh) in [("first", false), ("second (from the cache)", true)] {
+        let out = p.igl(&["check", "--message-format", "json"]);
+        assert!(out.status.success(), "{round}: {}", text(&out));
+        let lines = json_lines(&out);
+        let reasons: Vec<&str> = lines
+            .iter()
+            .map(|l| l["reason"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            reasons.last(),
+            Some(&"build-finished"),
+            "{round}: {reasons:?}"
+        );
+        assert_eq!(lines.last().unwrap()["success"], true);
+
+        let msg = lines
+            .iter()
+            .find(|l| l["reason"] == "compiler-message")
+            .unwrap_or_else(|| panic!("{round}: no compiler-message in {reasons:?}"));
+        assert_eq!(msg["message"]["level"], "warning");
+        assert!(
+            msg["message"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("unused variable")
+        );
+        assert!(
+            msg["message"]["spans"][0]["file_name"]
+                .as_str()
+                .unwrap()
+                .ends_with("lib.rs")
+        );
+        assert!(msg["package_id"].as_str().unwrap().contains("demo@0.1.0"));
+        assert_eq!(msg["target"]["kind"][0], "lib");
+        assert!(
+            msg["target"]["src_path"]
+                .as_str()
+                .unwrap()
+                .ends_with("src/lib.rs")
+        );
+
+        let artifact = lines
+            .iter()
+            .find(|l| l["reason"] == "compiler-artifact")
+            .unwrap();
+        assert_eq!(artifact["fresh"], expect_fresh, "{round}");
+        assert!(!artifact["filenames"].as_array().unwrap().is_empty());
+    }
+}
+
+#[test]
+fn message_format_json_reports_errors_and_a_failed_build() {
+    let p = Project::new();
+    p.write("Cargo.toml", LIB_MANIFEST);
+    p.write("src/lib.rs", "pub fn f() -> u32 { \"not a number\" }\n");
+    let out = p.igl(&["build", "--message-format=json"]);
+    assert!(!out.status.success());
+    let lines = json_lines(&out);
+    let err = lines
+        .iter()
+        .find(|l| l["reason"] == "compiler-message" && l["message"]["level"] == "error")
+        .unwrap_or_else(|| panic!("no error message: {lines:?}"));
+    assert_eq!(err["message"]["code"]["code"], "E0308");
+    assert_eq!(lines.last().unwrap()["reason"], "build-finished");
+    assert_eq!(lines.last().unwrap()["success"], false);
+}
+
+#[test]
+fn an_unknown_message_format_is_rejected() {
+    let p = lib_project();
+    let out = p.igl(&["build", "--message-format", "xml"]);
+    assert!(!out.status.success());
+    assert!(text(&out).contains("unknown --message-format"));
+}
+
+#[test]
+fn watch_runs_again_when_a_file_changes_and_shows_the_new_result() {
+    use std::io::Read;
+    use std::process::Stdio;
+    use std::sync::{Arc, Mutex};
+    let p = Project::new();
+    p.write("Cargo.toml", LIB_MANIFEST);
+    p.write("src/lib.rs", "pub fn f() {}\n");
+
+    let mut child = igel_command()
+        .args(["watch", "--interval-ms", "50", "--max-runs", "2"])
+        .current_dir(p.path())
+        .env("IGEL_HOME", p.home())
+        .env("NO_COLOR", "1")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let all = Arc::new(Mutex::new(String::new()));
+    let readers: Vec<_> = [
+        Box::new(child.stdout.take().unwrap()) as Box<dyn Read + Send>,
+        Box::new(child.stderr.take().unwrap()),
+    ]
+    .into_iter()
+    .map(|mut stream| {
+        let all = all.clone();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            while let Ok(n) = stream.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                all.lock()
+                    .unwrap()
+                    .push_str(&String::from_utf8_lossy(&buf[..n]));
+            }
+        })
+    })
+    .collect();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+
+    while !all.lock().unwrap().contains("waiting for changes") {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the first run did not finish: {}",
+            all.lock().unwrap()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    p.write(
+        "src/lib.rs",
+        "pub fn f() { let unused_in_second_run = 1; }\n",
+    );
+
+    while child.try_wait().unwrap().is_none() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "watch did not run a second time: {}",
+            all.lock().unwrap()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    for r in readers {
+        r.join().unwrap();
+    }
+    let all = all.lock().unwrap().clone();
+    assert_eq!(all.matches("igl check").count(), 2, "{all}");
+    assert!(all.contains("unused_in_second_run"), "{all}");
+    assert!(all.contains("waiting for changes"), "{all}");
+}
+
+#[test]
+fn a_failing_build_script_that_needs_a_system_package_says_which() {
+    let p = Project::new();
+    p.write(
+        "Cargo.toml",
+        "[package]\nname = \"needs-ssl\"\nversion = \"0.1.0\"\nedition = \"2021\"\nbuild = \"build.rs\"\n",
+    );
+    p.write(
+        "build.rs",
+        "fn main() {\n    eprintln!(\"Could not find directory of OpenSSL installation\");\n    std::process::exit(1);\n}\n",
+    );
+    p.write("src/lib.rs", "");
+    let out = p.igl(&["build"]);
+    assert!(!out.status.success());
+    let t = text(&out);
+    assert!(
+        t.contains("Could not find directory of OpenSSL installation"),
+        "{t}"
+    );
+    assert!(
+        t.contains("hint: this looks like the OpenSSL development files is missing"),
+        "{t}"
+    );
+    assert!(t.contains("OPENSSL_DIR"), "{t}");
+}
+
+fn git_in(dir: &Path, args: &[&str]) {
+    let status = Command::new("git")
+        .args([
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@example.com",
+            "-c",
+            "commit.gpgsign=false",
+        ])
+        .args(args)
+        .current_dir(dir)
+        .status()
+        .expect("git is required for this test");
+    assert!(status.success(), "git {args:?} failed");
+}
+
+#[test]
+fn affected_lists_the_changed_packages_and_everything_that_depends_on_them() {
+    let p = chain_project(3);
+    git_in(p.path(), &["init", "-q", "-b", "main"]);
+    git_in(p.path(), &["add", "-A"]);
+    git_in(p.path(), &["commit", "-q", "-m", "base"]);
+
+    let affected = |extra: &[&str]| -> Vec<String> {
+        let mut args = vec!["affected"];
+        args.extend_from_slice(extra);
+        p.ok(&args)
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(String::from)
+            .collect()
+    };
+
+    assert!(affected(&[]).is_empty(), "a clean tree affects nothing");
+
+    p.write(
+        "c1/src/lib.rs",
+        "include!(concat!(env!(\"OUT_DIR\"), \"/gen.rs\"));\npub fn value() -> u32 { 1 + GEN }\n",
+    );
+    assert_eq!(affected(&[]), ["app", "c1", "c2"]);
+
+    p.write("c0/src/extra.rs", "");
+    assert_eq!(affected(&[]), ["app", "c0", "c1", "c2"]);
+    assert_eq!(
+        affected(&["--format", "args"]),
+        ["-p app -p c0 -p c1 -p c2"]
+    );
+    let json: Vec<String> = serde_json::from_str(&p.ok(&["affected", "--format", "json"])).unwrap();
+    assert_eq!(json, ["app", "c0", "c1", "c2"]);
+
+    git_in(p.path(), &["add", "-A"]);
+    git_in(p.path(), &["commit", "-q", "-m", "change"]);
+    assert!(affected(&[]).is_empty());
+    assert_eq!(affected(&["--since", "HEAD~1"]), ["app", "c0", "c1", "c2"]);
+}
+
+#[test]
+fn scripts_run_with_clean_output_arguments_exit_codes_and_path_dependencies() {
+    let p = Project::new();
+    p.write(
+        "dep/Cargo.toml",
+        "[package]\nname = \"greeter\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    p.write(
+        "dep/src/lib.rs",
+        "pub fn hello(who: &str) -> String { format!(\"hello, {who}\") }\n",
+    );
+    p.write(
+        "hello.rs",
+        &format!(
+            "#!/usr/bin/env -S igl script\n---cargo\n[dependencies]\ngreeter = {{ path = {:?} }}\n---\n\
+             fn main() {{\n    let args: Vec<String> = std::env::args().skip(1).collect();\n    \
+             println!(\"{{}}\", greeter::hello(&args.join(\"+\")));\n    \
+             if args.iter().any(|a| a == \"fail\") {{ std::process::exit(7); }}\n}}\n",
+            p.path().join("dep")
+        ),
+    );
+
+    let run = |args: &[&str]| {
+        let mut all = vec!["script", "hello.rs"];
+        all.extend_from_slice(args);
+        p.igl(&all)
+    };
+    let out = run(&["a", "-b", "--c"]);
+    assert!(out.status.success(), "{}", text(&out));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "hello, a+-b+--c\n");
+
+    assert_eq!(
+        String::from_utf8_lossy(&run(&["again"]).stdout),
+        "hello, again\n"
+    );
+
+    assert_eq!(run(&["fail"]).status.code(), Some(7));
+
+    p.write(
+        "hello.rs",
+        &format!(
+            "---cargo\n[dependencies]\ngreeter = {{ path = {:?} }}\n---\n\
+             fn main() {{ println!(\"{{}}\", greeter::hello(\"edited\")); }}\n",
+            p.path().join("dep")
+        ),
+    );
+    assert_eq!(String::from_utf8_lossy(&run(&[]).stdout), "hello, edited\n");
+}
+
+#[test]
+fn a_script_with_a_compile_error_reports_it_with_the_right_line_number() {
+    let p = Project::new();
+    p.write(
+        "bad.rs",
+        "---cargo\n[dependencies]\n---\nfn main() {\n    let x: u32 = \"no\";\n}\n",
+    );
+    let out = p.igl(&["script", "bad.rs"]);
+    assert!(!out.status.success());
+    let t = text(&out);
+    assert!(t.contains("mismatched types"), "{t}");
+    assert!(
+        t.contains(&native("src/main.rs:5")),
+        "the error is on line 5 of the file: {t}"
+    );
+}
+
+#[test]
+fn cached_tests_are_skipped_until_something_that_matters_changes() {
+    let p = Project::new();
+    p.write("Cargo.toml", LIB_MANIFEST);
+    let marker = p.home().join("marker.txt");
+    let body = |pass: bool, extra: &str| {
+        format!(
+            "pub fn f() -> u32 {{ 1 {extra} }}\n#[cfg(test)]\nmod tests {{\n    #[test]\n    fn t() {{\n        use std::io::Write;\n        let path = std::env::var(\"IGEL_MARKER\").unwrap();\n        let mut f = std::fs::OpenOptions::new().create(true).append(true).open(path).unwrap();\n        writeln!(f, \"ran\").unwrap();\n        assert!({pass});\n    }}\n}}\n"
+        )
+    };
+    let runs = || std::fs::read_to_string(&marker).map_or(0, |t| t.lines().count());
+    let test = |args: &[&str]| -> (bool, String) {
+        let mut all = vec!["test", "--no-doc"];
+        all.extend_from_slice(args);
+        let out = igel_command()
+            .args(&all)
+            .current_dir(p.path())
+            .env("IGEL_HOME", p.home())
+            .env("IGEL_MARKER", &marker)
+            .env("NO_COLOR", "1")
+            .output()
+            .unwrap();
+        (out.status.success(), text(&out))
+    };
+
+    p.write("src/lib.rs", &body(true, ""));
+    assert!(test(&[]).0);
+    assert!(test(&[]).0);
+    assert_eq!(runs(), 2);
+
+    let (ok, t) = test(&["--cached"]);
+    assert!(ok && !t.contains("cached"), "{t}");
+    assert_eq!(runs(), 3);
+    let (ok, t) = test(&["--cached"]);
+    assert!(ok && t.contains("cached"), "{t}");
+    assert!(
+        t.contains("1 passed"),
+        "the remembered counts are shown: {t}"
+    );
+    assert_eq!(runs(), 3, "the binary was not executed");
+    assert!(test(&["--cached=false"]).0);
+    assert_eq!(runs(), 4);
+    assert!(test(&["--cached", "--", "--test-threads=1"]).0);
+    assert_eq!(runs(), 5);
+    p.write("src/lib.rs", &body(true, "+ 1"));
+    let (ok, t) = test(&["--cached"]);
+    assert!(ok && !t.contains("cached"), "{t}");
+    assert_eq!(runs(), 6);
+    assert!(test(&["--cached"]).1.contains("cached"));
+    assert_eq!(runs(), 6);
+
+    p.write("fixtures/data.txt", "one");
+    assert!(!test(&["--cached"]).1.contains("cached"));
+    assert_eq!(runs(), 7);
+
+    p.write("src/lib.rs", &body(false, ""));
+    for expected in [8, 9] {
+        let (ok, t) = test(&["--cached"]);
+        assert!(!ok && !t.contains("cached"), "{t}");
+        assert_eq!(runs(), expected);
+    }
+}
+
+fn igel_with_env(p: &Project, args: &[&str], env: &[(&str, &std::ffi::OsStr)]) -> Output {
+    let mut cmd = igel_command();
+    cmd.args(args)
+        .current_dir(p.path())
+        .env("IGEL_HOME", p.home())
+        .env("NO_COLOR", "1");
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    cmd.output().unwrap()
+}
+
+#[test]
+fn a_shared_store_lets_another_machine_skip_what_was_already_built() {
+    let shared = tempfile::tempdir().unwrap();
+    let remote: &std::ffi::OsStr = shared.path().as_os_str();
+
+    let ci = chain_project(6);
+    let out = igel_with_env(&ci, &["build"], &[("IGEL_CAS_REMOTE", remote)]);
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(
+        text(&out).contains("compiled") && !text(&out).contains("0 compiled"),
+        "{}",
+        text(&out)
+    );
+    assert!(
+        shared.path().join("objects").is_dir(),
+        "CI published to the shared store"
+    );
+
+    let dev = chain_project(6);
+    assert_ne!(ci.path(), dev.path());
+    let out = igel_with_env(
+        &dev,
+        &["build"],
+        &[
+            ("IGEL_CAS_REMOTE", remote),
+            ("IGEL_CAS_REMOTE_WRITE", "false".as_ref()),
+        ],
+    );
+    let t = text(&out);
+    assert!(out.status.success(), "{t}");
+    assert!(
+        t.contains("0 compiled"),
+        "everything came from the shared store: {t}"
+    );
+    let ran = igel_with_env(&dev, &["run", "-p", "app"], &[]);
+    assert!(text(&ran).contains("value=42"), "{}", text(&ran));
+
+    let alone = chain_project(6);
+    let t = text(&igel_with_env(&alone, &["build"], &[]));
+    assert!(!t.contains("0 compiled"), "{t}");
+}
+
+fn layered_project() -> Project {
+    let p = Project::new();
+    p.write(
+        "Cargo.toml",
+        "[workspace]\nresolver = \"2\"\nmembers = [\"app\", \"mid\", \"dep\"]\n",
+    );
+    p.write(
+        "dep/Cargo.toml",
+        "[package]\nname = \"dep\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    p.write("dep/src/lib.rs", "pub fn value() -> u32 { 41 }\n");
+    p.write(
+        "mid/Cargo.toml",
+        "[package]\nname = \"mid\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\ndep = { path = \"../dep\" }\n",
+    );
+    p.write(
+        "mid/src/lib.rs",
+        "pub fn value() -> u32 { dep::value() + 1 }\n",
+    );
+    p.write(
+        "app/Cargo.toml",
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\nmid = { path = \"../mid\" }\ndep = { path = \"../dep\" }\n",
+    );
+    p.write(
+        "app/src/main.rs",
+        "fn main() { println!(\"value={}\", mid::value() + dep::value() * 0); }\n",
+    );
+    p
+}
+
+fn ok_with_home(p: &Project, home: &Path, args: &[&str]) -> String {
+    let out = igel_with_env(p, args, &[("IGEL_HOME", home.as_os_str())]);
+    let t = text(&out);
+    assert!(
+        out.status.success(),
+        "`igl {}` failed:\n{t}",
+        args.join(" ")
+    );
+    t
+}
+
+#[test]
+fn a_crate_compiled_against_another_build_of_its_dependency_is_never_restored_beside_it() {
+    let home = tempfile::tempdir().unwrap();
+    let first = layered_project();
+    ok_with_home(&first, home.path(), &["build"]);
+
+    let second = layered_project();
+    second.write(
+        "mid/src/lib.rs",
+        "pub fn value() -> u32 { dep::value() + 1 } // changed\n",
+    );
+    ok_with_home(&second, home.path(), &["build", "--rebuild-all"]);
+
+    let third = layered_project();
+    third.write(
+        "mid/src/lib.rs",
+        "pub fn value() -> u32 { dep::value() + 1 } // changed\n",
+    );
+    third.write(
+        "app/src/main.rs",
+        "fn main() { println!(\"value={}\", mid::value() + dep::value() * 0); } // changed\n",
+    );
+    ok_with_home(&third, home.path(), &["build"]);
+    let run = ok_with_home(&third, home.path(), &["run", "-p", "app"]);
+    assert!(run.contains("value=42"), "{run}");
+}
+
+fn stored_manifests(home: &Path, krate: &str) -> Vec<PathBuf> {
+    walkdir::WalkDir::new(home.join("cas").join("objects"))
+        .into_iter()
+        .flatten()
+        .filter(|e| e.file_name() == "manifest.json")
+        .filter(|e| {
+            std::fs::read_to_string(e.path())
+                .ok()
+                .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+                .is_some_and(|m| m["crate_name"] == krate)
+        })
+        .map(|e| e.path().to_path_buf())
+        .collect()
+}
+
+#[test]
+fn a_stored_crate_that_does_not_fit_its_dependencies_is_compiled_again_and_replaced() {
+    let home = tempfile::tempdir().unwrap();
+    let first = layered_project();
+    ok_with_home(&first, home.path(), &["build"]);
+    let manifests = stored_manifests(home.path(), "mid");
+    assert!(!manifests.is_empty(), "mid is stored");
+    for path in &manifests {
+        let mut m: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        let against = m["compiled_against"]
+            .as_object_mut()
+            .expect("an entry records what it was compiled against");
+        assert_eq!(against.len(), 1, "mid has one dependency: {against:?}");
+        for content in against.values_mut() {
+            *content = serde_json::Value::from("another build");
+        }
+        std::fs::write(path, m.to_string()).unwrap();
+    }
+
+    let second = layered_project();
+    let out = ok_with_home(&second, home.path(), &["build"]);
+    assert!(out.contains("2 compiled"), "{out}");
+    let run = ok_with_home(&second, home.path(), &["run", "-p", "app"]);
+    assert!(run.contains("value=42"), "{run}");
+    for path in stored_manifests(home.path(), "mid") {
+        let m = std::fs::read_to_string(path).unwrap();
+        assert!(!m.contains("another build"), "{m}");
+    }
+    let third = layered_project();
+    let out = ok_with_home(&third, home.path(), &["build"]);
+    assert!(out.contains("0 compiled"), "{out}");
+}
+
+const IGEL_MANIFEST: &str = "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n";
+
+fn igel_only_project() -> Project {
+    let p = Project::new();
+    p.write("Igel.toml", IGEL_MANIFEST);
+    p.write(
+        "src/main.rs",
+        "fn main() { println!(\"hello from igl.toml\"); }\n\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn it_runs() { assert_eq!(2 + 2, 4); }\n}\n",
+    );
+    p
+}
+
+#[test]
+fn a_project_with_only_a_igel_toml_builds_runs_and_tests() {
+    let p = igel_only_project();
+    assert!(!p.path().join("Cargo.toml").exists());
+
+    assert!(p.ok(&["run"]).contains("hello from igl.toml"));
+    assert!(
+        p.ok(&["build"]).contains("0 compiled"),
+        "cached on the second build"
+    );
+    let t = p.ok(&["test"]);
+    assert!(t.contains("1 passed"), "{t}");
+    p.ok(&["check"]);
+    assert!(!p.path().join("Cargo.toml").exists());
+    assert!(
+        p.path().join("Cargo.lock").exists(),
+        "the lockfile is still Cargo's format"
+    );
+}
+
+#[test]
+fn the_manifest_and_igel_settings_can_share_one_igel_toml() {
+    let p = Project::new();
+    p.write(
+        "Igel.toml",
+        &format!(
+            "{IGEL_MANIFEST}\n[dependencies]\n\n[build]\njobs = 3\n\n[test]\ndoctests = false\n"
+        ),
+    );
+    p.write("src/lib.rs", "pub fn f() {}\n");
+    let listing = p.ok(&["config", "list", "--show-origin"]);
+    assert!(
+        listing.contains("build.jobs") && listing.contains("Igel.toml"),
+        "{listing}"
+    );
+    assert_eq!(p.ok(&["config", "get", "build.jobs"]).trim(), "3");
+    p.ok(&["config", "set", "build.jobs", "5"]);
+    let text = p.read("Igel.toml");
+    assert!(
+        text.contains("name = \"demo\"") && text.contains("jobs = 5"),
+        "{text}"
+    );
+    p.ok(&["build"]);
+}
+
+#[test]
+fn editing_settings_in_the_manifest_file_does_not_rebuild_but_editing_the_package_does() {
+    let p = igel_only_project();
+    assert!(p.ok(&["build"]).contains("1 compiled"));
+    p.write(
+        "Igel.toml",
+        &format!("{IGEL_MANIFEST}\n[build]\njobs = 2\n"),
+    );
+    assert!(p.ok(&["build"]).contains("0 compiled"));
+    p.write(
+        "Igel.toml",
+        "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2018\"\n\n[build]\njobs = 2\n",
+    );
+    assert!(p.ok(&["build"]).contains("1 compiled"));
+}
+
+#[test]
+fn a_workspace_can_mix_cargo_and_igel_manifests_and_path_dependencies_can_be_igel_only() {
+    let p = Project::new();
+    p.write(
+        "Igel.toml",
+        "[workspace]\nresolver = \"2\"\nmembers = [\"app\", \"lib-cargo\", \"lib-igl\"]\n",
+    );
+    p.write(
+        "app/Igel.toml",
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\nlib-cargo = { path = \"../lib-cargo\" }\nlib-igl = { path = \"../lib-igl\" }\nshared = { path = \"../shared\" }\n",
+    );
+    p.write(
+        "app/src/main.rs",
+        "fn main() { println!(\"{} {} {}\", lib_cargo::name(), lib_igl::name(), shared::name()); }\n",
+    );
+    p.write(
+        "lib-cargo/Cargo.toml",
+        "[package]\nname = \"lib-cargo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    p.write(
+        "lib-cargo/src/lib.rs",
+        "pub fn name() -> &'static str { \"cargo\" }\n",
+    );
+    p.write(
+        "lib-igl/Igel.toml",
+        "[package]\nname = \"lib-igl\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    p.write(
+        "lib-igl/src/lib.rs",
+        "pub fn name() -> &'static str { \"igl\" }\n",
+    );
+    p.write(
+        "shared/Igel.toml",
+        "[package]\nname = \"shared\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    p.write(
+        "shared/src/lib.rs",
+        "pub fn name() -> &'static str { \"shared\" }\n",
+    );
+
+    assert!(p.ok(&["run", "-p", "app"]).contains("cargo igl shared"));
+    let meta: serde_json::Value = serde_json::from_str(&p.ok(&["metadata"])).unwrap();
+    let manifests: Vec<String> = meta["packages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|pkg| pkg["manifest_path"].as_str())
+        .map(|m| {
+            Path::new(m)
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    assert!(
+        manifests.contains(&"Igel.toml".to_string())
+            && manifests.contains(&"Cargo.toml".to_string()),
+        "{manifests:?}"
+    );
+    let out = p.igel_in(&p.path().join("lib-igl"), &["build"]);
+    assert!(out.status.success(), "{}", text(&out));
+}
+
+#[test]
+fn workspace_inheritance_works_from_a_igel_toml_root() {
+    let p = Project::new();
+    p.write(
+        "Igel.toml",
+        "[workspace]\nmembers = [\"a\"]\n\n[workspace.package]\nversion = \"2.5.0\"\nedition = \"2021\"\n",
+    );
+    p.write(
+        "a/Igel.toml",
+        "[package]\nname = \"a\"\nversion.workspace = true\nedition.workspace = true\n",
+    );
+    p.write(
+        "a/src/main.rs",
+        "fn main() { println!(\"v{}\", env!(\"CARGO_PKG_VERSION\")); }\n",
+    );
+    assert!(p.ok(&["run"]).contains("v2.5.0"));
+}
+
+#[test]
+fn when_both_files_are_manifests_igel_toml_wins_and_a_settings_only_one_does_not() {
+    let p = Project::new();
+    p.write(
+        "Cargo.toml",
+        "[package]\nname = \"from-cargo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    p.write(
+        "Igel.toml",
+        "[package]\nname = \"from-igl\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    p.write(
+        "src/main.rs",
+        "fn main() { println!(\"{}\", env!(\"CARGO_PKG_NAME\")); }\n",
+    );
+    assert!(p.ok(&["run"]).contains("from-igl"));
+
+    p.write("Igel.toml", "[build]\njobs = 2\n");
+    assert!(p.ok(&["run"]).contains("from-cargo"));
+}
+
+#[test]
+fn locate_project_and_json_messages_name_the_real_manifest() {
+    let p = igel_only_project();
+    let located: serde_json::Value = serde_json::from_str(&p.ok(&["locate-project"])).unwrap();
+    assert!(
+        located["root"].as_str().unwrap().ends_with("Igel.toml"),
+        "{located}"
+    );
+
+    let out = p.igl(&["check", "--message-format", "json"]);
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let artifact = stdout
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .find(|v| v["reason"] == "compiler-artifact")
+        .expect("an artifact line");
+    assert!(
+        artifact["manifest_path"]
+            .as_str()
+            .unwrap()
+            .ends_with("Igel.toml"),
+        "{artifact}"
+    );
+}
+
+#[test]
+fn add_and_remove_edit_the_igel_toml_and_leave_its_settings_alone() {
+    let p = Project::new();
+    p.write(
+        "dep/Igel.toml",
+        "[package]\nname = \"helper\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    p.write("dep/src/lib.rs", "pub fn help() -> u32 { 42 }\n");
+    p.write(
+        "app/Igel.toml",
+        &format!(
+            "{}\n[dependencies]\n\n# my settings\n[build]\njobs = 2\n",
+            IGEL_MANIFEST.replace("demo", "app")
+        ),
+    );
+    p.write(
+        "app/src/main.rs",
+        "fn main() { println!(\"{}\", helper::help()); }\n",
+    );
+
+    let app = p.path().join("app");
+    let dep = p.path().join("dep");
+    let added = p.igel_in(&app, &["add", "helper", "--path", dep.to_str().unwrap()]);
+    assert!(added.status.success(), "{}", text(&added));
+    let manifest = std::fs::read_to_string(app.join("Igel.toml")).unwrap();
+    assert!(
+        manifest.contains("helper")
+            && manifest.contains("# my settings")
+            && manifest.contains("jobs = 2"),
+        "{manifest}"
+    );
+    assert!(!app.join("Cargo.toml").exists());
+    assert!(text(&p.igel_in(&app, &["run"])).contains("42"));
+
+    let removed = p.igel_in(&app, &["remove", "helper"]);
+    assert!(removed.status.success(), "{}", text(&removed));
+    let manifest = std::fs::read_to_string(app.join("Igel.toml")).unwrap();
+    assert!(
+        !manifest.contains("helper") && manifest.contains("jobs = 2"),
+        "{manifest}"
+    );
+}
+
+#[test]
+fn new_and_init_can_create_a_igel_toml_project() {
+    let p = Project::new();
+    let out = p.igl(&["new", "fresh", "--manifest", "igl", "--no-gitignore"]);
+    assert!(out.status.success(), "{}", text(&out));
+    let dir = p.path().join("fresh");
+    assert!(dir.join("Igel.toml").is_file() && !dir.join("Cargo.toml").exists());
+    let run = p.igel_in(&dir, &["run"]);
+    assert!(text(&run).contains("Hello, world!"), "{}", text(&run));
+
+    let existing = p.path().join("existing");
+    std::fs::create_dir_all(&existing).unwrap();
+    std::fs::write(existing.join("Igel.toml"), "[build]\njobs = 7\n").unwrap();
+    let out = p.igel_in(
+        &existing,
+        &[
+            "init",
+            "--manifest",
+            "igl",
+            "--name",
+            "existing",
+            "--no-gitignore",
+        ],
+    );
+    assert!(out.status.success(), "{}", text(&out));
+    let text_after = std::fs::read_to_string(existing.join("Igel.toml")).unwrap();
+    assert!(
+        text_after.contains("name = \"existing\"") && text_after.contains("jobs = 7"),
+        "{text_after}"
+    );
+    assert!(p.igel_in(&existing, &["build"]).status.success());
+
+    let again = p.igel_in(
+        &existing,
+        &["init", "--manifest", "cargo", "--no-gitignore"],
+    );
+    assert!(!again.status.success());
+    assert!(text(&again).contains("already exists"), "{}", text(&again));
+}
+
+#[test]
+fn a_git_dependency_can_be_a_igel_toml_only_repository() {
+    let repo = tempfile::tempdir().unwrap();
+    let d = repo.path();
+    git(d, &["init", "--quiet", "--initial-branch=main"]);
+    std::fs::create_dir_all(d.join("src")).unwrap();
+    std::fs::write(
+        d.join("Igel.toml"),
+        "[package]\nname = \"gitdep\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        d.join("src/lib.rs"),
+        "pub fn version() -> &'static str { \"igel-only git dependency\" }\n",
+    )
+    .unwrap();
+    git(d, &["add", "-A"]);
+    git(d, &["commit", "--quiet", "-m", "first"]);
+
+    let p = git_app(&format!("{{ git = {:?} }}", url(d)));
+    let out = p.ok(&["run"]);
+    assert!(
+        out.contains("gitdep says igel-only git dependency"),
+        "{out}"
+    );
+}
+
+#[test]
+fn an_unparsable_igel_toml_manifest_is_reported_not_skipped() {
+    let p = Project::new();
+    p.write(
+        "Cargo.toml",
+        "[package]\nname = \"fine\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    p.write("Igel.toml", "[package]\nname = \nversion = \"0.1.0\"\n");
+    p.write("src/main.rs", "fn main() {}\n");
+    let out = p.igl(&["build"]);
+    assert!(
+        !out.status.success(),
+        "must not silently fall back to Cargo.toml"
+    );
+    assert!(text(&out).contains("Igel.toml"), "{}", text(&out));
+}
+
+#[test]
+fn doctor_warns_when_igel_toml_shadows_a_cargo_toml() {
+    let p = Project::new();
+    p.write(
+        "Cargo.toml",
+        "[package]\nname = \"a\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    p.write(
+        "Igel.toml",
+        "[package]\nname = \"a\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    p.write("src/lib.rs", "");
+    assert!(
+        p.ok(&["doctor"])
+            .contains("both `Igel.toml` and `Cargo.toml` define this project")
+    );
+    p.write("Igel.toml", "[build]\njobs = 2\n");
+    assert!(!p.ok(&["doctor"]).contains("both `Igel.toml`"));
+}
+
+fn stamping_script(name: &str, sleep_ms: u64, extra: &str) -> String {
+    format!(
+        r#"use std::io::Write;
+fn stamp(event: &str) {{
+    let path = std::env::var("IGEL_T_STAMPS").unwrap();
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+    let mut f = std::fs::OpenOptions::new().create(true).append(true).open(path).unwrap();
+    writeln!(f, "{name} {{event}} {{now}}").unwrap();
+}}
+fn main() {{
+    stamp("start");
+    std::thread::sleep(std::time::Duration::from_millis({sleep_ms}));
+    stamp("end");
+    println!("cargo::rerun-if-changed=build.rs");
+    {extra}
+}}
+"#
+    )
+}
+
+fn stamps(path: &Path) -> std::collections::HashMap<String, u128> {
+    std::fs::read_to_string(path)
+        .unwrap()
+        .lines()
+        .map(|l| {
+            let mut it = l.split_whitespace();
+            let (who, what, at) = (it.next().unwrap(), it.next().unwrap(), it.next().unwrap());
+            (format!("{who} {what}"), at.parse().unwrap())
+        })
+        .collect()
+}
+
+#[test]
+fn a_build_script_runs_while_its_packages_dependencies_are_still_compiling() {
+    let p = Project::new();
+    p.write(
+        "Cargo.toml",
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\
+         [dependencies]\nslow = { path = \"slow\" }\n",
+    );
+    p.write("build.rs", &stamping_script("app", 0, ""));
+    p.write("src/lib.rs", "pub fn v() -> u32 { slow::v() + 1 }\n");
+    p.write(
+        "slow/Cargo.toml",
+        "[package]\nname = \"slow\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    // `slow`'s script waits for `app`'s to start: a fixed delay raced the compilers on a loaded machine.
+    let slow_script = stamping_script("slow", 0, "").replace(
+        "    stamp(\"start\");\n",
+        "    stamp(\"start\");\n    \
+         let log = std::env::var(\"IGEL_T_STAMPS\").unwrap();\n    \
+         for _ in 0..600 {\n        \
+         if std::fs::read_to_string(&log).unwrap_or_default().contains(\"app start\") { break; }\n        \
+         std::thread::sleep(std::time::Duration::from_millis(100));\n    }\n",
+    );
+    assert!(slow_script.contains("app start"));
+    p.write("slow/build.rs", &slow_script);
+    p.write("slow/src/lib.rs", "pub fn v() -> u32 { 1 }\n");
+    let log = p.home().join("stamps.txt");
+    let out = igel_command()
+        .args(["build", "-j", "4"])
+        .current_dir(p.path())
+        .env("IGEL_HOME", p.home())
+        .env("IGEL_T_STAMPS", &log)
+        .env("NO_COLOR", "1")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", text(&out));
+    let s = stamps(&log);
+    assert!(
+        s["app start"] < s["slow end"],
+        "app's build script waited for its dependency: {s:?}"
+    );
+}
+
+#[test]
+fn check_only_type_checks_the_ordinary_dependencies_of_a_crate_with_a_build_script() {
+    let p = Project::new();
+    p.write(
+        "Cargo.toml",
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\
+         [dependencies]\nplain = { path = \"plain\" }\n\
+         [build-dependencies]\nhelper = { path = \"helper\" }\n",
+    );
+    p.write(
+        "build.rs",
+        "fn main() { assert_eq!(helper::h(), 7); println!(\"cargo::rerun-if-changed=build.rs\"); }\n",
+    );
+    p.write("src/lib.rs", "pub fn v() -> u32 { plain::v() }\n");
+    for (name, body) in [
+        ("plain", "pub fn v() -> u32 { 1 }\n"),
+        ("helper", "pub fn h() -> u32 { 7 }\n"),
+    ] {
+        p.write(
+            &format!("{name}/Cargo.toml"),
+            &format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"),
+        );
+        p.write(&format!("{name}/src/lib.rs"), body);
+    }
+    p.ok(&["check"]);
+    let deps: Vec<String> = std::fs::read_dir(p.path().join(".igel/target/debug/deps"))
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    let has = |prefix: &str, ext: &str| {
+        deps.iter()
+            .any(|f| f.starts_with(prefix) && f.ends_with(ext))
+    };
+    assert!(has("libplain-", ".rmeta"), "{deps:?}");
+    assert!(
+        !has("libplain-", ".rlib"),
+        "an ordinary dependency was compiled to machine code by `check`: {deps:?}"
+    );
+    assert!(has("libhelper-", ".rlib"), "{deps:?}");
+}
+
+#[test]
+fn a_dependency_that_learns_an_outside_input_late_still_rekeys_its_dependents() {
+    let p = Project::new();
+    p.write(
+        "Cargo.toml",
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\
+         [dependencies]\nbase = { path = \"base\" }\n",
+    );
+    p.write("build.rs", &stamping_script("app", 0, ""));
+    p.write(
+        "src/main.rs",
+        "fn main() { println!(\"mode={}\", base::mode()); }\n",
+    );
+    p.write(
+        "base/Cargo.toml",
+        "[package]\nname = \"base\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    p.write(
+        "base/build.rs",
+        &stamping_script(
+            "base",
+            800,
+            r#"println!("cargo::rerun-if-env-changed=IGEL_T_MODE");
+    println!("cargo::rustc-env=MODE={}", std::env::var("IGEL_T_MODE").unwrap_or_default());"#,
+        ),
+    );
+    p.write(
+        "base/src/lib.rs",
+        "pub fn mode() -> &'static str { env!(\"MODE\") }\n",
+    );
+    let log = p.home().join("stamps.txt");
+    let run = |mode: &str, args: &[&str]| {
+        let out = igel_command()
+            .args(args)
+            .current_dir(p.path())
+            .env("IGEL_HOME", p.home())
+            .env("IGEL_T_STAMPS", &log)
+            .env("IGEL_T_MODE", mode)
+            .env("NO_COLOR", "1")
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{}", text(&out));
+        text(&out)
+    };
+    run("one", &["build", "-j", "4"]);
+    let s = stamps(&log);
+    assert!(
+        s["app end"] < s["base end"],
+        "the race did not happen: {s:?}"
+    );
+    let again = run("one", &["build", "-j", "4"]);
+    assert!(again.contains("0 compiled"), "{again}");
+    assert!(run("two", &["run", "-j", "4"]).contains("mode=two"));
+    let back = run("one", &["run", "-j", "4"]);
+    assert!(back.contains("mode=one"), "{back}");
+    assert!(back.contains("0 compiled"), "{back}");
+}
+
+fn require_rust(reg: &tempfile::TempDir, name: &str, version: &str, rv: &str) {
+    let path = reg.path().join("index/1").join(name);
+    let text = std::fs::read_to_string(&path).unwrap().replace(
+        &format!("\"vers\":\"{version}\""),
+        &format!("\"vers\":\"{version}\",\"rust_version\":\"{rv}\""),
+    );
+    std::fs::write(path, text).unwrap();
+}
+
+#[test]
+fn outdated_lists_what_the_lockfile_and_the_manifest_hold_back() {
+    let reg = local_registry(&[
+        ("a", "1.0.0", &[]),
+        ("a", "1.2.0", &[]),
+        ("a", "2.0.0", &[]),
+        ("b", "0.3.0", &[]),
+    ]);
+    let p = app_with(&reg, "a = \"1.0\"\nb = \"0.3\"\n");
+    p.write("Cargo.lock", "");
+    std::fs::remove_file(p.path().join("Cargo.lock")).unwrap();
+    p.ok(&["generate-lockfile"]);
+    p.ok(&["update", "-p", "a", "--precise", "1.0.0"]);
+
+    let out = p.igl(&["outdated", "--exit-code"]);
+    let table = text(&out);
+    assert_eq!(out.status.code(), Some(1), "{table}");
+    let row = table
+        .lines()
+        .find(|l| l.starts_with("a "))
+        .unwrap_or_else(|| panic!("no row for `a`:\n{table}"));
+    let cells: Vec<&str> = row.split_whitespace().collect();
+    assert_eq!(
+        &cells[..5],
+        ["a", "1.0", "1.0.0", "1.2.0", "2.0.0"],
+        "{row}"
+    );
+    assert!(
+        !table.lines().any(|l| l.starts_with("b ")),
+        "b is current:\n{table}"
+    );
+
+    let json = p.igl(&["outdated", "--format", "json"]);
+    let rows: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    assert_eq!(rows[0]["name"], "a");
+    assert_eq!(rows[0]["compatible"], "1.2.0");
+}
+
+#[test]
+fn upgrade_raises_requirements_keeping_the_manifests_formatting() {
+    let reg = local_registry(&[
+        ("a", "1.0.0", &[]),
+        ("a", "1.2.0", &[]),
+        ("a", "2.0.0", &[]),
+        ("bb", "0.3.0", &[]),
+        ("bb", "0.4.1", &[]),
+    ]);
+    let p = app_with(
+        &reg,
+        "a = \"1.0\" # keep this comment\nbb = { version = \"0.3\", default-features = false }\n",
+    );
+    p.ok(&["generate-lockfile"]);
+    p.ok(&["update", "-p", "a", "--precise", "1.0.0"]);
+
+    let out = p.ok(&["upgrade"]);
+    let manifest = p.read("Cargo.toml");
+    assert!(
+        manifest.contains("a = \"1.2\" # keep this comment"),
+        "{manifest}\n{out}"
+    );
+    assert!(
+        manifest.contains("bb = { version = \"0.3\", default-features = false }"),
+        "{manifest}"
+    );
+    assert!(
+        locked(&p).contains(&"a 1.2.0".to_string()),
+        "{:?}",
+        locked(&p)
+    );
+
+    p.ok(&["upgrade", "--incompatible", "bb"]);
+    let manifest = p.read("Cargo.toml");
+    assert!(
+        manifest.contains("bb = { version = \"0.4\", default-features = false }"),
+        "{manifest}"
+    );
+    assert!(manifest.contains("a = \"1.2\""), "{manifest}");
+    assert!(
+        locked(&p).contains(&"bb 0.4.1".to_string()),
+        "{:?}",
+        locked(&p)
+    );
+
+    let before = p.read("Cargo.toml");
+    p.ok(&["upgrade", "--incompatible", "--dry-run"]);
+    assert_eq!(p.read("Cargo.toml"), before);
+}
+
+#[test]
+fn upgrade_and_outdated_respect_the_packages_rust_version() {
+    let reg = local_registry(&[
+        ("a", "1.0.0", &[]),
+        ("a", "1.5.0", &[]),
+        ("a", "1.9.0", &[]),
+    ]);
+    require_rust(&reg, "a", "1.5.0", "1.50");
+    require_rust(&reg, "a", "1.9.0", "9.99");
+    let p = app_with(&reg, "a = \"1.0.0\"\n");
+    let manifest = p.read("Cargo.toml").replace(
+        "edition = \"2021\"",
+        "edition = \"2021\"\nrust-version = \"1.60\"",
+    );
+    p.write("Cargo.toml", &manifest);
+    p.ok(&["upgrade"]);
+    assert!(
+        p.read("Cargo.toml").contains("a = \"1.5.0\""),
+        "{}",
+        p.read("Cargo.toml")
+    );
+    let table = p.ok(&["outdated"]);
+    assert!(table.contains("1.9.0 needs a newer Rust"), "{table}");
+    p.ok(&["upgrade", "--ignore-rust-version"]);
+    assert!(
+        p.read("Cargo.toml").contains("a = \"1.9.0\""),
+        "{}",
+        p.read("Cargo.toml")
+    );
+}
+
+#[test]
+fn upgrade_edits_workspace_dependencies_where_members_inherit_them() {
+    let reg = local_registry(&[("a", "1.0.0", &[]), ("a", "1.3.0", &[])]);
+    let p = Project::new();
+    p.write(
+        "Cargo.toml",
+        "[workspace]\nmembers = [\"app\"]\n\n[workspace.dependencies]\na = \"1.0\"\n",
+    );
+    p.write(
+        "app/Cargo.toml",
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\
+         [dependencies]\na = { workspace = true }\n",
+    );
+    p.write("app/src/main.rs", "fn main() {}\n");
+    p.write(
+        ".cargo/config.toml",
+        &format!(
+            "[source.crates-io]\nreplace-with = \"local\"\n[source.local]\nlocal-registry = {:?}\n",
+            reg.path()
+        ),
+    );
+    p.ok(&["upgrade"]);
+    assert!(
+        p.read("Cargo.toml").contains("a = \"1.3\""),
+        "{}",
+        p.read("Cargo.toml")
+    );
+    assert!(
+        p.read("app/Cargo.toml")
+            .contains("a = { workspace = true }")
+    );
+    assert!(p.ok(&["upgrade", "-p", "app"]).contains("already allows"));
+}
+
+#[test]
+fn out_dir_holds_only_what_the_script_generated_and_script_errors_are_shown() {
+    let p = build_script_project();
+    p.ok(&["build"]);
+    let build = p.path().join(".igel/target/debug/build");
+    let dirs: Vec<_> = std::fs::read_dir(&build).unwrap().flatten().collect();
+    assert_eq!(dirs.len(), 1, "{dirs:?}");
+    let out: Vec<String> = std::fs::read_dir(dirs[0].path().join("out"))
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(
+        out,
+        ["generated.rs"],
+        "the script binary does not belong in OUT_DIR"
+    );
+
+    p.write("build.rs", "fn main() { let x: u32 = \"not a number\"; }\n");
+    let failed = p.igl(&["build"]);
+    assert!(!failed.status.success());
+    let msg = text(&failed);
+    assert!(
+        msg.contains("mismatched types"),
+        "the compiler's error is shown:\n{msg}"
+    );
+}
+
+#[test]
+fn unused_dependencies_are_found_by_asking_the_compiler() {
+    let p = Project::new();
+    p.write(
+        "Cargo.toml",
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\
+         [dependencies]\nused = { path = \"used\" }\nidle = { path = \"idle\" }\n\
+         tests-only = { path = \"tests-only\" }\n\
+         [dev-dependencies]\ndev-used = { path = \"dev-used\" }\ndev-idle = { path = \"dev-idle\" }\n\
+         [build-dependencies]\nbuild-used = { path = \"build-used\" }\nbuild-idle = { path = \"build-idle\" }\n",
+    );
+    for name in [
+        "used",
+        "idle",
+        "tests-only",
+        "dev-used",
+        "dev-idle",
+        "build-used",
+        "build-idle",
+    ] {
+        p.write(
+            &format!("{name}/Cargo.toml"),
+            &format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"),
+        );
+        p.write(&format!("{name}/src/lib.rs"), "pub fn f() -> u32 { 1 }\n");
+    }
+    p.write("src/lib.rs", "pub fn g() -> u32 { used::f() }\n");
+    p.write(
+        "tests/it.rs",
+        "#[test] fn t() { assert_eq!(dev_used::f() + tests_only::f() + app::g(), 3); }\n",
+    );
+    p.write(
+        "build.rs",
+        "fn main() { let _ = build_used::f(); println!(\"cargo::rerun-if-changed=build.rs\"); }\n",
+    );
+
+    for round in 0..2 {
+        let out = p.igl(&["unused"]);
+        let msg = text(&out);
+        assert_eq!(out.status.code(), Some(1), "round {round}:\n{msg}");
+        let unused_line = msg.lines().find(|l| l.contains("unused:")).unwrap_or("");
+        for name in ["idle", "dev-idle", "build-idle"] {
+            assert!(
+                unused_line.contains(&format!("{name} ")),
+                "round {round}: `{name}` is unused:\n{msg}"
+            );
+        }
+        for name in ["used [", "dev-used", "build-used"] {
+            assert!(
+                !unused_line.contains(name),
+                "round {round}: `{name}`:\n{msg}"
+            );
+        }
+        let dev_line = msg
+            .lines()
+            .find(|l| l.contains("could be dev-dependencies"))
+            .unwrap_or("");
+        assert!(dev_line.contains("tests-only"), "round {round}:\n{msg}");
+    }
+
+    p.ok(&["unused", "--fix"]);
+    let manifest = p.read("Cargo.toml");
+    for gone in ["idle = ", "dev-idle", "build-idle"] {
+        assert!(!manifest.contains(gone), "{manifest}");
+    }
+    assert!(
+        manifest.contains("used = { path = \"used\" }"),
+        "{manifest}"
+    );
+    let again = p.ok(&["unused"]);
+    assert!(again.contains("no unused dependencies"), "{again}");
+    p.ok(&["test"]);
+}
+
+#[test]
+fn a_dependency_used_only_under_another_cfg_is_reported_but_never_removed() {
+    let p = Project::new();
+    p.write(
+        "Cargo.toml",
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\
+         [dependencies]\nelsewhere = { path = \"elsewhere\" }\n",
+    );
+    p.write(
+        "elsewhere/Cargo.toml",
+        "[package]\nname = \"elsewhere\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    p.write("elsewhere/src/lib.rs", "pub fn f() {}\n");
+    p.write(
+        "src/lib.rs",
+        "#[cfg(target_os = \"plan9\")]\npub fn g() { elsewhere::f() }\n",
+    );
+    let out = p.ok(&["unused", "--fix"]);
+    assert!(out.contains("unused in this configuration"), "{out}");
+    assert!(
+        p.read("Cargo.toml").contains("elsewhere = { path"),
+        "must be kept"
+    );
+}
+
+#[test]
+fn sbom_lists_what_ships_with_checksums_purls_and_edges() {
+    let reg = local_registry(&[
+        ("a", "1.0.0", &[("b", "1")]),
+        ("b", "1.1.0", &[]),
+        ("t", "0.5.0", &[]),
+    ]);
+    let p = app_with(
+        &reg,
+        "a = \"1\"\nhelper = { path = \"helper\" }\n[dev-dependencies]\nt = \"0.5\"\n",
+    );
+    p.write(
+        "helper/Cargo.toml",
+        "[package]\nname = \"helper\"\nversion = \"0.2.0\"\nedition = \"2021\"\nlicense = \"MIT\"\n",
+    );
+    p.write("helper/src/lib.rs", "");
+    let manifest = p.read("Cargo.toml").replace(
+        "edition = \"2021\"",
+        "edition = \"2021\"\nlicense = \"Apache-2.0\"\ndescription = \"demo\"",
+    );
+    p.write("Cargo.toml", &manifest);
+
+    let out = p.igl(&["sbom"]);
+    assert!(out.status.success(), "{}", text(&out));
+    let bom: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(bom["bomFormat"], "CycloneDX");
+    assert_eq!(bom["metadata"]["component"]["purl"], "pkg:cargo/app@0.1.0");
+    assert_eq!(
+        bom["metadata"]["component"]["licenses"][0]["expression"],
+        "Apache-2.0"
+    );
+    let names: Vec<&str> = bom["components"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names.len(), 3, "{names:?}");
+    for n in ["a", "b", "helper"] {
+        assert!(names.contains(&n), "{names:?}");
+    }
+    let a = bom["components"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["name"] == "a")
+        .unwrap();
+    assert_eq!(a["purl"], "pkg:cargo/a@1.0.0");
+    assert_eq!(a["hashes"][0]["alg"], "SHA-256");
+    let lock = p.read("Cargo.lock");
+    assert!(lock.contains(a["hashes"][0]["content"].as_str().unwrap()));
+    let edges_of_a = bom["dependencies"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["ref"] == "pkg:cargo/a@1.0.0")
+        .unwrap();
+    assert_eq!(edges_of_a["dependsOn"][0], "pkg:cargo/b@1.1.0");
+
+    let with_dev: serde_json::Value =
+        serde_json::from_slice(&p.igl(&["sbom", "--dev"]).stdout).unwrap();
+    assert_eq!(with_dev["components"].as_array().unwrap().len(), 4);
+
+    // SPDX, to a file.
+    p.ok(&["sbom", "--format", "spdx", "-o", "bom.spdx.json"]);
+    let spdx: serde_json::Value = serde_json::from_str(&p.read("bom.spdx.json")).unwrap();
+    assert_eq!(spdx["spdxVersion"], "SPDX-2.3");
+    let rel = spdx["relationships"].as_array().unwrap();
+    assert!(rel.iter().any(|r| r["relationshipType"] == "DESCRIBES"
+        && r["relatedSpdxElement"] == "SPDXRef-Package-app-0.1.0"));
+    assert!(
+        rel.iter()
+            .any(|r| r["spdxElementId"] == "SPDXRef-Package-a-1.0.0"
+                && r["relatedSpdxElement"] == "SPDXRef-Package-b-1.1.0")
+    );
+}
+
+#[test]
+fn exec_surface_lists_build_scripts_and_proc_macros_with_their_chain() {
+    let p = Project::new();
+    p.write(
+        "Cargo.toml",
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\
+         [dependencies]\nmid = { path = \"mid\" }\n",
+    );
+    p.write("src/lib.rs", "pub use mid::*;\n");
+    p.write(
+        "mid/Cargo.toml",
+        "[package]\nname = \"mid\"\nversion = \"0.1.0\"\nedition = \"2021\"\nlinks = \"midnative\"\n\
+         [dependencies]\nmacros = { path = \"../macros\" }\n",
+    );
+    p.write("mid/build.rs", "fn main() {}\n");
+    p.write("mid/src/lib.rs", "pub use macros::*;\n");
+    p.write(
+        "macros/Cargo.toml",
+        "[package]\nname = \"macros\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[lib]\nproc-macro = true\n",
+    );
+    p.write("macros/src/lib.rs", "");
+    let human = p.ok(&["tree", "--exec-surface"]);
+    assert!(human.contains("2 of 3 packages run code"), "{human}");
+    let json = p.igl(&["tree", "--exec-surface", "--format", "json"]);
+    let items: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    let by_name = |n: &str| {
+        items
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["name"] == n)
+            .cloned()
+            .unwrap_or_else(|| panic!("{n} missing: {items}"))
+    };
+    let mid = by_name("mid");
+    assert_eq!(mid["runs"], serde_json::json!(["build-script", "links"]));
+    assert_eq!(mid["links"], "midnative");
+    assert_eq!(mid["via"], serde_json::json!(["app", "mid"]));
+    let macros = by_name("macros");
+    assert_eq!(macros["runs"], serde_json::json!(["proc-macro"]));
+    assert_eq!(macros["via"], serde_json::json!(["app", "mid", "macros"]));
+}
+
+fn published(reg: &tempfile::TempDir, name: &str, version: &str, when: &str) {
+    let path = reg.path().join("index/1").join(name);
+    let text = std::fs::read_to_string(&path).unwrap().replace(
+        &format!("\"vers\":\"{version}\""),
+        &format!("\"vers\":\"{version}\",\"pubtime\":\"{when}\""),
+    );
+    std::fs::write(path, text).unwrap();
+}
+
+#[test]
+fn a_minimum_release_age_keeps_brand_new_releases_out_until_they_mature() {
+    let reg = local_registry(&[
+        ("a", "1.0.0", &[]),
+        ("a", "1.1.0", &[]),
+        ("b", "2.0.0", &[]),
+    ]);
+    published(&reg, "a", "1.0.0", "2020-01-01T00:00:00Z");
+    published(&reg, "a", "1.1.0", "2099-01-01T00:00:00Z");
+    published(&reg, "b", "2.0.0", "2099-01-01T00:00:00Z");
+    let p = app_with(&reg, "a = \"1\"\nb = \"2\"\n");
+    let with_age = |args: &[&str]| {
+        let out = igel_command()
+            .args(args)
+            .current_dir(p.path())
+            .env("IGEL_HOME", p.home())
+            .env("IGEL_RESOLVE_MIN_RELEASE_AGE", "7d")
+            .env("NO_COLOR", "1")
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{}", text(&out));
+        text(&out)
+    };
+    let out = with_age(&["generate-lockfile"]);
+    assert_eq!(locked(&p), ["a 1.0.0", "app 0.1.0", "b 2.0.0"]);
+    assert!(
+        out.contains("younger than resolve.min-release-age"),
+        "{out}"
+    );
+    p.ok(&["update"]);
+    assert_eq!(locked(&p), ["a 1.1.0", "app 0.1.0", "b 2.0.0"]);
+    with_age(&["build"]);
+    assert_eq!(locked(&p), ["a 1.1.0", "app 0.1.0", "b 2.0.0"]);
+}
+
+#[test]
+fn retries_mark_flaky_tests_and_junit_reports_every_test() {
+    let p = Project::new();
+    p.write("Cargo.toml", LIB_MANIFEST);
+    let lib = r#"pub fn one() -> u32 { 1 }
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn flaky() {
+        let marker = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("first-run-done");
+        if !marker.exists() {
+            std::fs::write(&marker, "").unwrap();
+            panic!("fails the first time only");
+        }
+    }
+    #[test]
+    fn solid() { assert_eq!(super::one(), 1); }
+    #[test]
+    fn broken() { assert_eq!(super::one(), 2, "never passes"); }
+    #[test]
+    #[ignore]
+    fn skipped() {}
+}
+"#;
+    p.write("src/lib.rs", lib);
+    let out = p.igl(&["test", "--retries", "2", "--junit", "report.xml"]);
+    let msg = text(&out);
+    assert_eq!(out.status.code(), Some(101), "`broken` still fails:\n{msg}");
+    assert!(
+        msg.contains("flaky test(s)") && msg.contains("tests::flaky"),
+        "{msg}"
+    );
+
+    let xml = p.read("report.xml");
+    assert!(xml.contains("tests=\"4\" failures=\"1\""), "{xml}");
+    assert!(
+        xml.contains("name=\"flaky\">\n      <system-out>flaky:"),
+        "{xml}"
+    );
+    assert!(xml.contains("name=\"broken\">\n      <failure"), "{xml}");
+    assert!(xml.contains("never passes"), "{xml}");
+    assert!(xml.contains("name=\"skipped\">\n      <skipped/>"), "{xml}");
+    assert!(xml.contains("name=\"solid\"/>"), "{xml}");
+
+    std::fs::remove_file(p.path().join("first-run-done")).unwrap();
+    p.write(
+        "src/lib.rs",
+        &lib.replace("super::one(), 2", "super::one(), 1"),
+    );
+    let out = p.igl(&["test", "--retries", "1"]);
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(text(&out).contains("flaky test(s)"), "{}", text(&out));
+    std::fs::remove_file(p.path().join("first-run-done")).unwrap();
+    assert_eq!(p.igl(&["test"]).status.code(), Some(101));
+}
+
+#[test]
+fn failed_runs_only_what_failed_last_time() {
+    let p = Project::new();
+    p.write("Cargo.toml", LIB_MANIFEST);
+    let lib = r#"pub fn one() -> u32 { 1 }
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn solid() { assert_eq!(super::one(), 1); }
+    #[test]
+    fn broken() { assert_eq!(super::one(), 2); }
+    #[test]
+    fn also_broken() { assert_eq!(super::one(), 3); }
+}
+"#;
+    p.write("src/lib.rs", lib);
+    p.write("tests/other.rs", "#[test]\nfn elsewhere() {}\n");
+    let out = p.igl(&["test", "--no-fail-fast"]);
+    assert_eq!(out.status.code(), Some(101));
+    assert!(text(&out).contains("igl test --failed"), "{}", text(&out));
+
+    let out = p.igl(&["test", "--failed"]);
+    let msg = text(&out);
+    assert_eq!(out.status.code(), Some(101), "{msg}");
+    assert!(msg.contains("0 passed; 2 failed"), "{msg}");
+    assert!(!msg.contains("other"), "{msg}");
+
+    p.write(
+        "src/lib.rs",
+        &lib.replace("super::one(), 2", "super::one(), 1"),
+    );
+    let msg = text(&p.igl(&["test", "--failed"]));
+    assert!(msg.contains("1 passed; 1 failed"), "{msg}");
+    let msg = text(&p.igl(&["test", "--failed"]));
+    assert!(msg.contains("0 passed; 1 failed"), "{msg}");
+    assert!(!msg.contains("test tests::broken "), "{msg}");
+
+    p.write(
+        "src/lib.rs",
+        &lib.replace("super::one(), 2", "super::one(), 1")
+            .replace("super::one(), 3", "super::one(), 1"),
+    );
+    assert!(p.igl(&["test", "--failed"]).status.success());
+    let out = p.igl(&["test", "--failed"]);
+    let msg = text(&out);
+    assert!(out.status.success(), "{msg}");
+    assert!(msg.contains("nothing failed last time"), "{msg}");
+    assert!(msg.contains("4 passed"), "{msg}");
+}
+
+#[test]
+fn test_results_are_json_lines_with_message_format_json() {
+    let p = lib_project();
+    let out = p.igl(&["test", "--message-format", "json"]);
+    assert!(out.status.success(), "{}", text(&out));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let lines: Vec<serde_json::Value> = stdout
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap_or_else(|e| panic!("not JSON ({e}): {l}")))
+        .collect();
+    let suite = lines
+        .iter()
+        .find(|l| l["reason"] == "test-suite-finished")
+        .expect("a test-suite-finished line");
+    assert_eq!(suite["outcome"], "passed");
+    assert_eq!(suite["tests"][0]["name"], "tests::adds");
+    assert_eq!(suite["tests"][0]["status"], "passed");
+}
+
+#[test]
+fn a_store_bundle_carries_a_build_to_a_fresh_machine() {
+    let p = build_script_project();
+    p.ok(&["build"]);
+    p.ok(&["test", "--no-run"]);
+    let bundle = p.home().join("ci-cache.tar.gz");
+    let out = p.ok(&[
+        "cas",
+        "export",
+        "-o",
+        bundle.to_str().unwrap(),
+        "--for",
+        "build",
+        "--for",
+        "test",
+    ]);
+    assert!(out.contains("wrote"), "{out}");
+
+    let fresh = tempfile::tempdir().unwrap();
+    std::fs::remove_dir_all(p.path().join(".igel")).unwrap();
+    let igl = |args: &[&str]| {
+        let out = igel_command()
+            .args(args)
+            .current_dir(p.path())
+            .env("IGEL_HOME", fresh.path())
+            .env("NO_COLOR", "1")
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{}", text(&out));
+        text(&out)
+    };
+    assert!(igl(&["cas", "import", bundle.to_str().unwrap()]).contains("imported"));
+    let build = igl(&["build"]);
+    assert!(build.contains(" 0 compiled"), "{build}");
+    let main = std::fs::read_to_string(p.path().join("src/main.rs")).unwrap();
+    std::fs::write(p.path().join("src/main.rs"), main.clone() + "\n// edited\n").unwrap();
+    let edited = igl(&["build"]);
+    assert!(!edited.contains(" 0 compiled"), "{edited}");
+    std::fs::write(p.path().join("src/main.rs"), main).unwrap();
+    let scripts: Vec<_> = std::fs::read_dir(p.path().join(".igel/target/debug/build"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| e.path().join("script").exists())
+        .collect();
+    assert!(scripts.is_empty(), "{scripts:?}");
+    let run = igl(&["run"]);
+    assert!(
+        run.contains("cfg=true env=ok"),
+        "the restored program runs:\n{run}"
+    );
+    let test = igl(&["test", "--no-run"]);
+    assert!(
+        test.contains(" 0 compiled") || !test.contains("compiled"),
+        "{test}"
+    );
+}
+
+#[test]
+fn affected_partitions_split_the_packages_between_machines() {
+    let p = chain_project(3);
+    git_in(p.path(), &["init", "-q", "-b", "main"]);
+    git_in(p.path(), &["add", "-A"]);
+    git_in(p.path(), &["commit", "-q", "-m", "base"]);
+    p.write("c0/src/extra.rs", "");
+    let shard = |n: &str| -> Vec<String> {
+        p.ok(&["affected", "--partition", n])
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(String::from)
+            .collect()
+    };
+    assert_eq!(shard("1/2"), ["app", "c1"]);
+    assert_eq!(shard("2/2"), ["c0", "c2"]);
+    let bad = p.igl(&["affected", "--partition", "3/2"]);
+    assert!(!bad.status.success());
+    assert!(text(&bad).contains("N/M"), "{}", text(&bad));
+}
+
+fn watching_script_project(watch: bool) -> Project {
+    let p = Project::new();
+    p.write("Cargo.toml", LIB_MANIFEST);
+    let rerun = if watch {
+        "println!(\"cargo::rerun-if-changed=build.rs\");\n    println!(\"cargo::rerun-if-changed=schema.txt\");\n    println!(\"cargo::rerun-if-changed=build\");"
+    } else {
+        ""
+    };
+    p.write(
+        "build.rs",
+        &format!(
+            r#"#[path = "build/helper.rs"] mod helper;
+use std::io::Write;
+fn main() {{
+    let log = std::env::var("IGEL_T_RUNS").unwrap();
+    std::fs::OpenOptions::new().create(true).append(true).open(log).unwrap().write_all(b"run\n").unwrap();
+    let schema = std::fs::read_to_string("schema.txt").unwrap();
+    let out = std::path::PathBuf::from(std::env::var("OUT_DIR").unwrap());
+    std::fs::write(out.join("gen.rs"), format!("pub const SCHEMA: &str = {{:?}};", helper::decorate(schema.trim()))).unwrap();
+    {rerun}
+}}
+"#
+        ),
+    );
+    p.write(
+        "build/helper.rs",
+        "pub fn decorate(s: &str) -> String { format!(\"<{s}>\") }\n",
+    );
+    p.write("schema.txt", "v1\n");
+    p.write(
+        "src/lib.rs",
+        "include!(concat!(env!(\"OUT_DIR\"), \"/gen.rs\"));\npub fn schema() -> &'static str { SCHEMA }\n#[test] fn t() { assert!(SCHEMA.starts_with('<')); }\n",
+    );
+    p
+}
+
+fn build_counting_runs(p: &Project) -> usize {
+    let log = p.home().join("runs.log");
+    let out = igel_command()
+        .args(["build"])
+        .current_dir(p.path())
+        .env("IGEL_HOME", p.home())
+        .env("IGEL_T_RUNS", &log)
+        .env("NO_COLOR", "1")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", text(&out));
+    std::fs::read_to_string(&log).map_or(0, |t| t.lines().count())
+}
+
+#[test]
+fn a_build_script_reruns_only_when_a_file_it_watches_changes() {
+    let p = watching_script_project(true);
+    assert_eq!(build_counting_runs(&p), 1);
+    let bin = std::fs::read_dir(p.path().join(".igel/target/debug/build"))
+        .unwrap()
+        .flatten()
+        .next()
+        .unwrap()
+        .path()
+        .join("script")
+        .join(exe("build_script_build"));
+    let compiled_at = std::fs::metadata(&bin).unwrap().modified().unwrap();
+
+    p.write("src/lib.rs", &(p.read("src/lib.rs") + "pub fn more() {}\n"));
+    assert_eq!(
+        build_counting_runs(&p),
+        1,
+        "an unwatched edit must not run the script"
+    );
+
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    p.write("schema.txt", "v2\n");
+    assert_eq!(build_counting_runs(&p), 2);
+    assert_eq!(
+        std::fs::metadata(&bin).unwrap().modified().unwrap(),
+        compiled_at
+    );
+
+    p.write(
+        "build/helper.rs",
+        "pub fn decorate(s: &str) -> String { format!(\"<<{s}>>\") }\n",
+    );
+    assert_eq!(build_counting_runs(&p), 3);
+    assert_ne!(
+        std::fs::metadata(&bin).unwrap().modified().unwrap(),
+        compiled_at
+    );
+
+    p.write("schema.txt", "v1\n");
+    p.write(
+        "build/helper.rs",
+        "pub fn decorate(s: &str) -> String { format!(\"<{s}>\") }\n",
+    );
+    assert_eq!(build_counting_runs(&p), 3);
+}
+
+#[test]
+fn a_build_script_that_watches_nothing_reruns_on_any_change_like_cargo() {
+    let p = watching_script_project(false);
+    assert_eq!(build_counting_runs(&p), 1);
+    p.write("src/lib.rs", &(p.read("src/lib.rs") + "pub fn more() {}\n"));
+    assert_eq!(build_counting_runs(&p), 2);
+}
+
+#[test]
+fn graph_draws_the_package_graph_as_dot_and_mermaid() {
+    let p = chain_project(2);
+    let dot = p.ok(&["graph"]);
+    assert!(dot.starts_with("digraph igl {"), "{dot}");
+    let id = |name: &str| {
+        let line = dot
+            .lines()
+            .find(|l| l.contains(&format!("label=\"{name} 0.1.0\"")))
+            .unwrap_or_else(|| panic!("no node {name}:\n{dot}"));
+        line.split_whitespace().next().unwrap().to_string()
+    };
+    let (app, c1, c0) = (id("app"), id("c1"), id("c0"));
+    assert!(dot.contains(&format!("{app} -> {c1};")), "{dot}");
+    assert!(dot.contains(&format!("{c1} -> {c0};")), "{dot}");
+    assert!(!dot.contains(&format!("{app} -> {c0};")), "{dot}");
+
+    let mermaid = p.ok(&["graph", "--format", "mermaid", "-p", "c1"]);
+    assert!(mermaid.starts_with("flowchart LR"), "{mermaid}");
+    assert!(mermaid.contains("[\"c1 0.1.0\"]:::member"), "{mermaid}");
+    assert!(!mermaid.contains("app"), "only what c1 reaches:\n{mermaid}");
+}
+
+#[test]
+fn graph_units_lists_the_build_plan_with_keys_and_cache_state() {
+    let p = chain_project(2);
+    let plan = |p: &Project| -> serde_json::Value {
+        let out = p.igl(&["graph", "--units", "--format", "json"]);
+        assert!(out.status.success(), "{}", text(&out));
+        serde_json::from_slice(&out.stdout).unwrap()
+    };
+    let before = plan(&p);
+    let units = before["units"].as_array().unwrap();
+    let packages: std::collections::BTreeSet<&str> = units
+        .iter()
+        .map(|u| u["package"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        packages.into_iter().collect::<Vec<_>>(),
+        ["app", "c0", "c1"]
+    );
+    assert!(units.iter().all(|u| u["cached"] == false), "{before:#}");
+    let c1 = units.iter().find(|u| u["package"] == "c1").unwrap();
+    let to = c1["dependencies"][0]["index"].as_u64().unwrap() as usize;
+    assert_eq!(units[to]["package"], "c0");
+    assert_eq!(c1["dependencies"][0]["extern_crate_name"], "c0");
+
+    p.ok(&["build"]);
+    let after = plan(&p);
+    let units = after["units"].as_array().unwrap();
+    assert!(units.iter().all(|u| u["cached"] == true), "{after:#}");
+    assert_eq!(plan(&p)["units"], after["units"]);
+}
+
+#[test]
+fn a_dependencys_build_script_warnings_stay_quiet_but_the_workspaces_show() {
+    let reg = tempfile::tempdir().unwrap();
+    let (bytes, sum) = make_crate_with(
+        "noisy",
+        "1.0.0",
+        &[
+            ("src/lib.rs", "pub fn f() {}\n"),
+            (
+                "build.rs",
+                "fn main() { println!(\"cargo::warning=from the dependency\"); }\n",
+            ),
+        ],
+    );
+    std::fs::write(reg.path().join("noisy-1.0.0.crate"), bytes).unwrap();
+    let dir = reg.path().join("index/no/is");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("noisy"),
+        format!(
+            "{{\"name\":\"noisy\",\"vers\":\"1.0.0\",\"deps\":[],\"cksum\":\"{sum}\",\"features\":{{}},\"yanked\":false}}\n"
+        ),
+    )
+    .unwrap();
+    let p = app_with(&reg, "noisy = \"1\"\n");
+    p.write(
+        "build.rs",
+        "fn main() { println!(\"cargo::warning=from the workspace\"); }\n",
+    );
+    let out = p.ok(&["build"]);
+    assert!(out.contains("from the workspace"), "{out}");
+    assert!(!out.contains("from the dependency"), "{out}");
+}
+
+#[test]
+fn tree_shows_what_a_build_here_uses_like_cargo_tree() {
+    let p = Project::new();
+    p.write(
+        "Cargo.toml",
+        "[workspace]\nresolver = \"2\"\nmembers = [\"app\", \"lib1\", \"bld\", \"devd\", \"win\"]\n",
+    );
+    for (name, extra) in [
+        (
+            "lib1",
+            "[features]\ndefault = [\"std\"]\nstd = []\nextra = []\n",
+        ),
+        ("bld", ""),
+        ("devd", ""),
+        ("win", ""),
+    ] {
+        p.write(
+            &format!("{name}/Cargo.toml"),
+            &format!(
+                "[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n{extra}"
+            ),
+        );
+        p.write(&format!("{name}/src/lib.rs"), "");
+    }
+    let (elsewhere, elsewhere_triple) = if cfg!(windows) {
+        ("unix", "x86_64-unknown-linux-gnu")
+    } else {
+        ("windows", "x86_64-pc-windows-msvc")
+    };
+    p.write(
+        "app/Cargo.toml",
+        &format!(
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
+             [dependencies]\nlib1 = {{ path = \"../lib1\", features = [\"extra\"] }}\n\n\
+             [build-dependencies]\nbld = {{ path = \"../bld\" }}\n\n\
+             [dev-dependencies]\ndevd = {{ path = \"../devd\" }}\n\n\
+             [target.'cfg({elsewhere})'.dependencies]\nwin = {{ path = \"../win\" }}\n"
+        ),
+    );
+    p.write("app/src/lib.rs", "");
+    p.write("app/build.rs", "fn main() {}\n");
+
+    let stdout = |args: &[&str]| {
+        let out = p.igl(args);
+        assert!(out.status.success(), "{}", text(&out));
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    let tree = stdout(&["tree", "-p", "app"]);
+    let lines: Vec<&str> = tree.lines().collect();
+    assert!(lines[0].starts_with("app v0.1.0 ("), "{tree}");
+    assert!(lines[1].starts_with("└── lib1 v0.1.0"), "{tree}");
+    assert_eq!(lines[2], "[build-dependencies]", "{tree}");
+    assert!(lines[3].starts_with("└── bld v0.1.0"), "{tree}");
+    assert_eq!(lines[4], "[dev-dependencies]", "{tree}");
+    assert!(lines[5].starts_with("└── devd v0.1.0"), "{tree}");
+    assert!(!tree.contains("win v0.1.0"), "{tree}");
+    assert!(stdout(&["tree", "-p", "app", "--target", "all"]).contains("win v0.1.0"));
+    assert!(stdout(&["tree", "-p", "app", "--target", elsewhere_triple]).contains("win v0.1.0"));
+
+    let normal = stdout(&["tree", "-p", "app", "-e", "normal", "--prefix", "none"]);
+    let names: Vec<&str> = normal
+        .lines()
+        .map(|l| l.split(' ').next().unwrap())
+        .collect();
+    assert_eq!(names, ["app", "lib1"], "{normal}");
+
+    let why = stdout(&["tree", "-e", "features", "-i", "lib1", "--prefix", "depth"]);
+    let lines: Vec<&str> = why.lines().collect();
+    let std = lines
+        .iter()
+        .position(|l| *l == "1lib1 feature \"std\"")
+        .unwrap();
+    assert!(
+        lines[std + 1].starts_with("2lib1 feature \"default\""),
+        "{why}"
+    );
+    let default = lines
+        .iter()
+        .position(|l| *l == "1lib1 feature \"default\"")
+        .unwrap();
+    assert!(lines[default + 1].starts_with("2app v0.1.0"), "{why}");
+    assert!(lines.contains(&"1lib1 feature \"extra\""), "{why}");
+}
+
+#[test]
+fn test_builds_the_examples_first_and_runs_those_marked_test() {
+    let p = Project::new();
+    p.write(
+        "Cargo.toml",
+        "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
+         [[example]]\nname = \"checked\"\ntest = true\n",
+    );
+    p.write("src/lib.rs", "pub fn one() -> u32 { 1 }\n");
+    p.write(
+        "examples/tool.rs",
+        "fn main() { println!(\"tool ran\"); }\n",
+    );
+    p.write(
+        "examples/checked.rs",
+        "fn main() {}\n#[test]\nfn example_test() { assert_eq!(demo::one(), 1); }\n",
+    );
+    p.write(
+        "tests/runs_example.rs",
+        r#"#[test]
+fn example_binary_is_there() {
+    let mut exe = std::env::current_exe().unwrap();
+    exe.pop();
+    exe.pop();
+    let tool = exe.join("examples").join("tool").with_extension(std::env::consts::EXE_EXTENSION);
+    let out = std::process::Command::new(&tool).output().expect("the example was built");
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "tool ran");
+}
+"#,
+    );
+    let out = p.ok(&["test"]);
+    assert!(out.contains("(example checked) · 1 passed"), "{out}");
+    assert!(out.contains("(test runs_example) · 1 passed"), "{out}");
+    assert!(
+        !out.contains("example tool)"),
+        "a plain example is not run: {out}"
+    );
+    assert!(out.contains("✓ 2 passed"), "{out}");
+}
+
+#[cfg(unix)]
+#[test]
+fn panic_abort_profiles_still_test_with_unwinding_like_cargo() {
+    let p = Project::new();
+    p.write(
+        "Cargo.toml",
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
+         [profile.dev]\npanic = \"abort\"\n",
+    );
+    p.write(
+        "src/lib.rs",
+        "pub fn two() -> u32 { 2 }\n#[test]\nfn unit() { assert_eq!(two(), 2); }\n",
+    );
+    p.write(
+        "src/main.rs",
+        "fn main() { if std::env::args().count() > 1 { panic!(\"boom\") } }\n",
+    );
+    p.write(
+        "tests/it.rs",
+        "#[test]\n#[should_panic]\nfn unwinds() { panic!(\"caught by the harness\") }\n",
+    );
+    let out = p.ok(&["test"]);
+    assert!(out.contains("✓ 2 passed"), "{out}");
+
+    p.ok(&["build"]);
+    use std::os::unix::process::ExitStatusExt;
+    let status = Command::new(p.path().join(".igel/target/debug/app"))
+        .arg("panic")
+        .stderr(std::process::Stdio::null())
+        .status()
+        .unwrap();
+    assert_eq!(status.signal(), Some(6), "aborted, not unwound: {status:?}");
+}
+
+#[test]
+fn store_entries_unused_for_a_month_are_removed_in_the_background() {
+    let p = Project::new();
+    p.write("Cargo.toml", LIB_MANIFEST);
+    let cas = p.home().join("cas");
+    let manifests = || -> std::collections::BTreeSet<PathBuf> {
+        walkdir::WalkDir::new(cas.join("objects"))
+            .into_iter()
+            .flatten()
+            .filter(|e| e.file_name() == "manifest.json")
+            .map(|e| e.into_path())
+            .collect()
+    };
+    p.write("src/lib.rs", "pub fn f() {}\n");
+    p.ok(&["build"]);
+    let old = manifests();
+    p.write("src/lib.rs", "pub fn f() {}\npub fn g() {}\n");
+    p.ok(&["build"]);
+    let current: Vec<PathBuf> = manifests().difference(&old).cloned().collect();
+    assert!(!old.is_empty() && !current.is_empty());
+    let stamp = cas.join("last-gc");
+    assert!(stamp.exists(), "a new store only gets its stamp");
+
+    let days_ago =
+        |d: u64| std::time::SystemTime::now() - std::time::Duration::from_secs(d * 86_400);
+    for m in &old {
+        let mut json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(m).unwrap()).unwrap();
+        let then = days_ago(40)
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        json["stored_at"] = then.into();
+        let mut perms = std::fs::metadata(m).unwrap().permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        perms.set_readonly(false);
+        std::fs::set_permissions(m, perms).unwrap();
+        std::fs::write(m, json.to_string()).unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(m)
+            .unwrap()
+            .set_modified(days_ago(40))
+            .unwrap();
+    }
+    p.ok(&["build"]);
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    assert!(old.iter().all(|m| m.exists()));
+
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&stamp)
+        .unwrap()
+        .set_modified(days_ago(2))
+        .unwrap();
+    p.ok(&["build"]);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while old.iter().any(|m| m.exists()) && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(old.iter().all(|m| !m.exists()), "unused entries removed");
+    assert!(current.iter().all(|m| m.exists()), "what builds use stays");
+}
+
+#[test]
+fn a_cached_dependencys_script_output_still_reaches_rebuilt_dependents() {
+    let p = Project::new();
+    p.write(
+        "Cargo.toml",
+        "[workspace]\nresolver = \"2\"\nmembers = [\"app\", \"sys\"]\n",
+    );
+    p.write(
+        "sys/Cargo.toml",
+        "[package]\nname = \"sys\"\nversion = \"0.1.0\"\nedition = \"2021\"\nlinks = \"sysx\"\n",
+    );
+    p.write(
+        "sys/build.rs",
+        "fn main() {\n    println!(\"cargo::rerun-if-changed=build.rs\");\n    println!(\"cargo::metadata=greeting=hello\");\n}\n",
+    );
+    p.write("sys/src/lib.rs", "");
+    p.write(
+        "app/Cargo.toml",
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\nsys = { path = \"../sys\" }\n",
+    );
+    p.write(
+        "app/build.rs",
+        "fn main() {\n    let g = std::env::var(\"DEP_SYSX_GREETING\").expect(\"DEP_SYSX_GREETING\");\n    println!(\"cargo::rustc-env=GREETING={g}\");\n}\n",
+    );
+    p.write(
+        "app/src/main.rs",
+        "fn main() { println!(\"{}\", env!(\"GREETING\")); }\n",
+    );
+    p.ok(&["build"]);
+    p.write(
+        "app/src/main.rs",
+        "fn main() { println!(\"{} again\", env!(\"GREETING\")); }\n",
+    );
+    let out = p.ok(&["run", "-p", "app"]);
+    assert!(out.contains("hello again"), "{out}");
+
+    let bundle = p.home().join("bundle.tar");
+    p.ok(&["cas", "export", "-o", bundle.to_str().unwrap()]);
+    let fresh = tempfile::tempdir().unwrap();
+    std::fs::remove_dir_all(p.path().join(".igel")).unwrap();
+    let igl = |args: &[&str]| {
+        let out = igel_command()
+            .args(args)
+            .current_dir(p.path())
+            .env("IGEL_HOME", fresh.path())
+            .env("NO_COLOR", "1")
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{}", text(&out));
+        text(&out)
+    };
+    igl(&["cas", "import", bundle.to_str().unwrap()]);
+    p.write(
+        "app/src/main.rs",
+        "fn main() { println!(\"{} once more\", env!(\"GREETING\")); }\n",
+    );
+    let out = igl(&["run", "-p", "app"]);
+    assert!(out.contains("hello once more"), "{out}");
+}
+
+#[test]
+fn json_messages_report_build_scripts_for_rust_analyzer() {
+    let p = build_script_project();
+    let executed = |p: &Project| -> Vec<serde_json::Value> {
+        let out = p.igl(&["check", "--message-format", "json"]);
+        assert!(out.status.success(), "{}", text(&out));
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter(|v| v["reason"] == "build-script-executed")
+            .collect()
+    };
+    for _ in 0..2 {
+        let lines = executed(&p);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        let m = &lines[0];
+        assert!(
+            m["package_id"]
+                .as_str()
+                .unwrap()
+                .contains("#demo@1.2.3-beta.1"),
+            "{m}"
+        );
+        assert_eq!(m["cfgs"], serde_json::json!(["from_script"]), "{m}");
+        assert_eq!(m["env"], serde_json::json!([["SCRIPT_VAR", "ok"]]), "{m}");
+        let out_dir = PathBuf::from(m["out_dir"].as_str().unwrap());
+        assert!(out_dir.join("generated.rs").is_file(), "{m}");
+    }
+}
+
+#[test]
+fn a_declared_target_without_its_file_is_reported_like_cargo() {
+    let p = Project::new();
+    p.write(
+        "Cargo.toml",
+        "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
+         [[example]]\nname = \"gone\"\npath = \"examples/gone.rs\"\n",
+    );
+    p.write("src/lib.rs", "");
+    p.ok(&["build"]);
+    let out = p.igl(&["test"]);
+    assert!(!out.status.success());
+    assert!(
+        text(&out).contains("can't find example `gone` at path"),
+        "{}",
+        text(&out)
+    );
+}
+
+#[test]
+fn a_links_package_with_integration_tests_is_not_its_own_conflict() {
+    let p = Project::new();
+    p.write(
+        "Cargo.toml",
+        "[package]\nname = \"natlib\"\nversion = \"0.1.0\"\nedition = \"2021\"\nlinks = \"natlib_0_1\"\n",
+    );
+    p.write("build.rs", "fn main() {}\n");
+    p.write("src/lib.rs", "pub fn one() -> u32 { 1 }\n");
+    p.write(
+        "tests/aead_tests.rs",
+        "#[test]\nfn works() { assert_eq!(natlib::one(), 1); }\n",
+    );
+    let out = p.ok(&["test"]);
+    assert!(out.contains("(test aead_tests) · 1 passed"), "{out}");
+}
+
+#[test]
+fn a_workspace_crate_does_not_stand_in_for_its_published_release() {
+    let reg = local_registry(&[
+        ("core_lib", "1.0.0", &[]),
+        ("helper", "1.0.0", &[("core_lib", "^1.0")]),
+    ]);
+    let p = app_with(&reg, "");
+    p.write(
+        "Cargo.toml",
+        "[package]\nname = \"core_lib\"\nversion = \"1.1.0\"\nedition = \"2021\"\n\n\
+         [dev-dependencies]\nhelper = \"1\"\n",
+    );
+    p.write("src/lib.rs", "pub fn local() {}\n");
+    p.ok(&["generate-lockfile"]);
+    assert_eq!(
+        locked(&p),
+        ["core_lib 1.0.0", "core_lib 1.1.0", "helper 1.0.0"]
+    );
+    let lock = p.read("Cargo.lock");
+    assert!(lock.contains("\"core_lib 1.0.0\""), "{lock}");
+    p.ok(&["test"]);
+}
+
+#[test]
+fn a_proc_macro_crates_doc_tests_run_like_cargo() {
+    let p = Project::new();
+    p.write(
+        "Cargo.toml",
+        "[package]\nname = \"pm\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[lib]\nproc-macro = true\n",
+    );
+    p.write(
+        "src/lib.rs",
+        r#"//! ```
+//! pm::make_answer!();
+//! assert_eq!(answer(), 42);
+//! ```
+use proc_macro::TokenStream;
+
+#[proc_macro]
+pub fn make_answer(_: TokenStream) -> TokenStream {
+    "fn answer() -> u32 { 42 }".parse().unwrap()
+}
+"#,
+    );
+    let out = p.ok(&["test"]);
+    assert!(out.contains("(doc-tests) · 1 passed"), "{out}");
+}
+
+#[test]
+fn a_target_that_is_not_installed_is_reported_before_building() {
+    let p = lib_project();
+    let out = p.igl(&["build", "--target", "x86_64-unknown-linux-gnux"]);
+    assert!(!out.status.success());
+    assert!(
+        text(&out).contains("unknown target `x86_64-unknown-linux-gnux`"),
+        "{}",
+        text(&out)
+    );
+
+    let sysroot = String::from_utf8(
+        Command::new("rustc")
+            .args(["--print", "sysroot"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    let missing = [
+        "riscv64gc-unknown-none-elf",
+        "thumbv7em-none-eabihf",
+        "wasm32v1-none",
+    ]
+    .into_iter()
+    .find(|t| {
+        !std::path::Path::new(sysroot.trim())
+            .join("lib/rustlib")
+            .join(t)
+            .exists()
+    });
+    if let Some(t) = missing {
+        let out = p.igl(&["build", "--target", t]);
+        assert!(!out.status.success());
+        let msg = text(&out);
+        assert!(
+            msg.contains(&format!("the standard library for `{t}` is not installed")),
+            "{msg}"
+        );
+        assert!(!msg.contains("can't find crate"), "{msg}");
+    }
+}
+
+#[test]
+fn features_says_which_are_on_and_who_turned_them_on() {
+    let p = Project::new();
+    p.write(
+        "Cargo.toml",
+        "[workspace]\nresolver = \"2\"\nmembers = [\"app\", \"lib\"]\n",
+    );
+    p.write(
+        "lib/Cargo.toml",
+        "[package]\nname = \"lib\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
+         [features]\ndefault = [\"std\"]\nstd = []\nfast = [\"simd\"]\nsimd = []\nunused = []\n",
+    );
+    p.write("lib/src/lib.rs", "");
+    p.write(
+        "app/Cargo.toml",
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
+         [dependencies]\nlib = { path = \"../lib\", features = [\"fast\"] }\n\n\
+         [features]\nturbo = [\"lib/simd\"]\n",
+    );
+    p.write("app/src/main.rs", "fn main() {}\n");
+
+    let out = p.ok(&["features", "lib"]);
+    let line = |f: &str| {
+        out.lines()
+            .find(|l| l.contains(&format!("+ {f} ")) || l.trim_end().ends_with(&format!("+ {f}")))
+            .unwrap_or_else(|| panic!("no `{f}` line in:\n{out}"))
+            .to_string()
+    };
+    assert!(
+        out.contains("lib 0.1.0") && out.contains("4 of 5 features on"),
+        "{out}"
+    );
+    assert!(line("fast").contains("app"), "{out}");
+    assert!(line("simd").contains("feature `fast`"), "{out}");
+    assert!(line("default").contains("default features of app"), "{out}");
+    assert!(line("std").contains("feature `default`"), "{out}");
+    assert!(!out.contains("unused"), "{out}");
+    assert!(p.ok(&["features", "lib", "--all"]).contains("- unused"));
+
+    let out = p.ok(&["features"]);
+    assert!(out.contains("turbo") && out.contains("lib/simd"), "{out}");
+
+    let out = p.igl(&["features", "nope"]);
+    assert!(!out.status.success());
+    assert!(
+        text(&out).contains("`nope` is not in what a build"),
+        "{}",
+        text(&out)
+    );
+}
+
+#[test]
+fn a_lockfile_from_another_resolution_is_never_trusted() {
+    let reg = local_registry(&[("foo", "1.0.0", &[])]);
+    let p = app_with(&reg, "");
+    p.ok(&["build"]);
+    let lock_path = p.path().join("Igel.lock.bin");
+    let old = std::fs::read(&lock_path).unwrap();
+    p.write(
+        "Cargo.toml",
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[dependencies]\nfoo = \"1\"\n",
+    );
+    p.write("src/main.rs", "fn main() { foo::f(); }\n");
+    p.ok(&["build"]);
+    let new = std::fs::read(&lock_path).unwrap();
+    assert_eq!(&new[..9], b"IGELLOCK\x03");
+    let header = |b: &[u8]| 11 + u16::from_le_bytes([b[9], b[10]]) as usize;
+    let mut spliced = new[..header(&new)].to_vec();
+    spliced.extend_from_slice(&old[header(&old)..]);
+    std::fs::write(&lock_path, spliced).unwrap();
+
+    p.write("src/main.rs", "fn main() { foo::f(); foo::f(); }\n");
+    let out = p.ok(&["build"]);
+    assert!(!out.contains("undeclared"), "{out}");
+    let fixed = std::fs::read(&lock_path).unwrap();
+    assert_eq!(fixed, std::fs::read(&lock_path).unwrap());
+    assert!(p.read("Cargo.lock").contains("name = \"foo\""));
+
+    std::fs::write(&lock_path, &fixed[..fixed.len() / 2]).unwrap();
+    p.write("src/main.rs", "fn main() { foo::f(); }\n");
+    p.ok(&["build"]);
+}
+
+#[test]
+fn workspace_feature_unification_shares_dependency_builds_across_selections() {
+    let p = Project::new();
+    p.write(
+        "Cargo.toml",
+        "[workspace]\nmembers = [\"crates/*\"]\nresolver = \"2\"\n",
+    );
+    p.write(
+        "crates/shared/Cargo.toml",
+        "[package]\nname = \"shared\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[features]\nextra = []\n",
+    );
+    p.write(
+        "crates/shared/src/lib.rs",
+        "pub fn extra() -> bool { cfg!(feature = \"extra\") }\n",
+    );
+    p.write(
+        "crates/a/Cargo.toml",
+        "[package]\nname = \"a\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[dependencies]\nshared = { path = \"../shared\" }\n",
+    );
+    p.write(
+        "crates/a/src/main.rs",
+        "fn main() { println!(\"extra={}\", shared::extra()); }\n",
+    );
+    p.write(
+        "crates/b/Cargo.toml",
+        "[package]\nname = \"b\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[dependencies]\nshared = { path = \"../shared\", features = [\"extra\"] }\n",
+    );
+    p.write("crates/b/src/lib.rs", "this does not compile\n");
+
+    assert!(p.ok(&["run", "-p", "a"]).contains("extra=false"));
+
+    p.write(
+        "Igel.toml",
+        "[build]\nfeature-unification = \"workspace\"\n",
+    );
+    assert!(p.ok(&["run", "-p", "a"]).contains("extra=true"));
+
+    p.write("Igel.toml", "");
+    p.write(
+        ".cargo/config.toml",
+        "[resolver]\nfeature-unification = \"workspace\"\n",
+    );
+    assert!(p.ok(&["run", "-p", "a"]).contains("extra=true"));
+
+    p.write(
+        ".cargo/config.toml",
+        "[resolver]\nfeature-unification = \"everything\"\n",
+    );
+    let bad = p.igl(&["build", "-p", "a"]);
+    assert!(!bad.status.success());
+    assert!(
+        text(&bad).contains("unknown feature unification"),
+        "{}",
+        text(&bad)
+    );
+}
+
+#[test]
+fn pinned_workspaces_survive_cleanup_and_idle_entries_are_compressed() {
+    let p = Project::new();
+    p.write("Cargo.toml", LIB_MANIFEST);
+    p.write(
+        "src/lib.rs",
+        &format!(
+            "pub fn f() -> &'static str {{ \"{}\" }}\n",
+            "x".repeat(20_000)
+        ),
+    );
+    p.ok(&["build"]);
+    let cas = p.home().join("cas");
+    let manifests: Vec<PathBuf> = walkdir::WalkDir::new(cas.join("objects"))
+        .into_iter()
+        .flatten()
+        .filter(|e| e.file_name() == "manifest.json")
+        .map(|e| e.into_path())
+        .collect();
+    assert!(!manifests.is_empty());
+    let then = std::time::SystemTime::now() - std::time::Duration::from_secs(40 * 86_400);
+    let age = || {
+        for m in &manifests {
+            let mut json: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(m).unwrap()).unwrap();
+            json["stored_at"] = then
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+                .into();
+            let mut perms = std::fs::metadata(m).unwrap().permissions();
+            #[allow(clippy::permissions_set_readonly_false)]
+            perms.set_readonly(false);
+            std::fs::set_permissions(m, perms).unwrap();
+            std::fs::write(m, json.to_string()).unwrap();
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(m)
+                .unwrap()
+                .set_modified(then)
+                .unwrap();
+        }
+    };
+    age();
+
+    let out = p.ok(&["cas", "pin"]);
+    assert!(out.contains("pinned"), "{out}");
+    assert!(p.ok(&["cas", "pins"]).contains("entries"));
+
+    let out = p.ok(&["cas", "gc", "--max-age", "30d", "--compress-idle", "7d"]);
+    assert!(out.contains("0 entries"), "{out}");
+    assert!(out.contains("kept for pinned"), "{out}");
+    assert!(manifests.iter().all(|m| m.exists()));
+    let compressed = |m: &PathBuf| {
+        std::fs::read_dir(m.parent().unwrap())
+            .unwrap()
+            .flatten()
+            .any(|e| e.file_name().to_string_lossy().ends_with(".zst"))
+    };
+    assert!(manifests.iter().any(compressed), "{out}");
+
+    p.ok(&["clean"]);
+    assert!(p.ok(&["build"]).contains("0 compiled · 1 cached"));
+    assert!(!manifests.iter().any(compressed));
+
+    age();
+    assert!(p.ok(&["cas", "unpin"]).contains("unpinned"));
+    p.ok(&["cas", "gc", "--max-age", "30d"]);
+    assert!(manifests.iter().all(|m| !m.exists()));
+}
+
+#[test]
+fn tests_can_be_scheduled_one_batch_at_a_time_across_binaries() {
+    let p = lib_project();
+    let mut tests = String::new();
+    for i in 0..12 {
+        tests.push_str(&format!(
+            "#[test] fn t{i}() {{ std::thread::sleep(std::time::Duration::from_millis(50)); }}\n"
+        ));
+    }
+    tests.push_str("#[test] #[ignore] fn slow() {}\n");
+    p.write("tests/many.rs", &tests);
+    p.write("tests/other.rs", "#[test] fn alone() {}\n");
+
+    let whole = p.ok(&["test", "--no-doc"]);
+    let split = p.ok(&["test", "--no-doc", "--schedule", "tests"]);
+    assert!(split.contains("12 passed, 1 ignored"), "{split}");
+    assert!(split.contains("14 passed · 1 ignored"), "{split}");
+    assert!(whole.contains("14 passed · 1 ignored"), "{whole}");
+
+    let out = p.ok(&["test", "--no-doc", "--schedule", "tests", "t1"]);
+    assert!(out.contains("3 passed"), "{out}"); // t1, t10, t11
+
+    p.write("Igel.toml", "[test]\nschedule = \"tests\"\n");
+    p.write(
+        "tests/other.rs",
+        "#[test] fn alone() {}\n#[test] fn broken() { panic!(\"nope\") }\n",
+    );
+    let out = p.igl(&["test", "--no-doc", "--no-fail-fast"]);
+    assert!(!out.status.success());
+    let t = text(&out);
+    assert!(t.contains("nope") && t.contains("1 failed"), "{t}");
+}
+
+#[test]
+fn resolution_moves_back_from_a_release_whose_dependency_does_not_exist() {
+    let reg = local_registry(&[
+        ("b", "1.0.0", &[("c", "^1.0")]),
+        ("b", "1.1.0", &[("c", "^2.0")]),
+        ("c", "1.0.0", &[]),
+    ]);
+    let p = app_with(&reg, "b = \"1\"\n");
+    let out = p.ok(&["build"]);
+    assert_eq!(locked(&p), ["app 0.1.0", "b 1.0.0", "c 1.0.0"], "{out}");
+}
+
+#[test]
+fn an_impossible_version_choice_is_explained() {
+    let reg = local_registry(&[
+        ("a", "1.0.0", &[]),
+        ("a", "1.1.0", &[]),
+        ("b", "1.0.0", &[("a", "=1.1.0")]),
+    ]);
+    let p = app_with(&reg, "a = \"=1.0.0\"\nb = \"1\"\n");
+    let out = p.igl(&["build"]);
+    let t = text(&out);
+    assert!(t.contains("b 1.0.0 depends on a 1.1.0"), "{t}");
+    assert!(t.contains("side by side"), "{t}");
+    assert!(out.status.success(), "{t}");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn the_sandbox_confines_build_scripts() {
+    let p = lib_project();
+    let probe = p.igl(&["__sandbox", "--", "true"]);
+    if !probe.status.success() {
+        eprintln!("skipped: {}", text(&probe));
+        return;
+    }
+    let outside = p.home().join("planted");
+    p.write(
+        "build.rs",
+        &format!(
+            r#"
+fn main() {{
+    let out = std::env::var("OUT_DIR").unwrap();
+    std::fs::write(format!("{{out}}/generated.rs"), "pub const OK: u8 = 1;").unwrap();
+    let planted = std::fs::write({outside:?}, "x").is_ok();
+    let net = std::net::TcpStream::connect_timeout(
+        &"1.1.1.1:80".parse().unwrap(),
+        std::time::Duration::from_millis(500),
+    )
+    .map_err(|e| e.kind());
+    println!("cargo::warning=planted={{planted}} net_unreachable={{}}",
+        net.as_ref().err() == Some(&std::io::ErrorKind::NetworkUnreachable));
+}}
+"#
+        ),
+    );
+    p.write(
+        "src/lib.rs",
+        "include!(concat!(env!(\"OUT_DIR\"), \"/generated.rs\"));\n",
+    );
+    let out = p.ok(&["build"]);
+    assert!(out.contains("planted=true"), "{out}");
+    std::fs::remove_file(&outside).unwrap();
+
+    p.write("Igel.toml", "[build]\nsandbox = true\n");
+    let out = p.ok(&["build", "--rebuild-all"]);
+    assert!(out.contains("planted=false"), "{out}");
+    assert!(out.contains("net_unreachable=true"), "{out}");
+    assert!(!outside.exists());
+}
+
+#[test]
+fn audit_reports_advisories_for_locked_versions() {
+    let reg = local_registry(&[
+        ("smallvec", "1.6.0", &[]),
+        ("oldcrate", "0.3.1", &[]),
+        ("middle", "1.0.0", &[("smallvec", "^1.6")]),
+    ]);
+    let p = app_with(&reg, "middle = \"1\"\noldcrate = \"0.3\"\n");
+    p.ok(&["build"]);
+    let db = p.path().join("advisories");
+    std::fs::create_dir_all(&db).unwrap();
+    let advisory = |id: &str, aliases: &[&str], name: &str, events: &str, informational: &str| {
+        format!(
+            r#"{{"id":"{id}","aliases":{aliases:?},"summary":"Problem in {name}","details":"Details.",
+               "affected":[{{"package":{{"name":"{name}","ecosystem":"crates.io"}},
+               "ranges":[{{"type":"SEMVER","events":[{events}]}}],
+               "ecosystem_specific":{{"affects":{{"functions":["{name}::f"]}}}},
+               "database_specific":{{"informational":{informational}}}}}],
+               "severity":[{{"type":"CVSS_V3","score":"CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"}}]}}"#
+        )
+    };
+    let write = |file: &str, text: String| std::fs::write(db.join(file), text).unwrap();
+    write(
+        "RUSTSEC-2021-0003.json",
+        advisory(
+            "RUSTSEC-2021-0003",
+            &["GHSA-43w2-9j62-hq99"],
+            "smallvec",
+            r#"{"introduced":"1.0.0"},{"fixed":"1.6.1"}"#,
+            "null",
+        ),
+    );
+    write(
+        "GHSA-43w2-9j62-hq99.json",
+        advisory(
+            "GHSA-43w2-9j62-hq99",
+            &["RUSTSEC-2021-0003"],
+            "smallvec",
+            r#"{"introduced":"1.0.0"},{"fixed":"1.6.1"}"#,
+            "null",
+        ),
+    );
+    write(
+        "RUSTSEC-2020-0001.json",
+        advisory(
+            "RUSTSEC-2020-0001",
+            &[],
+            "oldcrate",
+            r#"{"introduced":"0"}"#,
+            "\"unmaintained\"",
+        ),
+    );
+    write(
+        "RUSTSEC-2019-0001.json",
+        advisory(
+            "RUSTSEC-2019-0001",
+            &[],
+            "smallvec",
+            r#"{"introduced":"0"},{"fixed":"1.0.0"}"#,
+            "null",
+        ),
+    );
+    let db_arg = db.to_str().unwrap();
+
+    let out = p.igl(&["audit", "--db", db_arg]);
+    let t = text(&out);
+    assert_eq!(out.status.code(), Some(1), "{t}");
+    assert!(
+        t.contains("smallvec 1.6.0 · RUSTSEC-2021-0003 · critical 9.8"),
+        "{t}"
+    );
+    assert!(
+        t.contains("app 0.1.0 → middle 1.0.0 → smallvec 1.6.0"),
+        "{t}"
+    );
+    assert!(t.contains("igl update smallvec --precise 1.6.1"), "{t}");
+    assert!(
+        t.contains("oldcrate 0.3.1 · RUSTSEC-2020-0001 · unmaintained"),
+        "{t}"
+    );
+    assert!(
+        !t.contains("GHSA-43w2") && !t.contains("RUSTSEC-2019-0001"),
+        "{t}"
+    );
+    assert!(t.contains("1 vulnerability found · 1 warning"), "{t}");
+
+    let out = p.igl(&["audit", "--db", db_arg, "--ignore", "RUSTSEC-2021-0003"]);
+    assert!(out.status.success(), "{}", text(&out));
+    let out = p.igl(&[
+        "audit",
+        "--db",
+        db_arg,
+        "--ignore",
+        "GHSA-43w2-9j62-hq99",
+        "--deny",
+        "unmaintained",
+    ]);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+    p.write("Igel.toml", "[audit]\nignore = \"RUSTSEC-2021-0003\"\n");
+    assert!(p.igl(&["audit", "--db", db_arg]).status.success());
+    p.write("Igel.toml", "");
+
+    let out = p.igl(&["audit", "--db", db_arg, "--format", "json"]);
+    let json: serde_json::Value =
+        serde_json::from_slice(&out.stdout).unwrap_or_else(|e| panic!("{e}: {}", text(&out)));
+    assert_eq!(json["vulnerabilities"]["count"], 1);
+    assert_eq!(
+        json["vulnerabilities"]["list"][0]["advisory"]["severity"],
+        "critical"
+    );
+    assert_eq!(
+        json["warnings"]["unmaintained"][0]["package"]["name"],
+        "oldcrate"
+    );
+}
+
+fn have_llvm_tools() -> bool {
+    let sysroot = Command::new("rustc")
+        .args(["--print", "sysroot"])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default();
+    std::path::Path::new(&sysroot)
+        .join("lib/rustlib")
+        .join(host_triple())
+        .join("bin/llvm-cov")
+        .is_file()
+}
+
+#[test]
+fn coverage_counts_what_tests_run_including_programs_they_start() {
+    if !have_llvm_tools() {
+        eprintln!("skipped: no llvm-tools component");
+        return;
+    }
+    let p = Project::new();
+    p.write(
+        "Cargo.toml",
+        "[package]\nname = \"cov\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    p.write(
+        "src/lib.rs",
+        "pub fn used(x: i32) -> i32 {\n    if x > 0 {\n        x\n    } else {\n        -x\n    }\n}\n\npub fn unused() -> i32 {\n    42\n}\n",
+    );
+    p.write(
+        "src/main.rs",
+        "fn main() {\n    println!(\"{}\", cov::used(-3));\n}\n",
+    );
+    p.write(
+        "tests/run.rs",
+        "#[test]\nfn runs() {\n    let out = std::process::Command::new(env!(\"CARGO_BIN_EXE_cov\")).output().unwrap();\n    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), \"3\");\n}\n",
+    );
+    let out = p.ok(&[
+        "coverage",
+        "--show-missing-lines",
+        "--lcov",
+        "-o",
+        "lcov.info",
+    ]);
+    assert!(out.contains("src/lib.rs"), "{out}");
+    assert!(out.contains("src/main.rs"), "{out}");
+    assert!(out.contains("not run: 3, 9-11"), "{out}");
+    let lcov = p.read("lcov.info");
+    assert!(lcov.contains("FNDA:1,cov::used"), "{lcov}");
+    assert!(lcov.contains("FNDA:0,cov::unused"), "{lcov}");
+
+    p.write("tests/fail.rs", "#[test]\nfn fails() { panic!(\"no\") }\n");
+    let out = p.igl(&["coverage"]);
+    assert_eq!(out.status.code(), Some(101), "{}", text(&out));
+    assert!(!text(&out).contains("of lines covered"), "{}", text(&out));
+    let out = p.igl(&["coverage", "--no-fail-fast"]);
+    assert_eq!(out.status.code(), Some(101), "{}", text(&out));
+    assert!(text(&out).contains("of lines covered"), "{}", text(&out));
+    std::fs::remove_file(p.path().join("tests/fail.rs")).unwrap();
+
+    let out = p.igl(&["coverage", "--fail-under", "99"]);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+    assert!(text(&out).contains("is below the required 99 %"));
+    assert!(p.path().join(".igel/target/coverage/build/debug").is_dir());
+    p.ok(&["build"]);
+    let scratch = tempfile::tempdir().unwrap();
+    let out = Command::new(p.path().join(".igel/target/debug/cov"))
+        .current_dir(scratch.path())
+        .env_remove("LLVM_PROFILE_FILE")
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "3");
+    assert!(
+        !scratch.path().join("default.profraw").exists(),
+        "the ordinary build is instrumented"
+    );
+}
+
+#[test]
+fn manifest_mistakes_cargo_refuses_are_refused_with_the_reason() {
+    let p = Project::new();
+    p.write("Cargo.toml", "[workspace]\nmembers = [\"a\", \"b\"]\n");
+    p.write(
+        "a/Cargo.toml",
+        "[package]\nname = \"a\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[dependencies]\nb = { path = \"../b\" }\n",
+    );
+    p.write("a/src/lib.rs", "");
+    p.write(
+        "b/Cargo.toml",
+        "[package]\nname = \"b\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[dependencies]\na = { path = \"../a\" }\n",
+    );
+    p.write("b/src/lib.rs", "");
+    let out = p.igl(&["build"]);
+    assert!(!out.status.success());
+    assert!(
+        text(&out).contains("a v0.1.0 → b v0.1.0 → a v0.1.0"),
+        "{}",
+        text(&out)
+    );
+
+    let p = Project::new();
+    p.write(
+        "Cargo.toml",
+        "[package]\nname = \"empty\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    let out = p.igl(&["build"]);
+    assert!(
+        text(&out).contains("no targets specified"),
+        "{}",
+        text(&out)
+    );
+
+    p.write(
+        "Cargo.toml",
+        "[package]\nname = \"f\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[features]\ndefault = [\"nope\"]\n",
+    );
+    p.write("src/lib.rs", "");
+    let out = p.igl(&["build"]);
+    assert!(
+        text(&out).contains(
+            "feature `default` includes `nope` which is neither a dependency nor another feature"
+        ),
+        "{}",
+        text(&out)
+    );
+    p.write(
+        "Cargo.toml",
+        "[package]\nname = \"f\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[dependencies]\nx = { path = \"x\" }\n[features]\nextra = [\"dep:x\"]\n",
+    );
+    p.write(
+        "x/Cargo.toml",
+        "[package]\nname = \"x\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    p.write("x/src/lib.rs", "");
+    let out = p.igl(&["build"]);
+    assert!(
+        text(&out).contains("`x` is not an optional dependency"),
+        "{}",
+        text(&out)
+    );
+    p.write(
+        "Cargo.toml",
+        "[package]\nname = \"f\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[target.'cfg(unix)'.dependencies]\nx = { path = \"x\", optional = true }\n[features]\nextra = [\"dep:x\", \"x/std\"]\nplain = [\"x\"]\n",
+    );
+    p.write(
+        "x/Cargo.toml",
+        "[package]\nname = \"x\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[features]\nstd = []\n",
+    );
+    p.ok(&["build", "--features", "extra"]);
+    p.write(
+        "x/Cargo.toml",
+        "[package]\nname = \"x\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    let out = p.igl(&["build", "--features", "extra"]);
+    assert!(
+        text(&out)
+            .contains("depends on `x` with feature `std`, but `x` does not have that feature"),
+        "{}",
+        text(&out)
+    );
+
+    let p = Project::new();
+    p.write("Cargo.toml", "[workspace]\nmembers = [\"a\", \"b\"]\n");
+    for d in ["a", "b"] {
+        p.write(
+            &format!("{d}/Cargo.toml"),
+            "[package]\nname = \"same\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        );
+        p.write(&format!("{d}/src/lib.rs"), "");
+    }
+    let out = p.igl(&["build"]);
+    assert!(
+        text(&out).contains("two packages named `same`"),
+        "{}",
+        text(&out)
+    );
+
+    let p = Project::new();
+    let out = p.igl(&["new", "test"]);
+    assert!(!out.status.success());
+    assert!(
+        text(&out).contains("built-in test library"),
+        "{}",
+        text(&out)
+    );
+}
+
+#[test]
+fn build_script_results_are_never_shared_between_different_packages() {
+    let p = Project::new();
+    let manifest = "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n";
+    p.write("one/Cargo.toml", manifest);
+    p.write(
+        "one/build.rs",
+        "fn main(){ println!(\"cargo::rerun-if-changed=data.txt\"); println!(\"cargo::rustc-env=DATA={}\", std::fs::read_to_string(\"data.txt\").unwrap().trim()); }",
+    );
+    p.write("one/data.txt", "from one");
+    p.write(
+        "one/src/main.rs",
+        "fn main(){ println!(\"{}\", env!(\"DATA\")) }",
+    );
+    p.write("two/Cargo.toml", manifest);
+    p.write(
+        "two/build.rs",
+        "fn main(){ println!(\"cargo::rerun-if-env-changed=MY_VAR\"); println!(\"cargo::rustc-env=V=[{}]\", std::env::var(\"MY_VAR\").unwrap_or_default()); }",
+    );
+    p.write(
+        "two/src/main.rs",
+        "fn main(){ println!(\"{}\", env!(\"V\")) }",
+    );
+    let run = |dir: &str| {
+        let out = p.igel_in(&p.path().join(dir), &["run", "-q"]);
+        assert!(out.status.success(), "{dir}: {}", text(&out));
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    assert_eq!(run("one"), "from one");
+    assert_eq!(run("two"), "[]");
+
+    for f in ["Cargo.toml", "build.rs", "src/main.rs"] {
+        p.write(&format!("three/{f}"), &p.read(&format!("one/{f}")));
+    }
+    p.write("three/data.txt", "from three");
+    assert_eq!(run("three"), "from three");
+    for f in ["Cargo.toml", "build.rs", "src/main.rs", "data.txt"] {
+        p.write(&format!("four/{f}"), &p.read(&format!("one/{f}")));
+    }
+    assert_eq!(run("four"), "from one");
+}
+
+#[test]
+fn default_run_and_metadata_nodes_match_cargo() {
+    let p = Project::new();
+    p.write(
+        "Cargo.toml",
+        "[workspace]\nmembers = [\"app\", \"helper\"]\n",
+    );
+    p.write(
+        "app/Cargo.toml",
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\ndefault-run = \"second\"\n[dependencies]\nhelper = { path = \"../helper\" }\n",
+    );
+    p.write("app/src/bin/first.rs", "fn main(){ println!(\"first\") }");
+    p.write(
+        "app/src/bin/second.rs",
+        "fn main(){ println!(\"second {}\", helper::X) }",
+    );
+    p.write(
+        "helper/Cargo.toml",
+        "[package]\nname = \"helper\"\nversion = \"0.2.0\"\nedition = \"2021\"\n",
+    );
+    p.write("helper/src/lib.rs", "pub const X: u8 = 1;");
+    let out = p.igel_in(&p.path().join("app"), &["run", "-q"]);
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "second 1",
+        "{}",
+        text(&out)
+    );
+
+    let out = p.igl(&["metadata", "--format-version", "1"]);
+    let m: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let dir = igel_common::fsutil::canonicalize(p.path()).unwrap();
+    let url = |name: &str| igel_common::fsutil::file_url(&dir.join(name));
+    let app_id = format!("path+{}#0.1.0", url("app"));
+    let helper_id = format!("path+{}#0.2.0", url("helper"));
+    let nodes = m["resolve"]["nodes"].as_array().unwrap();
+    assert_eq!(nodes.len(), 2, "{m}");
+    let app = nodes
+        .iter()
+        .find(|n| n["id"] == app_id.as_str())
+        .expect("app node");
+    assert_eq!(app["deps"][0]["name"], "helper");
+    assert_eq!(app["deps"][0]["pkg"], helper_id.as_str());
+    let pkg = m["packages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["name"] == "app")
+        .unwrap();
+    assert_eq!(pkg["default_run"], "second");
+    assert_eq!(pkg["targets"].as_array().unwrap().len(), 2);
+}
+
+fn exclusive_tests_project() -> Project {
+    let p = Project::new();
+    p.write(
+        "Cargo.toml",
+        "[package]\nname = \"excl\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    p.write("src/lib.rs", "pub fn f() -> u8 { 1 }\n");
+    for name in ["a", "b", "c"] {
+        p.write(
+            &format!("tests/{name}.rs"),
+            &format!(
+                r#"#[test]
+fn holds_the_shared_resource() {{
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mine = dir.join("{name}.here");
+    std::fs::write(&mine, "").unwrap();
+    if std::env::var_os("EXCL_EXPECT_COMPANY").is_some() {{
+        // Another binary must start while this one runs (the first to start
+        // waits for it; the markers stay, so later ones pass at once).
+        let start = std::time::Instant::now();
+        while !["a", "b", "c"].iter().any(|o| *o != "{name}" && dir.join(format!("{{o}}.here")).exists()) {{
+            assert!(start.elapsed().as_secs() < 30, "no other test binary ran at the same time");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }}
+    }} else {{
+        let lock = dir.join("lock");
+        std::fs::OpenOptions::new().write(true).create_new(true).open(&lock)
+            .expect("another test binary holds the shared resource");
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        std::fs::remove_file(&lock).unwrap();
+        std::fs::remove_file(&mine).unwrap();
+    }}
+}}
+"#
+            ),
+        );
+    }
+    p
+}
+
+#[test]
+fn test_binaries_run_one_at_a_time_unless_asked_otherwise() {
+    let p = exclusive_tests_project();
+    for _ in 0..3 {
+        let out = p.ok(&["test"]);
+        assert!(out.contains("3 passed"), "{out}");
+    }
+    let forget = || {
+        for name in ["a", "b", "c"] {
+            let _ = std::fs::remove_file(p.path().join(format!("{name}.here")));
+        }
+    };
+    let out = igel_with_env(
+        &p,
+        &["test", "--test-jobs", "3"],
+        &[("EXCL_EXPECT_COMPANY", "1".as_ref())],
+    );
+    assert!(out.status.success(), "{}", text(&out));
+    forget();
+    p.ok(&["config", "set", "test.jobs", "2"]);
+    let out = igel_with_env(&p, &["test"], &[("EXCL_EXPECT_COMPANY", "1".as_ref())]);
+    assert!(out.status.success(), "{}", text(&out));
+}
+
+#[cfg(unix)]
+#[test]
+fn a_test_that_leaves_a_process_running_does_not_hold_up_the_run() {
+    let p = Project::new();
+    p.write(
+        "Cargo.toml",
+        "[package]\nname = \"leak\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    p.write("src/lib.rs", "");
+    p.write(
+        "tests/server.rs",
+        "#[test]\nfn starts_a_server() {\n    std::process::Command::new(\"sleep\").arg(\"60\").spawn().unwrap();\n    println!(\"started\");\n}\n",
+    );
+    let start = std::time::Instant::now();
+    let out = p.ok(&["test"]);
+    assert!(out.contains("1 passed"), "{out}");
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(30),
+        "the run waited for the test's child: {:?}",
+        start.elapsed()
+    );
+}
+
+#[test]
+fn tests_see_the_package_environment_cargo_gives_them() {
+    let p = Project::new();
+    p.write(
+        "Cargo.toml",
+        "[package]\nname = \"envy\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\
+         repository = \"https://example.com/envy\"\nlicense = \"MIT\"\n",
+    );
+    p.write("src/lib.rs", "");
+    p.write(
+        "tests/env.rs",
+        r#"#[test]
+fn package_env() {
+    let var = |k: &str| std::env::var(k).unwrap_or_else(|_| panic!("{k} is not set"));
+    assert_eq!(var("CARGO_PKG_REPOSITORY"), "https://example.com/envy");
+    assert_eq!(var("CARGO_PKG_LICENSE"), "MIT");
+    assert!(var("CARGO_MANIFEST_PATH").ends_with("Cargo.toml"));
+    assert!(std::path::Path::new(&var("CARGO_TARGET_TMPDIR")).is_dir());
+}
+"#,
+    );
+    p.ok(&["test"]);
+}
+
+#[test]
+fn a_target_directory_or_store_inside_the_package_is_not_its_source() {
+    let p = lib_project();
+    p.ok(&["build", "--target-dir", "out"]);
+    let out = p.ok(&["build", "--target-dir", "out"]);
+    assert!(out.contains("0 compiled"), "{out}");
+    assert!(p.path().join("out/CACHEDIR.TAG").is_file());
+    let home = p.path().join(".ci-home");
+    let out = igel_with_env(&p, &["build"], &[("IGEL_HOME", home.as_os_str())]);
+    assert!(out.status.success(), "{}", text(&out));
+    let out = igel_with_env(&p, &["build"], &[("IGEL_HOME", home.as_os_str())]);
+    assert!(text(&out).contains("0 compiled"), "{}", text(&out));
+}
+
+#[test]
+fn a_hung_test_is_stopped_by_the_timeout_and_named() {
+    let p = Project::new();
+    p.write(
+        "Cargo.toml",
+        "[package]\nname = \"hang\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    p.write("src/lib.rs", "");
+    p.write(
+        "tests/h.rs",
+        "#[test]\nfn quick() {}\n#[test]\nfn hangs() { std::thread::sleep(std::time::Duration::from_secs(120)); }\n",
+    );
+    let start = std::time::Instant::now();
+    let out = p.igl(&["test", "--timeout", "2s"]);
+    let all = text(&out);
+    assert_eq!(out.status.code(), Some(101), "{all}");
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(60),
+        "{all}"
+    );
+    assert!(all.contains("ran longer than the timeout"), "{all}");
+    assert!(all.contains("still running or not started: hangs"), "{all}");
+    assert!(all.contains("1 passed · 1 failed"), "{all}");
+
+    p.ok(&["config", "set", "test.timeout", "2s"]);
+    let out = p.igl(&["test"]);
+    assert_eq!(out.status.code(), Some(101), "{}", text(&out));
+    let out = p.igl(&["test", "--timeout", "soon"]);
+    assert!(
+        text(&out).contains("invalid --timeout `soon`"),
+        "{}",
+        text(&out)
+    );
+}
+
+#[test]
+fn doc_tests_run_after_the_test_binaries_and_quiet_still_shows_the_result() {
+    let p = Project::new();
+    p.write(
+        "Cargo.toml",
+        "[package]\nname = \"order\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    p.write(
+        "src/lib.rs",
+        "/// ```\n/// assert_eq!(1, 2);\n/// ```\npub fn f() {}\n\n#[test]\nfn unit_fails() { panic!(\"unit\") }\n",
+    );
+    let out = p.igl(&["test"]);
+    let all = text(&out);
+    assert_eq!(out.status.code(), Some(101), "{all}");
+    assert!(all.contains("FAILED order (unit tests: lib)"), "{all}");
+    assert!(
+        !all.contains("order (doc-tests)"),
+        "doc tests ran first: {all}"
+    );
+
+    p.write(
+        "src/lib.rs",
+        "/// ```\n/// assert_eq!(1, 1);\n/// ```\npub fn f() {}\n\n#[test]\nfn unit() {}\n",
+    );
+    let out = p.ok(&["test", "-q"]);
+    assert!(out.contains("2 passed"), "{out}");
+    assert!(!out.contains("ok order"), "{out}");
+}
+
+#[test]
+fn a_mistyped_command_suggests_the_real_one() {
+    let out = igel_command().arg("buidl").output().unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("no such command: `buidl`"), "{err}");
+    assert!(err.contains("did you mean `igl build`?"), "{err}");
+    assert!(!err.contains("`igl b`"), "{err}");
+
+    let out = igel_command().args(["build", "--relase"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.starts_with("✗ unexpected argument '--relase'"), "{err}");
+    assert!(err.contains("'--release'"), "{err}");
+}
+
+#[test]
+fn with_rustc_runified_executables_compile_early_and_link_on_their_own() {
+    // Needs rustc-runified built for the toolchain the tests run with (`cargo runified driver` in
+    // `rustc-runified/`): IGEL_TEST_RUNIFIED names it.
+    let Some(driver) = std::env::var_os("IGEL_TEST_RUNIFIED") else {
+        eprintln!("skipped: IGEL_TEST_RUNIFIED names no rustc-runified");
+        return;
+    };
+    let p = Project::new();
+    p.write(
+        "Cargo.toml",
+        "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    p.write(
+        "src/lib.rs",
+        "pub fn answer() -> u32 { 42 }\n\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn unit() { assert_eq!(super::answer(), 42); }\n}\n",
+    );
+    p.write(
+        "src/main.rs",
+        "fn main() { println!(\"answer={}\", demo::answer()); }\n",
+    );
+    p.write(
+        "tests/it.rs",
+        "#[test]\nfn the_binary_runs() {\n    let out = std::process::Command::new(env!(\"CARGO_BIN_EXE_demo\")).output().unwrap();\n    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), \"answer=42\");\n}\n",
+    );
+    let igl = |args: &[&str]| {
+        let out = igel_command()
+            .args(args)
+            .current_dir(p.path())
+            .env("IGEL_HOME", p.home())
+            .env("NO_COLOR", "1")
+            .env("RUSTC", &driver)
+            .env("IGEL_TIMINGS", "1")
+            .output()
+            .unwrap();
+        let text = text(&out);
+        assert!(
+            out.status.success(),
+            "`igl {}` failed:\n{text}",
+            args.join(" ")
+        );
+        text
+    };
+    let doctor = igl(&["doctor"]);
+    assert!(doctor.contains("compiling with rustc-runified"), "{doctor}");
+    let tests = igl(&["test"]);
+    assert!(tests.contains("test it"), "{tests}");
+    let timeline =
+        std::fs::read_to_string(p.path().join(".igel/timings/igel-timing.html")).unwrap();
+    assert!(
+        timeline.contains("(link)"),
+        "the binary and the tests link as steps of their own"
+    );
+    let run = igl(&["run"]);
+    assert!(run.contains("answer=42"), "{run}");
+}
