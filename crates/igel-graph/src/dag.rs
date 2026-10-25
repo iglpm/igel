@@ -1,4 +1,4 @@
-use rune_common::{CompilationUnit, RuneError};
+use igel_common::{CompilationUnit, IgelError};
 use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -131,7 +131,7 @@ impl BuildGraph {
         names.join(" → ")
     }
 
-    pub fn topological_sort(&self) -> Result<Vec<NodeId>, RuneError> {
+    pub fn topological_sort(&self) -> Result<Vec<NodeId>, IgelError> {
         let mut in_degrees = vec![0; self.nodes.len()];
         for node in &self.nodes {
             in_degrees[node.id.0] = node.dependencies.len();
@@ -157,7 +157,7 @@ impl BuildGraph {
         }
 
         if sorted.len() != self.nodes.len() {
-            return Err(RuneError::DependencyCycle {
+            return Err(IgelError::DependencyCycle {
                 cycle: self.describe_cycle(&in_degrees),
             });
         }
@@ -250,7 +250,7 @@ impl Default for BuildGraph {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rune_common::{CompilationUnit, CrateId, CrateType, Edition};
+    use igel_common::{CompilationUnit, CrateId, CrateType, Edition};
     use std::path::PathBuf;
 
     fn make_unit(name: &str) -> CompilationUnit {

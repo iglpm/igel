@@ -68,7 +68,7 @@ pub fn priority_order(graph: &BuildGraph) -> Vec<NodeId> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rune_common::{CompilationUnit, CrateId, CrateType, Edition};
+    use igel_common::{CompilationUnit, CrateId, CrateType, Edition};
     use std::path::PathBuf;
 
     fn make_unit(name: &str) -> CompilationUnit {

@@ -1,13 +1,13 @@
 [package]
-name = "rune-graph"
-description = "Dependency graph, topological sort, and critical path computation for Rune"
+name = "igel-graph"
+description = "Dependency graph, topological sort, and critical path computation for Igel"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-rune-common.workspace = true
+igel-common.workspace = true
 
 [dev-dependencies]
 semver.workspace = true
