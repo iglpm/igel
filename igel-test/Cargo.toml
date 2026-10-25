@@ -1,5 +1,5 @@
 [package]
-name = "rune-test-app"
+name = "igel-test-app"
 version = "0.2.0"
 edition = "2021"
 
@@ -9,5 +9,5 @@ text-processor = { path = "crates/text-processor" }
 itoa = "^1.0.18"
 
 [[bin]]
-name = "rune-demo"
+name = "igel-demo"
 path = "src/main.rs"

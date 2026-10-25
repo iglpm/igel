@@ -2,7 +2,7 @@ use math_engine::{compute_stats, is_prime, sieve_of_eratosthenes};
 use text_processor::{render_banner, AsciiTable};
 
 fn main() {
-    println!("{}", render_banner("RUNE BUILD SYSTEM", "Multi-Crate Demo Project"));
+    println!("{}", render_banner("IGEL BUILD SYSTEM", "Multi-Crate Demo Project"));
     println!();
 
     println!("1. Computing primes up to 100 using Sieve of Eratosthenes...");
@@ -34,5 +34,5 @@ fn main() {
     let formatted = itoa_buf.format(1234567890_u64);
     println!("   Formatted integer with itoa: {}", formatted);
 
-    println!("\n✨ Demo project compiled and executed successfully via Rune!");
+    println!("\n✨ Demo project compiled and executed successfully via Igel!");
 }
