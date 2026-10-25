@@ -1,4 +1,4 @@
-//! Helpers that let concurrent Rune processes overlap safely: atomic replacement and per-unit locks.
+//! Helpers that let concurrent Igel processes overlap safely: atomic replacement and per-unit locks.
 
 use std::fs::{self, File, OpenOptions};
 use std::io;
@@ -113,7 +113,7 @@ pub fn tag_cache_dir(dir: &Path) {
         let _ = fs::write(
             tag,
             "Signature: 8a477f597d28d172789f06886806bc55\n\
-             # This file is a cache directory tag created by rune.\n\
+             # This file is a cache directory tag created by igl.\n\
              # For information about cache directory tags see https://bford.info/cachedir/\n",
         );
     }

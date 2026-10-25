@@ -524,7 +524,7 @@ impl CompilationUnit {
     }
 
     /// Whether this unit must produce a linked artifact rather than only `.rmeta`: proc-macros always,
-    /// binaries and dylibs except under `rune check`.
+    /// binaries and dylibs except under `igl check`.
     pub fn produces_real_artifact(&self) -> bool {
         self.crate_type == CrateType::ProcMacro
             || (self.harness && !self.check_only)
@@ -573,8 +573,8 @@ pub struct BuildScriptOutput {
 }
 
 impl BuildScriptOutput {
-    pub const OUT_DIR_PLACEHOLDER: &'static str = "${RUNE_OUT_DIR}";
-    pub const MANIFEST_DIR_PLACEHOLDER: &'static str = "${RUNE_MANIFEST_DIR}";
+    pub const OUT_DIR_PLACEHOLDER: &'static str = "${IGEL_OUT_DIR}";
+    pub const MANIFEST_DIR_PLACEHOLDER: &'static str = "${IGEL_MANIFEST_DIR}";
 
     /// Replaces paths into `OUT_DIR` and the package with placeholders, so the stored output is portable.
     pub fn normalize(&mut self, out_dir: &Path, manifest_dir: &Path) {
@@ -921,13 +921,13 @@ mod unit_tests {
         h.check_only = true;
         assert!(
             !h.produces_real_artifact(),
-            "`rune check` never links a harness"
+            "`igl check` never links a harness"
         );
     }
 
     fn script_out(project: &Path, key: &str) -> PathBuf {
         project
-            .join(".rune/target/debug/build")
+            .join(".igel/target/debug/build")
             .join(key)
             .join("out")
     }
@@ -995,7 +995,7 @@ mod unit_tests {
     #[test]
     fn output_stored_before_normalizing_is_not_portable() {
         let legacy: BuildScriptOutput =
-            serde_json::from_str(r#"{"link_libs":[],"link_search":[],"link_args":[],"cfgs":[],"check_cfgs":[],"env_vars":[["ISLE_DIR","C:\\tmp\\x\\.rune\\target\\debug\\build\\c-1\\out"]],"rerun_if_changed":[],"rerun_if_env_changed":[],"metadata":[],"warnings":[],"errors":[]}"#)
+            serde_json::from_str(r#"{"link_libs":[],"link_search":[],"link_args":[],"cfgs":[],"check_cfgs":[],"env_vars":[["ISLE_DIR","C:\\tmp\\x\\.igel\\target\\debug\\build\\c-1\\out"]],"rerun_if_changed":[],"rerun_if_env_changed":[],"metadata":[],"warnings":[],"errors":[]}"#)
                 .unwrap();
         assert!(!legacy.is_portable());
     }
@@ -1027,9 +1027,9 @@ mod unit_tests {
     #[cfg(windows)]
     #[test]
     fn windows_directories_match_in_any_case_slash_and_short_form() {
-        let dir = Path::new(r"C:\Proj\.rune\out");
+        let dir = Path::new(r"C:\Proj\.igel\out");
         assert_eq!(
-            replace_dir_in_str(r"c:/proj/.RUNE/out/inc;C:\Proj\.rune\out", dir, "$O"),
+            replace_dir_in_str(r"c:/proj/.IGEL/out/inc;C:\Proj\.igel\out", dir, "$O"),
             "$O/inc;$O"
         );
 

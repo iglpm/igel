@@ -19,7 +19,7 @@ pub mod timing;
 pub mod toolchain;
 pub mod types;
 
-pub use config::RuneConfig;
-pub use error::{RuneError, RuneResult};
+pub use config::IgelConfig;
+pub use error::{IgelError, IgelResult};
 pub use settings::Settings;
 pub use types::*;

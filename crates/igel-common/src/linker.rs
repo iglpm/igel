@@ -1,13 +1,13 @@
-//! The built-in linker, hyprlnk. Its cache-key identity is `rune:hyprlnk@<version>` (with, for
+//! The built-in linker, hyprlnk. Its cache-key identity is `igl:hyprlnk@<version>` (with, for
 //! Linux targets, the C compiler it links through); only when rustc runs does it become
 //! `-C linker=<this executable>` with [`EMBEDDED_ENV`] set, plus the linker flavor for targets
 //! whose default flavor isn't the linker's own command line.
 
 use std::path::{Path, PathBuf};
 
-pub const EMBEDDED_PREFIX: &str = "rune:hyprlnk";
+pub const EMBEDDED_PREFIX: &str = "igl:hyprlnk";
 
-pub const EMBEDDED_ENV: &str = "RUNE_HYPRLNK";
+pub const EMBEDDED_ENV: &str = "IGEL_HYPRLNK";
 
 /// The C compiler hyprlnk runs for rustc's `cc` command line on Linux (it finds the C runtime;
 /// hyprlnk is its `ld`). Must match `hyprlnk::CC_ENV`.
@@ -31,7 +31,7 @@ pub fn embedded(version: &str, driver: Option<&str>) -> String {
 /// The linker rustc runs, and the environment it needs.
 pub fn for_rustc(linker: &str) -> (PathBuf, Vec<(&'static str, String)>) {
     if is_embedded(linker) {
-        let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("rune"));
+        let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("igl"));
         // Always set the driver: an inherited one (a cross container exporting the target's
         // C compiler) would otherwise link host build scripts, and it is not in the cache key.
         // hyprlnk takes an empty one for `cc`.
@@ -62,13 +62,28 @@ pub fn is_c_compiler(linker: &Path) -> bool {
         || name.ends_with("-ld")
         || name.contains("-ld.")
         || name.contains("lld")
-        || matches!(name, "mold" | "wild" | "gold" | "hyprlnk" | "rune"))
+        || matches!(name, "mold" | "wild" | "gold" | "hyprlnk" | "igl"))
 }
 
 /// `-C linker-flavor` for the embedded linker on `target`: Apple targets would otherwise get a
 /// `cc` command line; with `ld64.lld` rustc passes ld64's (and `-flavor darwin` first).
-pub fn rustc_flavor(linker: &str, target: &str) -> Option<&'static str> {
-    (is_embedded(linker) && target.contains("-apple-")).then_some("ld64.lld")
+/// Cross Linux, Android and FreeBSD targets without a target C compiler driver also need `ld.lld`,
+/// so rustc directly invokes hyprlnk as GNU ld rather than calling the host's cc with -B.
+pub fn rustc_flavor(linker: &str, target: &str, host: &str) -> Option<&'static str> {
+    if !is_embedded(linker) {
+        return None;
+    }
+    if target.contains("-apple-") {
+        Some("ld64.lld")
+    } else if !linker.contains(DRIVER_SEP)
+        && (target.contains("-linux-")
+            || target.contains("-android")
+            || target.contains("-freebsd"))
+    {
+        if host != target { Some("ld.lld") } else { None }
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -78,7 +93,7 @@ mod tests {
     #[test]
     fn embedded_linker_round_trip() {
         let l = embedded("0.1.0", None);
-        assert_eq!(l, "rune:hyprlnk@0.1.0");
+        assert_eq!(l, "igl:hyprlnk@0.1.0");
         assert!(is_embedded(&l));
         assert!(!is_embedded("rust-lld"));
         let (exe, env) = for_rustc(&l);
@@ -134,10 +149,51 @@ mod tests {
     #[test]
     fn apple_targets_get_the_ld64_flavor() {
         let l = embedded("0.1.0", None);
-        assert_eq!(rustc_flavor(&l, "aarch64-apple-darwin"), Some("ld64.lld"));
-        assert_eq!(rustc_flavor(&l, "x86_64-apple-darwin"), Some("ld64.lld"));
-        assert_eq!(rustc_flavor(&l, "x86_64-pc-windows-msvc"), None);
-        assert_eq!(rustc_flavor(&l, "x86_64-unknown-linux-gnu"), None);
-        assert_eq!(rustc_flavor("cc", "aarch64-apple-darwin"), None);
+        assert_eq!(
+            rustc_flavor(&l, "aarch64-apple-darwin", "x86_64-unknown-linux-gnu"),
+            Some("ld64.lld")
+        );
+        assert_eq!(
+            rustc_flavor(&l, "x86_64-apple-darwin", "x86_64-unknown-linux-gnu"),
+            Some("ld64.lld")
+        );
+        assert_eq!(
+            rustc_flavor(&l, "x86_64-pc-windows-msvc", "x86_64-unknown-linux-gnu"),
+            None
+        );
+        assert_eq!(
+            rustc_flavor("cc", "aarch64-apple-darwin", "x86_64-unknown-linux-gnu"),
+            None
+        );
+    }
+
+    #[test]
+    fn cross_elf_targets_get_ld_flavor_without_driver() {
+        let l_bare = embedded("0.1.0", None);
+        let l_with_driver = embedded("0.1.0", Some("/usr/bin/aarch64-linux-gnu-gcc"));
+        assert_eq!(
+            rustc_flavor(
+                &l_bare,
+                "x86_64-unknown-linux-gnu",
+                "x86_64-unknown-linux-gnu"
+            ),
+            None
+        );
+        assert_eq!(
+            rustc_flavor(
+                &l_bare,
+                "aarch64-unknown-linux-gnu",
+                "x86_64-unknown-linux-gnu"
+            ),
+            Some("ld.lld")
+        );
+        assert_eq!(
+            rustc_flavor(
+                &l_with_driver,
+                "aarch64-unknown-linux-gnu",
+                "x86_64-unknown-linux-gnu"
+            ),
+            None
+        );
     }
 }

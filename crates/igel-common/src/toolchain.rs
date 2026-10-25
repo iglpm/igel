@@ -8,6 +8,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Mutex, OnceLock};
 
+pub const EMBEDDED_HYPRC_ENV: &str = "IGEL_HYPRC";
+
 #[derive(Debug, Clone)]
 pub struct Toolchain {
     pub rustc: PathBuf,
@@ -22,6 +24,8 @@ pub struct Toolchain {
     pub sysroot: Option<PathBuf>,
     /// rustc-runified, when it runs in place of `rustc` (`exec` is then its path).
     pub runified: Option<crate::runified::Driver>,
+    /// hyprc, when it runs in place of `rustc`.
+    pub hyprc: bool,
     probe_key: String,
     identity: String,
 }
@@ -139,6 +143,7 @@ impl Toolchain {
             version,
             sysroot,
             runified: None,
+            hyprc: false,
             probe_key: probe.key.clone(),
             identity: String::new(),
         };
@@ -183,6 +188,9 @@ impl Toolchain {
         if let Some(d) = &self.runified {
             out.push_str(&format!("runified={} {}\n", d.version, d.digest));
         }
+        if self.hyprc {
+            out.push_str("compiler=hyprc\n");
+        }
         for (label, tool) in [
             ("wrapper", &self.wrapper),
             ("workspace-wrapper", &self.workspace_wrapper),
@@ -205,10 +213,20 @@ impl Toolchain {
     }
 
     /// Runs rustc-runified instead of `rustc` when `choice` asks for it and it is there: `RUSTC`
-    /// names it, or it is installed for this exact compiler build (`$RUNE_HOME/runified/<key>/`)
+    /// names it, or it is installed for this exact compiler build (`$IGEL_HOME/runified/<key>/`)
     /// or shipped with the toolchain (`<sysroot>/bin/`).
     pub fn with_compiler(mut self, choice: crate::runified::Choice) -> Result<Toolchain, String> {
         use crate::runified::{self, Choice, Driver};
+        if choice == Choice::Hyprc {
+            self.hyprc = true;
+            if let Some(p) = find_hyprc() {
+                self.exec = p;
+            } else if let Ok(exe) = std::env::current_exe() {
+                self.exec = exe;
+            }
+            self.identity = self.compute_identity();
+            return Ok(self);
+        }
         if choice == Choice::Rustc || self.verbose_version.is_empty() {
             return Ok(self);
         }
@@ -245,7 +263,7 @@ impl Toolchain {
             ),
             None if choice == Choice::Required => Err(format!(
                 "`build.compiler = \"runified\"`, but rustc-runified is not installed for rustc {} \
-                 ({}): in `rustc-runified/`, `cargo runified driver --rune` builds it for this \
+                 ({}): in `rustc-runified/`, `cargo runified driver --igl` builds it for this \
                  toolchain",
                 self.release(),
                 key.as_deref().unwrap_or("unknown build")
@@ -292,8 +310,30 @@ impl Toolchain {
         for extra in &chain[1..] {
             cmd.arg(extra);
         }
+        if self.hyprc {
+            cmd.env(EMBEDDED_HYPRC_ENV, "1");
+            if let Some(sysroot) = &self.sysroot {
+                cmd.arg("--sysroot").arg(sysroot);
+            }
+        }
         if let (Some(_), Some(sysroot)) = (&self.runified, &self.sysroot) {
             crate::runified::find_libraries_in(&mut cmd, sysroot);
+        }
+        cmd
+    }
+
+    pub fn host_rustc_command(&self, workspace_member: bool) -> Command {
+        let mut chain: Vec<&Path> = Vec::new();
+        if let Some(w) = &self.wrapper {
+            chain.push(w);
+        }
+        if let (true, Some(w)) = (workspace_member, &self.workspace_wrapper) {
+            chain.push(w);
+        }
+        chain.push(&self.rustc);
+        let mut cmd = Command::new(chain[0]);
+        for extra in &chain[1..] {
+            cmd.arg(extra);
         }
         cmd
     }
@@ -355,6 +395,24 @@ pub fn find_program(program: &Path) -> Option<PathBuf> {
         .find(|p| p.is_file())
 }
 
+pub fn find_hyprc() -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("HYPRC") {
+        let pb = PathBuf::from(p);
+        if pb.is_file() {
+            return Some(pb);
+        }
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let candidate = dir.join(exe_name("hyprc"));
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    find_program(Path::new("hyprc"))
+}
+
 pub fn program_fingerprint(program: &Path) -> String {
     match find_program(program).and_then(|p| std::fs::metadata(&p).ok().map(|m| (p, m))) {
         Some((p, m)) => format!(
@@ -398,7 +456,7 @@ fn driver_fingerprint(sysroot: &Path) -> String {
 /// Cached by path, size and mtime: starting a C compiler costs more than a no-op build.
 pub fn tool_version(program: &Path) -> String {
     let fingerprint = program_fingerprint(program);
-    let path = crate::settings::rune_home()
+    let path = crate::settings::igel_home()
         .join("cache")
         .join("tools.json");
     let load = || -> HashMap<String, String> {
@@ -448,7 +506,7 @@ fn exe_name(name: &str) -> String {
 }
 
 fn probe_cache_path() -> PathBuf {
-    crate::settings::rune_home()
+    crate::settings::igel_home()
         .join("cache")
         .join("toolchains.json")
 }
@@ -914,7 +972,7 @@ mod tests {
         assert_eq!(
             info.matches("cfg(unix)"),
             cfg!(unix),
-            "host cfg disagrees with how Rune itself was built"
+            "host cfg disagrees with how Igel itself was built"
         );
     }
 

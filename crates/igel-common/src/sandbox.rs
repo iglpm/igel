@@ -1,5 +1,5 @@
 //! `build.sandbox`: build scripts and the compiler run with no network and a read-only file system except
-//! their output and temp directories. `rune __sandbox` sets this up (Linux namespaces / macOS
+//! their output and temp directories. `igl __sandbox` sets this up (Linux namespaces / macOS
 //! `sandbox-exec`) and then `exec`s the program.
 
 use std::ffi::{OsStr, OsString};
@@ -64,7 +64,7 @@ impl Sandbox {
     }
 }
 
-/// `rune __sandbox [--network] [--rw DIR]... -- PROGRAM ARGS...`. Exits 125 if setup fails.
+/// `igl __sandbox [--network] [--rw DIR]... -- PROGRAM ARGS...`. Exits 125 if setup fails.
 pub fn helper_main(args: &[OsString]) -> ! {
     let mut network = false;
     let mut writable: Vec<PathBuf> = Vec::new();
@@ -102,7 +102,7 @@ pub fn helper_main(args: &[OsString]) -> ! {
 }
 
 fn fail(message: &str) -> ! {
-    eprintln!("rune sandbox: {message}");
+    eprintln!("igl sandbox: {message}");
     std::process::exit(125);
 }
 
@@ -144,7 +144,7 @@ fn confine(writable: &[PathBuf], network: bool) -> Result<(), String> {
                 why.push_str(
                     " — AppArmor restricts unprivileged user namespaces here (Ubuntu 23.10+); \
                      allow them with `sysctl kernel.apparmor_restrict_unprivileged_userns=0` \
-                     or an AppArmor profile for rune",
+                     or an AppArmor profile for igl",
                 );
             } else {
                 why.push_str(" — unprivileged user namespaces may be disabled");

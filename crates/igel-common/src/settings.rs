@@ -1,5 +1,5 @@
-//! `rune config` settings, lowest to highest precedence: defaults, `~/.rune/config.toml`, `Rune.toml`,
-//! `RUNE_*` env vars, CLI flags. Every key is declared once in [`KEYS`].
+//! `igl config` settings, lowest to highest precedence: defaults, `~/.igel/config.toml`, `Igel.toml`,
+//! `IGEL_*` env vars, CLI flags. Every key is declared once in [`KEYS`].
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 use toml_edit::{DocumentMut, Item, Table, Value as TomlValue};
 
-pub const PROJECT_FILE: &str = "Rune.toml";
+pub const PROJECT_FILE: &str = "Igel.toml";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ValueKind {
@@ -113,7 +113,7 @@ pub const KEYS: &[KeyDef] = &[
         default: "false",
         description: "Run compilers and build scripts at low scheduling priority, so the rest of \
                       the machine (editor, browser, a call) stays responsive during a big build; \
-                      the build takes the cores nothing else wants. `rune watch` always does.",
+                      the build takes the cores nothing else wants. `igl watch` always does.",
     },
     KeyDef {
         name: "build.dependency-debuginfo",
@@ -143,7 +143,7 @@ pub const KEYS: &[KeyDef] = &[
                       otherwise type-check on one core — gets as many threads as there are idle \
                       cores (at most 8); crates started while the machine is busy get one. A \
                       number: that many for every crate. Whether it pays depends on the crate: \
-                      on Rune's own build it kept the cores busy but saved no time, on 4 cores \
+                      on Igel's own build it kept the cores busy but saved no time, on 4 cores \
                       with nightly and on 12 with rustc-runified.",
     },
     KeyDef {
@@ -151,20 +151,20 @@ pub const KEYS: &[KeyDef] = &[
         kind: ValueKind::Text,
         default: "auto",
         description: "Which compiler runs. `auto`: rustc-runified when it is installed for the \
-                      toolchain in use (`cargo runified driver --rune` in `rustc-runified/`, \
+                      toolchain in use (`cargo runified driver --igl` in `rustc-runified/`, \
                       or `RUSTC` naming it), the toolchain's `rustc` otherwise. rustc-runified \
                       is that same compiler plus what stable rustc lacks: a parallel front end \
                       (`build.frontend-threads`), and executables and tests that compile while \
                       their dependencies are still generating code, linking once they are done. \
                       `runified`: rustc-runified, or an error saying how to install it. `rustc`: \
-                      always the toolchain's `rustc`.",
+                      always the toolchain's `rustc`. `hyprc`: the experimental built-in hyprc compiler.",
     },
     KeyDef {
         name: "build.linker",
         kind: ValueKind::Text,
         default: "hyprlnk",
         description: "Which linker links binaries, tests and dynamic libraries. `hyprlnk`: the \
-                      linker built into Rune, with nothing to install. It takes precedence over \
+                      linker built into Igel, with nothing to install. It takes precedence over \
                       `target.<triple>.linker`; on Linux that names the C compiler hyprlnk \
                       links through (for the C runtime), `cc` otherwise. hyprlnk links Linux \
                       (glibc and musl on x86-64, x86, AArch64, ARM, RISC-V 64, POWER \
@@ -177,7 +177,7 @@ pub const KEYS: &[KeyDef] = &[
     KeyDef {
         name: "build.target-dir",
         kind: ValueKind::Path,
-        default: ".rune/target",
+        default: ".igel/target",
         description: "Directory for build output. Relative paths are relative to the project root.",
     },
     KeyDef {
@@ -189,7 +189,7 @@ pub const KEYS: &[KeyDef] = &[
     KeyDef {
         name: "cas.dir",
         kind: ValueKind::Path,
-        default: "~/.rune/cas",
+        default: "~/.igel/cas",
         description: "Location of the content-addressable store.",
     },
     KeyDef {
@@ -206,8 +206,8 @@ pub const KEYS: &[KeyDef] = &[
         name: "cas.remote-token",
         kind: ValueKind::Text,
         default: "none",
-        description: "Bearer token for a Cairn server. Prefer the RUNE_CAS_REMOTE_TOKEN \
-                      environment variable: anything in Rune.toml is readable by everyone who can \
+        description: "Bearer token for a Cairn server. Prefer the IGEL_CAS_REMOTE_TOKEN \
+                      environment variable: anything in Igel.toml is readable by everyone who can \
                       read the project.",
     },
     KeyDef {
@@ -283,7 +283,7 @@ pub const KEYS: &[KeyDef] = &[
         kind: ValueKind::Bool,
         default: "false",
         description: "Skip test binaries that passed before with an identical binary, package \
-                      files, arguments and RUST_/CARGO_/RUNE_ environment (`rune test --cached`). \
+                      files, arguments and RUST_/CARGO_/IGEL_ environment (`igl test --cached`). \
                       Only enable it if your tests depend on nothing else: no network, clock, or \
                       files outside the package.",
     },
@@ -291,14 +291,14 @@ pub const KEYS: &[KeyDef] = &[
         name: "audit.ignore",
         kind: ValueKind::Text,
         default: "",
-        description: "Advisories `rune audit` accepts (comma-separated IDs, e.g. \
+        description: "Advisories `igl audit` accepts (comma-separated IDs, e.g. \
                       `RUSTSEC-2023-0071`): reviewed, and not relevant to this project.",
     },
     KeyDef {
         name: "test.jobs",
         kind: ValueKind::Uint,
         default: "1",
-        description: "How many test binaries `rune test` runs at once. 1 (the default) is \
+        description: "How many test binaries `igl test` runs at once. 1 (the default) is \
                       Cargo's behaviour and safe for tests that share ports, files or databases \
                       across binaries; more finishes sooner when they don't. Each binary still \
                       runs its own tests in parallel, and building continues meanwhile. With \
@@ -316,7 +316,7 @@ pub const KEYS: &[KeyDef] = &[
         name: "test.schedule",
         kind: ValueKind::Text,
         default: "binaries",
-        description: "How `rune test` spreads tests over the cores. `binaries`: each test \
+        description: "How `igl test` spreads tests over the cores. `binaries`: each test \
                       binary runs as one process, as with Cargo. `tests`: each binary's tests \
                       are split into small batches, each its own process, scheduled across \
                       every binary at once (like cargo-nextest) — faster when a few binaries \
@@ -326,15 +326,15 @@ pub const KEYS: &[KeyDef] = &[
         name: "test.doctests",
         kind: ValueKind::Bool,
         default: "true",
-        description: "Run documentation tests as part of `rune test`.",
+        description: "Run documentation tests as part of `igl test`.",
     },
     KeyDef {
         name: "cross.default-target",
         kind: ValueKind::Text,
         default: "none",
-        description: "The target `rune cross` builds for when none is given, and `--cross` \
+        description: "The target `igl cross` builds for when none is given, and `--cross` \
                       without a value. A triple such as `aarch64-unknown-linux-gnu`. Plain \
-                      `rune build` is unaffected.",
+                      `igl build` is unaffected.",
     },
     KeyDef {
         name: "cross.engine",
@@ -358,7 +358,7 @@ pub const KEYS: &[KeyDef] = &[
         kind: ValueKind::Duration,
         default: "15m",
         description: "How long a warm container waits for the next build before it stops \
-                      (`15m`, `2h`; `0`: until stopped with `rune cross daemon stop`).",
+                      (`15m`, `2h`; `0`: until stopped with `igl cross daemon stop`).",
     },
     KeyDef {
         name: "cross.container-engine",
@@ -678,8 +678,9 @@ impl Settings {
                 "auto" => Ok(Choice::Auto),
                 "runified" => Ok(Choice::Required),
                 "rustc" => Ok(Choice::Rustc),
+                "hyprc" => Ok(Choice::Hyprc),
                 other => Err(format!(
-                    "unknown `build.compiler` `{other}`: expected `auto`, `runified` or `rustc`"
+                    "unknown `build.compiler` `{other}`: expected `auto`, `runified`, `rustc` or `hyprc`"
                 )),
             },
             Some(_) => Ok(Choice::Auto),
@@ -804,16 +805,16 @@ impl Settings {
 }
 
 pub fn global_config_path() -> PathBuf {
-    rune_home().join("config.toml")
+    igel_home().join("config.toml")
 }
 
-pub fn rune_home() -> PathBuf {
-    if let Some(dir) = std::env::var_os("RUNE_HOME") {
+pub fn igel_home() -> PathBuf {
+    if let Some(dir) = std::env::var_os("IGEL_HOME") {
         return PathBuf::from(dir);
     }
     home::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
-        .join(".rune")
+        .join(".igel")
 }
 
 pub fn config_path(scope: Scope, project_root: Option<&Path>) -> Option<PathBuf> {
@@ -855,7 +856,7 @@ pub fn set_in_file(path: &Path, key: &str, raw: &str) -> Result<Value, SettingsE
         doc[table_name] = Item::Table(Table::new());
     }
     if doc[table_name].is_array_of_tables() {
-        // `[[test]]` targets own the name `test` in a manifest `Rune.toml`.
+        // `[[test]]` targets own the name `test` in a manifest `Igel.toml`.
         return Err(SettingsError::File {
             path: path.to_path_buf(),
             message: format!(
@@ -1070,7 +1071,7 @@ pub fn format_size(bytes: u64) -> String {
 
 pub fn env_var_name(key: &str) -> String {
     format!(
-        "RUNE_{}",
+        "IGEL_{}",
         key.chars()
             .map(|c| if c == '.' || c == '-' {
                 '_'
@@ -1101,9 +1102,9 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
-    fn settings_share_a_rune_toml_with_the_manifest_except_where_test_targets_take_the_name() {
+    fn settings_share_a_igel_toml_with_the_manifest_except_where_test_targets_take_the_name() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("Rune.toml");
+        let path = dir.path().join("Igel.toml");
         std::fs::write(
             &path,
             "[package]\nname = \"a\"\n\n[dependencies]\nserde = \"1\"\n",
@@ -1120,7 +1121,7 @@ mod tests {
         assert_eq!(s.jobs(), Some(4));
         assert!(!s.doctests());
 
-        let with_targets = dir.path().join("t").join("Rune.toml");
+        let with_targets = dir.path().join("t").join("Igel.toml");
         std::fs::create_dir_all(with_targets.parent().unwrap()).unwrap();
         std::fs::write(
             &with_targets,
@@ -1131,7 +1132,7 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(
-            err.contains("list of targets") && err.contains("RUNE_TEST_DOCTESTS"),
+            err.contains("list of targets") && err.contains("IGEL_TEST_DOCTESTS"),
             "{err}"
         );
         set_in_file(&with_targets, "build.jobs", "2").unwrap();
@@ -1149,7 +1150,7 @@ mod tests {
     }
 
     fn no_global() -> PathBuf {
-        PathBuf::from("/nonexistent/rune/config.toml")
+        PathBuf::from("/nonexistent/igl/config.toml")
     }
 
     #[test]
@@ -1165,7 +1166,7 @@ mod tests {
     #[test]
     fn set_get_unset_roundtrip_preserves_other_content() {
         let dir = tempdir().unwrap();
-        let path = dir.path().join("Rune.toml");
+        let path = dir.path().join("Igel.toml");
         std::fs::write(&path, "# keep me\n[build]\njobs = 4 # inline\n").unwrap();
 
         set_in_file(&path, "build.release-rebuild-all", "on").unwrap();
@@ -1189,7 +1190,7 @@ mod tests {
     #[test]
     fn unset_removes_empty_table_header() {
         let dir = tempdir().unwrap();
-        let path = dir.path().join("Rune.toml");
+        let path = dir.path().join("Igel.toml");
         set_in_file(&path, "net.offline", "true").unwrap();
         unset_in_file(&path, "net.offline").unwrap();
         assert!(!std::fs::read_to_string(&path).unwrap().contains("[net]"));
@@ -1198,7 +1199,7 @@ mod tests {
     #[test]
     fn rejects_bad_values_and_unknown_keys() {
         let dir = tempdir().unwrap();
-        let path = dir.path().join("Rune.toml");
+        let path = dir.path().join("Igel.toml");
         assert!(matches!(
             set_in_file(&path, "build.release-rebuild-all", "maybe"),
             Err(SettingsError::InvalidValue { .. })
@@ -1218,7 +1219,7 @@ mod tests {
         std::fs::create_dir_all(&proj).unwrap();
         std::fs::write(&global, "[build]\nrelease-rebuild-all = false\njobs = 3\n").unwrap();
         std::fs::write(
-            proj.join("Rune.toml"),
+            proj.join("Igel.toml"),
             "[build]\nrelease-rebuild-all = true\n",
         )
         .unwrap();
@@ -1235,7 +1236,7 @@ mod tests {
             Some((_, Origin::Project(_)))
         ));
 
-        let env = |k: &str| (k == "RUNE_BUILD_RELEASE_REBUILD_ALL").then(|| "0".to_string());
+        let env = |k: &str| (k == "IGEL_BUILD_RELEASE_REBUILD_ALL").then(|| "0".to_string());
         let s = Settings::load_from(Some(&proj), &global, &env).unwrap();
         assert!(!s.release_rebuild_all());
         assert!(matches!(
@@ -1248,7 +1249,7 @@ mod tests {
     fn relative_project_paths_are_resolved_against_the_project() {
         let dir = tempdir().unwrap();
         std::fs::write(
-            dir.path().join("Rune.toml"),
+            dir.path().join("Igel.toml"),
             "[build]\ntarget-dir = \"out\"\n",
         )
         .unwrap();
@@ -1259,7 +1260,7 @@ mod tests {
     #[test]
     fn malformed_project_file_is_an_error_not_a_silent_default() {
         let dir = tempdir().unwrap();
-        std::fs::write(dir.path().join("Rune.toml"), "[build\n").unwrap();
+        std::fs::write(dir.path().join("Igel.toml"), "[build\n").unwrap();
         assert!(Settings::load_from(Some(dir.path()), &no_global(), &no_env).is_err());
     }
 
@@ -1267,7 +1268,7 @@ mod tests {
     fn wrong_type_in_file_is_reported_with_key_name() {
         let dir = tempdir().unwrap();
         std::fs::write(
-            dir.path().join("Rune.toml"),
+            dir.path().join("Igel.toml"),
             "[build]\nrelease-rebuild-all = \"yes please\"\n",
         )
         .unwrap();
@@ -1322,9 +1323,9 @@ mod tests {
     fn env_var_names() {
         assert_eq!(
             env_var_name("build.release-rebuild-all"),
-            "RUNE_BUILD_RELEASE_REBUILD_ALL"
+            "IGEL_BUILD_RELEASE_REBUILD_ALL"
         );
-        assert_eq!(env_var_name("cas.max-size"), "RUNE_CAS_MAX_SIZE");
+        assert_eq!(env_var_name("cas.max-size"), "IGEL_CAS_MAX_SIZE");
     }
 
     #[test]
@@ -1335,12 +1336,12 @@ mod tests {
         assert_eq!(empty.cross(), CrossSettings::default());
 
         std::fs::write(
-            dir.path().join("Rune.toml"),
+            dir.path().join("Igel.toml"),
             "[cross]\ndefault-target = \"aarch64-unknown-linux-gnu\"\nidle-timeout = \"90s\"\n\
              daemon = false\n\n[cross.target.aarch64-unknown-linux-gnu]\nimage = \"mine:1\"\n",
         )
         .unwrap();
-        let env = |k: &str| (k == "RUNE_CROSS_ENGINE").then(|| "container".to_string());
+        let env = |k: &str| (k == "IGEL_CROSS_ENGINE").then(|| "container".to_string());
         let s = Settings::load_from(Some(dir.path()), &none, &env).unwrap();
         let cross = s.cross();
         assert_eq!(

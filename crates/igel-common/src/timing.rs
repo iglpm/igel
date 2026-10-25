@@ -1,4 +1,4 @@
-//! Phase timing, enabled with `RUNE_TIMINGS=1` (or `--timings`).
+//! Phase timing, enabled with `IGEL_TIMINGS=1` (or `--timings`).
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
@@ -11,7 +11,7 @@ pub fn enable() {
 
 pub fn enabled() -> bool {
     ENABLED.load(Ordering::Relaxed)
-        || std::env::var("RUNE_TIMINGS").is_ok_and(|v| !v.is_empty() && v != "0")
+        || std::env::var("IGEL_TIMINGS").is_ok_and(|v| !v.is_empty() && v != "0")
 }
 
 pub struct Phase {

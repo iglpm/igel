@@ -2,9 +2,9 @@ use crate::settings::Settings;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone)]
-pub struct RuneConfig {
+pub struct IgelConfig {
     pub project_root: PathBuf,
-    pub rune_dir: PathBuf,
+    pub igel_dir: PathBuf,
     pub target_dir: PathBuf,
     pub fingerprint_dir: PathBuf,
     pub cas_dir: PathBuf,
@@ -29,18 +29,18 @@ fn absolute_in(base: &Path, path: &Path) -> PathBuf {
     crate::fsutil::simplified(&path).to_path_buf()
 }
 
-impl RuneConfig {
+impl IgelConfig {
     pub fn new(project_root: impl Into<PathBuf>) -> Self {
         let project_root = crate::fsutil::simplified(&project_root.into()).to_path_buf();
-        let rune_dir = project_root.join(".rune");
-        let target_dir = rune_dir.join("target");
-        let fingerprint_dir = rune_dir.join("fingerprints");
+        let igel_dir = project_root.join(".igel");
+        let target_dir = igel_dir.join("target");
+        let fingerprint_dir = igel_dir.join("fingerprints");
 
         let cas_dir = home::home_dir()
             .unwrap_or_else(|| PathBuf::from("."))
-            .join(".rune")
+            .join(".igel")
             .join("cas");
-        let cas_dir = match std::env::var_os("RUNE_HOME").filter(|h| !h.is_empty()) {
+        let cas_dir = match std::env::var_os("IGEL_HOME").filter(|h| !h.is_empty()) {
             Some(home) => PathBuf::from(home).join("cas"),
             None => cas_dir,
         };
@@ -48,7 +48,7 @@ impl RuneConfig {
 
         Self {
             project_root,
-            rune_dir,
+            igel_dir,
             target_dir,
             fingerprint_dir,
             cas_dir,
@@ -141,22 +141,22 @@ mod tests {
 
     #[test]
     fn test_config_paths() {
-        let config = RuneConfig::new("/tmp/myproject");
-        assert_eq!(config.rune_dir, PathBuf::from("/tmp/myproject/.rune"));
+        let config = IgelConfig::new("/tmp/myproject");
+        assert_eq!(config.igel_dir, PathBuf::from("/tmp/myproject/.igel"));
         assert_eq!(
             config.deps_dir("dev"),
-            PathBuf::from("/tmp/myproject/.rune/target/debug/deps")
+            PathBuf::from("/tmp/myproject/.igel/target/debug/deps")
         );
         assert_eq!(
             config.deps_dir("release"),
-            PathBuf::from("/tmp/myproject/.rune/target/release/deps")
+            PathBuf::from("/tmp/myproject/.igel/target/release/deps")
         );
     }
 
     #[test]
     fn directories_handed_to_the_compiler_are_absolute() {
         use crate::settings::{Origin, Value};
-        let root = std::env::temp_dir().join("rune-config-test");
+        let root = std::env::temp_dir().join("igel-config-test");
         let mut settings = Settings::default();
         let origin = || Origin::Env("TEST".into());
         settings.override_value(
@@ -165,7 +165,7 @@ mod tests {
             origin(),
         );
         settings.override_value("cas.dir", Value::Path("shared-cas".into()), origin());
-        let config = RuneConfig::new(&root).with_settings(settings);
+        let config = IgelConfig::new(&root).with_settings(settings);
         let cwd = std::env::current_dir().unwrap();
         assert_eq!(config.target_dir, cwd.join("out").join("build"));
         assert_eq!(config.cas_dir, cwd.join("shared-cas"));
@@ -183,11 +183,11 @@ mod tests {
 
     #[test]
     fn test_build_script_out_dir() {
-        let config = RuneConfig::new("/tmp/myproject");
+        let config = IgelConfig::new("/tmp/myproject");
         let dir = config.build_script_out_dir("dev", "my-crate", "abc123");
         assert_eq!(
             dir,
-            PathBuf::from("/tmp/myproject/.rune/target/debug/build/my-crate-abc123/out")
+            PathBuf::from("/tmp/myproject/.igel/target/debug/build/my-crate-abc123/out")
         );
     }
 }

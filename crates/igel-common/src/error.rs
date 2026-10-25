@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 #[derive(Debug, thiserror::Error)]
-pub enum RuneError {
+pub enum IgelError {
     #[error("failed to read manifest at {path}: {source}")]
     ManifestRead {
         path: PathBuf,
@@ -45,4 +45,4 @@ pub enum RuneError {
     Other(String),
 }
 
-pub type RuneResult<T> = Result<T, RuneError>;
+pub type IgelResult<T> = Result<T, IgelError>;

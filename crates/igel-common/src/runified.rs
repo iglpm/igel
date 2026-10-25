@@ -1,7 +1,7 @@
 //! rustc-runified (`rustc-runified/` in this repository): rustc, linked against the toolchain's
 //! own `rustc_driver`, plus `--runified=` options that a stable rustc only has as `-Z` flags — a
 //! parallel front end whose output doesn't depend on the thread count, and compiling an
-//! executable before the rlibs it links exist. Rune runs it in place of the toolchain's `rustc`
+//! executable before the rlibs it links exist. Igel runs it in place of the toolchain's `rustc`
 //! when one is installed for that toolchain (`build.compiler`).
 
 use std::collections::HashMap;
@@ -18,6 +18,8 @@ pub enum Choice {
     /// rustc-runified, or an error saying how to install it.
     Required,
     Rustc,
+    /// hyprc, the fast Rust compiler built into Igel.
+    Hyprc,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -46,7 +48,7 @@ impl Driver {
         if fingerprint.ends_with("|missing") {
             return None;
         }
-        let path = crate::settings::rune_home()
+        let path = crate::settings::igel_home()
             .join("cache")
             .join("runified.json");
         let load = || -> HashMap<String, Option<Driver>> {
@@ -164,9 +166,9 @@ pub fn metadata_never_completes(rmeta: &Path) {
     }
 }
 
-/// Where the driver for a toolchain is installed (`cargo runified driver --rune` puts it there).
+/// Where the driver for a toolchain is installed (`cargo runified driver --igl` puts it there).
 pub fn installed_path(key: &str) -> PathBuf {
-    crate::settings::rune_home()
+    crate::settings::igel_home()
         .join("runified")
         .join(key)
         .join(format!("rustc-runified{}", std::env::consts::EXE_SUFFIX))

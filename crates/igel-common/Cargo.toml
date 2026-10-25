@@ -1,6 +1,6 @@
 [package]
-name = "rune-common"
-description = "Shared types, errors, and utilities for the Rune build system"
+name = "igel-common"
+description = "Shared types, errors, and utilities for the Igel build system"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

@@ -189,7 +189,7 @@ fn filesystem(path: &std::path::Path) -> Option<(u64, u64)> {
     }
 }
 
-/// Runs `f` with SIGPIPE blocked, so a vanished pipe reader is `EPIPE` rather than the end of Rune.
+/// Runs `f` with SIGPIPE blocked, so a vanished pipe reader is `EPIPE` rather than the end of Igel.
 pub fn without_sigpipe<T>(f: impl FnOnce() -> T) -> T {
     #[cfg(unix)]
     // SAFETY: plain signal-mask calls on this thread's own mask, with
