@@ -1,16 +1,16 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/rune-common",
-    "crates/rune-manifest",
-    "crates/rune-graph",
-    "crates/rune-fingerprint",
-    "crates/rune-scheduler",
-    "crates/rune-compiler",
-    "crates/rune-cas",
-    "crates/rune-registry",
-    "crates/rune-resolver",
-    "crates/rune-cli",
+    "crates/igel-common",
+    "crates/igel-manifest",
+    "crates/igel-graph",
+    "crates/igel-fingerprint",
+    "crates/igel-scheduler",
+    "crates/igel-compiler",
+    "crates/igel-cas",
+    "crates/igel-registry",
+    "crates/igel-resolver",
+    "crates/igel-cli",
     "bench",
     "hyprlnk",
 ]
@@ -18,14 +18,14 @@ members = [
 # it has crates that belong to no workspace, and Cargo must not take them for members of this
 # one. hyprcross: a project of its own, with its own hyprlnk submodule (pinned by hyprcross);
 # two packages named hyprlnk can't share a workspace.
-exclude = ["rustc-runified", "hyprcross"]
+exclude = ["rustc-runified", "hyprcross", "hyprc"]
 
 [workspace.package]
 version = "2027.0.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 rust-version = "1.89"
-repository = "https://github.com/runepm/rune"
+repository = "https://github.com/runepm/igel"
 homepage = "https://runepm.com"
 
 [workspace.dependencies]
@@ -81,19 +81,20 @@ same-file = "1.0"
 dunce = "1.0"
 
 # Internal crates
-rune-common = { path = "crates/rune-common" }
-rune-manifest = { path = "crates/rune-manifest" }
-rune-graph = { path = "crates/rune-graph" }
-rune-fingerprint = { path = "crates/rune-fingerprint" }
-rune-scheduler = { path = "crates/rune-scheduler" }
-rune-compiler = { path = "crates/rune-compiler" }
-rune-cas = { path = "crates/rune-cas" }
-rune-registry = { path = "crates/rune-registry" }
-rune-resolver = { path = "crates/rune-resolver" }
+igel-common = { path = "crates/igel-common" }
+igel-manifest = { path = "crates/igel-manifest" }
+igel-graph = { path = "crates/igel-graph" }
+igel-fingerprint = { path = "crates/igel-fingerprint" }
+igel-scheduler = { path = "crates/igel-scheduler" }
+igel-compiler = { path = "crates/igel-compiler" }
+igel-cas = { path = "crates/igel-cas" }
+igel-registry = { path = "crates/igel-registry" }
+igel-resolver = { path = "crates/igel-resolver" }
 hyprlnk = { path = "hyprlnk" }
-# Cross-compilation (`rune cross`, `--cross`), without the hyprlnk it would bring: Rune links
+# Cross-compilation (`igl cross`, `--cross`), without the hyprlnk it would bring: Igel links
 # with its own.
 hyprcross = { path = "hyprcross", default-features = false }
+hyprc = { path = "hyprc", default-features = false }
 
 [profile.release]
 lto = "thin"

@@ -449,6 +449,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3f9eec918d3f24069decb9af1554cad7c880e2da24a9afd88aca000531ab82c1"
 
 [[package]]
+name = "foldhash"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
+
+[[package]]
 name = "form_urlencoded"
 version = "1.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -575,6 +581,9 @@ name = "hashbrown"
 version = "0.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
+dependencies = [
+ "foldhash",
+]
 
 [[package]]
 name = "heck"
@@ -693,8 +702,94 @@ dependencies = [
 ]
 
 [[package]]
+name = "hyprc"
+version = "0.1.0"
+dependencies = [
+ "hyprc-codegen",
+ "hyprc-hir",
+ "hyprc-mir",
+ "hyprc-resolve",
+ "hyprc-span",
+ "hyprc-syntax",
+ "hyprc-ty",
+ "mimalloc",
+ "rayon",
+]
+
+[[package]]
+name = "hyprc-codegen"
+version = "0.1.0"
+dependencies = [
+ "hyprc-hir",
+ "hyprc-mir",
+ "hyprc-span",
+ "hyprc-ty",
+ "rayon",
+ "rustc-hash",
+]
+
+[[package]]
+name = "hyprc-hir"
+version = "0.1.0"
+dependencies = [
+ "hyprc-resolve",
+ "hyprc-span",
+ "hyprc-syntax",
+ "rayon",
+]
+
+[[package]]
+name = "hyprc-mir"
+version = "0.1.0"
+dependencies = [
+ "hyprc-hir",
+ "hyprc-span",
+ "hyprc-syntax",
+ "hyprc-ty",
+ "rayon",
+]
+
+[[package]]
+name = "hyprc-resolve"
+version = "0.1.0"
+dependencies = [
+ "hyprc-span",
+ "hyprc-syntax",
+ "rayon",
+]
+
+[[package]]
+name = "hyprc-span"
+version = "0.1.0"
+dependencies = [
+ "hashbrown",
+ "rustc-hash",
+]
+
+[[package]]
+name = "hyprc-syntax"
+version = "0.1.0"
+dependencies = [
+ "hyprc-span",
+ "memchr",
+ "unicode-ident",
+]
+
+[[package]]
+name = "hyprc-ty"
+version = "0.1.0"
+dependencies = [
+ "hashbrown",
+ "hyprc-hir",
+ "hyprc-span",
+ "hyprc-syntax",
+ "rayon",
+ "rustc-hash",
+]
+
+[[package]]
 name = "hyprcross"
-version = "0.2.0"
+version = "2027.0.0-rc.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -1277,7 +1372,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "rune-bench"
+name = "igel-bench"
 version = "2027.0.0"
 dependencies = [
  "anyhow",
@@ -1290,14 +1385,14 @@ dependencies = [
 ]
 
 [[package]]
-name = "rune-cas"
+name = "igel-cas"
 version = "2027.0.0"
 dependencies = [
  "blake3",
  "filetime",
  "flate2",
  "reqwest",
- "rune-common",
+ "igel-common",
  "same-file",
  "serde",
  "serde_json",
@@ -1312,7 +1407,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "rune-cli"
+name = "igel-cli"
 version = "2027.0.0"
 dependencies = [
  "anyhow",
@@ -1326,6 +1421,7 @@ dependencies = [
  "flate2",
  "glob",
  "home",
+ "hyprc",
  "hyprcross",
  "hyprlnk",
  "indicatif",
@@ -1333,14 +1429,14 @@ dependencies = [
  "mimalloc",
  "rayon",
  "reqwest",
- "rune-cas",
- "rune-common",
- "rune-fingerprint",
- "rune-graph",
- "rune-manifest",
- "rune-registry",
- "rune-resolver",
- "rune-scheduler",
+ "igel-cas",
+ "igel-common",
+ "igel-fingerprint",
+ "igel-graph",
+ "igel-manifest",
+ "igel-registry",
+ "igel-resolver",
+ "igel-scheduler",
  "rustc-demangle",
  "semver",
  "serde",
@@ -1355,7 +1451,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "rune-common"
+name = "igel-common"
 version = "2027.0.0"
 dependencies = [
  "blake3",
@@ -1374,11 +1470,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "rune-compiler"
+name = "igel-compiler"
 version = "2027.0.0"
 dependencies = [
  "libc",
- "rune-common",
+ "igel-common",
  "serde",
  "serde_json",
  "thiserror",
@@ -1386,11 +1482,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "rune-fingerprint"
+name = "igel-fingerprint"
 version = "2027.0.0"
 dependencies = [
  "rayon",
- "rune-common",
+ "igel-common",
  "serde",
  "serde_json",
  "tempfile",
@@ -1399,19 +1495,19 @@ dependencies = [
 ]
 
 [[package]]
-name = "rune-graph"
+name = "igel-graph"
 version = "2027.0.0"
 dependencies = [
- "rune-common",
+ "igel-common",
  "semver",
 ]
 
 [[package]]
-name = "rune-manifest"
+name = "igel-manifest"
 version = "2027.0.0"
 dependencies = [
  "glob",
- "rune-common",
+ "igel-common",
  "semver",
  "serde",
  "tempfile",
@@ -1420,7 +1516,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "rune-registry"
+name = "igel-registry"
 version = "2027.0.0"
 dependencies = [
  "bincode",
@@ -1429,7 +1525,7 @@ dependencies = [
  "home",
  "rayon",
  "reqwest",
- "rune-common",
+ "igel-common",
  "serde",
  "serde_json",
  "tar",
@@ -1440,16 +1536,16 @@ dependencies = [
 ]
 
 [[package]]
-name = "rune-resolver"
+name = "igel-resolver"
 version = "2027.0.0"
 dependencies = [
  "bincode",
  "cfg-expr",
  "colored",
  "pubgrub",
- "rune-common",
- "rune-manifest",
- "rune-registry",
+ "igel-common",
+ "igel-manifest",
+ "igel-registry",
  "semver",
  "serde",
  "tempfile",
@@ -1459,7 +1555,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "rune-scheduler"
+name = "igel-scheduler"
 version = "2027.0.0"
 dependencies = [
  "console",
@@ -1467,11 +1563,11 @@ dependencies = [
  "indicatif",
  "jobserver",
  "rayon",
- "rune-cas",
- "rune-common",
- "rune-compiler",
- "rune-fingerprint",
- "rune-graph",
+ "igel-cas",
+ "igel-common",
+ "igel-compiler",
+ "igel-fingerprint",
+ "igel-graph",
  "semver",
  "serde",
  "serde_json",
